@@ -7,6 +7,11 @@ class Facture(models.Model):
     police_number = models.CharField(max_length=50)
     contrat_number = models.CharField(max_length=50)
     facture_number = models.CharField(max_length=50)
+    typologie = models.CharField(max_length=50, null=True)
+    categorie = models.CharField(max_length=50, null=True)
+    societe = models.CharField(max_length=50, null=True)
+    type_police = models.CharField(max_length=50, null=True)
+   
     date_facture = models.DateField()
     date_echeance = models.DateField(null=True, blank=True)
 

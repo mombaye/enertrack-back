@@ -26,5 +26,22 @@ services:
     depends_on:
       - db
 
+  redis:
+    image: redis:7
+    container_name: redis
+    ports:
+      - "6379:6379"
+
+  celery:
+    build: .
+    command: celery -A enertrack_backend worker --loglevel=info
+    volumes:
+      - .:/app
+    env_file:
+      - .env         # <-- AJOUTE CETTE LIGNE
+    depends_on:
+      - redis
+      - db
+
 volumes:
   postgres_data:

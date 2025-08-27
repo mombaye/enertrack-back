@@ -22,4 +22,12 @@ urlpatterns = [
     path('api/invoices/', include('invoices.urls')),
 
     
+    # ...
+    path('api/', include('energy.urls')),
+    path("api/", include("rectifiers.urls")),  # ✅ nouveau
+    path("api/", include("powerquality.urls")),   # ✅ nouveau
+    path("api/", include("pwmreport.urls")),      # ✅ nouveau
+    path("api/", include("billing.urls")),       # ✅ nouveau
+
+    
 ]

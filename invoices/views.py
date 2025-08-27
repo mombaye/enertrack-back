@@ -1,6 +1,10 @@
 import datetime
 import math
+from celery.result import AsyncResult
 from rest_framework import viewsets
+
+from invoices.tasks import import_factures_task
+from invoices.utils.parsers import safe_date, safe_decimal, safe_float, safe_int, safe_str
 from .models import Facture
 from .serializers import FactureSerializer
 from rest_framework.views import APIView
@@ -13,6 +17,8 @@ from django.db.models import Avg, Count
 import pandas as pd
 from core.models import Site
 import decimal
+import traceback
+from django.utils import timezone
 
 
 class FactureViewSet(viewsets.ModelViewSet):
@@ -29,6 +35,61 @@ class FactureViewSet(viewsets.ModelViewSet):
         if end_date:
             qs = qs.filter(date_facture__lte=parse_date(end_date))
         return qs
+    
+
+
+    @action(detail=False, methods=["get"], url_path="kpi-stats")
+    def kpi_stats(self, request):
+        """
+        Pour chaque site, retourne les moyennes (HT, TTC, consommation)
+        sur les 3 derniers mois, année en cours et année précédente.
+        """
+        user_country = self.request.user.pays
+        today = timezone.now().date()
+        start_year = today.replace(month=1, day=1)
+        start_3_months = (today.replace(day=1) - datetime.timedelta(days=1)).replace(day=1)  # 1er du mois dernier
+        start_3_months = (start_3_months - datetime.timedelta(days=2*30)).replace(day=1)  # Environ 3 mois avant
+
+        prev_year_start = (today.replace(year=today.year - 1, month=1, day=1))
+        prev_year_end = start_year - datetime.timedelta(days=1)
+
+        # Prépare le résultat
+        results = []
+        sites = Site.objects.filter(country=user_country)
+
+        for site in sites:
+            qs = Facture.objects.filter(site=site)
+
+            # 3 derniers mois
+            last_3m = qs.filter(date_facture__gte=start_3_months, date_facture__lte=today)
+            # Année en cours
+            current_year = qs.filter(date_facture__gte=start_year, date_facture__lte=today)
+            # Année précédente
+            previous_year = qs.filter(date_facture__gte=prev_year_start, date_facture__lte=prev_year_end)
+
+            results.append({
+                "site_id": site.id,
+                "site_name": site.name,
+                "kpi_last_3_months": {
+                    "avg_montant_ht": last_3m.aggregate(avg=Avg("montant_ht"))["avg"] or 0,
+                    "avg_montant_ttc": last_3m.aggregate(avg=Avg("montant_ttc"))["avg"] or 0,
+                    "avg_consommation_kwh": last_3m.aggregate(avg=Avg("consommation_kwh"))["avg"] or 0,
+                },
+                "kpi_current_year": {
+                    "avg_montant_ht": current_year.aggregate(avg=Avg("montant_ht"))["avg"] or 0,
+                    "avg_montant_ttc": current_year.aggregate(avg=Avg("montant_ttc"))["avg"] or 0,
+                    "avg_consommation_kwh": current_year.aggregate(avg=Avg("consommation_kwh"))["avg"] or 0,
+                },
+                "kpi_previous_year": {
+                    "avg_montant_ht": previous_year.aggregate(avg=Avg("montant_ht"))["avg"] or 0,
+                    "avg_montant_ttc": previous_year.aggregate(avg=Avg("montant_ttc"))["avg"] or 0,
+                    "avg_consommation_kwh": previous_year.aggregate(avg=Avg("consommation_kwh"))["avg"] or 0,
+                },
+            })
+
+      
+        return Response(results)
+
 
     @action(detail=False, methods=["get"], url_path="stats")
     def stats(self, request):
@@ -63,7 +124,8 @@ class FactureViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=["get"], url_path="between")
     def between(self, request):
         """
-        Renvoie la liste brute (pas paginée) des factures entre deux dates (start_date, end_date)
+        Renvoie la liste brute (pas paginée) des factures entre deux dates (start_date, end_date),
+        triée par nom de site puis date décroissante.
         """
         user_country = self.request.user.pays
         qs = Facture.objects.filter(site__country=user_country)
@@ -73,76 +135,14 @@ class FactureViewSet(viewsets.ModelViewSet):
             qs = qs.filter(date_facture__gte=parse_date(start_date))
         if end_date:
             qs = qs.filter(date_facture__lte=parse_date(end_date))
+        qs = qs.order_by('site__name', '-date_facture')  # <---- ici le tri !
         data = FactureSerializer(qs, many=True).data
         return Response(data)
 
 
 
 
-def safe_decimal(val):
-    # Gère aussi NaN et None
-    if val is None or (isinstance(val, float) and math.isnan(val)):
-        return None
-    try:
-        return decimal.Decimal(str(val).replace(',', '.'))
-    except (TypeError, decimal.InvalidOperation, ValueError):
-        return None
 
-def safe_float(val):
-    if val is None or (isinstance(val, float) and math.isnan(val)):
-        return None
-    try:
-        return float(val)
-    except (TypeError, ValueError):
-        return None
-
-def safe_int(val):
-    if val is None or (isinstance(val, float) and math.isnan(val)):
-        return None
-    try:
-        return int(val)
-    except (TypeError, ValueError):
-        return None
-
-
-def safe_date(val):
-    """
-    Gère les dates sous forme string, datetime, float Excel, ou None.
-    """
-    # Cas 1 : datetime.datetime ou datetime.date natif
-    if isinstance(val, (datetime.datetime, datetime.date)):
-        return val if isinstance(val, datetime.date) else val.date()
-    # Cas 2 : Numérique Excel (nombre de jours depuis 1899-12-30)
-    if isinstance(val, (float, int)) and not pd.isna(val):
-        # Excel start = 1899-12-30
-        excel_start = datetime.datetime(1899, 12, 30)
-        try:
-            return (excel_start + datetime.timedelta(days=int(val))).date()
-        except Exception:
-            return None
-    # Cas 3 : String (y compris format français 01/02/2025 ou ISO 2025-02-01)
-    if isinstance(val, str):
-        val = val.strip()
-        if not val:
-            return None
-        # D'abord tente parse_date (ISO)
-        d = parse_date(val)
-        if d:
-            return d
-        # Puis tente format FR
-        for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y"):
-            try:
-                return datetime.datetime.strptime(val, fmt).date()
-            except Exception:
-                continue
-        # Ajoute ici d'autres formats si besoin
-    return None
-
-
-def safe_str(val):
-    if val is None or (isinstance(val, float) and pd.isna(val)):
-        return None
-    return str(val).strip()
 
 class FactureImportView(APIView):
     parser_classes = [MultiPartParser]
@@ -173,6 +173,10 @@ class FactureImportView(APIView):
                     'site': site,
                     'police_number': safe_str(row.get('N° POLICE')),
                     'contrat_number': safe_str(row.get('N°COMPTE CONTRAT')),
+                    "typologie": safe_str(row.get('TYPOLOGIE')),
+                    "categorie": safe_str(row.get('CATEGORIE')),
+                    "societe": safe_str(row.get('SOCIÉTÉ')),
+                    "type_police": safe_str(row.get('TYPE POLICE')),
                     'date_facture': safe_date(row.get('DATE FACTURE')),
                     'date_echeance': safe_date(row.get('ÉCHÉANCE')),
                     'montant_ht': safe_decimal(row.get('MONTANT HT')),
@@ -189,7 +193,7 @@ class FactureImportView(APIView):
                     'index_ai_k2': safe_int(row.get('INDEX AI K2')),
                     'index_ni_k1': safe_int(row.get('INDEX NI K1')),
                     'index_ni_k2': safe_int(row.get('INDEX NI K2')),
-                    'consommation_kwh': safe_decimal(row.get('CONSOMMATION KWH')),
+                    'consommation_kwh': safe_decimal(row.get('CONS FACTURÉE')),
                     'rappel_majoration': safe_decimal(row.get('RAPPEL MAJORATION')),
                     'nb_jours': safe_int(row.get('NOMBRE DE JOURS')),
                     'ps': safe_float(row.get('PS')),
@@ -212,3 +216,29 @@ class FactureImportView(APIView):
             created += 1
 
         return Response({"message": f"{created} factures importées."}, status=201)
+
+
+class FactureAsyncImportView(APIView):
+    parser_classes = [MultiPartParser]
+
+    def post(self, request):
+        file = request.FILES.get('file')
+        if not file:
+            return Response({"error": "No file provided"}, status=400)
+        task = import_factures_task.delay(file.read())
+        return Response({"task_id": task.id}, status=202)
+
+
+class ImportStatusView(APIView):
+    def get(self, request, task_id):
+        result = AsyncResult(task_id)
+        if result.ready():
+            data = result.result
+            # Si c'est une exception, convertis en texte complet (traceback)
+            if isinstance(data, Exception):
+                data = ''.join(traceback.format_exception_only(type(data), data))
+            return Response({
+                "status": result.status,
+                "result": data
+            })
+        return Response({"status": result.status})
