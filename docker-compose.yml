@@ -25,12 +25,14 @@ services:
       - .env
     depends_on:
       - db
+    restart: always
 
   redis:
     image: redis:7
     container_name: redis
     ports:
       - "6379:6379"
+    restart: always
 
   celery:
     build: .
@@ -42,6 +44,7 @@ services:
     depends_on:
       - redis
       - db
-
+    restart: always
 volumes:
   postgres_data:
+
