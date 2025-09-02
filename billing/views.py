@@ -20,8 +20,12 @@ from .utils import parse_decimal_fr, iter_month_slices
 # ... (COLUMN_MAP, DATE_COLS, DEC_COLS identiques)
 
 from django.db.models import Q  # <-- ajoute ceci
-
-
+# services.py (ou dans views.py si tu préfères)
+from django.db import transaction
+from django.db.models import Sum, Count, Min, Max
+from .models import MonthlySynthesis, ContractMonth
+from typing import Set, Tuple
+from django.db.models import Q
 
 # === Mapping des en-têtes Excel -> champs modèle ===
 COLUMN_MAP = {
@@ -158,12 +162,15 @@ class ImportBatchViewSet(viewsets.GenericViewSet, mixins.ListModelMixin):
     queryset = ImportBatch.objects.all().order_by("-imported_at")
     serializer_class = ImportBatchSerializer
     parser_classes = (MultiPartParser, FormParser)
+    
 
     @action(methods=["post"], detail=False, url_path="import")
     def import_file(self, request, *args, **kwargs):
         f = request.FILES.get("file")
         if not f:
             return Response({"detail": "Aucun fichier fourni"}, status=400)
+
+        affected_keys = set()
 
         with transaction.atomic():
             batch = ImportBatch.objects.create(source_filename=f.name)
@@ -201,6 +208,7 @@ class ImportBatchViewSet(viewsets.GenericViewSet, mixins.ListModelMixin):
                 ).first()
 
                 if existing:
+                    # UPDATE
                     for k, v in data.items():
                         setattr(existing, k, v)
                     existing.batch = batch
@@ -210,23 +218,33 @@ class ImportBatchViewSet(viewsets.GenericViewSet, mixins.ListModelMixin):
                     payloads = _build_monthly_payloads(existing)
                     MonthlySynthesis.objects.bulk_create(payloads)
                     updated_count += 1
-                    monthly_total += len(payloads)
                 else:
+                    # INSERT
                     inv = SonatelInvoice.objects.create(batch=batch, **data)
                     payloads = _build_monthly_payloads(inv)
                     MonthlySynthesis.objects.bulk_create(payloads)
                     created_count += 1
-                    monthly_total += len(payloads)
 
-            return Response(
-                {
-                    "batch": ImportBatchSerializer(batch).data,
-                    "rows_created": created_count,
-                    "rows_updated": updated_count,
-                    "monthly_rows_created": monthly_total,
-                },
-                status=status.HTTP_201_CREATED,
-            )
+                monthly_total += len(payloads)
+                for p in payloads:
+                    affected_keys.add((p.numero_compte_contrat, p.year, p.month))
+
+            # ➜ agrégat/cleanup en une seule passe
+            count_upserted = upsert_contract_months_for_keys(affected_keys)
+            count_deleted = delete_stale_contract_months(affected_keys)
+
+        return Response(
+            {
+                "batch": ImportBatchSerializer(batch).data,
+                "rows_created": created_count,
+                "rows_updated": updated_count,
+                "monthly_rows_created": monthly_total,
+                "contract_months_upserted": count_upserted,
+                "contract_months_deleted": count_deleted,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
 
 
 class SonatelInvoiceViewSet(viewsets.ReadOnlyModelViewSet):
@@ -264,3 +282,112 @@ class MonthlySynthesisViewSet(viewsets.ReadOnlyModelViewSet):
         if facture:
             qs = qs.filter(numero_facture=facture)
         return qs
+
+
+
+
+
+
+def _q_or_from_keys(keys: Set[Tuple[str, int, int]]) -> Q:
+    q = Q()
+    first = True
+    for acc, y, m in keys:
+        part = Q(numero_compte_contrat=acc, year=y, month=m)
+        q = part if first else (q | part)
+        first = False
+    return q if not first else Q(pk__in=[])  # vide si rien
+
+def delete_stale_contract_months(keys: Set[Tuple[str, int, int]]) -> int:
+    """
+    Supprime les ContractMonth pour les (acc, y, m) donnés qui n'ont plus
+    aucune ligne MonthlySynthesis correspondante.
+    """
+    if not keys:
+        return 0
+
+    # Clés encore présentes dans MonthlySynthesis
+    alive = set(
+        MonthlySynthesis.objects
+        .filter(_q_or_from_keys(keys))
+        .values_list("numero_compte_contrat", "year", "month")
+        .distinct()
+    )
+
+    stale = keys - alive
+    if not stale:
+        return 0
+
+    return ContractMonth.objects.filter(_q_or_from_keys(stale)).delete()[0]
+
+
+
+def upsert_contract_months_for_keys(keys: set[tuple[str, int, int]]):
+    """
+    keys = {(numero_compte_contrat, year, month), ...}
+    Recalcule depuis MonthlySynthesis et fait un upsert dans ContractMonth.
+    """
+    if not keys:
+        return 0
+
+    # Filtre one-shot
+    filters = None
+    from django.db.models import Q
+    for (acc, y, m) in keys:
+        q = Q(numero_compte_contrat=acc, year=y, month=m)
+        filters = (filters | q) if filters is not None else q
+
+    qs = (MonthlySynthesis.objects
+          .filter(filters)
+          .values("numero_compte_contrat", "year", "month")
+          .annotate(
+              conso=Sum("conso"),
+              montant_energie=Sum("montant_energie"),
+              montant_ttc=Sum("montant_ttc"),
+              invoices_count=Count("id"),
+              first_period_start=Min("period_start"),
+              last_period_end=Max("period_end"),
+          ))
+
+    # Prépare upsert
+    objs = [
+        ContractMonth(
+            numero_compte_contrat=r["numero_compte_contrat"],
+            year=r["year"], month=r["month"],
+            conso=r["conso"], montant_energie=r["montant_energie"], montant_ttc=r["montant_ttc"],
+            invoices_count=r["invoices_count"],
+            first_period_start=r["first_period_start"],
+            last_period_end=r["last_period_end"],
+        )
+        for r in qs
+    ]
+
+    # Django 4.1+ : bulk upsert
+    try:
+        ContractMonth.objects.bulk_create(
+            objs,
+            update_conflicts=True,
+            unique_fields=["numero_compte_contrat", "year", "month"],
+            update_fields=[
+                "conso", "montant_energie", "montant_ttc",
+                "invoices_count", "first_period_start", "last_period_end"
+            ],
+        )
+        return len(objs)
+    except TypeError:
+        # Fallback si ta version ne supporte pas update_conflicts
+        # (plus lent mais OK pour un volume modéré)
+        with transaction.atomic():
+            for o in objs:
+                ContractMonth.objects.update_or_create(
+                    numero_compte_contrat=o.numero_compte_contrat,
+                    year=o.year, month=o.month,
+                    defaults=dict(
+                        conso=o.conso,
+                        montant_energie=o.montant_energie,
+                        montant_ttc=o.montant_ttc,
+                        invoices_count=o.invoices_count,
+                        first_period_start=o.first_period_start,
+                        last_period_end=o.last_period_end,
+                    )
+                )
+        return len(objs)

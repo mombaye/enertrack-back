@@ -2,6 +2,8 @@
 from rest_framework import serializers
 from .models import ImportBatch, SonatelInvoice, MonthlySynthesis
 
+from .models import ContractMonth
+
 class ImportBatchSerializer(serializers.ModelSerializer):
     class Meta:
         model = ImportBatch
@@ -16,3 +18,11 @@ class MonthlySynthesisSerializer(serializers.ModelSerializer):
     class Meta:
         model = MonthlySynthesis
         exclude = []
+
+
+
+
+class ContractMonthSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ContractMonth
+        fields = "__all__"

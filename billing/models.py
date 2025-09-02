@@ -106,3 +106,39 @@ class MonthlySynthesis(models.Model):
 
     def __str__(self):
         return f"{self.numero_compte_contrat} {self.year}-{self.month:02d}"
+
+
+
+
+DEC = dict(max_digits=18, decimal_places=3, null=True, blank=True)
+
+class ContractMonth(models.Model):
+    """Agrégat par contrat × (année, mois) basé sur MonthlySynthesis."""
+    numero_compte_contrat = models.CharField(max_length=32)
+    year  = models.IntegerField()
+    month = models.IntegerField()
+
+    # Agrégats principaux
+    conso = models.DecimalField(**DEC)               # Somme conso du mois
+    montant_energie = models.DecimalField(**DEC)     # Somme énergie du mois
+    montant_ttc = models.DecimalField(**DEC)         # Somme TTC du mois
+
+    # Info utile
+    invoices_count = models.IntegerField(default=0)  # nb de lignes source contributrices
+    first_period_start = models.DateField(null=True, blank=True)
+    last_period_end    = models.DateField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["numero_compte_contrat", "year", "month"],
+                name="uniq_contract_month"
+            )
+        ]
+        indexes = [
+            models.Index(fields=["numero_compte_contrat", "year", "month"]),
+            models.Index(fields=["year", "month"]),
+        ]
+
+    def __str__(self):
+        return f"{self.numero_compte_contrat} {self.year}-{self.month:02d}"
