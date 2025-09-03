@@ -16,3 +16,10 @@ class MonthlySynthesisSerializer(serializers.ModelSerializer):
     class Meta:
         model = MonthlySynthesis
         exclude = []
+
+
+
+class ContractMonthSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ContractMonth
+        fields = "__all__"
