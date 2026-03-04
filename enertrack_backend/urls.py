@@ -28,6 +28,10 @@ urlpatterns = [
     path("api/", include("powerquality.urls")),   # ✅ nouveau
     path("api/", include("pwmreport.urls")),      # ✅ nouveau
     path("api/", include("billing.urls")),       # ✅ nouveau
+    path("api/", include("gridoutages.urls")),       # ✅ nouveau
+    path("api/dashboard/", include("dashboard.urls")),   # ← ajouter
+    path("api/certification/", include("certification.urls")),
+    path("api/", include("users.urls")),
 
     
 ]

@@ -17,16 +17,25 @@ SECRET_KEY = 'django-insecure-4z%jl$rp-=z8swn1&9lhej9gd!suod(@fwga(ozd%*8lh%#7+m
 DEBUG = True
 
 ALLOWED_HOSTS = [
-    "http://localhost:5173",
     "localhost",
-    "192.168.1.29"
+    "192.168.1.29",
 ]
 
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:5173",
-    "http://192.168.1.29:8080",
+    "http://192.168.1.29",       # ← ajoute ceci
+    "http://192.168.1.29:80",
     "http://192.168.1.29:8000",
-    "http://192.168.1.29:80"
+    "http://192.168.1.29:8080",
+]
+
+# (optionnel mais recommandé si tu fais des POST depuis ces origines)
+CSRF_TRUSTED_ORIGINS = [
+    "http://localhost:5173",
+    "http://192.168.1.29",
+    "http://192.168.1.29:80",
+    "http://192.168.1.29:8000",
+    "http://192.168.1.29:8080",
 ]
 # Application definition
 
@@ -49,6 +58,8 @@ INSTALLED_APPS = [
     'powerquality',  # ✅ nouveau
     'pwmreport',           # ✅ nouveau
     'corsheaders',
+    'gridoutages',  # ✅ nouveau
+    'dashboard'
 
 ]
 
@@ -62,6 +73,8 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     'corsheaders.middleware.CorsMiddleware',
 ]
+
+
 
 ROOT_URLCONF = 'enertrack_backend.urls'
 
@@ -146,7 +159,12 @@ REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
     ),
+    "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.PageNumberPagination",
+    "PAGE_SIZE": 20,
 }
+
+
+
 
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=30),
@@ -161,3 +179,11 @@ CELERY_BROKER_URL = 'redis://redis:6379/0'  # nom du service Docker
 CELERY_RESULT_BACKEND = 'redis://redis:6379/0'
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
+EFMS_SQL_HOST      = os.environ.get("EFMS_SQL_HOST",     "172.30.0.149")
+EFMS_SQL_PORT      = int(os.environ.get("EFMS_SQL_PORT", 1433))
+EFMS_SQL_DB        = os.environ.get("EFMS_SQL_DB",       "SQL1-ProdDB")
+EFMS_SQL_USER      = os.environ.get("EFMS_SQL_USER",     "")
+EFMS_SQL_PASSWORD  = os.environ.get("EFMS_SQL_PASSWORD", "")
+EFMS_SQL_DRIVER    = os.environ.get("EFMS_SQL_DRIVER",   "ODBC Driver 17 for SQL Server")
+EFMS_SQL_TIMEOUT   = int(os.environ.get("EFMS_SQL_TIMEOUT",     10))
+EFMS_SQL_MAX_RETRIES = int(os.environ.get("EFMS_SQL_MAX_RETRIES", 2))

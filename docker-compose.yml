@@ -1,16 +1,58 @@
 version: "3.9"
 
 services:
+
   db:
     image: postgres:15
     volumes:
       - postgres_data:/var/lib/postgresql/data/
     environment:
-      POSTGRES_DB: enertrack_db
-      POSTGRES_USER: enertrack_user
-      POSTGRES_PASSWORD: enertrack_pass
+      POSTGRES_DB:       ${POSTGRES_DB:-enertrack_db}
+      POSTGRES_USER:     ${POSTGRES_USER:-enertrack_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-enertrack_pass}
     ports:
       - "5432:5432"
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-enertrack_user} -d ${POSTGRES_DB:-enertrack_db}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Sonde eFMS — verifie que SQL Server est joignable via tunnel Unifi site-to-site
+  # Indicateur passif : ne bloque pas web/celery, visible dans docker compose ps/logs
+  efms-probe:
+    image: alpine:3.19
+    restart: always
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        apk add --no-cache netcat-openbsd -q
+        while true; do
+          if nc -z -w5 172.30.0.149 1433; then
+            echo '[efms-probe] OK — SQL Server joignable'
+          else
+            echo '[efms-probe] WARN — SQL Server non joignable'
+          fi
+          sleep 60
+        done
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z -w5 172.30.0.149 1433"]
+      interval: 60s
+      timeout: 10s
+      start_period: 15s
+      retries: 2
 
   web:
     build:
@@ -24,27 +66,27 @@ services:
     env_file:
       - .env
     depends_on:
-      - db
-    restart: always
-
-  redis:
-    image: redis:7
-    container_name: redis
-    ports:
-      - "6379:6379"
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     restart: always
 
   celery:
-    build: .
-    command: celery -A enertrack_backend worker --loglevel=info
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    command: celery -A enertrack_backend worker --loglevel=info --concurrency=4
     volumes:
-      - .:/app
+      - .:/code
     env_file:
-      - .env         # <-- AJOUTE CETTE LIGNE
+      - .env
     depends_on:
-      - redis
-      - db
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     restart: always
+
 volumes:
   postgres_data:
-

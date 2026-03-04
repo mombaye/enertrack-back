@@ -1,11 +1,12 @@
 # sonatel_billing/utils.py
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
+import pandas as pd
 
 FR_WS = {" ", "\u00A0"}  # espaces & espaces insécables
 
-def parse_decimal_fr(x):
-    """'458 543' -> Decimal('458543'); '48 763' -> 48763; ''/None -> None."""
+"""def parse_decimal_fr(x):
+    '458 543' -> Decimal('458543'); '48 763' -> 48763; ''/None -> None.
     if x is None:
         return None
     s = str(x).strip()
@@ -19,6 +20,33 @@ def parse_decimal_fr(x):
     try:
         return Decimal(s)
     except InvalidOperation:
+        return None"""
+
+
+def parse_decimal_fr(val):
+    # Cas vides / NaN pandas
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+
+    s = str(val).strip().replace("\u00a0", "")  # supprime NBSP
+    if s == "":
+        return None
+
+    # valeurs "nulles" diverses
+    if s.lower() in {"nan", "na", "n/a", "#n/a", "none"}:
+        return None
+
+    # format FR -> remplace séparateurs
+    s = s.replace(" ", "").replace(",", ".")
+
+    try:
+        dec = Decimal(s)
+        # Si jamais on tombe sur un Decimal NaN, on le neutralise
+        if dec.is_nan():
+            return None
+        return dec
+    except InvalidOperation:
+        # si ce n'est pas un nombre, on renvoie None plutôt que planter
         return None
 
 def month_start(d: date) -> date:

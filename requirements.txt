@@ -9,3 +9,4 @@ redis
 django-cors-headers
 pandas
 openpyxl
+pyodbc>=4.0.39
