@@ -99,9 +99,13 @@ class DashboardSummaryView(APIView):
 
     def _billing(self, start: date, end: date) -> dict:
 
-        # ── Base MonthlySynthesis filtrée sur la plage ────────────────────────
+        # ── Base MonthlySynthesis filtrée sur la plage + sites éligibles ─────────
         ms_base = _filter_year_month_range(
-            MonthlySynthesis.objects.select_related("source__site"),
+            MonthlySynthesis.objects.select_related("source__site").filter(
+                source__site__isnull=False,
+                source__site__invoice_payment__iexact="Aktivco",
+                source__site__grid_fee=True,
+            ),
             start, end,
         )
 
@@ -118,9 +122,13 @@ class DashboardSummaryView(APIView):
 
         # Nb factures distinctes dans la plage (via overlap avec periode)
         inv_qs = SonatelInvoice.objects.filter(
+            site__isnull=False,
+            site__invoice_payment__iexact="Aktivco",
+            site__grid_fee=True,
             date_debut_periode__lte=end,
             date_fin_periode__gte=start,
         )
+
         total_invoices = inv_qs.count()
 
         # Nb sites et contrats actifs (avec au moins 1 facture dans la plage)
@@ -128,8 +136,7 @@ class DashboardSummaryView(APIView):
             inv_qs.values("numero_compte_contrat").distinct().count()
         )
         active_sites = (
-            inv_qs.filter(site__isnull=False)
-            .values("site_id").distinct().count()
+            inv_qs.values("site_id").distinct().count()
         )
 
         # Répartition statuts

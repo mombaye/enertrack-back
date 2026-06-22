@@ -13,6 +13,23 @@ class ImportBatch(models.Model):
         TIERS_INVOICE = "TIERS_INVOICE", "TIERS_INVOICE"
         STATUS_UPDATE = "STATUS_UPDATE", "STATUS_UPDATE"   # ✅ Step 7
 
+    
+    class TaskStatus(models.TextChoices):
+        PENDING  = "PENDING",  "En attente"
+        RUNNING  = "RUNNING",  "En cours"
+        SUCCESS  = "SUCCESS",  "Terminé"
+        FAILURE  = "FAILURE",  "Échec"
+ 
+    task_id       = models.CharField(max_length=255, blank=True, null=True, db_index=True)
+    task_status   = models.CharField(
+        max_length=16, choices=TaskStatus.choices,
+        default=TaskStatus.PENDING, db_index=True,
+    )
+    task_progress = models.PositiveSmallIntegerField(default=0)   # 0-100
+    task_message  = models.TextField(blank=True, default="")
+    task_meta     = models.JSONField(null=True, blank=True)        # résultats finaux / progression
+    task_updated_at = models.DateTimeField(null=True, blank=True)
+
     kind = models.CharField(
         max_length=32, choices=Kind.choices, default=Kind.SENELEC_INVOICE, db_index=True
     )
@@ -38,7 +55,7 @@ class ImportIssue(models.Model):
     batch = models.ForeignKey(ImportBatch, on_delete=models.CASCADE, related_name="issues")
     row_number = models.IntegerField(null=True, blank=True)
     severity = models.CharField(max_length=10, choices=Severity.choices, default=Severity.WARN)
-    field = models.CharField(max_length=64, null=True, blank=True)
+    field = models.CharField(max_length=255, null=True, blank=True)
     message = models.TextField()
     raw_data = models.JSONField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -59,7 +76,7 @@ class ContractSiteLink(models.Model):
     Mapping: Numéro contrat -> Site
     """
     site = models.ForeignKey("core.Site", on_delete=models.CASCADE, related_name="contract_links")
-    numero_compte_contrat = models.CharField(max_length=32, unique=True, db_index=True)
+    numero_compte_contrat = models.CharField(max_length=128, unique=True, db_index=True)
 
     first_seen_at = models.DateTimeField(auto_now_add=True)
     last_seen_at = models.DateTimeField(auto_now=True)
@@ -67,6 +84,11 @@ class ContractSiteLink(models.Model):
     source_filename = models.CharField(max_length=255, null=True, blank=True)
     imported_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL)
 
+    load_activation = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True,
+        help_text="Load au moment de l'activation du site en Watts")
+
+    puissance_contractuelle = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True,
+        help_text="Puissance définie au contrat en Watts")
     def __str__(self):
         return f"{self.numero_compte_contrat} -> {self.site.site_id}"
 
@@ -89,6 +111,8 @@ class TariffRate(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     last_seen_at = models.DateTimeField(null=True, blank=True)
+    # billing/models.py
+    energie_k3 = models.DecimalField(max_digits=10, decimal_places=4, null=True, blank=True)
     last_seen_batch = models.ForeignKey(
         ImportBatch, null=True, blank=True, on_delete=models.SET_NULL, related_name="tariff_rates"
     )
@@ -116,6 +140,13 @@ class SonatelInvoice(models.Model):
         VALIDATED = "VALIDATED", "Validée"
         CONTESTED = "CONTESTED", "Contestée"
 
+    class PaymentStatus(models.TextChoices):
+        PAID         = "PAID",         "Payée"
+        UNPAID       = "UNPAID",       "Impayée"
+        OUT_OF_SCOPE = "OUT_OF_SCOPE", "Hors scope / Annulée"
+
+
+
     batch = models.ForeignKey(ImportBatch, on_delete=models.CASCADE, related_name="rows")
 
     # audit
@@ -142,7 +173,7 @@ class SonatelInvoice(models.Model):
     rue = models.CharField(max_length=255, null=True, blank=True)
 
     # Facture
-    numero_facture = models.CharField(max_length=64, db_index=True)
+    numero_facture = models.CharField(max_length=128, db_index=True)
     date_comptable_facture = models.DateField(null=True, blank=True)
 
     # Montants principaux (source)
@@ -190,10 +221,10 @@ class SonatelInvoice(models.Model):
     # Typologies / classification
     type_de_tarif = models.CharField(max_length=128, null=True, blank=True)  # catégorie tarifaire
     type_de_client = models.CharField(max_length=128, null=True, blank=True)
-    ccg = models.CharField(max_length=64, null=True, blank=True)
+    ccg = models.CharField(max_length=128, null=True, blank=True)
     type_compte_de_contrat = models.CharField(max_length=128, null=True, blank=True)
     anc_cote = models.CharField(max_length=128, null=True, blank=True)
-    unite_de_releve = models.CharField(max_length=64, null=True, blank=True)
+    unite_de_releve = models.CharField(max_length=128, null=True, blank=True)
 
     # Réactif
     ancien_index_reactif = models.DecimalField(**DEC)
@@ -208,7 +239,7 @@ class SonatelInvoice(models.Model):
 
     # Divers utiles
     agence = models.CharField(max_length=128, null=True, blank=True)
-    numero_compteur = models.CharField(max_length=64, null=True, blank=True)
+    numero_compteur = models.CharField(max_length=128, null=True, blank=True)
 
     # Échéance de paiement
     echeance = models.DateField(null=True, blank=True, db_index=True)
@@ -232,6 +263,8 @@ class SonatelInvoice(models.Model):
         related_name="status_updates",
     )
 
+    payment_status            = models.CharField(max_length=16, choices=PaymentStatus.choices, null=True, blank=True, db_index=True)
+    payment_status_updated_at = models.DateTimeField(null=True, blank=True)
    
 
     class Meta:
@@ -299,7 +332,7 @@ class MonthlySynthesis(models.Model):
 
     # clés fonctionnelles
     numero_compte_contrat = models.CharField(max_length=32, db_index=True)
-    numero_facture = models.CharField(max_length=64, db_index=True)
+    numero_facture = models.CharField(max_length=128, db_index=True)
 
     status = models.CharField(
         max_length=16,

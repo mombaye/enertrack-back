@@ -10,3 +10,10 @@ django-cors-headers
 pandas
 openpyxl
 pyodbc>=4.0.39
+
+lightgbm
+shap
+hijri-converter
+scikit-learn
+
+requests==2.33.1

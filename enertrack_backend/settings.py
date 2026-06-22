@@ -19,6 +19,7 @@ DEBUG = True
 ALLOWED_HOSTS = [
     "localhost",
     "192.168.1.29",
+     "api-enertrack.camusatsn.com",
 ]
 
 CORS_ALLOWED_ORIGINS = [
@@ -27,6 +28,8 @@ CORS_ALLOWED_ORIGINS = [
     "http://192.168.1.29:80",
     "http://192.168.1.29:8000",
     "http://192.168.1.29:8080",
+    "https://api-enertrack.camusatsn.com",
+    "https://egrid.camusatsn.com",
 ]
 
 # (optionnel mais recommandé si tu fais des POST depuis ces origines)
@@ -36,6 +39,8 @@ CSRF_TRUSTED_ORIGINS = [
     "http://192.168.1.29:80",
     "http://192.168.1.29:8000",
     "http://192.168.1.29:8080",
+    "https://api-enertrack.camusatsn.com",
+    "https://egrid.camusatsn.com",
 ]
 # Application definition
 
@@ -59,7 +64,13 @@ INSTALLED_APPS = [
     'pwmreport',           # ✅ nouveau
     'corsheaders',
     'gridoutages',  # ✅ nouveau
-    'dashboard'
+    'dashboard',
+    'estimation',
+    'financial',
+    'prediction',
+    'ml',
+    'optimization',
+    "fuel_tracking",
 
 ]
 
@@ -187,3 +198,8 @@ EFMS_SQL_PASSWORD  = os.environ.get("EFMS_SQL_PASSWORD", "")
 EFMS_SQL_DRIVER    = os.environ.get("EFMS_SQL_DRIVER",   "ODBC Driver 17 for SQL Server")
 EFMS_SQL_TIMEOUT   = int(os.environ.get("EFMS_SQL_TIMEOUT",     10))
 EFMS_SQL_MAX_RETRIES = int(os.environ.get("EFMS_SQL_MAX_RETRIES", 2))
+
+ENOC_BASE_URL = os.getenv("ENOC_BASE_URL", "").rstrip("/")
+ENOC_INTEGRATION_CLIENT_ID = os.getenv("ENOC_INTEGRATION_CLIENT_ID", "enertrack")
+ENOC_INTEGRATION_SHARED_SECRET = os.getenv("ENOC_INTEGRATION_SHARED_SECRET", "")
+ENOC_INTEGRATION_TIMEOUT = int(os.getenv("ENOC_INTEGRATION_TIMEOUT", "30"))

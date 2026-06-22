@@ -48,13 +48,15 @@ import math
 from decimal import Decimal, InvalidOperation
 from django.db.models import OuterRef, Subquery
 from rest_framework.permissions import IsAuthenticated
-
+import tempfile, os
+from certification.models import CertificationResult
 
 
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from django.db.models import Sum, Count
 from decimal import Decimal
+from django.db.models.functions import ExtractYear, ExtractMonth, Coalesce
 
 # ----------------------------
 # Helpers
@@ -68,7 +70,11 @@ D30 = Decimal("30")
 IGNORED_SITE_KEY = "site_sonatel"
 
 
+
+ 
+ 
 def _parse_qp_date(request, name: str):
+    from datetime import datetime
     v = request.query_params.get(name)
     if not v:
         return None
@@ -76,7 +82,8 @@ def _parse_qp_date(request, name: str):
         return datetime.strptime(v, "%Y-%m-%d").date()
     except Exception:
         raise ValidationError({name: "format attendu YYYY-MM-DD"})
-
+ 
+ 
 def _filter_year_month_range(qs, start: date, end: date):
     sy, sm = start.year, start.month
     ey, em = end.year, end.month
@@ -85,6 +92,75 @@ def _filter_year_month_range(qs, start: date, end: date):
         (Q(year__lt=ey) | Q(year=ey, month__lte=em)),
     )
 
+
+def _apply_scope_to_invoice_qs(qs, scope: str):
+    scope = (scope or "ALL").upper()
+
+    if scope == "PAID":
+        return qs.filter(payment_status=SonatelInvoice.PaymentStatus.PAID)
+
+    if scope == "UNPAID":
+        return qs.filter(payment_status=SonatelInvoice.PaymentStatus.UNPAID)
+
+    if scope == "OUT_OF_SCOPE":
+        return qs.filter(payment_status=SonatelInvoice.PaymentStatus.OUT_OF_SCOPE)
+
+    if scope == "UNDEFINED":
+        return qs.filter(Q(payment_status__isnull=True) | Q(payment_status=""))
+
+    # règle métier : Payée = Certifiée
+    if scope == "CERTIFIED":
+        return qs.filter(
+            Q(payment_status=SonatelInvoice.PaymentStatus.PAID)
+            | Q(status=SonatelInvoice.Status.VALIDATED)
+        )
+
+    if scope == "CONTESTED":
+        return qs.filter(status=SonatelInvoice.Status.CONTESTED).exclude(
+            payment_status=SonatelInvoice.PaymentStatus.PAID
+        )
+
+    if scope == "CREATED":
+        return qs.filter(status=SonatelInvoice.Status.CREATED).exclude(
+            payment_status=SonatelInvoice.PaymentStatus.PAID
+        )
+
+    return qs
+
+
+def _apply_scope_to_monthly_qs(qs, scope: str):
+    scope = (scope or "ALL").upper()
+
+    if scope == "PAID":
+        return qs.filter(source__payment_status=SonatelInvoice.PaymentStatus.PAID)
+
+    if scope == "UNPAID":
+        return qs.filter(source__payment_status=SonatelInvoice.PaymentStatus.UNPAID)
+
+    if scope == "OUT_OF_SCOPE":
+        return qs.filter(source__payment_status=SonatelInvoice.PaymentStatus.OUT_OF_SCOPE)
+
+    if scope == "UNDEFINED":
+        return qs.filter(Q(source__payment_status__isnull=True) | Q(source__payment_status=""))
+
+    # règle métier : Payée = Certifiée
+    if scope == "CERTIFIED":
+        return qs.filter(
+            Q(source__payment_status=SonatelInvoice.PaymentStatus.PAID)
+            | Q(source__status=SonatelInvoice.Status.VALIDATED)
+        )
+
+    if scope == "CONTESTED":
+        return qs.filter(source__status=SonatelInvoice.Status.CONTESTED).exclude(
+            source__payment_status=SonatelInvoice.PaymentStatus.PAID
+        )
+
+    if scope == "CREATED":
+        return qs.filter(source__status=SonatelInvoice.Status.CREATED).exclude(
+            source__payment_status=SonatelInvoice.PaymentStatus.PAID
+        )
+
+    return qs
 
 def _norm_txt(x: str) -> str:
     s = (x or "").strip().lower()
@@ -328,6 +404,16 @@ def _pick_tariff_rate(
 
 
 
+def eligible_site_q():
+    return Q(site__invoice_payment__iexact="Aktivco", site__grid_fee=True)
+
+def eligible_source_site_q():
+    return Q(source__site__invoice_payment__iexact="Aktivco", source__site__grid_fee=True)
+
+def eligible_contract_link_q():
+    return Q(site__invoice_payment__iexact="Aktivco", site__grid_fee=True)
+
+
 def normalize_tariff_category(raw: str | None) -> str | None:
     if not raw:
         return None
@@ -521,306 +607,143 @@ class ImportBatchViewSet(viewsets.GenericViewSet, mixins.ListModelMixin):
 
         return Response(ImportIssueSerializer(qs, many=True).data)
 
+   
     @action(methods=["post"], detail=False, url_path="import")
     def import_file(self, request, *args, **kwargs):
         f = request.FILES.get("file")
         if not f:
             return Response({"detail": "Aucun fichier fourni"}, status=400)
-
+    
         echeance_raw = request.data.get("echeance") or request.data.get("date_echeance")
         echeance = _to_date_fr(echeance_raw)
-
         if not echeance:
+            return Response({"detail": "Paramètre echeance requis (YYYY-MM-DD)"}, status=400)
+    
+        # ✅ Sauvegarder dans default_storage → MEDIA_ROOT (volume partagé web+celery)
+        import uuid as _uuid
+        from django.core.files.storage import default_storage
+        from django.core.files.base import ContentFile
+    
+        storage_key = f"billing_imports/{_uuid.uuid4().hex}_{f.name}"
+        default_storage.save(storage_key, ContentFile(f.read()))
+    
+        batch = ImportBatch.objects.create(
+            source_filename=f.name,
+            task_status=ImportBatch.TaskStatus.PENDING,
+            task_message="En file d'attente…",
+            task_meta={"storage_key": storage_key},
+        )
+    
+        from .tasks import import_invoices_task
+        result = import_invoices_task.delay(batch.id, storage_key, str(echeance))
+        batch.task_id = result.id
+        batch.save(update_fields=["task_id"])
+    
+        return Response(
+            {
+                "batch": ImportBatchSerializer(batch).data,
+                "task_id": result.id,
+                "detail": "Import lancé. Suivre via /batches/{id}/task-status/",
+            },
+            status=status.HTTP_202_ACCEPTED,
+        )
+
+    # billing/views.py — AJOUT dans ImportBatchViewSet
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Ajouter cette action DANS la classe ImportBatchViewSet, après import_file().
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    @action(methods=["post"], detail=False, url_path="import-status-update")
+    def import_status_update(self, request, *args, **kwargs):
+        """
+        Import asynchrone de mise à jour des statuts.
+
+        Accepte le fichier facturation Sonatel standard (même format que l'import normal).
+        Chaque ligne identifiée (contrat + facture + dates) voit son statut mis à jour.
+
+        Body (multipart/form-data) :
+          - file          : fichier Excel (.xlsx / .xls)
+          - status        : statut cible (CREATED | VALIDATED | CONTESTED) — défaut VALIDATED
+          - echeance      : date d'échéance YYYY-MM-DD (pour la traçabilité du batch)
+
+        Retour : batch JSON + task_id  (poller via GET /batches/{id}/task-status/)
+        """
+        f = request.FILES.get("file")
+        if not f:
+            return Response({"detail": "Aucun fichier fourni"}, status=400)
+
+        # Statut cible (facultatif, défaut VALIDATED)
+        from .models import SonatelInvoice
+        target_status = (request.data.get("status") or "VALIDATED").strip().upper()
+        valid_statuses = {s.value for s in SonatelInvoice.Status}
+        if target_status not in valid_statuses:
             return Response(
-                {"detail": "Paramètre 'echeance' requis (format date)"},
-                status=400
+                {
+                    "detail": f"Statut invalide: {target_status!r}.",
+                    "accepted": sorted(valid_statuses),
+                },
+                status=400,
             )
 
+        # Sauvegarde dans default_storage (volume partagé web+celery)
+        import uuid as _uuid
+        from django.core.files.storage import default_storage
+        from django.core.files.base import ContentFile
 
-        affected_keys: Set[Tuple[str, int, int]] = set()
+        storage_key = f"billing_status_updates/{_uuid.uuid4().hex}_{f.name}"
+        default_storage.save(storage_key, ContentFile(f.read()))
 
-        created_count = 0
-        updated_count = 0
-        monthly_total = 0
-        skipped_missing_required = 0
-        skipped_invalid_period = 0
-        skipped_dup_in_file = 0
+        batch = ImportBatch.objects.create(
+            kind=ImportBatch.Kind.STATUS_UPDATE,
+            source_filename=f.name,
+            imported_by=request.user if request.user.is_authenticated else None,
+            task_status=ImportBatch.TaskStatus.PENDING,
+            task_message="En file d'attente…",
+            task_meta={
+                "storage_key": storage_key,
+                "target_status": target_status,
+            },
+        )
 
-        issues_buf = []
-        seen_in_file = set()
-
-        # ✅ cache tarifs pour éviter N requêtes
-        tariff_cache: Dict[tuple, Optional[TariffRate]] = {}
-
-        with transaction.atomic():
-            batch = ImportBatch.objects.create(source_filename=f.name)
-
-            df = pd.read_excel(f, dtype=object)
-
-            # renommage robuste via normalisation
-            normed_cols = {_norm_header(c): c for c in df.columns}
-            normed_map = {_norm_header(src): dst for src, dst in COLUMN_MAP.items()}
-            rename_map = {normed_cols[src]: dst for src, dst in normed_map.items() if src in normed_cols}
-            df = df.rename(columns=rename_map)
-
-            if "numero_compte_contrat" in df.columns:
-                contracts = set(df["numero_compte_contrat"].dropna().map(_to_contract_str).dropna().tolist())
-            else:
-                contracts = set()
-
-            contract_to_site_id = dict(
-                ContractSiteLink.objects.filter(numero_compte_contrat__in=contracts)
-                .values_list("numero_compte_contrat", "site_id")
-            )
-            missing_contracts = set()
-
-            required_cols = ["numero_compte_contrat", "numero_facture", "date_debut_periode", "date_fin_periode"]
-            missing_cols = [c for c in required_cols if c not in df.columns]
-            if missing_cols:
-                issues_buf.append(
-                    ImportIssue(
-                        batch=batch,
-                        row_number=None,
-                        severity=ImportIssue.Severity.ERROR,
-                        field=";".join(missing_cols),
-                        message=f"Colonnes obligatoires manquantes dans le fichier: {', '.join(missing_cols)}",
-                        raw_data={"columns": list(df.columns)},
-                    )
-                )
-                ImportIssue.objects.bulk_create(issues_buf)
-                return Response(
-                    {
-                        "batch": ImportBatchSerializer(batch).data,
-                        "detail": "Fichier invalide (colonnes obligatoires manquantes).",
-                        "missing_columns": missing_cols,
-                    },
-                    status=400,
-                )
-
-            for i, row in df.iterrows():
-                excel_row = int(i) + 2
-                raw_row = _row_snapshot(row.to_dict())
-
-                data = {}
-
-                for k in COLUMN_MAP.values():
-                    if k not in df.columns:
-                        continue
-                    val = row.get(k, None)
-
-                    if k in DATE_COLS:
-                        parsed = _to_date_fr(val)
-                        if parsed is None and not _is_blank(val):
-                            issues_buf.append(
-                                ImportIssue(
-                                    batch=batch,
-                                    row_number=excel_row,
-                                    severity=ImportIssue.Severity.WARN,
-                                    field=k,
-                                    message=f"Date non parseable: {val!r}",
-                                    raw_data=raw_row,
-                                )
-                            )
-                        data[k] = parsed
-
-                    elif k in INT_COLS:
-                        parsed = _to_int(val)
-                        if parsed is None and not _is_blank(val):
-                            issues_buf.append(
-                                ImportIssue(
-                                    batch=batch,
-                                    row_number=excel_row,
-                                    severity=ImportIssue.Severity.WARN,
-                                    field=k,
-                                    message=f"Entier non parseable: {val!r}",
-                                    raw_data=raw_row,
-                                )
-                            )
-                        data[k] = parsed
-
-                    elif k in DEC_COLS:
-                        try:
-                            parsed = parse_decimal_fr(val)
-                        except Exception as e:
-                            parsed = None
-                            issues_buf.append(
-                                ImportIssue(
-                                    batch=batch,
-                                    row_number=excel_row,
-                                    severity=ImportIssue.Severity.WARN,
-                                    field=k,
-                                    message=f"Decimal parse error: {val!r} ({e})",
-                                    raw_data=raw_row,
-                                )
-                            )
-                        if parsed is None and not _is_blank(val):
-                            issues_buf.append(
-                                ImportIssue(
-                                    batch=batch,
-                                    row_number=excel_row,
-                                    severity=ImportIssue.Severity.WARN,
-                                    field=k,
-                                    message=f"Decimal non parseable: {val!r}",
-                                    raw_data=raw_row,
-                                )
-                            )
-                        data[k] = parsed
-
-                    else:
-                        data[k] = None if _is_blank(val) else str(val).strip()
-                data["echeance"] = echeance
-
-
-                # Mapping site
-                data["numero_compte_contrat"] = _to_contract_str(data.get("numero_compte_contrat"))
-                acc = data.get("numero_compte_contrat")
-                if acc:
-                    site_pk = contract_to_site_id.get(acc)
-                    if site_pk:
-                        data["site_id"] = site_pk
-                    else:
-                        missing_contracts.add(acc)
-
-                # requis minimum
-                req_missing = []
-                if _is_blank(data.get("numero_compte_contrat")):
-                    req_missing.append("numero_compte_contrat")
-                if _is_blank(data.get("numero_facture")):
-                    req_missing.append("numero_facture")
-                if data.get("date_debut_periode") is None:
-                    req_missing.append("date_debut_periode")
-                if data.get("date_fin_periode") is None:
-                    req_missing.append("date_fin_periode")
-
-                if req_missing:
-                    skipped_missing_required += 1
-                    issues_buf.append(
-                        ImportIssue(
-                            batch=batch,
-                            row_number=excel_row,
-                            severity=ImportIssue.Severity.ERROR,
-                            field=";".join(req_missing),
-                            message=f"Ligne ignorée: champs requis manquants ({', '.join(req_missing)})",
-                            raw_data=raw_row,
-                        )
-                    )
-                    continue
-
-                # période valide
-                if data["date_fin_periode"] < data["date_debut_periode"]:
-                    skipped_invalid_period += 1
-                    issues_buf.append(
-                        ImportIssue(
-                            batch=batch,
-                            row_number=excel_row,
-                            severity=ImportIssue.Severity.ERROR,
-                            field="date_debut_periode;date_fin_periode",
-                            message="Ligne ignorée: date_fin_periode < date_debut_periode",
-                            raw_data=raw_row,
-                        )
-                    )
-                    continue
-
-                # dédup interne
-                key = (
-                    data["numero_compte_contrat"],
-                    data["numero_facture"],
-                    data["date_debut_periode"],
-                    data["date_fin_periode"],
-                )
-                if key in seen_in_file:
-                    skipped_dup_in_file += 1
-                    issues_buf.append(
-                        ImportIssue(
-                            batch=batch,
-                            row_number=excel_row,
-                            severity=ImportIssue.Severity.WARN,
-                            field="uniq_key",
-                            message="Doublon dans le fichier (même contrat+facture+période). Ligne ignorée.",
-                            raw_data=raw_row,
-                        )
-                    )
-                    continue
-                seen_in_file.add(key)
-
-                # ✅ CALCUL DONNÉES CIBLES (avant upsert)
-                _compute_target_fields(
-                    data=data,
-                    issues_buf=issues_buf,
-                    batch=batch,
-                    excel_row=excel_row,
-                    raw_row=raw_row,
-                    tariff_cache=tariff_cache,
-                )
-
-                # upsert
-                existing = SonatelInvoice.objects.filter(
-                    numero_compte_contrat=data["numero_compte_contrat"],
-                    numero_facture=data["numero_facture"],
-                    date_debut_periode=data["date_debut_periode"],
-                    date_fin_periode=data["date_fin_periode"],
-                ).first()
-
-                if existing:
-                    for k, v in data.items():
-                        setattr(existing, k, v)
-                    existing.batch = batch
-
-                    if hasattr(existing, "last_seen_at"):
-                        existing.last_seen_at = timezone.now()
-                    if hasattr(existing, "last_seen_batch"):
-                        existing.last_seen_batch = batch
-
-                    existing.save()
-
-                    existing.months.all().delete()
-                    payloads = _build_monthly_payloads(existing)
-                    MonthlySynthesis.objects.bulk_create(payloads)
-
-                    updated_count += 1
-                else:
-                    create_kwargs = dict(batch=batch, **data)
-                    field_names = {fld.name for fld in SonatelInvoice._meta.fields}
-
-                    if "last_seen_at" in field_names:
-                        create_kwargs["last_seen_at"] = timezone.now()
-                    if "last_seen_batch" in field_names:
-                        create_kwargs["last_seen_batch"] = batch
-
-                    inv = SonatelInvoice.objects.create(**create_kwargs)
-                    payloads = _build_monthly_payloads(inv)
-                    MonthlySynthesis.objects.bulk_create(payloads)
-
-                    created_count += 1
-
-                monthly_total += len(payloads)
-                for p in payloads:
-                    affected_keys.add((p.numero_compte_contrat, p.year, p.month))
-
-            if issues_buf:
-                ImportIssue.objects.bulk_create(issues_buf)
-
-            count_upserted = upsert_contract_months_for_keys(affected_keys)
-            count_deleted = delete_stale_contract_months(affected_keys)
+        from .tasks import import_status_update_task
+        result = import_status_update_task.delay(batch.id, storage_key, target_status)
+        batch.task_id = result.id
+        batch.save(update_fields=["task_id"])
 
         return Response(
             {
                 "batch": ImportBatchSerializer(batch).data,
-                "rows_created": created_count,
-                "rows_updated": updated_count,
-                "monthly_rows_created": monthly_total,
-                "skipped_missing_required": skipped_missing_required,
-                "skipped_invalid_period": skipped_invalid_period,
-                "skipped_duplicate_in_file": skipped_dup_in_file,
-                "issues_logged": len(issues_buf),
-                "contract_months_upserted": count_upserted,
-                "contract_months_deleted": count_deleted,
-                "invoices_missing_site_count": len(missing_contracts),
-                "invoices_missing_site_sample": list(missing_contracts)[:20],
+                "task_id": result.id,
+                "detail": (
+                    f"Mise à jour statuts lancée (→ {target_status}). "
+                    f"Suivre via GET /batches/{batch.id}/task-status/"
+                ),
             },
-            status=status.HTTP_201_CREATED,
+            status=status.HTTP_202_ACCEPTED,
         )
 
+
+    @action(methods=["get"], detail=True, url_path="task-status")
+    def task_status(self, request, pk=None):
+        """
+        Polling endpoint pour suivre la progression d'un import async.
+        GET /sonatel-billing/batches/{id}/task-status/
+        """
+        batch = self.get_object()
+        from .serializers import ImportBatchSerializer
+        return Response({
+            "id":            batch.id,
+            "task_id":       batch.task_id,
+            "task_status":   batch.task_status,
+            "task_progress": batch.task_progress,
+            "task_message":  batch.task_message,
+            "task_meta":     batch.task_meta,
+            "task_updated_at": batch.task_updated_at.isoformat() if batch.task_updated_at else None,
+            "source_filename": batch.source_filename,
+            "imported_at":   batch.imported_at.isoformat() if batch.imported_at else None,
+        })
+ 
+ 
 
 # ----------------------------
 # ContractMonth upsert / cleanup ✅ (avec sommes données cibles)
@@ -861,6 +784,13 @@ class ContractMonthViewSet(viewsets.ReadOnlyModelViewSet):
     def get_queryset(self):
         qs = super().get_queryset()
 
+        eligible_accounts = ContractSiteLink.objects.filter(
+            site__invoice_payment__iexact="Aktivco",
+            site__grid_fee=True,
+        ).values_list("numero_compte_contrat", flat=True)
+
+        qs = qs.filter(numero_compte_contrat__in=eligible_accounts)
+
         year = self.request.query_params.get("year")
         month = self.request.query_params.get("month")
         account = self.request.query_params.get("account")
@@ -880,58 +810,480 @@ class ContractMonthViewSet(viewsets.ReadOnlyModelViewSet):
 
         if site_code:
             qs = qs.filter(
-                numero_compte_contrat__in=ContractSiteLink.objects.filter(site__site_id=site_code)
-                .values_list("numero_compte_contrat", flat=True)
+                numero_compte_contrat__in=ContractSiteLink.objects.filter(
+                    site__site_id=site_code,
+                    site__invoice_payment__iexact="Aktivco",
+                    site__grid_fee=True,
+                ).values_list("numero_compte_contrat", flat=True)
             )
 
-        # ✅ NEW: date range => filtre months
         if start and end:
             qs = _filter_year_month_range(qs, start, end)
 
-        link = ContractSiteLink.objects.filter(numero_compte_contrat=OuterRef("numero_compte_contrat"))
+        link = ContractSiteLink.objects.filter(
+            numero_compte_contrat=OuterRef("numero_compte_contrat"),
+            site__invoice_payment__iexact="Aktivco",
+            site__grid_fee=True,
+        )
+
         return qs.annotate(
             site_id=Subquery(link.values("site__site_id")[:1]),
             site_name=Subquery(link.values("site__name")[:1]),
         )
 
-class SonatelInvoiceViewSet(viewsets.ReadOnlyModelViewSet):
-    queryset = SonatelInvoice.objects.select_related("batch").all().order_by("-date_comptable_facture")
-    serializer_class = SonatelInvoiceSerializer
+
+class SonatelBillingStatsAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
+    def get(self, request):
+        start = _parse_qp_date(request, "start")
+        end = _parse_qp_date(request, "end")
+
+        if not start or not end:
+            today = timezone.localdate()
+            start = start or date(today.year, 1, 1)
+            end = end or today
+
+        if end < start:
+            raise ValidationError({"end": "end < start"})
+
+        site_code = request.query_params.get("site")
+        scope = (request.query_params.get("scope") or "ALL").upper()
+
+        def s(v):
+            return str(v or Decimal("0"))
+
+        # ------------------------------------------------------------------
+        # Base globale (non filtrée par scope) -> pour cartes de statuts
+        # ------------------------------------------------------------------
+        monthly_global = MonthlySynthesis.objects.select_related("source__site").filter(
+            source__site__isnull=False,
+            source__site__invoice_payment__iexact="Aktivco",
+            source__site__grid_fee=True,
+        )
+        monthly_global = _filter_year_month_range(monthly_global, start, end)
+        monthly_global = monthly_global.exclude(
+            Q(source__site__site_id__icontains=IGNORED_SITE_KEY) |
+            Q(source__site__name__icontains=IGNORED_SITE_KEY)
+        )
+
+        if site_code:
+            monthly_global = monthly_global.filter(source__site__site_id=site_code)
+
+        invoice_global = SonatelInvoice.objects.select_related("site").filter(
+            site__isnull=False,
+            site__invoice_payment__iexact="Aktivco",
+            site__grid_fee=True,
+        ).exclude(
+            Q(site__site_id__icontains=IGNORED_SITE_KEY) |
+            Q(site__name__icontains=IGNORED_SITE_KEY)
+        )
+
+        if site_code:
+            invoice_global = invoice_global.filter(site__site_id=site_code)
+
+        invoice_global = (
+            invoice_global
+            .exclude(date_debut_periode__isnull=True)
+            .exclude(date_fin_periode__isnull=True)
+            .filter(date_debut_periode__lte=end, date_fin_periode__gte=start)
+        )
+
+        # ------------------------------------------------------------------
+        # Base filtrée globalement par scope -> pour toutes les autres stats
+        # ------------------------------------------------------------------
+        monthly_filtered = _apply_scope_to_monthly_qs(monthly_global, scope)
+
+        # ------------------------------------------------------------------
+        # Évolution mensuelle (filtrée par scope)
+        # ------------------------------------------------------------------
+        evo = (
+            monthly_filtered.values("year", "month")
+            .annotate(
+                invoices=Count("source_id", distinct=True),
+                montant_ht=Sum("montant_hors_tva"),
+                montant_ttc=Sum("montant_ttc"),
+                nrj=Sum("energie_calculee"),
+                abonnement=Sum("abonnement_calcule"),
+                penalite_prime=Sum("penalite_abonnement_calculee"),
+                cosphi=Sum("montant_cosinus_phi"),
+            )
+            .order_by("year", "month")
+        )
+
+        evolution = [
+            {
+                "period": f"{r['year']}-{str(r['month']).zfill(2)}",
+                "invoices": r["invoices"] or 0,
+                "montant_ht": s(r["montant_ht"]),
+                "montant_ttc": s(r["montant_ttc"]),
+                "nrj": s(r["nrj"]),
+                "abonnement": s(r["abonnement"]),
+                "penalite_prime": s(r["penalite_prime"]),
+                "cosphi": s(r["cosphi"]),
+            }
+            for r in evo
+        ]
+
+        # ------------------------------------------------------------------
+        # Top sites (filtrés par scope)
+        # ------------------------------------------------------------------
+        by_site = (
+            monthly_filtered.values("source__site__site_id", "source__site__name")
+            .annotate(
+                conso=Sum("conso"),
+                montant_ht=Sum("montant_hors_tva"),
+                montant_cosphi=Sum("montant_cosinus_phi"),
+                penalite_prime=Sum("penalite_abonnement_calculee"),
+                abonnement=Sum("abonnement_calcule"),
+            )
+        )
+
+        def top(order_field: str):
+            rows = by_site.order_by(f"-{order_field}")[:20]
+            return [
+                {
+                    "site_id": r["source__site__site_id"],
+                    "site_name": r["source__site__name"],
+                    "conso": float(r["conso"] or 0),
+                    "montant_ht": s(r["montant_ht"]),
+                    "montant_cosphi": s(r["montant_cosphi"]),
+                    "penalite_prime": s(r["penalite_prime"]),
+                    "abonnement": s(r["abonnement"]),
+                }
+                for r in rows
+            ]
+
+        # ------------------------------------------------------------------
+        # Distribution HT (filtrée par scope)
+        # ------------------------------------------------------------------
+        agg = monthly_filtered.aggregate(
+            total_ht=Sum("montant_hors_tva"),
+            nrj=Sum("energie_calculee"),
+            cosphi=Sum("montant_cosinus_phi"),
+            pen_prime=Sum("penalite_abonnement_calculee"),
+            abonnement=Sum("abonnement_calcule"),
+        )
+        total_ht = agg["total_ht"] or Decimal("0")
+
+        def pct(v):
+            v = v or Decimal("0")
+            return float((v / total_ht * 100) if total_ht else Decimal("0"))
+
+        distribution = {
+            "total_ht": s(total_ht),
+            "parts": [
+                {"key": "NRJ", "label": "NRJ", "value": s(agg["nrj"]), "percent": pct(agg["nrj"])},
+                {"key": "COSPHI", "label": "Montant Cos Phi", "value": s(agg["cosphi"]), "percent": pct(agg["cosphi"])},
+                {"key": "PEN_PRIME", "label": "Pénalité Prime", "value": s(agg["pen_prime"]), "percent": pct(agg["pen_prime"])},
+                {"key": "ABONNEMENT", "label": "Abonnement", "value": s(agg["abonnement"]), "percent": pct(agg["abonnement"])},
+            ],
+        }
+
+        # ------------------------------------------------------------------
+        # Statuts paiement (globaux sur la période, non filtrés par scope)
+        # ------------------------------------------------------------------
+        payment_summary = invoice_global.aggregate(
+            total=Count("id"),
+            paid=Count("id", filter=Q(payment_status=SonatelInvoice.PaymentStatus.PAID)),
+            unpaid=Count("id", filter=Q(payment_status=SonatelInvoice.PaymentStatus.UNPAID)),
+            out_of_scope=Count("id", filter=Q(payment_status=SonatelInvoice.PaymentStatus.OUT_OF_SCOPE)),
+            undefined=Count("id", filter=Q(payment_status__isnull=True) | Q(payment_status="")),
+        )
+
+        payment_total = payment_summary["total"] or 0
+
+        payment_evo_qs = (
+            invoice_global
+            .annotate(ref_date=Coalesce("date_comptable_facture", "date_fin_periode"))
+            .exclude(ref_date__isnull=True)
+            .annotate(year=ExtractYear("ref_date"), month=ExtractMonth("ref_date"))
+            .values("year", "month")
+            .annotate(
+                total=Count("id"),
+                paid=Count("id", filter=Q(payment_status=SonatelInvoice.PaymentStatus.PAID)),
+                unpaid=Count("id", filter=Q(payment_status=SonatelInvoice.PaymentStatus.UNPAID)),
+                out_of_scope=Count("id", filter=Q(payment_status=SonatelInvoice.PaymentStatus.OUT_OF_SCOPE)),
+                undefined=Count("id", filter=Q(payment_status__isnull=True) | Q(payment_status="")),
+            )
+            .order_by("year", "month")
+        )
+
+        payment_evolution = [
+            {
+                "period": f"{r['year']}-{str(r['month']).zfill(2)}",
+                "total": r["total"] or 0,
+                "paid": r["paid"] or 0,
+                "unpaid": r["unpaid"] or 0,
+                "out_of_scope": r["out_of_scope"] or 0,
+                "undefined": r["undefined"] or 0,
+            }
+            for r in payment_evo_qs
+        ]
+
+        # ------------------------------------------------------------------
+        # Certification billing (globale sur la période, non filtrée par scope)
+        # règle : Payée = Certifiée
+        # ------------------------------------------------------------------
+        certified_filter = (
+            Q(payment_status=SonatelInvoice.PaymentStatus.PAID)
+            | Q(status=SonatelInvoice.Status.VALIDATED)
+        )
+        contested_filter = (
+            Q(status=SonatelInvoice.Status.CONTESTED)
+            & ~Q(payment_status=SonatelInvoice.PaymentStatus.PAID)
+        )
+        created_filter = (
+            Q(status=SonatelInvoice.Status.CREATED)
+            & ~Q(payment_status=SonatelInvoice.PaymentStatus.PAID)
+        )
+
+        invoice_cert_summary = invoice_global.aggregate(
+            total=Count("id"),
+            certified=Count("id", filter=certified_filter),
+            contested=Count("id", filter=contested_filter),
+            created=Count("id", filter=created_filter),
+        )
+
+        invoice_cert_total = invoice_cert_summary["total"] or 0
+        invoice_certified = invoice_cert_summary["certified"] or 0
+
+        invoice_cert_evo_qs = (
+            invoice_global
+            .annotate(ref_date=Coalesce("date_comptable_facture", "date_fin_periode"))
+            .exclude(ref_date__isnull=True)
+            .annotate(year=ExtractYear("ref_date"), month=ExtractMonth("ref_date"))
+            .values("year", "month")
+            .annotate(
+                total=Count("id"),
+                certified=Count("id", filter=certified_filter),
+                contested=Count("id", filter=contested_filter),
+                created=Count("id", filter=created_filter),
+            )
+            .order_by("year", "month")
+        )
+
+        invoice_cert_evolution = [
+            {
+                "period": f"{r['year']}-{str(r['month']).zfill(2)}",
+                "total": r["total"] or 0,
+                "certified": r["certified"] or 0,
+                "contested": r["contested"] or 0,
+                "created": r["created"] or 0,
+            }
+            for r in invoice_cert_evo_qs
+        ]
+
+        # ------------------------------------------------------------------
+        # Certification technique eFMS/Sénélec (inchangée)
+        # ------------------------------------------------------------------
+        cert_base = CertificationResult.objects.select_related("cert_batch", "site").filter(
+            site__isnull=False,
+            site__invoice_payment__iexact="Aktivco",
+            site__grid_fee=True,
+        ).filter(
+            (Q(cert_batch__echeance_year__gt=start.year) |
+             Q(cert_batch__echeance_year=start.year, cert_batch__echeance_month__gte=start.month)),
+            (Q(cert_batch__echeance_year__lt=end.year) |
+             Q(cert_batch__echeance_year=end.year, cert_batch__echeance_month__lte=end.month)),
+        )
+
+        if site_code:
+            cert_base = cert_base.filter(site__site_id=site_code)
+
+        cert_summary = cert_base.aggregate(
+            total=Count("id"),
+            certified_fms=Count("id", filter=Q(status=CertificationResult.Status.CERTIFIED_FMS)),
+            certified_senelec=Count("id", filter=Q(status=CertificationResult.Status.CERTIFIED_SENELEC)),
+            needs_review=Count("id", filter=Q(status=CertificationResult.Status.NEEDS_REVIEW)),
+            unknown_contract=Count("id", filter=Q(status=CertificationResult.Status.UNKNOWN_CONTRACT)),
+            fms_unavailable=Count("id", filter=Q(status=CertificationResult.Status.FMS_UNAVAILABLE)),
+            mesure_alert=Count("id", filter=Q(status=CertificationResult.Status.MESURE_A_VERIFIER)),
+        )
+
+        certified_total = (cert_summary["certified_fms"] or 0) + (cert_summary["certified_senelec"] or 0)
+        other_total = (
+            (cert_summary["needs_review"] or 0)
+            + (cert_summary["unknown_contract"] or 0)
+            + (cert_summary["fms_unavailable"] or 0)
+            + (cert_summary["mesure_alert"] or 0)
+        )
+        total_cert = cert_summary["total"] or 0
+
+        cert_evo_qs = (
+            cert_base.values("cert_batch__echeance_year", "cert_batch__echeance_month")
+            .annotate(
+                total=Count("id"),
+                certified_fms=Count("id", filter=Q(status=CertificationResult.Status.CERTIFIED_FMS)),
+                certified_senelec=Count("id", filter=Q(status=CertificationResult.Status.CERTIFIED_SENELEC)),
+                needs_review=Count("id", filter=Q(status=CertificationResult.Status.NEEDS_REVIEW)),
+                unknown_contract=Count("id", filter=Q(status=CertificationResult.Status.UNKNOWN_CONTRACT)),
+                fms_unavailable=Count("id", filter=Q(status=CertificationResult.Status.FMS_UNAVAILABLE)),
+                mesure_alert=Count("id", filter=Q(status=CertificationResult.Status.MESURE_A_VERIFIER)),
+            )
+            .order_by("cert_batch__echeance_year", "cert_batch__echeance_month")
+        )
+
+        cert_evolution = []
+        for r in cert_evo_qs:
+            other = (
+                (r["needs_review"] or 0)
+                + (r["unknown_contract"] or 0)
+                + (r["fms_unavailable"] or 0)
+                + (r["mesure_alert"] or 0)
+            )
+            cert_evolution.append({
+                "period": f"{r['cert_batch__echeance_year']}-{str(r['cert_batch__echeance_month']).zfill(2)}",
+                "total": r["total"] or 0,
+                "certified_total": (r["certified_fms"] or 0) + (r["certified_senelec"] or 0),
+                "certified_fms": r["certified_fms"] or 0,
+                "certified_senelec": r["certified_senelec"] or 0,
+                "needs_review": r["needs_review"] or 0,
+                "unknown_contract": r["unknown_contract"] or 0,
+                "fms_unavailable": r["fms_unavailable"] or 0,
+                "mesure_alert": r["mesure_alert"] or 0,
+                "other": other,
+            })
+
+        return Response({
+            "range": {"start": start.isoformat(), "end": end.isoformat()},
+            "scope": scope,
+            "top": {
+                "conso_vs_montant": top("montant_ht"),
+                "cosphi": top("montant_cosphi"),
+                "pen_prime": top("penalite_prime"),
+                "abonnement": top("abonnement"),
+            },
+            "evolution": evolution,
+            "distribution_ht": distribution,
+            "payment_statuses": {
+                "summary": {
+                    "total": payment_total,
+                    "paid": payment_summary["paid"] or 0,
+                    "unpaid": payment_summary["unpaid"] or 0,
+                    "out_of_scope": payment_summary["out_of_scope"] or 0,
+                    "undefined": payment_summary["undefined"] or 0,
+                    "paid_pct": round(((payment_summary["paid"] or 0) / payment_total) * 100, 2) if payment_total else 0,
+                },
+                "evolution": payment_evolution,
+            },
+            "invoice_certification": {
+                "summary": {
+                    "total": invoice_cert_total,
+                    "certified": invoice_certified,
+                    "contested": invoice_cert_summary["contested"] or 0,
+                    "created": invoice_cert_summary["created"] or 0,
+                    "taux_certification": round((invoice_certified / invoice_cert_total) * 100, 2) if invoice_cert_total else 0,
+                },
+                "evolution": invoice_cert_evolution,
+            },
+            "certification": {
+                "summary": {
+                    "total": total_cert,
+                    "certified_total": certified_total,
+                    "certified_fms": cert_summary["certified_fms"] or 0,
+                    "certified_senelec": cert_summary["certified_senelec"] or 0,
+                    "needs_review": cert_summary["needs_review"] or 0,
+                    "unknown_contract": cert_summary["unknown_contract"] or 0,
+                    "fms_unavailable": cert_summary["fms_unavailable"] or 0,
+                    "mesure_alert": cert_summary["mesure_alert"] or 0,
+                    "other": other_total,
+                    "taux_certification": round((certified_total / total_cert) * 100, 2) if total_cert else 0,
+                },
+                "evolution": cert_evolution,
+            },
+        })
+
+
+        
+class SonatelInvoiceViewSet(viewsets.ReadOnlyModelViewSet):
+    queryset = SonatelInvoice.objects.select_related("batch", "site").all().order_by("-date_comptable_facture")
+    serializer_class = SonatelInvoiceSerializer
+    permission_classes = [IsAuthenticated]
+ 
     def get_queryset(self):
         qs = super().get_queryset()
-
-        q = self.request.query_params.get("search")
-        status_ = self.request.query_params.get("status")
-        site_code = self.request.query_params.get("site")
-
+ 
+        qs = qs.filter(site__isnull=False)
+        qs = qs.filter(site__invoice_payment__iexact="Aktivco", site__grid_fee=True)
+ 
+        q          = self.request.query_params.get("search")
+        status_    = self.request.query_params.get("status")
+        pay_status = self.request.query_params.get("payment_status")   # ✅ nouveau
+        site_code  = self.request.query_params.get("site")
+ 
         start = _parse_qp_date(self.request, "start")
-        end = _parse_qp_date(self.request, "end")
-
+        end   = _parse_qp_date(self.request, "end")
+ 
         if q:
             qs = qs.filter(
                 Q(numero_facture__icontains=q)
                 | Q(numero_compte_contrat__icontains=q)
                 | Q(numero_compteur__icontains=q)
             )
+ 
         if status_:
             qs = qs.filter(status=status_.upper())
-
+ 
+        # ✅ Filtre paiement — ?payment_status=PAID|UNPAID|OUT_OF_SCOPE
+        if pay_status:
+            qs = qs.filter(payment_status=pay_status.upper())
+ 
         if site_code:
             qs = qs.filter(site__site_id=site_code)
-
-        # ✅ overlap [date_debut_periode, date_fin_periode] avec [start,end]
+ 
         if start or end:
             if not start:
-                start = date.min
+                from datetime import date as _date_cls
+                start = _date_cls.min
             if not end:
-                end = date.max
-            qs = qs.exclude(date_debut_periode__isnull=True).exclude(date_fin_periode__isnull=True)
-            qs = qs.filter(date_debut_periode__lte=end, date_fin_periode__gte=start)
-
+                from datetime import date as _date_cls
+                end = _date_cls.max
+            qs = (
+                qs
+                .exclude(date_debut_periode__isnull=True)
+                .exclude(date_fin_periode__isnull=True)
+                .filter(date_debut_periode__lte=end, date_fin_periode__gte=start)
+            )
+ 
         return qs
 
+
+    @action(methods=["patch"], detail=True, url_path="update-status")
+    def update_status(self, request, pk=None):
+        invoice = self.get_object()
+
+        status_ = request.data.get("status")
+        payment_status = request.data.get("payment_status")
+
+        update_fields = ["updated_at"]
+
+        if status_ is not None:
+            valid = {s.value for s in SonatelInvoice.Status}
+            if status_.upper() not in valid:
+                return Response({"detail": f"Statut invalide: {status_!r}. Acceptés: {sorted(valid)}"}, status=400)
+            invoice.status = status_.upper()
+            invoice.status_updated_at = timezone.now()
+            update_fields += ["status", "status_updated_at"]
+
+        if payment_status is not None:
+            valid = {s.value for s in SonatelInvoice.PaymentStatus}
+            if payment_status.upper() not in valid:
+                return Response({"detail": f"Payment status invalide: {payment_status!r}. Acceptés: {sorted(valid)}"}, status=400)
+            invoice.payment_status = payment_status.upper()
+            invoice.payment_status_updated_at = timezone.now()
+            update_fields += ["payment_status", "payment_status_updated_at"]
+
+        if len(update_fields) <= 1:
+            return Response({"detail": "Aucun champ à mettre à jour (status ou payment_status requis)"}, status=400)
+
+        invoice.save(update_fields=update_fields)
+
+        # Propager le statut certif sur les MonthlySynthesis liés
+        if "status" in update_fields:
+            invoice.months.update(status=invoice.status)
+
+        return Response(SonatelInvoiceSerializer(invoice).data)
 
 class MonthlySynthesisViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = MonthlySynthesis.objects.select_related("source", "source__site").all().order_by("-year", "-month")
@@ -940,6 +1292,9 @@ class MonthlySynthesisViewSet(viewsets.ReadOnlyModelViewSet):
 
     def get_queryset(self):
         qs = super().get_queryset()
+
+        qs = qs.filter(source__site__isnull=False)
+        qs = qs.filter(source__site__invoice_payment__iexact="Aktivco", source__site__grid_fee=True)
 
         year = self.request.query_params.get("year")
         month = self.request.query_params.get("month")
@@ -966,7 +1321,6 @@ class MonthlySynthesisViewSet(viewsets.ReadOnlyModelViewSet):
         if site_code:
             qs = qs.filter(source__site__site_id=site_code)
 
-        # ✅ NEW: date range => filtre months
         if start and end:
             qs = _filter_year_month_range(qs, start, end)
 
@@ -985,6 +1339,11 @@ def upsert_contract_months_for_keys(keys: Set[Tuple[str, int, int]]) -> int:
 
     qs = (
         MonthlySynthesis.objects.filter(filters)
+        .filter(
+            source__site__isnull=False,
+            source__site__invoice_payment__iexact="Aktivco",
+            source__site__grid_fee=True,
+        )
         .values("numero_compte_contrat", "year", "month")
         .annotate(
             conso=Sum("conso"),
@@ -1294,6 +1653,18 @@ class ContractSiteLinkViewSet(viewsets.GenericViewSet, mixins.ListModelMixin):
     parser_classes = (MultiPartParser, FormParser)
     permission_classes = [IsAuthenticated]
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+ 
+        # ✅ Filtre de recherche : site_id ou nom du site
+        q = self.request.query_params.get("search")
+        if q:
+            qs = qs.filter(
+                Q(site__site_id__icontains=q) | Q(site__name__icontains=q)
+            )
+ 
+        return qs
+
     @action(methods=["post"], detail=False, url_path="import")
     def import_file(self, request, *args, **kwargs):
         f = request.FILES.get("file")
@@ -1305,9 +1676,12 @@ class ContractSiteLinkViewSet(viewsets.GenericViewSet, mixins.ListModelMixin):
 
         # ton fichier: Code site | Name | Numéro contrat
         COLS = {
-            "code_site": ["Code site", "Code_site", "Site", "Site ID", "site_id", "code"],
-            "name": ["Name", "Nom", "Site name", "Libelle"],
-            "numero_contrat": ["Numéro contrat", "Numero contrat", "Numero_contrat", "Contrat", "Contract"],
+            "code_site":               ["Site ID"],
+            "name":                    ["Site Name"],
+            "numero_contrat":          ["Numéro contrat", "Numero contrat"],
+            "puissance_contractuelle": ["Puissance contractuelle"],     # col K → W
+            "load_activation":         ["Load activation"],             # à chercher plus à droite
+            "typologie_contractuelle": ["Typologie contractuelle"],
         }
 
         def pick(colnames):
@@ -1386,6 +1760,7 @@ class ContractSiteLinkViewSet(viewsets.GenericViewSet, mixins.ListModelMixin):
 
 
 
+"""
 class SonatelBillingStatsAPIView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -1404,11 +1779,20 @@ class SonatelBillingStatsAPIView(APIView):
 
         base = MonthlySynthesis.objects.select_related("source__site")
         base = base.filter(source__site__isnull=False)
+        base = base.filter(
+            source__site__invoice_payment__iexact="Aktivco",
+            source__site__grid_fee=True,
+        )
         base = _filter_year_month_range(base, start, end)
         base = base.exclude(
             Q(source__site__site_id__icontains=IGNORED_SITE_KEY) |
             Q(source__site__name__icontains=IGNORED_SITE_KEY)
         )
+ 
+        # ✅ Filtre optionnel par site (recherche frontend)
+        site_code = request.query_params.get("site")
+        if site_code:
+            base = base.filter(source__site__site_id=site_code)
 
 
         def s(v):  # json safe decimal
@@ -1493,21 +1877,506 @@ class SonatelBillingStatsAPIView(APIView):
             ],
         }
 
+        # ── Certification stats ───────────────────────────────────────────────
+        cert_base = CertificationResult.objects.select_related("cert_batch", "site").filter(
+            site__isnull=False,
+            site__invoice_payment__iexact="Aktivco",
+            site__grid_fee=True,
+        ).filter(
+            (Q(cert_batch__echeance_year__gt=start.year) |
+             Q(cert_batch__echeance_year=start.year, cert_batch__echeance_month__gte=start.month)),
+            (Q(cert_batch__echeance_year__lt=end.year) |
+             Q(cert_batch__echeance_year=end.year, cert_batch__echeance_month__lte=end.month)),
+        )
+
+        if site_code:
+            cert_base = cert_base.filter(site__site_id=site_code)
+
+        cert_summary = cert_base.aggregate(
+            total=Count("id"),
+            certified_fms=Count("id", filter=Q(status=CertificationResult.Status.CERTIFIED_FMS)),
+            certified_senelec=Count("id", filter=Q(status=CertificationResult.Status.CERTIFIED_SENELEC)),
+            needs_review=Count("id", filter=Q(status=CertificationResult.Status.NEEDS_REVIEW)),
+            unknown_contract=Count("id", filter=Q(status=CertificationResult.Status.UNKNOWN_CONTRACT)),
+            fms_unavailable=Count("id", filter=Q(status=CertificationResult.Status.FMS_UNAVAILABLE)),
+        )
+
+        certified_total = (cert_summary["certified_fms"] or 0) + (cert_summary["certified_senelec"] or 0)
+        other_total = (
+            (cert_summary["needs_review"] or 0)
+            + (cert_summary["unknown_contract"] or 0)
+            + (cert_summary["fms_unavailable"] or 0)
+        )
+        total_cert = cert_summary["total"] or 0
+
+        cert_evo_qs = (
+            cert_base.values("cert_batch__echeance_year", "cert_batch__echeance_month")
+            .annotate(
+                total=Count("id"),
+                certified_fms=Count("id", filter=Q(status=CertificationResult.Status.CERTIFIED_FMS)),
+                certified_senelec=Count("id", filter=Q(status=CertificationResult.Status.CERTIFIED_SENELEC)),
+                needs_review=Count("id", filter=Q(status=CertificationResult.Status.NEEDS_REVIEW)),
+                unknown_contract=Count("id", filter=Q(status=CertificationResult.Status.UNKNOWN_CONTRACT)),
+                fms_unavailable=Count("id", filter=Q(status=CertificationResult.Status.FMS_UNAVAILABLE)),
+            )
+            .order_by("cert_batch__echeance_year", "cert_batch__echeance_month")
+        )
+
+        cert_evolution = []
+        for r in cert_evo_qs:
+            other = (r["needs_review"] or 0) + (r["unknown_contract"] or 0) + (r["fms_unavailable"] or 0)
+            cert_evolution.append({
+                "period": f"{r['cert_batch__echeance_year']}-{str(r['cert_batch__echeance_month']).zfill(2)}",
+                "total": r["total"] or 0,
+                "certified_total": (r["certified_fms"] or 0) + (r["certified_senelec"] or 0),
+                "certified_fms": r["certified_fms"] or 0,
+                "certified_senelec": r["certified_senelec"] or 0,
+                "needs_review": r["needs_review"] or 0,
+                "unknown_contract": r["unknown_contract"] or 0,
+                "fms_unavailable": r["fms_unavailable"] or 0,
+                "other": other,
+            })
+
         return Response(
             {
                 "range": {"start": start.isoformat(), "end": end.isoformat()},
                 "top": {
-                    "conso_vs_montant": top("montant_ht"),      # top sur montant_ht (graphe conso vs montant)
+                    "conso_vs_montant": top("montant_ht"),
                     "cosphi": top("montant_cosphi"),
                     "pen_prime": top("penalite_prime"),
                     "abonnement": top("abonnement"),
                 },
                 "evolution": evolution,
                 "distribution_ht": distribution,
+                "certification": {
+                    "summary": {
+                        "total": total_cert,
+                        "certified_total": certified_total,
+                        "certified_fms": cert_summary["certified_fms"] or 0,
+                        "certified_senelec": cert_summary["certified_senelec"] or 0,
+                        "needs_review": cert_summary["needs_review"] or 0,
+                        "unknown_contract": cert_summary["unknown_contract"] or 0,
+                        "fms_unavailable": cert_summary["fms_unavailable"] or 0,
+                        "other": other_total,
+                        "taux_certification": round((certified_total / total_cert) * 100, 2) if total_cert else 0,
+                    },
+                    "evolution": cert_evolution,
+                },
             }
         )
 
+"""
 
 
 
 
+
+class ImpactedSitesAPIView(APIView):
+    """
+    GET /billing/impacted-sites/
+    
+    Retourne les sites impactés par le cos phi et/ou la pénalité prime fixe,
+    mois par mois, sur une période donnée.
+
+    Paramètres :
+      - start  (YYYY-MM-DD) : début de période  [défaut: 1er janvier année courante]
+      - end    (YYYY-MM-DD) : fin de période     [défaut: aujourd'hui]
+      - filter : "cosphi" | "penalty" | "both"   [défaut: "both"]
+      - min_amount : montant minimum pour être inclus dans les résultats [défaut: 0]
+
+    Réponse :
+    {
+      "range": {"start": "...", "end": "..."},
+      "summary": {
+        "total_cosphi":  "...",   // montant cosphi total sur la période
+        "total_penalty": "...",   // montant pénalité total sur la période
+        "sites_cosphi_count":  N, // nb sites distincts avec cosphi
+        "sites_penalty_count": N, // nb sites distincts avec pénalité
+      },
+      "by_month": [
+        {
+          "period": "2025-01",
+          "sites": [
+            {
+              "site_id": "...",
+              "site_name": "...",
+              "numero_compte_contrat": "...",
+              "valeur_cosinus_phi": 0.72,
+              "montant_cosphi": "15420.000",
+              "penalite_prime": "8200.000",
+              "montant_hors_tva": "245000.000",
+              // poids relatif dans la facture
+              "pct_cosphi_sur_ht": 6.29,
+              "pct_penalty_sur_ht": 3.35,
+            },
+            ...
+          ],
+          "totaux": {
+            "montant_cosphi": "...",
+            "penalite_prime": "...",
+            "sites_count": N,
+          }
+        },
+        ...
+      ]
+    }
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        # ── Paramètres ────────────────────────────────────────────────────────
+        start = _parse_qp_date(request, "start")
+        end   = _parse_qp_date(request, "end")
+
+        if not start or not end:
+            today = timezone.localdate()
+            start = start or date(today.year, 1, 1)
+            end   = end   or today
+
+        if end < start:
+            raise ValidationError({"end": "end < start"})
+
+        filter_mode = request.query_params.get("filter", "both").lower()
+        if filter_mode not in ("cosphi", "penalty", "both"):
+            raise ValidationError({"filter": "valeurs acceptées : cosphi | penalty | both"})
+
+        try:
+            min_amount = Decimal(request.query_params.get("min_amount", "0"))
+        except Exception:
+            min_amount = Decimal("0")
+
+        # ── Base queryset ─────────────────────────────────────────────────────
+        base = (
+            MonthlySynthesis.objects
+            .select_related("source__site")
+            .filter(
+                source__site__isnull=False,
+                source__site__invoice_payment__iexact="Aktivco",
+                source__site__grid_fee=True,
+            )
+        )
+        base = _filter_year_month_range(base, start, end)
+
+        # Filtre selon le mode
+        if filter_mode == "cosphi":
+            base = base.filter(montant_cosinus_phi__isnull=False).exclude(montant_cosinus_phi=D0)
+        elif filter_mode == "penalty":
+            base = base.filter(penalite_abonnement_calculee__isnull=False).exclude(penalite_abonnement_calculee=D0)
+        else:  # both — au moins l'un des deux non nul
+            base = base.filter(
+                Q(montant_cosinus_phi__isnull=False, montant_cosinus_phi__gt=D0)
+                | Q(montant_cosinus_phi__lt=D0)  # cosphi peut être négatif (minoration)
+                | Q(penalite_abonnement_calculee__isnull=False, penalite_abonnement_calculee__gt=D0)
+            )
+
+        # ── Agrégat par mois + site ───────────────────────────────────────────
+        rows = (
+            base
+            .values(
+                "year",
+                "month",
+                "source__site__site_id",
+                "source__site__name",
+                "numero_compte_contrat",
+            )
+            .annotate(
+                montant_cosphi=Sum("montant_cosinus_phi"),
+                penalite_prime=Sum("penalite_abonnement_calculee"),
+                montant_hors_tva=Sum("montant_hors_tva"),
+                valeur_cosinus_phi=Avg("valeur_cosinus_phi"),
+            )
+            .order_by("year", "month", "-montant_cosphi")
+        )
+
+        # ── Filtrage min_amount ───────────────────────────────────────────────
+        def _passes_min(r):
+            cosphi  = abs(r["montant_cosphi"]  or D0)
+            penalty = abs(r["penalite_prime"]  or D0)
+            if filter_mode == "cosphi":
+                return cosphi >= min_amount
+            if filter_mode == "penalty":
+                return penalty >= min_amount
+            return (cosphi + penalty) >= min_amount
+
+        # ── Construction de la réponse par mois ──────────────────────────────
+        months_map: dict[str, dict] = {}
+
+        total_cosphi  = Decimal("0")
+        total_penalty = Decimal("0")
+        sites_cosphi:  set[str] = set()
+        sites_penalty: set[str] = set()
+
+        for r in rows:
+            if not _passes_min(r):
+                continue
+
+            period = f"{r['year']}-{str(r['month']).zfill(2)}"
+            if period not in months_map:
+                months_map[period] = {
+                    "period": period,
+                    "sites": [],
+                    "totaux": {
+                        "montant_cosphi": Decimal("0"),
+                        "penalite_prime": Decimal("0"),
+                        "sites_count": 0,
+                    }
+                }
+
+            cosphi_val  = r["montant_cosphi"]  or Decimal("0")
+            penalty_val = r["penalite_prime"]  or Decimal("0")
+            ht_val      = r["montant_hors_tva"] or Decimal("0")
+            site_id     = r["source__site__site_id"]
+
+            # Pourcentage dans la facture HT
+            pct_cosphi  = float(cosphi_val  / ht_val * 100) if ht_val else 0
+            pct_penalty = float(penalty_val / ht_val * 100) if ht_val else 0
+
+            months_map[period]["sites"].append({
+                "site_id":                site_id,
+                "site_name":              r["source__site__name"],
+                "numero_compte_contrat":  r["numero_compte_contrat"],
+                "valeur_cosinus_phi":     float(r["valeur_cosinus_phi"]) if r["valeur_cosinus_phi"] else None,
+                "montant_cosphi":         str(cosphi_val.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)),
+                "penalite_prime":         str(penalty_val.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)),
+                "montant_hors_tva":       str(ht_val.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)),
+                "pct_cosphi_sur_ht":      round(pct_cosphi, 2),
+                "pct_penalty_sur_ht":     round(pct_penalty, 2),
+            })
+
+            months_map[period]["totaux"]["montant_cosphi"]  += cosphi_val
+            months_map[period]["totaux"]["penalite_prime"]  += penalty_val
+            months_map[period]["totaux"]["sites_count"]     += 1
+
+            total_cosphi  += cosphi_val
+            total_penalty += penalty_val
+
+            if cosphi_val != D0:
+                sites_cosphi.add(site_id)
+            if penalty_val > D0:
+                sites_penalty.add(site_id)
+
+        # Sérialiser les totaux Decimal → str
+        by_month = []
+        for period_data in months_map.values():
+            t = period_data["totaux"]
+            period_data["totaux"] = {
+                "montant_cosphi": str(t["montant_cosphi"].quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)),
+                "penalite_prime": str(t["penalite_prime"].quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)),
+                "sites_count":    t["sites_count"],
+            }
+            by_month.append(period_data)
+
+        return Response({
+            "range": {"start": start.isoformat(), "end": end.isoformat()},
+            "filter": filter_mode,
+            "summary": {
+                "total_cosphi":        str(total_cosphi.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)),
+                "total_penalty":       str(total_penalty.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)),
+                "sites_cosphi_count":  len(sites_cosphi),
+                "sites_penalty_count": len(sites_penalty),
+            },
+            "by_month": by_month,
+        })
+
+
+
+class FNPSitesAPIView(APIView):
+    """
+    GET /sonatel-billing/fnp/
+    Retourne les sites sans facture (Factures Non Parvenues) sur la période,
+    avec estimation basée sur la moyenne glissante des N derniers mois connus.
+
+    Params :
+      - start   YYYY-MM-DD
+      - end     YYYY-MM-DD
+      - site    filtre optionnel sur site_id
+      - horizon nb de mois d'historique pour l'estimation (défaut 3, max 12)
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from collections import defaultdict
+
+        start = _parse_qp_date(request, "start")
+        end   = _parse_qp_date(request, "end")
+
+        if not start or not end:
+            today = timezone.localdate()
+            start = start or date(today.year, 1, 1)
+            end   = end   or today
+
+        if end < start:
+            raise ValidationError({"end": "end < start"})
+
+        site_code = request.query_params.get("site")
+        try:
+            horizon = max(1, min(int(request.query_params.get("horizon", 3)), 12))
+        except Exception:
+            horizon = 3
+
+        # ── 1) Contrats éligibles ─────────────────────────────────────────────
+        link_qs = (
+            ContractSiteLink.objects
+            .filter(site__invoice_payment__iexact="Aktivco", site__grid_fee=True)
+            .select_related("site")
+        )
+        if site_code:
+            link_qs = link_qs.filter(site__site_id=site_code)
+
+        contracts = {lnk.numero_compte_contrat: lnk for lnk in link_qs}
+        if not contracts:
+            return Response({
+                "range": {"start": start.isoformat(), "end": end.isoformat()},
+                "horizon": horizon,
+                "summary": {
+                    "fnp_count": 0, "sites_count": 0,
+                    "estimated_total_ht": "0.000",
+                    "months_covered": 0, "months_with_fnp": 0,
+                },
+                "rows": [],
+            })
+
+        # ── 2) Énumération des mois dans la plage ─────────────────────────────
+        months_in_range: list[tuple[int, int]] = []
+        cur = date(start.year, start.month, 1)
+        end_anchor = date(end.year, end.month, 1)
+        while cur <= end_anchor:
+            months_in_range.append((cur.year, cur.month))
+            # avance d'un mois
+            cur = date(
+                cur.year + (1 if cur.month == 12 else 0),
+                (cur.month % 12) + 1,
+                1,
+            )
+
+        # ── 3) Synthèses existantes sur la plage ──────────────────────────────
+        existing: set[tuple[str, int, int]] = set(
+            _filter_year_month_range(
+                MonthlySynthesis.objects.filter(
+                    numero_compte_contrat__in=contracts.keys(),
+                    source__site__invoice_payment__iexact="Aktivco",
+                    source__site__grid_fee=True,
+                ),
+                start, end,
+            ).values_list("numero_compte_contrat", "year", "month")
+        )
+
+        # ── 4) Clés FNP = attendues − existantes ─────────────────────────────
+        fnp_keys: list[tuple[str, int, int]] = [
+            (contract, y, m)
+            for contract in contracts
+            for y, m in months_in_range
+            if (contract, y, m) not in existing
+        ]
+
+        if not fnp_keys:
+            return Response({
+                "range": {"start": start.isoformat(), "end": end.isoformat()},
+                "horizon": horizon,
+                "summary": {
+                    "fnp_count": 0, "sites_count": 0,
+                    "estimated_total_ht": "0.000",
+                    "months_covered": len(months_in_range), "months_with_fnp": 0,
+                },
+                "rows": [],
+            })
+
+        fnp_contracts = list({c for c, _, _ in fnp_keys})
+
+        # ── 5) Historique en masse pour tous les contrats FNP ─────────────────
+        # On récupère TOUT l'historique (pas filtré sur la plage) pour pouvoir
+        # calculer les moyennes avant chaque mois manquant.
+        history_qs = (
+            MonthlySynthesis.objects
+            .filter(
+                numero_compte_contrat__in=fnp_contracts,
+                source__site__invoice_payment__iexact="Aktivco",
+                source__site__grid_fee=True,
+            )
+            .order_by("numero_compte_contrat", "-year", "-month")
+            .values(
+                "numero_compte_contrat", "year", "month",
+                "conso", "montant_hors_tva", "montant_ttc",
+                "abonnement_calcule", "penalite_abonnement_calculee", "energie_calculee",
+            )
+        )
+
+        history_by_contract: dict[str, list] = defaultdict(list)
+        for row in history_qs:
+            history_by_contract[row["numero_compte_contrat"]].append(row)
+
+        # ── Helpers ───────────────────────────────────────────────────────────
+        def _pk(y, m):
+            return y * 100 + m
+
+        def _avg(rows, field):
+            vals = [Decimal(str(r[field])) for r in rows if r.get(field) is not None]
+            return (sum(vals) / len(vals)) if vals else None
+
+        def _fmt(v):
+            if v is None:
+                return None
+            return str(v.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP))
+
+        # ── 6) Construction des lignes résultantes ────────────────────────────
+        result_rows = []
+        for contract, y, m in fnp_keys:
+            link = contracts[contract]
+            target_pk = _pk(y, m)
+
+            # Les N derniers mois strictement antérieurs à (y, m)
+            hist = [
+                h for h in history_by_contract[contract]
+                if _pk(h["year"], h["month"]) < target_pk
+            ][:horizon]
+
+            last = hist[0] if hist else None
+            last_period = (
+                f"{last['year']}-{str(last['month']).zfill(2)}" if last else None
+            )
+
+            result_rows.append({
+                "site_id":               link.site.site_id,
+                "site_name":             link.site.name,
+                "numero_compte_contrat": contract,
+                "year":   y,
+                "month":  m,
+                "period": f"{y}-{str(m).zfill(2)}",
+                "est_conso":       _fmt(_avg(hist, "conso")),
+                "est_montant_ht":  _fmt(_avg(hist, "montant_hors_tva")),
+                "est_montant_ttc": _fmt(_avg(hist, "montant_ttc")),
+                "est_abonnement":  _fmt(_avg(hist, "abonnement_calcule")),
+                "est_penalite":    _fmt(_avg(hist, "penalite_abonnement_calculee")),
+                "est_nrj":         _fmt(_avg(hist, "energie_calculee")),
+                "history_months":  len(hist),
+                "last_invoice_period": last_period,
+                "typology": link.site.typology if hasattr(link.site, 'typology') else None,
+            })
+
+        # ── 7) Résumé ─────────────────────────────────────────────────────────
+        total_est_ht = sum(
+            Decimal(r["est_montant_ht"]) for r in result_rows if r["est_montant_ht"]
+        )
+        total_est_ttc = sum(
+            Decimal(r["est_montant_ttc"]) for r in result_rows if r["est_montant_ttc"]
+        )
+        sites_count   = len({r["site_id"] for r in result_rows})
+        months_w_fnp  = len({(r["year"], r["month"]) for r in result_rows})
+        no_hist_count = sum(1 for r in result_rows if r["history_months"] == 0)
+
+        result_rows.sort(key=lambda r: (r["year"], r["month"], r["site_id"]))
+
+        return Response({
+            "range":   {"start": start.isoformat(), "end": end.isoformat()},
+            "horizon": horizon,
+            "summary": {
+                "fnp_count":          len(result_rows),
+                "sites_count":        sites_count,
+                "estimated_total_ht": str(total_est_ht.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)),
+                "estimated_total_ttc":str(total_est_ttc.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)),
+                "months_covered":     len(months_in_range),
+                "months_with_fnp":    months_w_fnp,
+                "no_history_count":   no_hist_count,   # FNP sans historique (nouveau site)
+            },
+            "rows": result_rows,
+        })

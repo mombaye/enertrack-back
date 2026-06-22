@@ -9,6 +9,8 @@ from .views import (
     ContractSiteLinkViewSet,
     ContractMonthViewSet,  # ✅ ADD
     SonatelBillingStatsAPIView,
+    ImpactedSitesAPIView,
+    FNPSitesAPIView
 )
 
 from billing.views_compute import SonatelBillingComputeView
@@ -35,4 +37,7 @@ urlpatterns = [
     path("", include(router.urls)),
     path("sonatel-billing/compute/", SonatelBillingComputeView.as_view(), name="sb-compute"),
     path("sonatel-billing/stats/", SonatelBillingStatsAPIView.as_view()),
+    path("billing/impacted-sites/", ImpactedSitesAPIView.as_view(), name="impacted-sites"),
+    path("sonatel-billing/fnp/", FNPSitesAPIView.as_view(), name="sb-fnp"),
+    
 ]

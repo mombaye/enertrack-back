@@ -4,6 +4,7 @@ services:
 
   db:
     image: postgres:15
+    shm_size: 2gb
     volumes:
       - postgres_data:/var/lib/postgresql/data/
     environment:
@@ -90,3 +91,4 @@ services:
 
 volumes:
   postgres_data:
+
