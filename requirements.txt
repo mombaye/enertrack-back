@@ -9,7 +9,10 @@ redis
 django-cors-headers
 pandas
 openpyxl
+pyxlsb
 pyodbc>=4.0.39
+snowflake-connector-python>=3.6
+pymongo>=4.6
 
 lightgbm
 shap

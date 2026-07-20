@@ -7,8 +7,14 @@ pour un site sur une plage de mois.
 
 Stratégie par mois :
   1. LOCAL  → CertificationResult (déjà calculé lors d'un batch de certification)
-  2. REMOTE → EfmsService.get_conso_acm / get_conso_periode (fallback SQL Server)
-  3. SOLAR  → SQL2-ProdDB.[silver].[fact_solar_mth] (toujours requête directe)
+  2. SYNC   → FinancialConsoMonthly (synchronisé depuis Snowflake/SQL Server par
+              la commande `sync_financial_conso` — plus AUCUN appel Snowflake/SQL
+              Server live dans le chemin de requête HTTP, cf. migration
+              perf du 2026-07)
+
+`_fetch_remote_bulk` (les anciennes requêtes live Snowflake + SQL Server,
+chunkées 400 sites) n'est plus appelée que par la commande de synchronisation
+`financial/management/commands/sync_financial_conso.py` — jamais depuis une vue.
 
 Retourne un dict {month: ConsoMonthData} consommable directement dans SiteMargeDetailView.
 """
@@ -40,37 +46,17 @@ class ConsoMonthData:
     ratio_fms:          Optional[Decimal] = None   # ratio FMS / Sénélec
     fms_available:      bool              = False
     acm_available:      bool              = False
-    fms_source:         str               = "none"  # "local" | "remote" | "none"
+    fms_source:         str               = "none"  # "local" | "synced" | "none"
     acm_source:         str               = "none"
 
     # Solar
     solar_kwh:          Optional[float]   = None
     unavail_hours:      Optional[float]   = None
-    solar_source:       str               = "none"  # "remote" | "none"
+    solar_source:       str               = "none"  # "synced" | "none"
 
     # Meta
     date_debut:         Optional[date]    = None
     date_fin:           Optional[date]    = None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPER : connexion SQL2-ProdDB pour solar
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _build_sql2_conn_string() -> str:
-    host     = getattr(settings, "EFMS_SQL_HOST",   "172.30.0.149")
-    port     = int(getattr(settings, "EFMS_SQL_PORT", 1433))
-    user     = getattr(settings, "EFMS_SQL_USER",   "")
-    password = getattr(settings, "EFMS_SQL_PASSWORD", "")
-    driver   = getattr(settings, "EFMS_SQL_DRIVER", "ODBC Driver 17 for SQL Server")
-    return (
-        f"DRIVER={{{driver}}};"
-        f"SERVER={host},{port};"
-        f"DATABASE=SQL2-ProdDB;"
-        f"UID={user};PWD={password};"
-        "TrustServerCertificate=yes;"
-        "Connection Timeout=8;"
-    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -96,7 +82,7 @@ class FinancialConsoService:
             row["conso_fms_source"] = data.fms_source
     """
 
-    # Timeout pour les requêtes SQL Remote (en secondes)
+    # Timeout pour les requêtes SQL Remote (en secondes) — utilisé par _fetch_remote_bulk
     REMOTE_TIMEOUT = 10
 
     def __init__(
@@ -133,15 +119,11 @@ class FinancialConsoService:
         # ── ÉTAPE 1 : données locales (CertificationResult) ───────────────────
         missing_months = self._fill_from_local(result, months)
 
-        # ── ÉTAPE 2 : fallback remote pour les mois sans données locales ──────
+        # ── ÉTAPE 2 : FinancialConsoMonthly (synchronisé) pour les mois manquants ──
         if missing_months:
-            logger.info(
-                "[ConsoService] %s — %d mois sans données locales → requête eFMS remote : %s",
-                self.site_id, len(missing_months), missing_months,
-            )
-            self._fill_from_remote(result, missing_months)
+            self._fill_from_sync(result, missing_months)
 
-        # ── ÉTAPE 3 : production solaire (toujours remote) ────────────────────
+        # ── ÉTAPE 3 : production solaire (synchronisée) ────────────────────────
         self._fill_solar(result, months)
 
         return result
@@ -155,34 +137,84 @@ class FinancialConsoService:
         month_end: int,
     ) -> dict[tuple, dict]:
         """
-        Requête bulk directe sur SQL1-ProdDB (Grid + ACM) et SQL2-ProdDB (Solar).
- 
+        Lecture bulk Postgres (FinancialConsoMonthly) pour un ensemble de sites
+        sur une plage de mois (inter-années supporté). Remplace l'ancienne
+        version qui interrogeait Snowflake/SQL Server en direct à chaque appel.
+
+        Retourne :
+            { (site_id, year, month): {
+                "fms_grid_kwh":  Decimal|None,
+                "fms_acm_kwh":   Decimal|None,
+                "solar_kwh":     float|None,
+                "unavail_hours": float|None,
+            }}
+        """
+        from financial.models import FinancialConsoMonthly
+
+        if not site_ids:
+            return {}
+
+        qs = FinancialConsoMonthly.objects.filter(
+            site__site_id__in=site_ids,
+        ).filter(
+            _period_filter(year_start, month_start, year_end, month_end)
+        ).values(
+            "site__site_id", "year", "month",
+            "fms_grid_kwh", "fms_acm_kwh", "solar_kwh", "unavail_hours",
+        )
+
+        result: dict[tuple, dict] = {}
+        for row in qs:
+            key = (row["site__site_id"], row["year"], row["month"])
+            result[key] = {
+                "fms_grid_kwh":  row["fms_grid_kwh"],
+                "fms_acm_kwh":   row["fms_acm_kwh"],
+                "solar_kwh":     float(row["solar_kwh"]) if row["solar_kwh"] is not None else None,
+                "unavail_hours": float(row["unavail_hours"]) if row["unavail_hours"] is not None else None,
+            }
+        return result
+
+    @staticmethod
+    def _fetch_remote_bulk(
+        site_ids: list[str],
+        year_start: int,
+        month_start: int,
+        year_end: int,
+        month_end: int,
+    ) -> dict[tuple, dict]:
+        """
+        Requête bulk EN DIRECT : Snowflake (Grid + ACM) et SQL2-ProdDB (Solar).
+
+        N'est appelée QUE par `sync_financial_conso` (management command) pour
+        alimenter FinancialConsoMonthly — plus jamais depuis une vue HTTP.
+
         Retourne :
             { (site_id, year, month): {
                 "fms_grid_kwh": Decimal|None,
                 "fms_acm_kwh":  Decimal|None,
                 "solar_kwh":    float|None,
+                "unavail_hours": float|None,
+                "grid_mode":    "exact"|"extrapol"|"none",
             }}
         """
         import calendar as _cal
         from datetime import date as _date
         import pyodbc
- 
+
         if not site_ids:
             return {}
- 
+
         CHUNK_SIZE = 400
         MIN_PTS    = 3
         MIN_DENSE  = 20
- 
-        # ── Connexions ────────────────────────────────────────────────────────
+
         host     = getattr(settings, "EFMS_SQL_HOST",     "172.30.0.149")
         port     = int(getattr(settings, "EFMS_SQL_PORT",  1433))
         user     = getattr(settings, "EFMS_SQL_USER",     "")
         password = getattr(settings, "EFMS_SQL_PASSWORD", "")
         driver   = getattr(settings, "EFMS_SQL_DRIVER",   "ODBC Driver 17 for SQL Server")
         timeout  = int(getattr(settings, "EFMS_SQL_TIMEOUT", 15))
- 
+
         def _conn_str(database: str) -> str:
             return (
                 f"DRIVER={{{driver}}};"
@@ -192,138 +224,115 @@ class FinancialConsoService:
                 "TrustServerCertificate=yes;"
                 f"Connection Timeout={timeout};"
             )
- 
-        TABLE_GRID = "[SQL1-ProdDB].[dbo].[silver.gfms_Grid_Report_day]"
-        TABLE_ACM  = "[SQL1-ProdDB].[dbo].[silver.gfms_AC_Meter_Report_day]"
- 
+
         d_start = _date(year_start, month_start, 1)
         d_end   = _date(year_end, month_end, _cal.monthrange(year_end, month_end)[1])
- 
-        # Toutes les clés (year, month) dans la plage — pour la requête solar
-        period_keys: list[tuple[int, int]] = []
-        y, m = year_start, month_start
-        while (y, m) <= (year_end, month_end):
-            period_keys.append((y, m))
-            if m == 12:
-                y, m = y + 1, 1
-            else:
-                m += 1
- 
+
         result: dict[tuple, dict] = {}
- 
-        # ── SQL1 : Grid + ACM ─────────────────────────────────────────────────
+
+        # ── Grid + ACM — Snowflake (DB_GFMS_ANALYTICS_PROD.GOLD) ────────────────
         conn1 = None
         try:
-            conn1  = pyodbc.connect(_conn_str("SQL1-ProdDB"), timeout=timeout)
+            from certification.services.snowflake_service import SnowflakeService
+
+            sf = SnowflakeService()
+            conn1 = sf._connect()
             cursor = conn1.cursor()
- 
-            # Résolution colonne Grid
-            COL_CANDIDATES = [
-                "GRID_ENERGY_CONSO_PER_DAY", "Grid Energy Conso per Day",
-                "Grid_Energy_Conso_per_day", "Grid_Energy_Conso_per_Day",
-                "GridEnergyConso", "energy_kwh", "conso_kwh",
-            ]
-            cursor.execute(f"SELECT TOP 0 * FROM {TABLE_GRID}")
-            db_cols = {d[0].lower(): d[0] for d in cursor.description}
-            col_grid = next(
-                (db_cols[c.lower()] for c in COL_CANDIDATES if c.lower() in db_cols),
-                next((v for k, v in db_cols.items()
-                      if any(x in k for x in ("conso", "energy", "kwh"))), None),
-            )
- 
-            if col_grid:
-                for chunk_start in range(0, len(site_ids), CHUNK_SIZE):
-                    chunk = site_ids[chunk_start: chunk_start + CHUNK_SIZE]
-                    ph    = ",".join("?" * len(chunk))
- 
-                    # GRID
-                    cursor.execute(f"""
-                        SELECT
-                            site_id,
-                            YEAR([Date])                           AS yr,
-                            MONTH([Date])                          AS mo,
-                            SUM(TRY_CAST([{col_grid}] AS FLOAT))  AS grid_kwh,
-                            COUNT([Date])                          AS nb_pts
-                        FROM {TABLE_GRID}
-                        WHERE site_id IN ({ph})
-                          AND [Date] >= ? AND [Date] <= ?
-                          AND [{col_grid}] IS NOT NULL
-                          AND TRY_CAST([{col_grid}] AS FLOAT) > 0.1
-                        GROUP BY site_id, YEAR([Date]), MONTH([Date])
-                    """, (*chunk, d_start, d_end))
- 
-                    for row in cursor.fetchall():
-                        sid, yr, mo, kwh, nb = row[0], int(row[1]), int(row[2]), row[3], int(row[4])
-                        key = (sid, yr, mo)
-                        if key not in result:
-                            result[key] = {"fms_grid_kwh": None, "fms_acm_kwh": None, "solar_kwh": None}
-                        if kwh is not None and nb >= MIN_PTS:
-                            days_m = _cal.monthrange(yr, mo)[1]
-                            val = Decimal(str(kwh))
-                            if nb < MIN_DENSE:
-                                val = (val / Decimal(str(nb)) * days_m)
-                            result[key]["fms_grid_kwh"] = val.quantize(Decimal("0.001"))
- 
-                    # ACM  (act_energy_p = index cumulatif → MAX - MIN)
-                    cursor.execute(f"""
-                        SELECT
-                            site_id,
-                            YEAR([Date])                                AS yr,
-                            MONTH([Date])                               AS mo,
-                            MAX(act_energy_p) - MIN(act_energy_p)      AS acm_kwh,
-                            COUNT([Date])                               AS nb_pts,
-                            DATEDIFF(day, MIN([Date]), MAX([Date]))     AS span_days
-                        FROM {TABLE_ACM}
-                        WHERE site_id IN ({ph})
-                          AND [Date] >= ? AND [Date] <= ?
-                          AND act_energy_p IS NOT NULL AND act_energy_p > 0
-                        GROUP BY site_id, YEAR([Date]), MONTH([Date])
-                    """, (*chunk, d_start, d_end))
- 
-                    for row in cursor.fetchall():
-                        sid   = row[0]
-                        yr    = int(row[1])
-                        mo    = int(row[2])
-                        delta = row[3]
-                        nb    = int(row[4])
-                        span  = int(row[5]) if row[5] else 1
-                        key   = (sid, yr, mo)
-                        if key not in result:
-                            result[key] = {"fms_grid_kwh": None, "fms_acm_kwh": None, "solar_kwh": None}
-                        if delta is not None and delta > 0 and nb >= MIN_PTS:
-                            days_m = _cal.monthrange(yr, mo)[1]
-                            d = Decimal(str(delta))
-                            if nb >= MIN_DENSE:
-                                result[key]["fms_acm_kwh"] = d.quantize(Decimal("0.001"))
-                            else:
-                                result[key]["fms_acm_kwh"] = (
-                                    d / Decimal(str(max(1, span))) * days_m
-                                ).quantize(Decimal("0.001"))
- 
+            db_schema = f"{sf.database}.{sf.schema}"
+
+            for chunk_start in range(0, len(site_ids), CHUNK_SIZE):
+                chunk = site_ids[chunk_start: chunk_start + CHUNK_SIZE]
+                ph    = ",".join(["%s"] * len(chunk))
+
+                # GRID
+                cursor.execute(f"""
+                    SELECT
+                        SITE_ID,
+                        YEAR(DATE)                           AS yr,
+                        MONTH(DATE)                          AS mo,
+                        SUM(GRID_ENERGY_CONSO_PER_DAY)       AS grid_kwh,
+                        COUNT(DATE)                          AS nb_pts
+                    FROM {db_schema}.GRID_REPORT
+                    WHERE SITE_ID IN ({ph})
+                      AND DATE >= %s AND DATE <= %s
+                      AND GRID_ENERGY_CONSO_PER_DAY IS NOT NULL
+                      AND GRID_ENERGY_CONSO_PER_DAY > 0.1
+                    GROUP BY SITE_ID, YEAR(DATE), MONTH(DATE)
+                """, tuple(chunk) + (d_start, d_end))
+
+                for row in cursor.fetchall():
+                    sid, yr, mo, kwh, nb = row[0], int(row[1]), int(row[2]), row[3], int(row[4])
+                    key = (sid, yr, mo)
+                    if key not in result:
+                        result[key] = {"fms_grid_kwh": None, "fms_acm_kwh": None, "solar_kwh": None, "unavail_hours": None, "grid_mode": "none"}
+                    if kwh is not None and nb >= MIN_PTS:
+                        days_m = _cal.monthrange(yr, mo)[1]
+                        val = Decimal(str(kwh))
+                        if nb >= MIN_DENSE:
+                            result[key]["grid_mode"] = "exact"
+                        else:
+                            val = (val / Decimal(str(nb)) * days_m)
+                            result[key]["grid_mode"] = "extrapol"
+                        result[key]["fms_grid_kwh"] = val.quantize(Decimal("0.001"))
+
+                # ACM  (ACT_ENERGY_P = index cumulatif → MAX - MIN)
+                cursor.execute(f"""
+                    SELECT
+                        SITE_ID,
+                        YEAR(DATE)                                AS yr,
+                        MONTH(DATE)                               AS mo,
+                        MAX(ACT_ENERGY_P) - MIN(ACT_ENERGY_P)     AS acm_kwh,
+                        COUNT(DATE)                               AS nb_pts,
+                        DATEDIFF('day', MIN(DATE), MAX(DATE))     AS span_days
+                    FROM {db_schema}.AC_METER
+                    WHERE SITE_ID IN ({ph})
+                      AND DATE >= %s AND DATE <= %s
+                      AND ACT_ENERGY_P IS NOT NULL AND ACT_ENERGY_P > 0
+                    GROUP BY SITE_ID, YEAR(DATE), MONTH(DATE)
+                """, tuple(chunk) + (d_start, d_end))
+
+                for row in cursor.fetchall():
+                    sid   = row[0]
+                    yr    = int(row[1])
+                    mo    = int(row[2])
+                    delta = row[3]
+                    nb    = int(row[4])
+                    span  = int(row[5]) if row[5] else 1
+                    key   = (sid, yr, mo)
+                    if key not in result:
+                        result[key] = {"fms_grid_kwh": None, "fms_acm_kwh": None, "solar_kwh": None, "unavail_hours": None, "grid_mode": "none"}
+                    if delta is not None and delta > 0 and nb >= MIN_PTS:
+                        days_m = _cal.monthrange(yr, mo)[1]
+                        d = Decimal(str(delta))
+                        if nb >= MIN_DENSE:
+                            result[key]["fms_acm_kwh"] = d.quantize(Decimal("0.001"))
+                        else:
+                            result[key]["fms_acm_kwh"] = (
+                                d / Decimal(str(max(1, span))) * days_m
+                            ).quantize(Decimal("0.001"))
+
         except Exception as e:
-            logger.warning("[ConsoService bulk] Erreur SQL1 Grid/ACM : %s", e)
+            logger.warning("[ConsoService sync] Erreur Snowflake Grid/ACM : %s", e)
         finally:
             if conn1:
                 try:
                     conn1.close()
                 except Exception:
                     pass
- 
+
         # ── SQL2 : Solar ──────────────────────────────────────────────────────
-        # fact_solar_mth a une ligne par (site_id, month_year)
-        # month_year format : "2025-03" ou datetime
         conn2 = None
         try:
             period_start = f"{year_start}-{month_start:02d}"
             period_end   = f"{year_end}-{month_end:02d}"
- 
+
             conn2  = pyodbc.connect(_conn_str("SQL2-ProdDB"), timeout=timeout)
             cursor = conn2.cursor()
- 
+
             for chunk_start in range(0, len(site_ids), CHUNK_SIZE):
                 chunk = site_ids[chunk_start: chunk_start + CHUNK_SIZE]
                 ph    = ",".join("?" * len(chunk))
- 
+
                 cursor.execute(f"""
                     SELECT
                         site_id,
@@ -335,13 +344,13 @@ class FinancialConsoService:
                       AND month_year >= ?
                       AND month_year <= ?
                 """, (*chunk, period_start, period_end))
- 
+
                 for row in cursor.fetchall():
                     sid      = row[0]
                     my       = row[1]   # datetime ou string "2025-03"
                     solar_v  = row[2]
                     unavail  = row[3]
- 
+
                     try:
                         if hasattr(my, "month"):
                             yr, mo = my.year, my.month
@@ -350,28 +359,26 @@ class FinancialConsoService:
                             yr, mo = int(yr_s), int(mo_s)
                     except Exception:
                         continue
- 
+
                     key = (sid, yr, mo)
                     if key not in result:
-                        result[key] = {"fms_grid_kwh": None, "fms_acm_kwh": None, "solar_kwh": None}
- 
+                        result[key] = {"fms_grid_kwh": None, "fms_acm_kwh": None, "solar_kwh": None, "unavail_hours": None, "grid_mode": "none"}
+
                     if solar_v is not None:
-                        result[key]["solar_kwh"]    = float(solar_v)
+                        result[key]["solar_kwh"] = float(solar_v)
                     if unavail is not None:
                         result[key]["unavail_hours"] = float(unavail)
- 
+
         except Exception as e:
-            logger.warning("[ConsoService bulk] Erreur SQL2 Solar : %s", e)
+            logger.warning("[ConsoService sync] Erreur SQL2 Solar : %s", e)
         finally:
             if conn2:
                 try:
                     conn2.close()
                 except Exception:
                     pass
- 
+
         return result
- 
- 
 
     # ── ÉTAPE 1 : local ──────────────────────────────────────────────────────
 
@@ -438,60 +445,41 @@ class FinancialConsoService:
         ]
         return missing
 
-    # ── ÉTAPE 2 : remote eFMS ────────────────────────────────────────────────
+    # ── ÉTAPE 2 : FinancialConsoMonthly (synchronisé) ───────────────────────
 
-    def _fill_from_remote(
+    def _fill_from_sync(
         self, result: dict[int, ConsoMonthData], months: list[int]
     ) -> None:
         """
-        Pour chaque mois manquant, interroge eFMS directement (ACM + Grid).
-        Utilise les méthodes ponctuelles d'EfmsService (pas de prefetch —
-        on est sur 1 site, pas un batch de 3000).
+        Pour chaque mois manquant, lit FinancialConsoMonthly (Postgres) —
+        alimentée par `sync_financial_conso`, plus aucun appel Snowflake ici.
         """
-        try:
-            from certification.services.efms import EfmsService, EfmsConnectionError, EfmsQueryError
-            svc = EfmsService()
-        except ImportError:
-            logger.warning("[ConsoService] EfmsService non disponible")
-            return
+        from financial.models import FinancialConsoMonthly
 
-        for m in months:
-            data       = result[m]
-            bill_row   = self._billing_index.get(m, {})
-            date_debut, date_fin = self._month_bounds(m, bill_row)
+        rows = FinancialConsoMonthly.objects.filter(
+            site__site_id=self.site_id,
+            year=self.year,
+            month__in=months,
+        )
 
-            if date_debut is None or date_fin is None:
+        for row in rows:
+            data = result.get(row.month)
+            if data is None:
                 continue
 
-            data.date_debut = date_debut
-            data.date_fin   = date_fin
+            bill_row = self._billing_index.get(row.month, {})
+            data.date_debut, data.date_fin = self._month_bounds(row.month, bill_row)
 
-            # ── ACM (priorité) ───────────────────────────────────────────────
-            try:
-                acm_periode, _ = svc.get_conso_acm(
-                    self.site_id, date_debut, date_fin
-                )
-                if acm_periode is not None:
-                    data.conso_acm_kwh  = acm_periode
-                    data.acm_available  = True
-                    data.acm_source     = "remote"
-            except (EfmsConnectionError, EfmsQueryError) as e:
-                logger.warning("[ConsoService] ACM remote %s m=%d : %s", self.site_id, m, e)
+            if row.fms_acm_kwh is not None:
+                data.conso_acm_kwh = row.fms_acm_kwh
+                data.acm_available = True
+                data.acm_source = "synced"
 
-            # ── Grid / FMS ───────────────────────────────────────────────────
-            try:
-                fms_periode, fms_mode = svc.get_conso_periode(
-                    self.site_id, date_debut, date_fin
-                )
-                if fms_periode is not None:
-                    data.conso_fms_kwh  = fms_periode
-                    data.fms_available  = True
-                    data.fms_source     = f"remote:{fms_mode}"
-            except (EfmsConnectionError, EfmsQueryError) as e:
-                logger.warning("[ConsoService] Grid remote %s m=%d : %s", self.site_id, m, e)
+            if row.fms_grid_kwh is not None:
+                data.conso_fms_kwh = row.fms_grid_kwh
+                data.fms_available = True
+                data.fms_source = f"synced:{row.grid_mode}"
 
-            # ── Ratio FMS / Facturée (si on a les deux) ──────────────────────
-            if data.conso_fms_kwh is not None:
                 facturee_str = bill_row.get("energie")
                 if facturee_str:
                     try:
@@ -508,64 +496,22 @@ class FinancialConsoService:
     def _fill_solar(
         self, result: dict[int, ConsoMonthData], months: list[int]
     ) -> None:
-        """
-        Requête directe sur SQL2-ProdDB.[silver].[fact_solar_mth].
-        Une seule connexion pour tous les mois de la plage.
-        """
-        try:
-            import pyodbc
+        """Lit solar_kwh/unavail_hours depuis FinancialConsoMonthly (Postgres)."""
+        from financial.models import FinancialConsoMonthly
 
-            period_start = f"{self.year}-{self.month_start:02d}"
-            period_end   = f"{self.year}-{self.month_end:02d}"
+        rows = FinancialConsoMonthly.objects.filter(
+            site__site_id=self.site_id,
+            year=self.year,
+            month__in=months,
+        )
 
-            conn = pyodbc.connect(_build_sql2_conn_string(), timeout=self.REMOTE_TIMEOUT)
-            cursor = conn.cursor()
-
-            cursor.execute(
-                """
-                SELECT
-                    month_year,
-                    solar_production_kwh_mth,
-                    monitoring_unavailability_hours
-                FROM [SQL2-ProdDB].[silver].[fact_solar_mth]
-                WHERE site_id = ?
-                  AND month_year >= ?
-                  AND month_year <= ?
-                ORDER BY month_year
-                """,
-                (self.site_id, period_start, period_end),
-            )
-
-            for row_sql in cursor.fetchall():
-                # month_year : "2025-03" ou datetime selon le driver
-                my = row_sql[0]
-                try:
-                    if hasattr(my, "month"):
-                        m = my.month
-                    else:
-                        _, m_str = str(my).split("-")
-                        m = int(m_str)
-                except (ValueError, AttributeError):
-                    continue
-
-                if m not in result:
-                    continue
-
-                data = result[m]
-                solar_val  = row_sql[1]
-                unavail    = row_sql[2]
-
-                data.solar_kwh     = float(solar_val)  if solar_val  is not None else None
-                data.unavail_hours = float(unavail)    if unavail     is not None else None
-                data.solar_source  = "remote" if data.solar_kwh is not None else "none"
-
-            conn.close()
-
-        except Exception as e:
-            logger.warning(
-                "[ConsoService] Impossible de charger fact_solar_mth pour %s : %s",
-                self.site_id, e,
-            )
+        for row in rows:
+            data = result.get(row.month)
+            if data is None:
+                continue
+            data.solar_kwh     = float(row.solar_kwh) if row.solar_kwh is not None else None
+            data.unavail_hours = float(row.unavail_hours) if row.unavail_hours is not None else None
+            data.solar_source  = "synced" if data.solar_kwh is not None else "none"
 
     # ── Helper : bornes d'un mois ─────────────────────────────────────────────
 
@@ -578,11 +524,6 @@ class FinancialConsoService:
         """
         import calendar as _cal
 
-        # 1. Dates réelles depuis la facture (si billing_rows fourni)
-        # Les billing_rows ont first_period_start / last_period_end dans
-        # ContractMonth — ils ne sont pas exposés directement ici,
-        # mais nb_jours peut guider.
-        # On utilise le mois calendaire comme référence par défaut.
         try:
             last_day = _cal.monthrange(self.year, month)[1]
             d_start  = date(self.year, month, 1)
@@ -590,3 +531,16 @@ class FinancialConsoService:
             return d_start, d_end
         except Exception:
             return None, None
+
+
+def _period_filter(year_start: int, month_start: int, year_end: int, month_end: int):
+    """Q() inter-années pour filtrer FinancialConsoMonthly sur (year, month)."""
+    from django.db.models import Q
+
+    if year_start == year_end:
+        return Q(year=year_start, month__gte=month_start, month__lte=month_end)
+    return (
+        Q(year=year_start, month__gte=month_start)
+        | Q(year__gt=year_start, year__lt=year_end)
+        | Q(year=year_end, month__lte=month_end)
+    )

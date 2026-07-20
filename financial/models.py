@@ -253,4 +253,79 @@ class FinancialEvaluation(models.Model):
             f"→ marge={self.marge} [{self.marge_statut}]"
         )
 
+
+class FinancialConsoMonthly(models.Model):
+    """
+    Conso FMS/ACM/Solaire mensuelle synchronisée depuis Snowflake (GRID_REPORT,
+    AC_METER) et SQL Server (fact_solar_mth) — cf. sync_financial_conso.
+
+    Remplace les appels live à Snowflake/SQL Server faits auparavant à chaque
+    requête HTTP (financial/services/conso_service.py) : le site web ne lit
+    plus que cette table Postgres, jamais Snowflake en direct.
+    """
+
+    class GridMode(models.TextChoices):
+        EXACT    = "exact",    "Exact (données denses)"
+        EXTRAPOL = "extrapol", "Extrapolé (données éparses)"
+        NONE     = "none",     "Aucune donnée"
+
+    site  = models.ForeignKey("core.Site", on_delete=models.CASCADE, related_name="conso_monthly")
+    year  = models.IntegerField(db_index=True)
+    month = models.IntegerField(db_index=True)
+
+    fms_grid_kwh = models.DecimalField(**DEC)
+    grid_mode    = models.CharField(max_length=10, choices=GridMode.choices, default=GridMode.NONE)
+
+    fms_acm_kwh  = models.DecimalField(**DEC)
+
+    solar_kwh      = models.DecimalField(**DEC)
+    unavail_hours  = models.DecimalField(**DEC)
+
+    synced_at  = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["site", "year", "month"],
+                name="uniq_financial_conso_monthly",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["site", "year", "month"]),
+            models.Index(fields=["year", "month"]),
+        ]
+
+    def __str__(self):
+        return f"{self.site.site_id} {self.year}-{self.month:02d} conso"
+
+
+class FinancialConsoSyncRun(models.Model):
+    """Traçabilité d'une exécution de sync_financial_conso (cf. FuelEfmsSyncRun)."""
+
+    class Status(models.TextChoices):
+        RUNNING = "RUNNING", "En cours"
+        SUCCESS = "SUCCESS", "Succès"
+        FAILED  = "FAILED",  "Échec"
+
+    month_from = models.CharField(max_length=7, null=True, blank=True)  # YYYY-MM
+    month_to   = models.CharField(max_length=7, null=True, blank=True)
+
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.RUNNING, db_index=True)
+
+    rows_fetched = models.IntegerField(default=0)
+    rows_created = models.IntegerField(default=0)
+    rows_updated = models.IntegerField(default=0)
+
+    started_at  = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    error_message = models.TextField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-started_at"]
+
+    def __str__(self):
+        return f"Financial conso sync {self.month_from}→{self.month_to} [{self.status}]"
+
     

@@ -29,7 +29,8 @@ from django.db.models import F
 from django.utils import timezone
 
 from .models import EstimationBatch, EstimationResult
-from certification.services.efms import EfmsService, EfmsConnectionError, EfmsQueryError
+from certification.services.efms import EfmsConnectionError, EfmsQueryError
+from certification.services.snowflake_efms import SnowflakeEfmsService as EfmsService
 
 logger = logging.getLogger(__name__)
 

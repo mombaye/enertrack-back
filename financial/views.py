@@ -2161,171 +2161,11 @@ class SuiviConsoView(APIView):
         )
 
 
-    @staticmethod
-    def fetch_bulk_for_list(
-        site_ids: list[str],
-        year_start: int,
-        month_start: int,
-        year_end: int,
-        month_end: int,
-    ) -> dict[tuple, dict]:
-        """
-        Requête bulk directe sur SQL1-ProdDB (Grid + ACM) pour un ensemble de sites
-        sur une plage de mois (inter-années supporté).
- 
-        Retourne :
-            { (site_id, year, month): {"fms_grid_kwh": Decimal|None,
-                                       "fms_acm_kwh":  Decimal|None} }
- 
-        Utilisé par SuiviConsoView — ne passe PAS par CertificationResult.
-        Même stratégie de chunking que prefetch_batch (max 400 sites / requête).
-        """
-        import calendar as _cal
-        from datetime import date as _date
-        import pyodbc
- 
-        if not site_ids:
-            return {}
- 
-        CHUNK_SIZE   = 400
-        MIN_PTS      = 3    # EfmsService.MIN_POINTS_EXTRAPOL
-        MIN_DENSE    = 20   # EfmsService.MIN_DAYS_DENSE
- 
-        host     = getattr(settings, "EFMS_SQL_HOST",     "172.30.0.149")
-        port     = int(getattr(settings, "EFMS_SQL_PORT",  1433))
-        user     = getattr(settings, "EFMS_SQL_USER",     "")
-        password = getattr(settings, "EFMS_SQL_PASSWORD", "")
-        driver   = getattr(settings, "EFMS_SQL_DRIVER",   "ODBC Driver 17 for SQL Server")
-        timeout  = int(getattr(settings, "EFMS_SQL_TIMEOUT", 15))
- 
-        conn_str = (
-            f"DRIVER={{{driver}}};"
-            f"SERVER={host},{port};"
-            f"DATABASE=SQL1-ProdDB;"
-            f"UID={user};PWD={password};"
-            "TrustServerCertificate=yes;"
-            f"Connection Timeout={timeout};"
-        )
- 
-        TABLE_GRID = "[SQL1-ProdDB].[dbo].[silver.gfms_Grid_Report_day]"
-        TABLE_ACM  = "[SQL1-ProdDB].[dbo].[silver.gfms_AC_Meter_Report_day]"
- 
-        # Bornes calendaires de la plage complète
-        d_start = _date(year_start, month_start, 1)
-        d_end   = _date(year_end, month_end, _cal.monthrange(year_end, month_end)[1])
- 
-        result: dict[tuple, dict] = {}
- 
-        conn = None
-        try:
-            conn   = pyodbc.connect(conn_str, timeout=timeout)
-            cursor = conn.cursor()
- 
-            # ── Résolution colonne Grid ───────────────────────────────────────
-            COL_CANDIDATES = [
-                "GRID_ENERGY_CONSO_PER_DAY",
-                "Grid Energy Conso per Day",
-                "Grid_Energy_Conso_per_day",
-                "Grid_Energy_Conso_per_Day",
-                "GridEnergyConso",
-                "energy_kwh",
-                "conso_kwh",
-            ]
-            cursor.execute(f"SELECT TOP 0 * FROM {TABLE_GRID}")
-            db_cols = {d[0].lower(): d[0] for d in cursor.description}
-            col_grid = next(
-                (db_cols[c.lower()] for c in COL_CANDIDATES if c.lower() in db_cols),
-                next((v for k, v in db_cols.items()
-                      if any(x in k for x in ("conso", "energy", "kwh"))), None),
-            )
-            if not col_grid:
-                logger.warning("[ConsoService bulk] Colonne Grid introuvable")
-                return {}
- 
-            for chunk_start in range(0, len(site_ids), CHUNK_SIZE):
-                chunk = site_ids[chunk_start: chunk_start + CHUNK_SIZE]
-                ph    = ",".join("?" * len(chunk))
- 
-                # ── GRID : SUM par (site, année, mois) ────────────────────────
-                cursor.execute(f"""
-                    SELECT
-                        site_id,
-                        YEAR([Date])                       AS yr,
-                        MONTH([Date])                      AS mo,
-                        SUM(TRY_CAST([{col_grid}] AS FLOAT)) AS grid_kwh,
-                        COUNT([Date])                      AS nb_pts
-                    FROM {TABLE_GRID}
-                    WHERE site_id IN ({ph})
-                      AND [Date] >= ? AND [Date] <= ?
-                      AND [{col_grid}] IS NOT NULL
-                      AND TRY_CAST([{col_grid}] AS FLOAT) > 0.1
-                    GROUP BY site_id, YEAR([Date]), MONTH([Date])
-                """, (*chunk, d_start, d_end))
- 
-                for row in cursor.fetchall():
-                    sid, yr, mo, kwh, nb = row[0], int(row[1]), int(row[2]), row[3], int(row[4])
-                    key = (sid, yr, mo)
-                    if key not in result:
-                        result[key] = {"fms_grid_kwh": None, "fms_acm_kwh": None}
-                    if kwh is not None and nb >= MIN_PTS:
-                        days_in_month = _cal.monthrange(yr, mo)[1]
-                        if nb >= MIN_DENSE:
-                            result[key]["fms_grid_kwh"] = Decimal(str(kwh)).quantize(Decimal("0.001"))
-                        else:
-                            # Extrapolation : moyenne journalière × jours du mois
-                            daily = Decimal(str(kwh)) / Decimal(str(nb))
-                            result[key]["fms_grid_kwh"] = (daily * days_in_month).quantize(Decimal("0.001"))
- 
-                # ── ACM : MAX - MIN par (site, année, mois) ───────────────────
-                # act_energy_p est un index cumulatif → conso = MAX - MIN / mois
-                cursor.execute(f"""
-                    SELECT
-                        site_id,
-                        YEAR([Date])                                  AS yr,
-                        MONTH([Date])                                 AS mo,
-                        MAX(act_energy_p) - MIN(act_energy_p)        AS acm_kwh,
-                        COUNT([Date])                                 AS nb_pts,
-                        DATEDIFF(day, MIN([Date]), MAX([Date]))       AS span_days
-                    FROM {TABLE_ACM}
-                    WHERE site_id IN ({ph})
-                      AND [Date] >= ? AND [Date] <= ?
-                      AND act_energy_p IS NOT NULL AND act_energy_p > 0
-                    GROUP BY site_id, YEAR([Date]), MONTH([Date])
-                """, (*chunk, d_start, d_end))
- 
-                for row in cursor.fetchall():
-                    sid   = row[0]
-                    yr    = int(row[1])
-                    mo    = int(row[2])
-                    delta = row[3]   # MAX - MIN (peut être None si 1 seul point)
-                    nb    = int(row[4])
-                    span  = int(row[5]) if row[5] else 1
- 
-                    key = (sid, yr, mo)
-                    if key not in result:
-                        result[key] = {"fms_grid_kwh": None, "fms_acm_kwh": None}
- 
-                    if delta is not None and delta > 0 and nb >= MIN_PTS:
-                        days_in_month = _cal.monthrange(yr, mo)[1]
-                        d = Decimal(str(delta))
-                        if nb >= MIN_DENSE:
-                            result[key]["fms_acm_kwh"] = d.quantize(Decimal("0.001"))
-                        else:
-                            # Extrapolation sur le span couvert
-                            daily = d / Decimal(str(max(1, span)))
-                            result[key]["fms_acm_kwh"] = (daily * days_in_month).quantize(Decimal("0.001"))
- 
-        except Exception as e:
-            logger.warning("[ConsoService bulk] Erreur requête eFMS bulk : %s", e)
-        finally:
-            if conn:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
- 
-        return result
- 
+    # NOTE : l'ancienne copie locale de fetch_bulk_for_list (requêtes Snowflake live,
+    # dupliquée avec financial/services/conso_service.py) a été supprimée — cette vue
+    # utilise désormais exclusivement FinancialConsoService.fetch_bulk_for_list, qui
+    # lit FinancialConsoMonthly (Postgres) au lieu d'interroger Snowflake en direct.
+
     # ── Handler principal ─────────────────────────────────────────────────────
 
     def get(self, request):
@@ -2538,12 +2378,7 @@ class SuiviConsoView(APIView):
 
         if site_ids_in_result:
             try:
-                fetcher = getattr(FinancialConsoService, "fetch_bulk_for_list", None)
-
-                if fetcher is None:
-                    fetcher = self.fetch_bulk_for_list
-
-                efms_index = fetcher(
+                efms_index = FinancialConsoService.fetch_bulk_for_list(
                     site_ids=list(site_ids_in_result),
                     year_start=ys,
                     month_start=ms,

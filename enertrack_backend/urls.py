@@ -34,6 +34,7 @@ urlpatterns = [
     path("api/", include("users.urls")),
     path("api/estimation/", include("estimation.urls")),  # ✅
     path("api/financial/", include("financial.urls")),
+    path("api/bo-analysis/", include("bo_analysis.urls")),
     path("api/", include("prediction.urls")),  # ✅
 
     path("api/optimization/", include("optimization.urls")),

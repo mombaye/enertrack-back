@@ -1,5 +1,13 @@
+# fuel_tracking/serializers.py
+
 from rest_framework import serializers
-from .models import FuelEfmsMonthly, FuelEfmsSyncRun
+
+from fuel_tracking.models import (
+    FuelEfmsMonthly,
+    FuelEfmsSyncRun,
+    FuelEnocMovement,
+    FuelEnocSyncRun,
+)
 
 
 class FuelEfmsMonthlySerializer(serializers.ModelSerializer):
@@ -27,15 +35,22 @@ class FuelEfmsMonthlySerializer(serializers.ModelSerializer):
         ]
 
 
-# fuel_tracking/serializers.py
-
-from rest_framework import serializers
-
-from fuel_tracking.models import (
-    FuelEnocMovement,
-    FuelEnocSyncRun,
-    FuelEfmsSyncRun,
-)
+class FuelEfmsSyncRunSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = FuelEfmsSyncRun
+        fields = [
+            "id",
+            "country",
+            "month_from",
+            "month_to",
+            "status",
+            "rows_fetched",
+            "rows_created",
+            "rows_updated",
+            "started_at",
+            "finished_at",
+            "error_message",
+        ]
 
 
 class FuelEnocMovementSerializer(serializers.ModelSerializer):
@@ -78,7 +93,21 @@ class FuelEnocMovementSerializer(serializers.ModelSerializer):
             "created_by",
             "validated_by",
             "done_by",
+            "created_at_source",
+            "validated_at_source",
+            "done_at_source",
+            "source_created_at",
+            "source_updated_at",
+            "import_source",
+            "import_key",
+            "delivery_note_number",
+            "delivery_note_quantity_liters",
+            "supplier",
+            "gauging_method",
+            "rms_level_before",
+            "rms_level_after",
             "comment",
+            "raw_payload",
             "synced_at",
             "updated_at",
         ]
@@ -100,22 +129,3 @@ class FuelEnocSyncRunSerializer(serializers.ModelSerializer):
             "finished_at",
             "error_message",
         ]
-
-
-class FuelEfmsSyncRunSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = FuelEfmsSyncRun
-        fields = [
-            "id",
-            "country",
-            "start_month",
-            "end_month",
-            "status",
-            "rows_fetched",
-            "rows_created",
-            "rows_updated",
-            "started_at",
-            "finished_at",
-            "error_message",
-        ]
-

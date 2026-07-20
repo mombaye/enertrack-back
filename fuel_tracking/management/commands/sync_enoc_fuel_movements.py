@@ -41,9 +41,15 @@ def parse_dt(value):
             raw = raw.split("+")[0]
             raw = raw.split(".")[0]
 
-            for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+            candidates = [
+                (raw[:19], "%Y-%m-%dT%H:%M:%S"),
+                (raw[:19], "%Y-%m-%d %H:%M:%S"),
+                (raw[:10], "%Y-%m-%d"),
+            ]
+
+            for candidate, fmt in candidates:
                 try:
-                    dt = datetime.strptime(raw[: len(fmt)], fmt)
+                    dt = datetime.strptime(candidate, fmt)
                     break
                 except Exception:
                     pass
@@ -56,6 +62,36 @@ def parse_dt(value):
 
     return dt
 
+
+def deduplicate_payloads(payloads: list[dict]) -> tuple[list[dict], int]:
+    """
+    Évite l'erreur PostgreSQL :
+    ON CONFLICT DO UPDATE command cannot affect row a second time
+
+    Si ENOC renvoie deux fois le même source_id dans le même batch,
+    on garde la version la plus récente.
+    """
+    deduped = {}
+    duplicates = 0
+
+    for item in payloads:
+        source_system = str(item.get("source_system") or "ENOC").strip()
+        source_id = str(item.get("source_id") or "").strip()
+
+        if not source_id:
+            continue
+
+        item["source_system"] = source_system
+        item["source_id"] = source_id
+
+        key = (source_system, source_id)
+
+        if key in deduped:
+            duplicates += 1
+
+        deduped[key] = item
+
+    return list(deduped.values()), duplicates
 
 def parse_d(value):
     if not value:
@@ -230,7 +266,31 @@ class Command(BaseCommand):
 
                 payloads.append(clean)
 
-            self.stdout.write(f"\n  Total mouvements préparés : {len(payloads)}")
+            raw_payload_count = len(payloads)
+            payloads, duplicate_count = deduplicate_payloads(payloads)
+
+            self.stdout.write(f"\n  Total mouvements SQL/API reçus : {raw_payload_count}")
+            self.stdout.write(f"  Total mouvements uniques       : {len(payloads)}")
+
+            if duplicate_count:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"  Doublons ENOC fusionnés        : {duplicate_count}"
+                    )
+                )
+
+            site_context_count = sum(
+                1 for item in payloads
+                if (item.get("raw_payload") or {}).get("site_context")
+            )
+
+            ge_context_count = sum(
+                1 for item in payloads
+                if (item.get("raw_payload") or {}).get("ge_context")
+            )
+
+            self.stdout.write(f"  Mouvements avec site_context   : {site_context_count}")
+            self.stdout.write(f"  Mouvements avec ge_context     : {ge_context_count}")
 
             if dry_run:
                 for item in payloads[:10]:

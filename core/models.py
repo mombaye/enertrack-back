@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.db import models
 
 
@@ -163,3 +164,35 @@ class GridTargetRule(models.Model):
 
     def __str__(self):
         return f"{self.configuration} | {self.site_type} | {self.load_band}"
+
+
+class Notification(models.Model):
+    """
+    Notification in-app générique (pas liée exclusivement au module financier/BO).
+    Référence "à plat" plutôt qu'une GenericForeignKey — un seul producteur pour l'instant,
+    à revisiter si un deuxième module génère des notifications.
+    """
+
+    recipient = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="notifications"
+    )
+    verb    = models.CharField(max_length=50)
+    message = models.CharField(max_length=500)
+
+    related_app   = models.CharField(max_length=50, blank=True)
+    related_model = models.CharField(max_length=50, blank=True)
+    related_id    = models.IntegerField(null=True, blank=True)
+    site_id_ref   = models.CharField(max_length=50, blank=True)
+    year          = models.IntegerField(null=True, blank=True)
+    month         = models.IntegerField(null=True, blank=True)
+
+    is_read    = models.BooleanField(default=False, db_index=True)
+    email_sent = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["recipient", "is_read", "-created_at"])]
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.verb} → {self.recipient} ({'lu' if self.is_read else 'non lu'})"

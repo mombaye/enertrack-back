@@ -33,6 +33,13 @@ class FuelEfmsMonthly(models.Model):
     monitoring_unavailability_hours = models.DecimalField(**DECIMAL_KWARGS)
     monitoring_unavailability_percent = models.DecimalField(**DECIMAL_KWARGS)
 
+    rh_hours = models.DecimalField(
+        max_digits=18, decimal_places=3, null=True, blank=True,
+        help_text="RH calculé via la cascade Snowflake (DSE/redresseur/GE_STATUS) ou ENOC en secours.",
+    )
+    rh_source = models.CharField(max_length=32, null=True, blank=True, db_index=True)
+    avec_dse = models.BooleanField(null=True, blank=True)
+
     cph_l_per_hour = models.DecimalField(
         max_digits=18,
         decimal_places=6,
@@ -229,3 +236,132 @@ class FuelEnocSyncRun(models.Model):
 
     def __str__(self):
         return f"ENOC Fuel sync {self.start_date}→{self.end_date} [{self.status}]"
+
+
+class FuelSiteScope(models.Model):
+    """
+    Périmètre des sites réellement concernés par le suivi fuel (sites avec GE
+    installé — Off-Grid ou Hybride). Le parc complet compte ~3300 sites mais
+    seuls ceux avec un GE consomment du fuel ; les sites On-Grid sans genset
+    (PS/GG-SO/GG-NG) n'ont rien à suivre ici.
+
+    Volontairement séparé de core.Site (qui sert financial/certification/billing
+    et n'a pas ce concept) pour ne pas complexifier ce modèle avec une notion
+    propre au module fuel.
+    """
+
+    class Source(models.TextChoices):
+        CURATED_OPS_LIST = "CURATED_OPS_LIST", "Liste opérationnelle validée"
+        TYPOLOGY_CROSSWALK = "TYPOLOGY_CROSSWALK", "Règle typologie (catalogue installé)"
+
+    site_id = models.CharField(max_length=128, unique=True, db_index=True)
+    site_name = models.CharField(max_length=255, null=True, blank=True)
+
+    has_genset = models.BooleanField(db_index=True)
+    catalogue_typology = models.CharField(max_length=32, null=True, blank=True)
+    billing_typology = models.CharField(max_length=64, null=True, blank=True)
+
+    source = models.CharField(max_length=32, choices=Source.choices)
+
+    imported_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Périmètre fuel (site avec GE)"
+        verbose_name_plural = "Périmètre fuel (sites avec GE)"
+        ordering = ["site_id"]
+
+    def __str__(self):
+        return f"{self.site_id} | GE={'oui' if self.has_genset else 'non'} [{self.source}]"
+
+
+class GensetFuelCurve(models.Model):
+    """
+    Catalogue de consommation fuel par modèle de GE (feuille "GENSET DB" du
+    fichier de synthèse Ops). Pour chaque modèle, la conso à 100/75/50% de
+    charge est mesurée, puis une régression quadratique conso(x) = a·x² + b·x + c
+    (x = % de charge) est ajustée sur ces 3 points — c'est cette courbe qui
+    donne la conso théorique réelle, bien plus précise qu'un simple ratio
+    linéaire charge/puissance.
+
+    ENOC ne remonte que la marque + puissance (kVA) du GE installé, jamais le
+    modèle précis (ex: pas moyen de distinguer un FG Wilson P50-3 d'un P50-4
+    à 45 kVA) — le matching se fait donc par (marque, kVA), voir
+    services/genset_curve_matching.py. Quand plusieurs modèles partagent la
+    même (marque, kVA) avec des courbes différentes, toutes les variantes sont
+    gardées ici et le matching moyenne/flag l'ambiguïté au moment du calcul.
+    """
+
+    manufacturer = models.CharField(max_length=64)
+    manufacturer_normalized = models.CharField(max_length=64, db_index=True)
+    type_de_ge = models.CharField(max_length=64)
+    genset_list = models.CharField(max_length=255, null=True, blank=True)
+
+    voltage_v = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    phases = models.IntegerField(null=True, blank=True)
+    prp_kva = models.DecimalField(max_digits=10, decimal_places=2, db_index=True)
+    prp_kw = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    cosphi = models.DecimalField(max_digits=6, decimal_places=4, null=True, blank=True)
+
+    conso_100_l_h = models.DecimalField(max_digits=10, decimal_places=3)
+    conso_75_l_h = models.DecimalField(max_digits=10, decimal_places=3)
+    conso_50_l_h = models.DecimalField(max_digits=10, decimal_places=3)
+
+    coef_a = models.DecimalField(max_digits=14, decimal_places=6)
+    coef_b = models.DecimalField(max_digits=14, decimal_places=6)
+    coef_c = models.DecimalField(max_digits=14, decimal_places=6)
+
+    imported_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        verbose_name = "Courbe conso GE (catalogue)"
+        verbose_name_plural = "Courbes conso GE (catalogue)"
+        ordering = ["manufacturer_normalized", "prp_kva"]
+        indexes = [
+            models.Index(fields=["manufacturer_normalized", "prp_kva"]),
+        ]
+
+    def __str__(self):
+        return f"{self.manufacturer} {self.type_de_ge} ({self.prp_kva} kVA)"
+
+    def conso_l_h_at(self, charge_pct: float) -> float:
+        """conso(x) = a·x² + b·x + c, x en fraction (1.0 = 100% de charge)."""
+        x = float(charge_pct)
+        return float(self.coef_a) * x * x + float(self.coef_b) * x + float(self.coef_c)
+
+
+class CphMatrixPoint(models.Model):
+    """
+    Point de la matrice CPH (feuille "CPH" du fichier Suivi Ravitaillement) :
+    conso horaire mesurée (L/h) par (famille moteur, puissance nominale kVA,
+    % de charge). Contrairement à GensetFuelCurve (courbe quadratique ajustée
+    sur 3 points, par marque+modèle précis), cette matrice donne 20 points de
+    mesure réels par taille de moteur — plus fine sur l'axe %charge, mais
+    seule la famille "Perkins" est actuellement renseignée dans le fichier
+    source (Kohler/Mitsubishi/... sont des blocs vides, pas importés).
+    """
+
+    engine_family = models.CharField(max_length=64, db_index=True)
+    engine_family_normalized = models.CharField(max_length=64, db_index=True)
+    dg_capacity_kva = models.DecimalField(max_digits=10, decimal_places=2, db_index=True)
+    charge_pct = models.DecimalField(max_digits=6, decimal_places=4)
+    cph_l_h = models.DecimalField(max_digits=10, decimal_places=4)
+
+    imported_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        verbose_name = "Point matrice CPH"
+        verbose_name_plural = "Points matrice CPH"
+        ordering = ["engine_family_normalized", "dg_capacity_kva", "charge_pct"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["engine_family_normalized", "dg_capacity_kva", "charge_pct"],
+                name="uniq_cph_matrix_point",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["engine_family_normalized", "dg_capacity_kva"]),
+        ]
+
+    def __str__(self):
+        return f"{self.engine_family} {self.dg_capacity_kva} kVA @ {float(self.charge_pct):.0%} = {self.cph_l_h} L/h"

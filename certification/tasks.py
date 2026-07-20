@@ -26,7 +26,8 @@ from django.db.models import F
 from django.utils import timezone
 
 from .models import CertificationBatch, CertificationResult
-from .services.efms import EfmsService, EfmsConnectionError, EfmsQueryError
+from .services.efms import EfmsConnectionError, EfmsQueryError
+from .services.snowflake_efms import SnowflakeEfmsService as EfmsService
 from .services.billing_check import check_montant_coherence
 
 logger = logging.getLogger(__name__)

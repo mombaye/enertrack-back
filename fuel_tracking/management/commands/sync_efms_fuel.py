@@ -1,10 +1,14 @@
+from calendar import monthrange
+from collections import defaultdict
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from django.core.management.base import BaseCommand
 from django.db import transaction
 from django.utils import timezone
 
 from certification.services.efms import EfmsService
-from fuel_tracking.models import FuelEfmsMonthly, FuelEfmsSyncRun
+from fuel_tracking.models import FuelEfmsMonthly, FuelEfmsSyncRun, FuelSiteScope
+from fuel_tracking.services.rh_service import RhCalculationService
 
 
 TABLE_ORDER = "[SQL2-ProdDB].[silver].[fact_fuel_order_mth]"
@@ -52,6 +56,99 @@ def build_anomalies(row: dict) -> list[str]:
         anomalies.append("HIGH_MONITORING_UNAVAILABILITY")
 
     return anomalies
+
+
+
+def deduplicate_payloads(payloads: list[dict]) -> tuple[list[dict], int]:
+    """
+    Sécurise le bulk upsert PostgreSQL.
+
+    PostgreSQL refuse un bulk_create(update_conflicts=True) si deux lignes du même batch
+    ont la même clé unique country/month_year/site_id.
+
+    On fusionne donc les doublons normalisés avant insertion.
+    """
+    deduped = {}
+    duplicates = 0
+
+    sum_fields = [
+        "fuel_order_l",
+        "fuel_deli_l",
+        "fuel_conso_l",
+        "ge_working_hours",
+        "abnormal_ge_working_hours",
+        "monitoring_unavailability_hours",
+    ]
+
+    for item in payloads:
+        country = str(item.get("country") or "").strip()
+        month_year = str(item.get("month_year") or "").strip()
+        site_id = str(item.get("site_id") or "").strip()
+
+        if not country or not month_year or not site_id:
+            continue
+
+        item["country"] = country
+        item["month_year"] = month_year
+        item["site_id"] = site_id
+
+        key = (country, month_year, site_id)
+
+        if key not in deduped:
+            deduped[key] = item
+            continue
+
+        duplicates += 1
+        target = deduped[key]
+
+        if not target.get("site_name") and item.get("site_name"):
+            target["site_name"] = item["site_name"]
+
+        for field in sum_fields:
+            target[field] = to_decimal(target.get(field)) + to_decimal(item.get(field))
+
+        target["monitoring_unavailability_percent"] = max(
+            to_decimal(target.get("monitoring_unavailability_percent")),
+            to_decimal(item.get("monitoring_unavailability_percent")),
+        )
+
+        ge_hours = target["ge_working_hours"]
+        if ge_hours > 0:
+            target["cph_l_per_hour"] = target["fuel_conso_l"] / ge_hours
+        else:
+            target["cph_l_per_hour"] = None
+
+        target["anomaly_flags"] = build_anomalies(target)
+
+    return list(deduped.values()), duplicates
+
+
+def attach_rh_data(payloads: list[dict]) -> None:
+    """
+    Calcule le RH (cascade Snowflake DSE/redresseur/GE_STATUS, repli ENOC) pour
+    chaque (site_id, month_year) présent dans payloads, et injecte rh_hours/
+    rh_source/avec_dse directement dans les dicts.
+    """
+    by_month: dict[str, list[str]] = defaultdict(list)
+    for item in payloads:
+        by_month[item["month_year"]].append(item["site_id"])
+
+    rh_svc = RhCalculationService()
+    rh_by_key: dict[tuple[str, str], dict] = {}
+
+    for month_year, site_ids in by_month.items():
+        year, month = parse_month_year(month_year)
+        date_debut = date(year, month, 1)
+        date_fin = date(year, month, monthrange(year, month)[1])
+        batch_result = rh_svc.compute_rh_batch(site_ids, date_debut, date_fin)
+        for site_id, r in batch_result.items():
+            rh_by_key[(month_year, site_id)] = r
+
+    for item in payloads:
+        r = rh_by_key.get((item["month_year"], item["site_id"]), {})
+        item["rh_hours"] = r.get("rh_hours")
+        item["rh_source"] = r.get("source")
+        item["avec_dse"] = r.get("avec_dse")
 
 
 class Command(BaseCommand):
@@ -261,7 +358,43 @@ class Command(BaseCommand):
                 clean["anomaly_flags"] = build_anomalies(clean)
                 payloads.append(clean)
 
-            self.stdout.write(f"  Lignes récupérées : {len(payloads)}")
+            raw_payload_count = len(payloads)
+
+            # Périmètre : ne garder que les sites avec GE installé (cf. FuelSiteScope).
+            # Le parc complet (~3300 sites) inclut des sites On-Grid sans genset qui
+            # n'ont rien à consommer côté fuel — les traiter gaspille du calcul RH
+            # (Snowflake/ENOC) et pollue le module avec des sites hors-sujet.
+            in_scope_ids = set(
+                FuelSiteScope.objects.filter(has_genset=True).values_list("site_id", flat=True)
+            )
+            out_of_scope_count = 0
+
+            if in_scope_ids:
+                filtered = [p for p in payloads if p["site_id"] in in_scope_ids]
+                out_of_scope_count = len(payloads) - len(filtered)
+                payloads = filtered
+            else:
+                self.stdout.write(self.style.WARNING(
+                    "  FuelSiteScope vide — aucun filtrage de périmètre appliqué "
+                    "(lancer `import_fuel_site_scope` d'abord)."
+                ))
+
+            payloads, duplicate_count = deduplicate_payloads(payloads)
+
+            self.stdout.write(f"  Lignes récupérées SQL      : {raw_payload_count}")
+            if in_scope_ids:
+                self.stdout.write(f"  Hors périmètre (sans GE)   : {out_of_scope_count}")
+            self.stdout.write(f"  Lignes uniques préparées   : {len(payloads)}")
+
+            if duplicate_count:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"  Doublons normalisés fusionnés : {duplicate_count}"
+                    )
+                )
+
+            self.stdout.write("  Calcul RH (Snowflake / ENOC)...")
+            attach_rh_data(payloads)
 
             if dry_run:
                 for item in payloads[:10]:
@@ -269,11 +402,12 @@ class Command(BaseCommand):
                         f"  {item['month_year']} | {item['site_id']} | "
                         f"order={item['fuel_order_l']} | deli={item['fuel_deli_l']} | "
                         f"conso={item['fuel_conso_l']} | ge_h={item['ge_working_hours']} | "
-                        f"cph={item['cph_l_per_hour']} | anomalies={item['anomaly_flags']}"
+                        f"cph={item['cph_l_per_hour']} | anomalies={item['anomaly_flags']} | "
+                        f"rh={item['rh_hours']} [{item['rh_source']}] avec_dse={item['avec_dse']}"
                     )
 
                 sync_run.status = FuelEfmsSyncRun.Status.SUCCESS
-                sync_run.rows_fetched = len(payloads)
+                sync_run.rows_fetched = raw_payload_count
                 sync_run.finished_at = timezone.now()
                 sync_run.save()
                 self.stdout.write(self.style.SUCCESS("\n  DRY RUN terminé. Aucune donnée insérée.\n"))
@@ -282,36 +416,79 @@ class Command(BaseCommand):
             created = 0
             updated = 0
 
-            with transaction.atomic():
-                for item in payloads:
-                    _, was_created = FuelEfmsMonthly.objects.update_or_create(
+            now = timezone.now()
+
+            existing_keys = set(
+                FuelEfmsMonthly.objects.filter(
+                    country=country,
+                    month_year__gte=from_month,
+                    month_year__lte=to_month,
+                ).values_list("country", "month_year", "site_id")
+            )
+
+            objects = []
+
+            for item in payloads:
+                key = (item["country"], item["month_year"], item["site_id"])
+
+                if key in existing_keys:
+                    updated += 1
+                else:
+                    created += 1
+
+                objects.append(
+                    FuelEfmsMonthly(
                         country=item["country"],
                         month_year=item["month_year"],
                         site_id=item["site_id"],
-                        defaults={
-                            "year": item["year"],
-                            "month": item["month"],
-                            "site_name": item["site_name"],
-                            "fuel_order_l": item["fuel_order_l"],
-                            "fuel_deli_l": item["fuel_deli_l"],
-                            "fuel_conso_l": item["fuel_conso_l"],
-                            "ge_working_hours": item["ge_working_hours"],
-                            "abnormal_ge_working_hours": item["abnormal_ge_working_hours"],
-                            "monitoring_unavailability_hours": item["monitoring_unavailability_hours"],
-                            "monitoring_unavailability_percent": item["monitoring_unavailability_percent"],
-                            "cph_l_per_hour": item["cph_l_per_hour"],
-                            "anomaly_flags": item["anomaly_flags"],
-                            "synced_at": timezone.now(),
-                        },
+                        year=item["year"],
+                        month=item["month"],
+                        site_name=item["site_name"],
+                        fuel_order_l=item["fuel_order_l"],
+                        fuel_deli_l=item["fuel_deli_l"],
+                        fuel_conso_l=item["fuel_conso_l"],
+                        ge_working_hours=item["ge_working_hours"],
+                        abnormal_ge_working_hours=item["abnormal_ge_working_hours"],
+                        monitoring_unavailability_hours=item["monitoring_unavailability_hours"],
+                        monitoring_unavailability_percent=item["monitoring_unavailability_percent"],
+                        cph_l_per_hour=item["cph_l_per_hour"],
+                        anomaly_flags=item["anomaly_flags"],
+                        rh_hours=item["rh_hours"],
+                        rh_source=item["rh_source"],
+                        avec_dse=item["avec_dse"],
+                        synced_at=now,
+                    )
+                )
+
+            if not dry_run and objects:
+                with transaction.atomic():
+                    FuelEfmsMonthly.objects.bulk_create(
+                        objects,
+                        batch_size=1000,
+                        update_conflicts=True,
+                        unique_fields=["country", "month_year", "site_id"],
+                        update_fields=[
+                            "year",
+                            "month",
+                            "site_name",
+                            "fuel_order_l",
+                            "fuel_deli_l",
+                            "fuel_conso_l",
+                            "ge_working_hours",
+                            "abnormal_ge_working_hours",
+                            "monitoring_unavailability_hours",
+                            "monitoring_unavailability_percent",
+                            "cph_l_per_hour",
+                            "anomaly_flags",
+                            "rh_hours",
+                            "rh_source",
+                            "avec_dse",
+                            "synced_at",
+                        ],
                     )
 
-                    if was_created:
-                        created += 1
-                    else:
-                        updated += 1
-
             sync_run.status = FuelEfmsSyncRun.Status.SUCCESS
-            sync_run.rows_fetched = len(payloads)
+            sync_run.rows_fetched = raw_payload_count
             sync_run.rows_created = created
             sync_run.rows_updated = updated
             sync_run.finished_at = timezone.now()

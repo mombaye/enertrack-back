@@ -1,4 +1,4 @@
-from django.shortcuts import render
+from django.shortcuts import render, get_object_or_404
 
 from rest_framework import viewsets, status
 
@@ -13,7 +13,7 @@ import pandas as pd
 
 
 
-from .models import Site, GridTargetRule
+from .models import Site, GridTargetRule, Notification
 from .serializers import SiteSerializer, GridTargetRuleSerializer
 
 
@@ -611,3 +611,74 @@ class GridTargetRuleImportView(APIView):
             },
             status=status.HTTP_200_OK,
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Notifications in-app
+# ─────────────────────────────────────────────────────────────────────────────
+
+class NotificationListView(APIView):
+    """GET /api/core/notifications/?unread=true&page=&page_size="""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        qs = Notification.objects.filter(recipient=request.user)
+        unread_count = qs.filter(is_read=False).count()
+
+        if request.query_params.get("unread") == "true":
+            qs = qs.filter(is_read=False)
+
+        total = qs.count()
+        try:
+            page = max(1, int(request.query_params.get("page", 1)))
+            page_size = min(100, max(5, int(request.query_params.get("page_size", 20))))
+        except (ValueError, TypeError):
+            page, page_size = 1, 20
+        offset = (page - 1) * page_size
+        qs = qs[offset: offset + page_size]
+
+        data = [
+            {
+                "id": n.id,
+                "verb": n.verb,
+                "message": n.message,
+                "related_app": n.related_app,
+                "related_model": n.related_model,
+                "related_id": n.related_id,
+                "site_id": n.site_id_ref,
+                "year": n.year,
+                "month": n.month,
+                "is_read": n.is_read,
+                "created_at": n.created_at,
+            }
+            for n in qs
+        ]
+        return Response({
+            "count": total,
+            "unread_count": unread_count,
+            "page": page,
+            "page_size": page_size,
+            "pages": (total + page_size - 1) // page_size if page_size else 1,
+            "results": data,
+        })
+
+
+class NotificationMarkReadView(APIView):
+    """POST /api/core/notifications/<id>/read/"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        notif = get_object_or_404(Notification, pk=pk, recipient=request.user)
+        if not notif.is_read:
+            notif.is_read = True
+            notif.save(update_fields=["is_read"])
+        return Response({"id": notif.id, "is_read": True})
+
+
+class NotificationMarkAllReadView(APIView):
+    """POST /api/core/notifications/mark-all-read/"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        updated = Notification.objects.filter(recipient=request.user, is_read=False).update(is_read=True)
+        return Response({"updated": updated})
