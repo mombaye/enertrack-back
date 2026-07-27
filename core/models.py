@@ -1,7 +1,6 @@
+from django.conf import settings
 from django.db import models
 
-# Create your models here.
-from django.db import models
 
 class Site(models.Model):
     ZONE_CHOICES = [
@@ -30,37 +29,11 @@ class Site(models.Model):
         ('ben', 'Bénin'),
         ('nga', 'Nigeria'),
         ('gha', 'Ghana'),
-        ('cma', 'Cameroon'),
+        ('cmr', 'Cameroun'),
         ('cog', 'Congo'),
         ('gab', 'Gabon'),
         ('cod', 'Congo Démocratique'),
         ('tcd', 'Tchad'),
-        ('cmr', 'Cameroun'),
-        ('mar', 'Maroc'),
-        ('tun', 'Tunisie'),
-        ('dji', 'Djibouti'),
-        ('eth', 'Ethiopie'),
-        ('ken', 'Kenya'),
-        ('uga', 'Ouganda'),
-        ('rwa', 'Rwanda'),
-        ('zmb', 'Zambie'),
-        ('zaf', 'Afrique du Sud'),
-        ('moz', 'Mozambique'),
-        ('ang', 'Angola'),
-        ('nam', 'Namibie'),
-        ('zwi', 'Zimbabwe'),
-        ('tza', 'Tanzanie'),
-        ('mwi', 'Malawi'),
-        ('sud', 'Soudan'),
-        ('ssd', 'Soudan du Sud'),
-        ('ery', 'Erythrée'),
-        ('som', 'Somalie'),
-        ('uga', 'Ouganda'),
-        ('cog', 'Congo'),
-        ('gab', 'Gabon'),
-        ('cod', 'Congo Démocratique'),
-        ('tcd', 'Tchad'),
-        ('cmr', 'Cameroun'),
         ('mar', 'Maroc'),
         ('tun', 'Tunisie'),
         ('dji', 'Djibouti'),
@@ -77,23 +50,149 @@ class Site(models.Model):
         ('tza', 'Tanzanie'),
     ]
 
-    site_id = models.CharField(max_length=20, unique=True)
-    name = models.CharField(max_length=100)
-    is_new = models.BooleanField(default=False)
-    installation_date = models.DateField(null=True, blank=True)
-    activation_date = models.DateField(null=True, blank=True)
-    is_billed = models.BooleanField(default=True)
+    SCOPE_STATUS = [
+        ("IN_SCOPE", "In scope"),
+        ("OUT_OF_SCOPE", "Out of scope"),
+        ("UNKNOWN", "Unknown"),
+    ]
 
-    real_typology = models.CharField(max_length=100, null=True, blank=True)
-    contratual_typology = models.CharField(max_length=100, null=True, blank=True)
-    billing_typology = models.CharField(max_length=100, null=True, blank=True)
-    power_kw = models.IntegerField(null=True, blank=True)
+    SITE_KIND = [
+        ("INDOOR", "Indoor"),
+        ("OUTDOOR", "Outdoor"),
+    ]
 
-    batch_aktivco = models.CharField(max_length=100, null=True, blank=True)
+    # Identité
+    site_id = models.CharField(max_length=50, unique=True, db_index=True)
+    name = models.CharField(max_length=255, null=True)
+
+    # Référentiel client / master data
+    modernized = models.BooleanField(null=True, blank=True)
+    ordered_typology = models.CharField(max_length=255, null=True, blank=True)
+    installed_typology = models.CharField(max_length=255, null=True, blank=True)
+    billing_typology = models.CharField(max_length=255, null=True, blank=True)
+
+    contract_number = models.CharField(max_length=255, null=True, blank=True, db_index=True)
+    meter_number = models.CharField(max_length=255, null=True, blank=True, db_index=True)
+
+    analysis_load = models.IntegerField(null=True, blank=True)
+    load_band = models.CharField(max_length=100, null=True, blank=True)
+
+    site_type = models.CharField(max_length=50, choices=SITE_KIND, null=True, blank=True)
+    ordered_site_type = models.CharField(max_length=50, choices=SITE_KIND, null=True, blank=True)
+    installed_site_type = models.CharField(max_length=50, choices=SITE_KIND, null=True, blank=True)
+
+    configuration = models.CharField(max_length=255, null=True, blank=True)
+    target_mapping_key = models.CharField(max_length=255, null=True, blank=True, db_index=True)
+
+    transformer_capacity = models.IntegerField(null=True, blank=True)
+
+    indoor_billed_outdoor = models.BooleanField(null=True, blank=True)
+    not_yet_solarized = models.BooleanField(null=True, blank=True)
+    solarization_date = models.DateField(null=True, blank=True)
+
+    energy_desk_comment = models.TextField(null=True, blank=True)
+    load_comment_category = models.CharField(max_length=100, null=True, blank=True)
+
+    invoice_payment = models.CharField(max_length=100, null=True, blank=True)
+    grid_fee = models.BooleanField(null=True, blank=True)
     batch_operational = models.CharField(max_length=100, null=True, blank=True)
 
+    scope_status = models.CharField(
+        max_length=20,
+        choices=SCOPE_STATUS,
+        default="UNKNOWN",
+        blank=True,
+    )
+
+    meter_status = models.CharField(max_length=50, null=True, blank=True)
+
+    # Métadonnées
     zone = models.CharField(max_length=3, choices=ZONE_CHOICES, null=True, blank=True)
     country = models.CharField(max_length=3, choices=COUNTRY_CHOICES, default='sen')
 
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["site_id"]),
+            models.Index(fields=["contract_number"]),
+            models.Index(fields=["meter_number"]),
+            models.Index(fields=["scope_status"]),
+            models.Index(fields=["target_mapping_key"]),
+            models.Index(fields=["invoice_payment", "grid_fee"]),
+        ]
+
     def __str__(self):
         return f"{self.site_id} - {self.name}"
+
+
+class GridTargetRule(models.Model):
+    """
+    Règles de référence client pour déterminer :
+    - la cible énergie grid
+    - la cible/jour
+    - la redevance attendue
+    à partir de la configuration + type + bande de charge
+    """
+
+    configuration = models.CharField(max_length=255, db_index=True)
+    site_type = models.CharField(max_length=50, null=True, blank=True, db_index=True)   # INDOOR / OUTDOOR
+    load_band = models.CharField(max_length=100, null=True, blank=True, db_index=True)
+
+    target_kwh = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
+    target_kwh_per_day = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
+    grid_fee_amount = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
+
+    active = models.BooleanField(default=True)
+    source_sheet = models.CharField(max_length=100, null=True, blank=True)
+    source_row = models.IntegerField(null=True, blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["configuration", "site_type", "load_band"],
+                name="uniq_grid_target_rule"
+            )
+        ]
+        indexes = [
+            models.Index(fields=["configuration", "site_type", "load_band"]),
+        ]
+
+    def __str__(self):
+        return f"{self.configuration} | {self.site_type} | {self.load_band}"
+
+
+class Notification(models.Model):
+    """
+    Notification in-app générique (pas liée exclusivement au module financier/BO).
+    Référence "à plat" plutôt qu'une GenericForeignKey — un seul producteur pour l'instant,
+    à revisiter si un deuxième module génère des notifications.
+    """
+
+    recipient = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="notifications"
+    )
+    verb    = models.CharField(max_length=50)
+    message = models.CharField(max_length=500)
+
+    related_app   = models.CharField(max_length=50, blank=True)
+    related_model = models.CharField(max_length=50, blank=True)
+    related_id    = models.IntegerField(null=True, blank=True)
+    site_id_ref   = models.CharField(max_length=50, blank=True)
+    year          = models.IntegerField(null=True, blank=True)
+    month         = models.IntegerField(null=True, blank=True)
+
+    is_read    = models.BooleanField(default=False, db_index=True)
+    email_sent = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["recipient", "is_read", "-created_at"])]
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.verb} → {self.recipient} ({'lu' if self.is_read else 'non lu'})"

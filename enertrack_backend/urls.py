@@ -28,6 +28,17 @@ urlpatterns = [
     path("api/", include("powerquality.urls")),   # ✅ nouveau
     path("api/", include("pwmreport.urls")),      # ✅ nouveau
     path("api/", include("billing.urls")),       # ✅ nouveau
+    path("api/", include("gridoutages.urls")),       # ✅ nouveau
+    path("api/dashboard/", include("dashboard.urls")),   # ← ajouter
+    path("api/certification/", include("certification.urls")),
+    path("api/", include("users.urls")),
+    path("api/estimation/", include("estimation.urls")),  # ✅
+    path("api/financial/", include("financial.urls")),
+    path("api/bo-analysis/", include("bo_analysis.urls")),
+    path("api/", include("prediction.urls")),  # ✅
+
+    path("api/optimization/", include("optimization.urls")),
+    path("api/fuel-tracking/", include("fuel_tracking.urls")),
 
     
 ]

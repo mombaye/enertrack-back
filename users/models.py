@@ -9,6 +9,7 @@ class CustomUser(AbstractUser):
         ('admin', 'Admin'),
         ('manager', 'Manager'),
         ('analyst', 'Analyst'),
+        ('bo', 'Back Office'),
     )
 
     COUNTRY_CHOICES = (
