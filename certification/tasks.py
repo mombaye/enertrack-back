@@ -286,7 +286,10 @@ def certify_single_invoice(self, result_id: int) -> dict:
         date_fin   = invoice.date_fin_periode
 
         # ── Étape 5 : Source PRIMAIRE — Grid ─────────────────────────────────
-        grid_p, grid_30j, last_month = efms.get_conso_grid_cached(cert_batch_id, site_id)
+        grid_p, grid_30j, last_month = (
+            efms.get_conso_grid_cached(cert_batch_id, site_id, date_debut, date_fin)
+            if date_debut and date_fin else (None, None, None)
+        )
 
         if grid_p is None and grid_30j is None and date_debut and date_fin:
             try:
@@ -309,14 +312,20 @@ def certify_single_invoice(self, result_id: int) -> dict:
             result.fms_last_complete_month = last_month
 
             # Charger ACM informatif (Grid primaire mais ACM affiché)
-            acm_p_info, acm_30j_info = efms.get_conso_acm_cached(cert_batch_id, site_id)
+            acm_p_info, acm_30j_info = (
+                efms.get_conso_acm_cached(cert_batch_id, site_id, date_debut, date_fin)
+                if date_debut and date_fin else (None, None)
+            )
             if acm_p_info is not None or acm_30j_info is not None:
                 result.estim_conso_acm_periode = acm_p_info
                 result.estim_conso_acm_30j     = acm_30j_info
 
         else:
             # ── Étape 5B : Fallback — ACM ─────────────────────────────────────
-            acm_p, acm_30j = efms.get_conso_acm_cached(cert_batch_id, site_id)
+            acm_p, acm_30j = (
+                efms.get_conso_acm_cached(cert_batch_id, site_id, date_debut, date_fin)
+                if date_debut and date_fin else (None, None)
+            )
 
             if acm_p is None and acm_30j is None and date_debut and date_fin:
                 try:
@@ -460,18 +469,29 @@ def launch_certification_batch(cert_batch_id: int) -> None:
             .values_list("site__site_id", "invoice__date_debut_periode", "invoice__date_fin_periode")
         )
 
-        all_debuts      = [r[1] for r in site_ids_with_dates if r[1]]
-        all_fins        = [r[2] for r in site_ids_with_dates if r[2]]
-        unique_site_ids = list({r[0] for r in site_ids_with_dates if r[0]})
+        # Groupe par période EXACTE (pas une seule enveloppe min/max pour tout
+        # le batch) : un batch mélange en pratique des factures de périodes très
+        # différentes (constaté : jusqu'à ~9 mois d'écart entre factures d'un
+        # même batch), donc une enveloppe globale ferait calculer la "conso
+        # période" ACM/Grid de chaque site sur une fenêtre bien plus large que
+        # sa propre facture — écarts constatés jusqu'à ×6 sur la conso ACM.
+        # Les sites qui partagent la même période exacte restent regroupés en
+        # une seule requête bulk Snowflake (pas de perte de l'optimisation).
+        period_groups: dict[tuple, set] = {}
+        for site_id, d_debut, d_fin in site_ids_with_dates:
+            if not site_id or not d_debut or not d_fin:
+                continue
+            period_groups.setdefault((d_debut, d_fin), set()).add(site_id)
 
-        if all_debuts and all_fins and unique_site_ids:
+        if period_groups:
             try:
                 efms = EfmsService(cert_batch=cert_batch)
                 efms.prefetch_batch(
                     cert_batch_id=cert_batch_id,
-                    site_ids=unique_site_ids,
-                    date_debut=min(all_debuts),
-                    date_fin=max(all_fins),
+                    groups=[
+                        (list(site_ids), d_debut, d_fin)
+                        for (d_debut, d_fin), site_ids in period_groups.items()
+                    ],
                 )
             except Exception as e:
                 logger.warning("[launch] Prefetch échoué (%s)", e)

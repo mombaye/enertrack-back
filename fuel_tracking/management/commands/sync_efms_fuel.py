@@ -1,3 +1,4 @@
+import logging
 from calendar import monthrange
 from collections import defaultdict
 from datetime import date
@@ -9,6 +10,9 @@ from django.utils import timezone
 from certification.services.efms import EfmsService
 from fuel_tracking.models import FuelEfmsMonthly, FuelEfmsSyncRun, FuelSiteScope
 from fuel_tracking.services.rh_service import RhCalculationService
+from fuel_tracking.services.rms_service import StockRmsService
+
+logger = logging.getLogger(__name__)
 
 
 TABLE_ORDER = "[SQL2-ProdDB].[silver].[fact_fuel_order_mth]"
@@ -30,6 +34,14 @@ def parse_month_year(month_year: str) -> tuple[int, int]:
     raw = str(month_year or "").strip()
     year, month = raw.split("-")
     return int(year), int(month)
+
+
+def months_between(from_month: str, to_month: str) -> list[str]:
+    y1, m1 = parse_month_year(from_month)
+    y2, m2 = parse_month_year(to_month)
+    start = y1 * 12 + (m1 - 1)
+    end = y2 * 12 + (m2 - 1)
+    return [f"{(idx // 12):04d}-{(idx % 12) + 1:02d}" for idx in range(start, end + 1)]
 
 
 def build_anomalies(row: dict) -> list[str]:
@@ -149,6 +161,46 @@ def attach_rh_data(payloads: list[dict]) -> None:
         item["rh_hours"] = r.get("rh_hours")
         item["rh_source"] = r.get("source")
         item["avec_dse"] = r.get("avec_dse")
+
+
+def attach_stock_rms_data(payloads: list[dict]) -> None:
+    """
+    Calcule le Stock Ouv./Clôt. RMS (niveau de cuve télémétrie, au plus proche
+    du 1er et du dernier jour du mois) pour chaque (site_id, month_year) présent
+    dans payloads, et injecte stock_ouv_rms_l/stock_ouv_rms_at/stock_clot_rms_l/
+    stock_clot_rms_at directement dans les dicts.
+    """
+    by_month: dict[str, list[str]] = defaultdict(list)
+    for item in payloads:
+        by_month[item["month_year"]].append(item["site_id"])
+
+    rms_svc = StockRmsService()
+    rms_by_key: dict[tuple[str, str], dict] = {}
+
+    for month_year, site_ids in by_month.items():
+        year, month = parse_month_year(month_year)
+        date_debut = date(year, month, 1)
+        date_fin = date(year, month, monthrange(year, month)[1])
+        batch_result = rms_svc.compute_rms_batch(site_ids, date_debut, date_fin)
+        for site_id, r in batch_result.items():
+            rms_by_key[(month_year, site_id)] = r
+
+        # Comparaison silencieuse vs VW_FUEL_REPORT (Snowflake DEV, accès
+        # accordé le 24/07) — logge seulement, ne change aucun affichage ni
+        # donnée persistée. Sert à accumuler de la confiance avant un éventuel
+        # cutover, une fois la vue passée en PROD (attendu Q4).
+        try:
+            from fuel_tracking.services.vw_fuel_report_compare import log_stock_rms_comparison
+            log_stock_rms_comparison(batch_result, date_debut, date_fin)
+        except Exception as e:
+            logger.warning("[sync_efms_fuel] Comparaison VW_FUEL_REPORT sautée (%s)", e)
+
+    for item in payloads:
+        r = rms_by_key.get((item["month_year"], item["site_id"]), {})
+        item["stock_ouv_rms_l"] = r.get("ouv_rms")
+        item["stock_ouv_rms_at"] = r.get("ouv_rms_at")
+        item["stock_clot_rms_l"] = r.get("clot_rms")
+        item["stock_clot_rms_at"] = r.get("clot_rms_at")
 
 
 class Command(BaseCommand):
@@ -379,6 +431,46 @@ class Command(BaseCommand):
                     "(lancer `import_fuel_site_scope` d'abord)."
                 ))
 
+            # ✅ Repli RH / Stock RMS quand eFMS (SQL Server) n'a encore rien publié
+            # pour un mois demandé (retard de publication côté eFMS — vu jusqu'à
+            # plusieurs mois). RH et Stock RMS viennent de Snowflake/ENOC, pas
+            # d'eFMS : sans ce repli, ils ne sont jamais calculés pour ce mois
+            # alors qu'ils pourraient l'être indépendamment. On crée des lignes
+            # "coquille" (fuel_order/deli/conso à 0) pour les sites du périmètre,
+            # uniquement sur les mois demandés n'ayant AUCUNE ligne eFMS — un mois
+            # déjà partiellement publié n'est pas touché.
+            if in_scope_ids and from_month and to_month:
+                covered_months = {p["month_year"] for p in payloads}
+                missing_months = [m for m in months_between(from_month, to_month) if m not in covered_months]
+                if missing_months:
+                    shell_count = 0
+                    for m in missing_months:
+                        y, mo = parse_month_year(m)
+                        for site_id in sorted(in_scope_ids):
+                            payloads.append({
+                                "month_year": m,
+                                "year": y,
+                                "month": mo,
+                                "country": country,
+                                "site_id": site_id,
+                                "site_name": None,
+                                "fuel_order_l": Decimal("0"),
+                                "fuel_deli_l": Decimal("0"),
+                                "fuel_conso_l": Decimal("0"),
+                                "ge_working_hours": Decimal("0"),
+                                "abnormal_ge_working_hours": Decimal("0"),
+                                "monitoring_unavailability_hours": Decimal("0"),
+                                "monitoring_unavailability_percent": Decimal("0"),
+                                "cph_l_per_hour": None,
+                                "anomaly_flags": [],
+                            })
+                            shell_count += 1
+                    self.stdout.write(self.style.WARNING(
+                        f"  eFMS (SQL Server) n'a rien publié pour {len(missing_months)} mois "
+                        f"({', '.join(missing_months)}) — {shell_count} ligne(s) coquille ajoutée(s) "
+                        "pour calculer RH/Stock RMS quand même (Snowflake/ENOC, indépendant d'eFMS)."
+                    ))
+
             payloads, duplicate_count = deduplicate_payloads(payloads)
 
             self.stdout.write(f"  Lignes récupérées SQL      : {raw_payload_count}")
@@ -396,6 +488,9 @@ class Command(BaseCommand):
             self.stdout.write("  Calcul RH (Snowflake / ENOC)...")
             attach_rh_data(payloads)
 
+            self.stdout.write("  Calcul Stock Ouv./Clôt. RMS (Snowflake)...")
+            attach_stock_rms_data(payloads)
+
             if dry_run:
                 for item in payloads[:10]:
                     self.stdout.write(
@@ -403,7 +498,8 @@ class Command(BaseCommand):
                         f"order={item['fuel_order_l']} | deli={item['fuel_deli_l']} | "
                         f"conso={item['fuel_conso_l']} | ge_h={item['ge_working_hours']} | "
                         f"cph={item['cph_l_per_hour']} | anomalies={item['anomaly_flags']} | "
-                        f"rh={item['rh_hours']} [{item['rh_source']}] avec_dse={item['avec_dse']}"
+                        f"rh={item['rh_hours']} [{item['rh_source']}] avec_dse={item['avec_dse']} | "
+                        f"stock_ouv_rms={item['stock_ouv_rms_l']} stock_clot_rms={item['stock_clot_rms_l']}"
                     )
 
                 sync_run.status = FuelEfmsSyncRun.Status.SUCCESS
@@ -456,6 +552,10 @@ class Command(BaseCommand):
                         rh_hours=item["rh_hours"],
                         rh_source=item["rh_source"],
                         avec_dse=item["avec_dse"],
+                        stock_ouv_rms_l=item["stock_ouv_rms_l"],
+                        stock_ouv_rms_at=item["stock_ouv_rms_at"],
+                        stock_clot_rms_l=item["stock_clot_rms_l"],
+                        stock_clot_rms_at=item["stock_clot_rms_at"],
                         synced_at=now,
                     )
                 )
@@ -483,6 +583,10 @@ class Command(BaseCommand):
                             "rh_hours",
                             "rh_source",
                             "avec_dse",
+                            "stock_ouv_rms_l",
+                            "stock_ouv_rms_at",
+                            "stock_clot_rms_l",
+                            "stock_clot_rms_at",
                             "synced_at",
                         ],
                     )

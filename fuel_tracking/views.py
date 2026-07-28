@@ -1,7 +1,7 @@
 # fuel_tracking/views.py
 
 import logging
-from datetime import datetime, time, timedelta
+from datetime import datetime, time
 from decimal import Decimal
 from math import ceil
 
@@ -214,8 +214,14 @@ def _load_enoc_mongo_refs(site_ids):
 def _load_rh_initial(country, site_ids, prev_month, prev_start, prev_end):
     """
     RH Initial = RH calculé du mois précédent (même cascade que RH Final).
-    On réutilise d'abord la valeur déjà persistée (FuelEfmsMonthly du mois M-1,
-    si ce mois a déjà été synchronisé), sinon on la calcule en direct.
+    Lit uniquement la valeur déjà persistée (FuelEfmsMonthly du mois M-1, via le
+    cron nocturne sync_efms_fuel_auto) — PAS de repli Snowflake live ici : mesuré
+    à ~3s par appel Snowflake (GFMS_DATA_TRACKER_NC), quasi indépendant du nombre
+    de sites (coût fixe, pas de gain à limiter la taille du lot) — c'était la
+    cause principale des pages Suivi Carburant très lentes au filtrage par date.
+    Même principe déjà appliqué à Suivi Conso (Grid/ACM) : aucun appel Snowflake
+    live dans le chemin de requête HTTP. Un site dont le mois précédent n'a pas
+    encore été synchronisé affiche "—" plutôt que de bloquer la page.
     """
     clean_ids = sorted({str(sid).strip() for sid in site_ids if sid and str(sid).strip()})
     if not clean_ids:
@@ -229,48 +235,36 @@ def _load_rh_initial(country, site_ids, prev_month, prev_start, prev_end):
         if row["rh_hours"] is not None:
             result[row["site_id"]] = {"rh_hours": row["rh_hours"], "source": row["rh_source"]}
 
-    missing = [sid for sid in clean_ids if sid not in result]
-    if missing:
-        try:
-            from fuel_tracking.services.rh_service import RhCalculationService
-
-            live = RhCalculationService().compute_rh_batch(missing, prev_start.date(), (prev_end - timedelta(days=1)).date())
-            for sid, r in live.items():
-                if r.get("rh_hours") is not None:
-                    result[sid] = {"rh_hours": r["rh_hours"], "source": r["source"]}
-        except Exception as e:
-            logger.warning("[fuel_tracking] Calcul RH Initial (mois précédent) indisponible: %s", e)
-
     return result
 
 
-def _load_stock_rms(site_ids, date_debut, date_fin):
-    """Stock Ouv./Clôt. RMS — niveau de cuve télémétrie Snowflake (GFMS_METRICS)."""
+def _load_stock_rms(country, month, site_ids):
+    """
+    Stock Ouv./Clôt. RMS — niveau de cuve, télémétrie Snowflake (GFMS_DATA_TRACKER_NC).
+
+    Lit uniquement la valeur déjà persistée (FuelEfmsMonthly du mois affiché, via
+    le cron nocturne sync_efms_fuel_auto) — PAS de repli Snowflake live ici, même
+    principe que _load_rh_initial : mesuré à ~29s/200 sites en requête directe sur
+    cette table brute, c'était l'une des deux causes des pages Suivi Carburant très
+    lentes au filtrage par date. Un site dont le mois n'a pas encore été synchronisé
+    affiche "—" plutôt que de bloquer la page.
+    """
     clean_ids = sorted({str(sid).strip() for sid in site_ids if sid and str(sid).strip()})
     if not clean_ids:
         return {}
 
-    try:
-        from certification.services.snowflake_service import SnowflakeService
-
-        sf = SnowflakeService()
-        data_id_map = sf.get_data_id_map(clean_ids)
-        data_ids = list(data_id_map.values())
-        ouv_by_data_id = sf.get_fuel_level_near_date(data_ids, date_debut)
-        clot_by_data_id = sf.get_fuel_level_near_date(data_ids, date_fin)
-
-        result = {}
-        for site_id, data_id in data_id_map.items():
-            ouv = ouv_by_data_id.get(data_id)
-            clot = clot_by_data_id.get(data_id)
-            result[site_id] = {
-                "ouv_rms": ouv["level"] if ouv else None,
-                "clot_rms": clot["level"] if clot else None,
+    result = {}
+    persisted = FuelEfmsMonthly.objects.filter(
+        country__iexact=country, month_year=month, site_id__in=clean_ids
+    ).values("site_id", "stock_ouv_rms_l", "stock_clot_rms_l")
+    for row in persisted:
+        if row["stock_ouv_rms_l"] is not None or row["stock_clot_rms_l"] is not None:
+            result[row["site_id"]] = {
+                "ouv_rms": row["stock_ouv_rms_l"],
+                "clot_rms": row["stock_clot_rms_l"],
             }
-        return result
-    except Exception as e:
-        logger.warning("[fuel_tracking] Stock RMS Snowflake indisponible: %s", e)
-        return {}
+
+    return result
 
 
 def _load_prelevement_out(site_ids, start, end):
@@ -796,8 +790,14 @@ class FuelMonthlyTrackingView(APIView):
 
         site_refs = _load_site_refs(site_ids)
         mongo_site_refs, mongo_ge_assets, mongo_fuel_targets = _load_enoc_mongo_refs(site_ids)
-        rh_initial_by_site = _load_rh_initial(country, site_ids, prev_month, prev_start, prev_end)
-        stock_rms_by_site = _load_stock_rms(site_ids, start.date(), (end - timedelta(days=1)).date())
+        # RH Initial (repli Snowflake live pour les sites sans mois précédent synced) et
+        # Stock RMS sont calculés plus bas, uniquement pour les sites de la page affichée —
+        # pas pour tout le périmètre (jusqu'à ~467+ sites) : les deux finissent par
+        # interroger GFMS_DATA_TRACKER_NC, une table de télémétrie brute coûteuse
+        # (mesuré : ~19s/467 sites pour RH Initial, ~29s/200 sites pour Stock RMS) —
+        # ça n'a pas de sens de la requêter pour des sites qui ne seront même pas affichés.
+        rh_initial_by_site: dict = {}
+        stock_rms_by_site: dict = {}
         prelevement_out_by_site = _load_prelevement_out(site_ids, start, end)
         zone_filter = str(zone or "").strip().lower()
 
@@ -1047,6 +1047,35 @@ class FuelMonthlyTrackingView(APIView):
         total_pages = ceil(total / limit) if total else 1
         start_idx = (page - 1) * limit
         end_idx = start_idx + limit
+        page_rows = rows[start_idx:end_idx]
+
+        # RH Initial + Stock RMS : calculés ici seulement, pour les sites réellement
+        # affichés sur cette page (voir commentaire plus haut sur le coût de
+        # GFMS_DATA_TRACKER_NC).
+        page_site_ids = {r["site_id"] for r in page_rows if r.get("site_id")}
+
+        rh_initial_by_site = _load_rh_initial(country, page_site_ids, prev_month, prev_start, prev_end)
+        stock_rms_by_site = _load_stock_rms(country, month, page_site_ids)
+
+        for r in page_rows:
+            site_id = r.get("site_id")
+
+            rh_initial = rh_initial_by_site.get(site_id)
+            if rh_initial:
+                r["efms"]["rh_initial_hours"] = rh_initial.get("rh_hours")
+                r["efms"]["rh_initial_source"] = rh_initial.get("source")
+                if r["efms"].get("rh_hours") is not None and rh_initial.get("rh_hours") is not None:
+                    r["efms"]["rh_delta_hours"] = float(r["efms"]["rh_hours"]) - float(rh_initial["rh_hours"])
+
+            rms = stock_rms_by_site.get(site_id)
+            if rms:
+                r["stock"]["ouv_rms"] = rms.get("ouv_rms")
+                r["stock"]["clot_rms"] = rms.get("clot_rms")
+                r["stock"]["delta_rms"] = (
+                    rms["clot_rms"] - rms["ouv_rms"]
+                    if rms.get("clot_rms") is not None and rms.get("ouv_rms") is not None
+                    else None
+                )
 
         return Response({
             "filters": {
@@ -1071,7 +1100,7 @@ class FuelMonthlyTrackingView(APIView):
                     3,
                 ),
             },
-            "data": rows[start_idx:end_idx],
+            "data": page_rows,
             "pagination": {
                 "page": page,
                 "limit": limit,

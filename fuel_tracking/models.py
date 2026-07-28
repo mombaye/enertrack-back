@@ -48,6 +48,17 @@ class FuelEfmsMonthly(models.Model):
         help_text="CPH réel = fuel_conso_l / ge_working_hours",
     )
 
+    stock_ouv_rms_l = models.DecimalField(
+        max_digits=18, decimal_places=3, null=True, blank=True,
+        help_text="Niveau de cuve RMS (IM_GENERATOR_FUEL_LEVEL) le plus proche du 1er du mois.",
+    )
+    stock_ouv_rms_at = models.DateTimeField(null=True, blank=True)
+    stock_clot_rms_l = models.DecimalField(
+        max_digits=18, decimal_places=3, null=True, blank=True,
+        help_text="Niveau de cuve RMS (IM_GENERATOR_FUEL_LEVEL) le plus proche du dernier jour du mois.",
+    )
+    stock_clot_rms_at = models.DateTimeField(null=True, blank=True)
+
     anomaly_flags = models.JSONField(default=list, blank=True)
 
     synced_at = models.DateTimeField(default=timezone.now)

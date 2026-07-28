@@ -23,6 +23,9 @@ urlpatterns = [
     path("dashboard/sites-recurrents/",       views.DashboardSitesRecurrentsView.as_view(),     name="dashboard-recurrents"),
     path("suivi-conso/", views.SuiviConsoView.as_view(), name="suivi-conso"),
 
+    # ── Dashboard Marge Grid ──────────────────────────────────────────────────
+    path("marge-dashboard/", views.MargeDashboardDataView.as_view(), name="marge-dashboard"),
+
    
 ]
 

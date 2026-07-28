@@ -307,7 +307,7 @@ def estimate_single_site(self, result_id: int) -> dict:
         efms = EfmsService()
 
         # ── Source 1 : ACM ────────────────────────────────────────────────────
-        acm_p, acm_30j = efms.get_conso_acm_cached(batch.id, site.site_id)
+        acm_p, acm_30j = efms.get_conso_acm_cached(batch.id, site.site_id, debut, fin)
 
         if acm_p is None and acm_30j is None:
             try:
@@ -327,7 +327,7 @@ def estimate_single_site(self, result_id: int) -> dict:
         else:
             # ── Source 2 : Grid FMS ───────────────────────────────────────────
             # [FIX A] get_conso_grid_cached retourne 3 valeurs
-            grid_p, grid_30j, _ = efms.get_conso_grid_cached(batch.id, site.site_id)
+            grid_p, grid_30j, _ = efms.get_conso_grid_cached(batch.id, site.site_id, debut, fin)
             kvah = kvarh = est_kwh = None
 
             if grid_p is None:
@@ -587,9 +587,7 @@ def launch_estimation_batch(batch_id: int) -> None:
             efms = EfmsService()
             efms.prefetch_batch(
                 cert_batch_id=batch_id,
-                site_ids=site_ids,
-                date_debut=debut,
-                date_fin=fin,
+                groups=[(site_ids, debut, fin)],
             )
         except Exception as e:
             logger.warning("[estimation] Prefetch FMS échoué (%s) — fallback ponctuel", e)

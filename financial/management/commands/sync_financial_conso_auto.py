@@ -95,27 +95,42 @@ class Command(BaseCommand):
         self.stdout.write(f"  Dry run        : {dry_run}")
         self.stdout.write("═" * 80 + "\n")
 
-        available_months = []
+        grid_month = None
         try:
-            m = self._latest_month_snowflake_grid()
-            if m:
-                available_months.append(m)
+            grid_month = self._latest_month_snowflake_grid()
         except Exception as e:
             self.stdout.write(self.style.WARNING(f"  Erreur lecture Snowflake GRID_REPORT : {e}"))
 
+        solar_month = None
         try:
-            m = self._latest_month_sql2_solar()
-            if m:
-                available_months.append(m)
+            solar_month = self._latest_month_sql2_solar()
         except Exception as e:
             self.stdout.write(self.style.WARNING(f"  Erreur lecture SQL Server fact_solar_mth : {e}"))
 
-        if not available_months:
+        if not grid_month and not solar_month:
             self.stdout.write(self.style.WARNING("\n  Aucun mois disponible côté source.\n"))
             return
 
-        latest_complete_month = min(available_months)
-        self.stdout.write(f"  Dernier mois complet retenu : {latest_complete_month}")
+        # ✅ Le Grid/ACM (Snowflake, quotidien) pilote la fenêtre à synchroniser
+        # — on ne bloque plus sur le Solaire (SQL Server fact_solar_mth, qui a
+        # son propre retard de publication, souvent 1-2 mois derrière). Avant
+        # ce fix, un `min()` des deux sources faisait plafonner tout le sync
+        # (Grid ET ACM inclus) au mois du composant le plus en retard, alors
+        # que Grid/ACM étaient déjà à jour au jour le jour. Le Solaire reste
+        # simplement à 0 pour les mois où sa source n'a pas encore publié,
+        # et se remplira tout seul au prochain run une fois disponible
+        # (sync_financial_conso fait un upsert, donc un mois déjà synchronisé
+        # se complète automatiquement sans double-compte).
+        latest_complete_month = grid_month or solar_month
+        if solar_month and solar_month < latest_complete_month:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"  Solaire (SQL Server) en retard : dernier mois publié {solar_month}, "
+                    f"Grid/ACM (Snowflake) déjà à {latest_complete_month} — synchronisé quand même, "
+                    "solaire à 0 en attendant que la source rattrape."
+                )
+            )
+        self.stdout.write(f"  Dernier mois retenu (piloté par Grid/ACM) : {latest_complete_month}")
 
         local_latest = FinancialConsoMonthly.objects.aggregate(v=Max("year"))["v"]
         if local_latest:

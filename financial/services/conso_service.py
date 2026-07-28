@@ -275,19 +275,23 @@ class FinancialConsoService:
                             result[key]["grid_mode"] = "extrapol"
                         result[key]["fms_grid_kwh"] = val.quantize(Decimal("0.001"))
 
-                # ACM  (ACT_ENERGY_P = index cumulatif → MAX - MIN)
+                # ACM (index cumulatif -> MAX - MIN). COALESCE(ACT_ENERGY_P, ACM_ENERGY_P) :
+                # ~39 sites (sur ~7900) ne remontent jamais ACT_ENERGY_P et ne reportent
+                # que sous ACM_ENERGY_P (vérifié en base) — sans ce repli, ces sites
+                # n'ont jamais de conso ACM synchronisée.
                 cursor.execute(f"""
                     SELECT
                         SITE_ID,
                         YEAR(DATE)                                AS yr,
                         MONTH(DATE)                               AS mo,
-                        MAX(ACT_ENERGY_P) - MIN(ACT_ENERGY_P)     AS acm_kwh,
+                        MAX(COALESCE(ACT_ENERGY_P, ACM_ENERGY_P)) - MIN(COALESCE(ACT_ENERGY_P, ACM_ENERGY_P)) AS acm_kwh,
                         COUNT(DATE)                               AS nb_pts,
                         DATEDIFF('day', MIN(DATE), MAX(DATE))     AS span_days
                     FROM {db_schema}.AC_METER
                     WHERE SITE_ID IN ({ph})
                       AND DATE >= %s AND DATE <= %s
-                      AND ACT_ENERGY_P IS NOT NULL AND ACT_ENERGY_P > 0
+                      AND COALESCE(ACT_ENERGY_P, ACM_ENERGY_P) IS NOT NULL
+                      AND COALESCE(ACT_ENERGY_P, ACM_ENERGY_P) > 0
                     GROUP BY SITE_ID, YEAR(DATE), MONTH(DATE)
                 """, tuple(chunk) + (d_start, d_end))
 

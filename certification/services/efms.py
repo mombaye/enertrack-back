@@ -156,6 +156,17 @@ class EfmsService:
     def _cache_key_grid(cert_batch_id: int) -> str:
         return f"efms:grid:batch:{cert_batch_id}"
 
+    @staticmethod
+    def _cache_entry_key(site_id: str, date_debut: date, date_fin: date) -> str:
+        """
+        Clé composite site+période dans le cache d'un batch. Un même site peut
+        avoir plusieurs factures (donc plusieurs périodes) dans un même batch
+        de certification — indexer uniquement par site_id ferait que la
+        dernière période traitée écrase silencieusement le cache des autres
+        factures de ce site.
+        """
+        return f"{site_id}|{date_debut.isoformat()}|{date_fin.isoformat()}"
+
     # ─────────────────────────────────────────────────────────────────────────
     # Helpers conversion → conso kWh
     # ─────────────────────────────────────────────────────────────────────────
@@ -446,19 +457,19 @@ class EfmsService:
     # ─────────────────────────────────────────────────────────────────────────
 
     def get_conso_acm_cached(
-        self, cert_batch_id: int, site_id: str
+        self, cert_batch_id: int, site_id: str, date_debut: date, date_fin: date
     ) -> tuple[Optional[Decimal], Optional[Decimal]]:
-        """Retourne (conso_periode, conso_30j) ACM depuis le cache."""
+        """Retourne (conso_periode, conso_30j) ACM depuis le cache (clé site+période)."""
         data = cache.get(self._cache_key_acm(cert_batch_id)) or {}
-        entry = data.get(site_id, {})
+        entry = data.get(self._cache_entry_key(site_id, date_debut, date_fin), {})
         return entry.get("periode"), entry.get("30j")
 
     def get_conso_grid_cached(
-        self, cert_batch_id: int, site_id: str
+        self, cert_batch_id: int, site_id: str, date_debut: date, date_fin: date
     ) -> tuple[Optional[Decimal], Optional[Decimal], Optional[date]]:
-        """Retourne (conso_periode, conso_30j, last_month_date) Grid depuis le cache."""
+        """Retourne (conso_periode, conso_30j, last_month_date) Grid depuis le cache (clé site+période)."""
         data = cache.get(self._cache_key_grid(cert_batch_id)) or {}
-        entry = data.get(site_id, {})
+        entry = data.get(self._cache_entry_key(site_id, date_debut, date_fin), {})
         return entry.get("periode"), entry.get("30j"), entry.get("last_month_date")
 
     # ─────────────────────────────────────────────────────────────────────────

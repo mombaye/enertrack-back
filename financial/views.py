@@ -2588,3 +2588,65 @@ class SuiviConsoView(APIView):
             "pages": (total + page_size - 1) // page_size if page_size else 1,
             "results": result_rows[offset: offset + page_size],
         })
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dashboard Marge Grid — Focus Sites en Marge Négative (CDC v1.0)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class MargeDashboardDataView(APIView):
+    """
+    Données brutes du Dashboard Marge Grid — une ligne par site, les deux
+    bases de marge (estimée/réelle) déjà calculées. Tout le filtrage/tri/
+    agrégation (sélecteur de périmètre, base de marge, filtres transverses)
+    se fait côté client, comme spécifié dans le CDC.
+
+    Le filtre "période" ne s'applique qu'à la marge réelle (FinancialEvaluation) :
+    la marge estimée vient de BOMarginSnapshot, un snapshot figé Mai→Juin, non
+    paramétrable par année.
+    """
+    permission_classes = [IsAuthenticated]
+
+    REAL_INVOICE_SOURCES = [
+        FinancialEvaluation.CalculationSource.PAID_INVOICE,
+        FinancialEvaluation.CalculationSource.RAW_UNPAID_INVOICE,
+    ]
+
+    def get(self, request):
+        from financial.services.marge_dashboard_service import build_marge_dashboard_rows
+
+        # Périodes (année, mois) pour lesquelles une vraie facture Sénélec est
+        # rapprochée quelque part dans le portefeuille — souvent très peu
+        # nombreuses (le rapprochement facture est un processus lent), donc on
+        # expose la liste exacte plutôt qu'un simple sélecteur d'année : un
+        # sélecteur d'année seul peut retomber sur un mois non représentatif
+        # (ex. mars 2026 : 0 site NOK sur 1370, contre 752/1745 en janvier 2026).
+        available_periods = list(
+            FinancialEvaluation.objects
+            .filter(calculation_source__in=self.REAL_INVOICE_SOURCES)
+            .order_by("-year", "-month")
+            .values_list("year", "month")
+            .distinct()
+        )
+        available_years = sorted({y for y, _m in available_periods}, reverse=True)
+
+        req_year = request.query_params.get("year")
+        req_month = request.query_params.get("month")
+
+        if req_year and req_month:
+            year, month = int(req_year), int(req_month)
+        elif available_periods:
+            # Par défaut : la période la plus récente de l'année demandée si elle
+            # existe, sinon la période la plus récente disponible tout court.
+            target_year = int(req_year) if req_year else timezone.localdate().year
+            match = next((p for p in available_periods if p[0] == target_year), None)
+            year, month = match or available_periods[0]
+        else:
+            year, month = timezone.localdate().year, 6
+
+        data = build_marge_dashboard_rows(year, month)
+        data["meta"]["available_years"] = available_years or [year]
+        data["meta"]["available_periods"] = [{"year": y, "month": m} for y, m in available_periods] or [{"year": year, "month": month}]
+        data["meta"]["reelle_year"] = year
+        data["meta"]["reelle_month"] = month
+        return Response(data)

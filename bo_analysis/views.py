@@ -237,7 +237,11 @@ class BOMarginSnapshotListView(APIView):
         total = qs.count()
         try:
             page = max(1, int(request.query_params.get("page", 1)))
-            page_size = min(200, max(10, int(request.query_params.get("page_size", 50))))
+            # Snapshot figé (import Excel unique, ~3300 lignes, jamais réalimenté) :
+            # plafond plus haut que les autres listes bo-analysis pour permettre à un
+            # consommateur (ex. Suivi Conso) de charger tout le référentiel en un
+            # seul appel plutôt que de paginer un jeu de données qui ne bouge jamais.
+            page_size = min(5000, max(10, int(request.query_params.get("page_size", 50))))
         except (ValueError, TypeError):
             page, page_size = 1, 50
 

@@ -57,20 +57,26 @@ class SnowflakeEfmsService(EfmsService):
     def prefetch_batch(
         self,
         cert_batch_id: int,
-        site_ids: list[str],
-        date_debut: date,
-        date_fin: date,
+        groups: list[tuple[list[str], date, date]],
     ) -> None:
-        if not site_ids:
+        """
+        `groups` : liste de (site_ids, date_debut, date_fin) — un groupe par
+        période de facture DISTINCTE dans le batch, pas une seule fenêtre
+        min(debuts)/max(fins) pour tout le batch. Sans ce regroupement par
+        période réelle, un site facturé sur ~30 jours mais batché avec des
+        sites d'autres périodes se voyait attribuer une "conso période"
+        calculée sur l'enveloppe globale du batch (parfois plusieurs mois),
+        au lieu de sa propre période — écarts constatés jusqu'à ×6 en prod.
+        Les sites qui partagent exactement la même période restent groupés
+        dans une seule requête bulk (l'optimisation de coût Snowflake est
+        préservée), seule l'hétérogénéité entre groupes est corrigée.
+        """
+        if not groups:
             return
 
-        nb_jours_periode = (date_fin - date_debut).days + 1
-        d30_debut        = date_fin - timedelta(days=29)
-        fenetre_debut    = date_debut - timedelta(days=90)
-        fenetre_fin      = date_fin   + timedelta(days=90)
-
-        acm_cache: dict[str, dict]  = {}
+        acm_cache: dict[str, dict] = {}
         grid_cache: dict[str, dict] = {}
+        total_sites = sum(len(site_ids) for site_ids, _, _ in groups)
 
         try:
             conn = self.sf._connect()
@@ -82,165 +88,185 @@ class SnowflakeEfmsService(EfmsService):
             db_schema = f"{self.sf.database}.{self.sf.schema}"
 
             logger.info(
-                "[Snowflake-eFMS prefetch] %d sites — %s→%s",
-                len(site_ids), date_debut, date_fin,
+                "[Snowflake-eFMS prefetch] %d sites, %d période(s) distincte(s)",
+                total_sites, len(groups),
             )
 
-            for chunk in self.sf._chunks(site_ids):
-                ph = ",".join(["%s"] * len(chunk))
+            for site_ids, date_debut, date_fin in groups:
+                if not site_ids:
+                    continue
 
-                def _acm_query(d_s, d_e):
-                    cursor.execute(f"""
-                        SELECT
-                            SITE_ID,
-                            MAX(ACT_ENERGY_P)  AS idx_max,
-                            MIN(ACT_ENERGY_P)  AS idx_min,
-                            COUNT(DATE)        AS nb_pts,
-                            DATEDIFF('day', MIN(DATE), MAX(DATE)) AS span_days
-                        FROM {db_schema}.AC_METER
-                        WHERE SITE_ID IN ({ph})
-                          AND DATE >= %s AND DATE <= %s
-                          AND ACT_ENERGY_P IS NOT NULL AND ACT_ENERGY_P > 0
-                        GROUP BY SITE_ID
-                    """, tuple(chunk) + (d_s, d_e))
-                    return {r[0]: r for r in cursor.fetchall()}
+                nb_jours_periode = (date_fin - date_debut).days + 1
+                d30_debut = date_fin - timedelta(days=29)
+                fenetre_debut = date_debut - timedelta(days=90)
+                fenetre_fin = date_fin + timedelta(days=90)
 
-                def _acm_fenetre_query():
-                    cursor.execute(f"""
-                        SELECT
-                            SITE_ID,
-                            MAX(ACT_ENERGY_P) - MIN(ACT_ENERGY_P) AS delta,
-                            COUNT(DATE)                            AS nb_pts,
-                            DATEDIFF('day', MIN(DATE), MAX(DATE))  AS span_days
-                        FROM {db_schema}.AC_METER
-                        WHERE SITE_ID IN ({ph})
-                          AND DATE >= %s AND DATE <= %s
-                          AND ACT_ENERGY_P IS NOT NULL AND ACT_ENERGY_P > 0
-                        GROUP BY SITE_ID
-                    """, tuple(chunk) + (fenetre_debut, fenetre_fin))
-                    return {r[0]: r for r in cursor.fetchall()}
+                for chunk in self.sf._chunks(site_ids):
+                    ph = ",".join(["%s"] * len(chunk))
 
-                acm_p_rows  = _acm_query(date_debut, date_fin)
-                acm_30_rows = _acm_query(d30_debut,  date_fin)
-                acm_f_rows  = _acm_fenetre_query()
+                    # COALESCE(ACT_ENERGY_P, ACM_ENERGY_P) : ~39 sites (sur ~7900) ne
+                    # remontent jamais ACT_ENERGY_P et ne reportent que sous ACM_ENERGY_P
+                    # (vérifié en base) — sans ce repli, ces sites n'ont jamais de conso ACM.
+                    def _acm_query(d_s, d_e):
+                        cursor.execute(f"""
+                            SELECT
+                                SITE_ID,
+                                MAX(COALESCE(ACT_ENERGY_P, ACM_ENERGY_P))  AS idx_max,
+                                MIN(COALESCE(ACT_ENERGY_P, ACM_ENERGY_P))  AS idx_min,
+                                COUNT(DATE)        AS nb_pts,
+                                DATEDIFF('day', MIN(DATE), MAX(DATE)) AS span_days
+                            FROM {db_schema}.AC_METER
+                            WHERE SITE_ID IN ({ph})
+                              AND DATE >= %s AND DATE <= %s
+                              AND COALESCE(ACT_ENERGY_P, ACM_ENERGY_P) IS NOT NULL
+                              AND COALESCE(ACT_ENERGY_P, ACM_ENERGY_P) > 0
+                            GROUP BY SITE_ID
+                        """, tuple(chunk) + (d_s, d_e))
+                        return {r[0]: r for r in cursor.fetchall()}
 
-                for sid in chunk:
-                    rp = acm_p_rows.get(sid)
-                    r3 = acm_30_rows.get(sid)
-                    rf = acm_f_rows.get(sid)
+                    def _acm_fenetre_query():
+                        cursor.execute(f"""
+                            SELECT
+                                SITE_ID,
+                                MAX(COALESCE(ACT_ENERGY_P, ACM_ENERGY_P)) - MIN(COALESCE(ACT_ENERGY_P, ACM_ENERGY_P)) AS delta,
+                                COUNT(DATE)                            AS nb_pts,
+                                DATEDIFF('day', MIN(DATE), MAX(DATE))  AS span_days
+                            FROM {db_schema}.AC_METER
+                            WHERE SITE_ID IN ({ph})
+                              AND DATE >= %s AND DATE <= %s
+                              AND COALESCE(ACT_ENERGY_P, ACM_ENERGY_P) IS NOT NULL
+                              AND COALESCE(ACT_ENERGY_P, ACM_ENERGY_P) > 0
+                            GROUP BY SITE_ID
+                        """, tuple(chunk) + (fenetre_debut, fenetre_fin))
+                        return {r[0]: r for r in cursor.fetchall()}
 
-                    def _d(r, nb_j, _rf=rf):
-                        if r is None:
+                    acm_p_rows = _acm_query(date_debut, date_fin)
+                    acm_30_rows = _acm_query(d30_debut, date_fin)
+                    acm_f_rows = _acm_fenetre_query()
+
+                    for sid in chunk:
+                        rp = acm_p_rows.get(sid)
+                        r3 = acm_30_rows.get(sid)
+                        rf = acm_f_rows.get(sid)
+
+                        def _d(r, nb_j, _rf=rf):
+                            if r is None:
+                                return self._delta_to_conso(
+                                    None, None, 0, 1, nb_j,
+                                    _rf[1] if _rf else None,
+                                    int(_rf[2]) if _rf else 0,
+                                    int(_rf[3]) if _rf else 1,
+                                )
                             return self._delta_to_conso(
-                                None, None, 0, 1, nb_j,
+                                r[1], r[2], int(r[3]), int(r[4]), nb_j,
                                 _rf[1] if _rf else None,
                                 int(_rf[2]) if _rf else 0,
                                 int(_rf[3]) if _rf else 1,
                             )
-                        return self._delta_to_conso(
-                            r[1], r[2], int(r[3]), int(r[4]), nb_j,
-                            _rf[1] if _rf else None,
-                            int(_rf[2]) if _rf else 0,
-                            int(_rf[3]) if _rf else 1,
-                        )
 
-                    acm_cache[sid] = {"periode": _d(rp, nb_jours_periode), "30j": _d(r3, 30)}
+                        # Clé composite site+période : un même site peut avoir plusieurs
+                        # factures (donc plusieurs périodes) dans un même batch — une clé
+                        # par seul site_id écraserait silencieusement les autres factures
+                        # de ce site avec les valeurs de la dernière période traitée.
+                        acm_cache[self._cache_entry_key(sid, date_debut, date_fin)] = {
+                            "periode": _d(rp, nb_jours_periode), "30j": _d(r3, 30),
+                        }
 
-                def _grid_query(d_s, d_e):
+                    def _grid_query(d_s, d_e):
+                        cursor.execute(f"""
+                            SELECT
+                                SITE_ID,
+                                SUM(GRID_ENERGY_CONSO_PER_DAY) AS total,
+                                COUNT(DATE)                     AS nb_pts
+                            FROM {db_schema}.GRID_REPORT
+                            WHERE SITE_ID IN ({ph})
+                              AND DATE >= %s AND DATE <= %s
+                              AND GRID_ENERGY_CONSO_PER_DAY IS NOT NULL
+                              AND GRID_ENERGY_CONSO_PER_DAY > 0.1
+                            GROUP BY SITE_ID
+                        """, tuple(chunk) + (d_s, d_e))
+                        return {r[0]: r for r in cursor.fetchall()}
+
+                    grid_p_rows = _grid_query(date_debut, date_fin)
+                    grid_30_rows = _grid_query(d30_debut, date_fin)
+
                     cursor.execute(f"""
-                        SELECT
-                            SITE_ID,
-                            SUM(GRID_ENERGY_CONSO_PER_DAY) AS total,
-                            COUNT(DATE)                     AS nb_pts
+                        SELECT SITE_ID,
+                            AVG(GRID_ENERGY_CONSO_PER_DAY),
+                            COUNT(DATE)
                         FROM {db_schema}.GRID_REPORT
                         WHERE SITE_ID IN ({ph})
                           AND DATE >= %s AND DATE <= %s
                           AND GRID_ENERGY_CONSO_PER_DAY IS NOT NULL
                           AND GRID_ENERGY_CONSO_PER_DAY > 0.1
                         GROUP BY SITE_ID
-                    """, tuple(chunk) + (d_s, d_e))
-                    return {r[0]: r for r in cursor.fetchall()}
+                    """, tuple(chunk) + (fenetre_debut, fenetre_fin))
+                    grid_f_rows = {r[0]: r for r in cursor.fetchall()}
 
-                grid_p_rows  = _grid_query(date_debut, date_fin)
-                grid_30_rows = _grid_query(d30_debut,  date_fin)
+                    cursor.execute(f"""
+                        SELECT t.SITE_ID, t.yr, t.mo, t.conso, t.nb_jours
+                        FROM (
+                            SELECT
+                                SITE_ID,
+                                YEAR(DATE)                          AS yr,
+                                MONTH(DATE)                         AS mo,
+                                SUM(GRID_ENERGY_CONSO_PER_DAY)     AS conso,
+                                COUNT(DATE)                         AS nb_jours,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY SITE_ID
+                                    ORDER BY YEAR(DATE) DESC, MONTH(DATE) DESC
+                                ) AS rn
+                            FROM {db_schema}.GRID_REPORT
+                            WHERE SITE_ID IN ({ph})
+                              AND DATE < %s
+                              AND GRID_ENERGY_CONSO_PER_DAY IS NOT NULL
+                              AND GRID_ENERGY_CONSO_PER_DAY > 0.1
+                            GROUP BY SITE_ID, YEAR(DATE), MONTH(DATE)
+                            HAVING COUNT(DATE) >= {self.MIN_POINTS_EXTRAPOL}
+                        ) t WHERE t.rn = 1
+                    """, tuple(chunk) + (date_debut,))
+                    grid_lm_rows = {r[0]: r for r in cursor.fetchall()}
 
-                cursor.execute(f"""
-                    SELECT SITE_ID,
-                        AVG(GRID_ENERGY_CONSO_PER_DAY),
-                        COUNT(DATE)
-                    FROM {db_schema}.GRID_REPORT
-                    WHERE SITE_ID IN ({ph})
-                      AND DATE >= %s AND DATE <= %s
-                      AND GRID_ENERGY_CONSO_PER_DAY IS NOT NULL
-                      AND GRID_ENERGY_CONSO_PER_DAY > 0.1
-                    GROUP BY SITE_ID
-                """, tuple(chunk) + (fenetre_debut, fenetre_fin))
-                grid_f_rows = {r[0]: r for r in cursor.fetchall()}
+                    for sid in chunk:
+                        gp = grid_p_rows.get(sid)
+                        g30 = grid_30_rows.get(sid)
+                        gf = grid_f_rows.get(sid)
+                        glm = grid_lm_rows.get(sid)
 
-                cursor.execute(f"""
-                    SELECT t.SITE_ID, t.yr, t.mo, t.conso, t.nb_jours
-                    FROM (
-                        SELECT
-                            SITE_ID,
-                            YEAR(DATE)                          AS yr,
-                            MONTH(DATE)                         AS mo,
-                            SUM(GRID_ENERGY_CONSO_PER_DAY)     AS conso,
-                            COUNT(DATE)                         AS nb_jours,
-                            ROW_NUMBER() OVER (
-                                PARTITION BY SITE_ID
-                                ORDER BY YEAR(DATE) DESC, MONTH(DATE) DESC
-                            ) AS rn
-                        FROM {db_schema}.GRID_REPORT
-                        WHERE SITE_ID IN ({ph})
-                          AND DATE < %s
-                          AND GRID_ENERGY_CONSO_PER_DAY IS NOT NULL
-                          AND GRID_ENERGY_CONSO_PER_DAY > 0.1
-                        GROUP BY SITE_ID, YEAR(DATE), MONTH(DATE)
-                        HAVING COUNT(DATE) >= {self.MIN_POINTS_EXTRAPOL}
-                    ) t WHERE t.rn = 1
-                """, tuple(chunk) + (date_debut,))
-                grid_lm_rows = {r[0]: r for r in cursor.fetchall()}
+                        def _g(r, nb_j, _gf=gf):
+                            return self._sum_to_conso(
+                                r[1] if r else None,
+                                int(r[2]) if r else 0,
+                                nb_j,
+                                _gf[1] if _gf else None,
+                                int(_gf[2]) if _gf else 0,
+                            )
 
-                for sid in chunk:
-                    gp  = grid_p_rows.get(sid)
-                    g30 = grid_30_rows.get(sid)
-                    gf  = grid_f_rows.get(sid)
-                    glm = grid_lm_rows.get(sid)
+                        conso_30j = _g(g30, 30)
+                        last_month_date = None
 
-                    def _g(r, nb_j, _gf=gf):
-                        return self._sum_to_conso(
-                            r[1] if r else None,
-                            int(r[2]) if r else 0,
-                            nb_j,
-                            _gf[1] if _gf else None,
-                            int(_gf[2]) if _gf else 0,
-                        )
+                        if conso_30j is None and glm is not None and glm[3] is not None:
+                            nb_j_lm = int(glm[4])
+                            if nb_j_lm >= self.MIN_DAYS_DENSE:
+                                conso_30j = Decimal(str(glm[3]))
+                            elif nb_j_lm >= self.MIN_POINTS_EXTRAPOL:
+                                conso_30j = Decimal(str(glm[3])) / Decimal(str(nb_j_lm)) * 30
+                            last_month_date = date(int(glm[1]), int(glm[2]), 1)
 
-                    conso_30j       = _g(g30, 30)
-                    last_month_date = None
+                        grid_cache[self._cache_entry_key(sid, date_debut, date_fin)] = {
+                            "periode": _g(gp, nb_jours_periode),
+                            "30j": conso_30j,
+                            "last_month_date": last_month_date,
+                        }
 
-                    if conso_30j is None and glm is not None and glm[3] is not None:
-                        nb_j_lm = int(glm[4])
-                        if nb_j_lm >= self.MIN_DAYS_DENSE:
-                            conso_30j = Decimal(str(glm[3]))
-                        elif nb_j_lm >= self.MIN_POINTS_EXTRAPOL:
-                            conso_30j = Decimal(str(glm[3])) / Decimal(str(nb_j_lm)) * 30
-                        last_month_date = date(int(glm[1]), int(glm[2]), 1)
-
-                    grid_cache[sid] = {
-                        "periode":         _g(gp, nb_jours_periode),
-                        "30j":             conso_30j,
-                        "last_month_date": last_month_date,
-                    }
-
-            cache.set(self._cache_key_acm(cert_batch_id),  acm_cache,  timeout=self.CACHE_TTL)
+            cache.set(self._cache_key_acm(cert_batch_id), acm_cache, timeout=self.CACHE_TTL)
             cache.set(self._cache_key_grid(cert_batch_id), grid_cache, timeout=self.CACHE_TTL)
 
-            nb_acm  = sum(1 for v in acm_cache.values()  if v["periode"] or v["30j"])
+            nb_acm = sum(1 for v in acm_cache.values() if v["periode"] or v["30j"])
             nb_grid = sum(1 for v in grid_cache.values() if v["periode"] or v["30j"])
             logger.info(
                 "[Snowflake-eFMS prefetch] Terminé — ACM %d/%d sites · Grid %d/%d sites",
-                nb_acm, len(site_ids), nb_grid, len(site_ids),
+                nb_acm, total_sites, nb_grid, total_sites,
             )
 
         except EfmsConnectionError:
@@ -276,22 +302,24 @@ class SnowflakeEfmsService(EfmsService):
 
             def _q(d_s, d_e, nb_j):
                 cursor.execute(f"""
-                    SELECT MAX(ACT_ENERGY_P), MIN(ACT_ENERGY_P),
+                    SELECT MAX(COALESCE(ACT_ENERGY_P, ACM_ENERGY_P)), MIN(COALESCE(ACT_ENERGY_P, ACM_ENERGY_P)),
                            COUNT(DATE),
                            DATEDIFF('day', MIN(DATE), MAX(DATE))
                     FROM {db_schema}.AC_METER
                     WHERE SITE_ID = %s AND DATE >= %s AND DATE <= %s
-                      AND ACT_ENERGY_P IS NOT NULL AND ACT_ENERGY_P > 0
+                      AND COALESCE(ACT_ENERGY_P, ACM_ENERGY_P) IS NOT NULL
+                      AND COALESCE(ACT_ENERGY_P, ACM_ENERGY_P) > 0
                 """, (site_id, d_s, d_e))
                 r = cursor.fetchone()
 
                 cursor.execute(f"""
-                    SELECT MAX(ACT_ENERGY_P) - MIN(ACT_ENERGY_P),
+                    SELECT MAX(COALESCE(ACT_ENERGY_P, ACM_ENERGY_P)) - MIN(COALESCE(ACT_ENERGY_P, ACM_ENERGY_P)),
                            COUNT(DATE),
                            DATEDIFF('day', MIN(DATE), MAX(DATE))
                     FROM {db_schema}.AC_METER
                     WHERE SITE_ID = %s AND DATE >= %s AND DATE <= %s
-                      AND ACT_ENERGY_P IS NOT NULL AND ACT_ENERGY_P > 0
+                      AND COALESCE(ACT_ENERGY_P, ACM_ENERGY_P) IS NOT NULL
+                      AND COALESCE(ACT_ENERGY_P, ACM_ENERGY_P) > 0
                 """, (site_id, fenetre_debut, fenetre_fin))
                 rf = cursor.fetchone()
 
