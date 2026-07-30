@@ -73,13 +73,14 @@ PAYMENT_STATUS_MAP: dict[str, str] = {
     "paye":                           "PAID",
     "payé":                           "PAID",
     "paye ":                          "PAID",
+    "payee":                          "PAID",
     "impayee":                        "UNPAID",
     "impayée":                        "UNPAID",
     "hors scope / remplace / annul":  "OUT_OF_SCOPE",
     "hors scope / remplace / annul ": "OUT_OF_SCOPE",
     "hors scope":                     "OUT_OF_SCOPE",
     "annule":                         "OUT_OF_SCOPE",
-    "annulé":                         "OUT_OF_SCOPE",
+    "annulee":                         "OUT_OF_SCOPE",
 }
 
 
