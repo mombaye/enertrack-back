@@ -12,7 +12,7 @@ services:
       POSTGRES_USER:     ${POSTGRES_USER:-enertrack_user}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-enertrack_pass}
     ports:
-      - "5432:5432"
+      - "5436:5432"
     restart: always
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-enertrack_user} -d ${POSTGRES_DB:-enertrack_db}"]
@@ -23,7 +23,7 @@ services:
   redis:
     image: redis:7
     ports:
-      - "6379:6379"
+      - "6381:6379"
     restart: always
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
