@@ -26,6 +26,8 @@ class SonatelInvoiceSerializer(serializers.ModelSerializer):
         )
 
 
+from .models import ContractMonth
+
 class ImportBatchSerializer(serializers.ModelSerializer):
     class Meta:
         model = ImportBatch

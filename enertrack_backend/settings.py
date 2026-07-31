@@ -192,6 +192,16 @@ CELERY_RESULT_BACKEND = 'redis://redis:6379/0'
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 
+# Cache Redis (DB 1, distincte du broker Celery en DB 0) — utilisé notamment pour
+# mettre en cache les lectures vers des sources externes lentes (Mongo ENOC,
+# Snowflake) afin que l'utilisateur ne ressente pas leur latence réseau.
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+        'LOCATION': 'redis://redis:6379/1',
+    }
+}
+
 # Email — bascule sur un vrai SMTP en définissant EMAIL_BACKEND=django.core.mail.backends.smtp.EmailBackend
 # + EMAIL_HOST/EMAIL_PORT/EMAIL_HOST_USER/EMAIL_HOST_PASSWORD/EMAIL_USE_TLS. Par défaut, les emails sont
 # juste loggés en console pour ne jamais bloquer le workflow tant que le SMTP n'est pas configuré.

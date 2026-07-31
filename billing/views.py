@@ -46,7 +46,7 @@ from django.utils import timezone
 
 import math
 from decimal import Decimal, InvalidOperation
-from django.db.models import OuterRef, Subquery
+from django.db.models import OuterRef, Subquery, Exists
 from rest_framework.permissions import IsAuthenticated
 import tempfile, os
 from certification.models import CertificationResult
@@ -116,7 +116,17 @@ def _apply_scope_to_invoice_qs(qs, scope: str):
         )
 
     if scope == "CONTESTED":
-        return qs.filter(status=SonatelInvoice.Status.CONTESTED).exclude(
+        # "Contestée" = résultat de certification "À analyser" (NEEDS_REVIEW),
+        # pas le champ SonatelInvoice.status (rempli manuellement à l'import).
+        # Exists() plutôt qu'un filtre __ de relation inversée : une facture peut
+        # avoir plusieurs CertificationResult (un par batch/échéance), un simple
+        # `certifications__status=...` sur ce qs (ensuite agrégé) dupliquerait
+        # les lignes et fausserait les Sum()/Count().
+        needs_review = CertificationResult.objects.filter(
+            invoice=OuterRef("pk"),
+            status=CertificationResult.Status.NEEDS_REVIEW,
+        )
+        return qs.filter(Exists(needs_review)).exclude(
             payment_status=SonatelInvoice.PaymentStatus.PAID
         )
 
@@ -151,7 +161,13 @@ def _apply_scope_to_monthly_qs(qs, scope: str):
         )
 
     if scope == "CONTESTED":
-        return qs.filter(source__status=SonatelInvoice.Status.CONTESTED).exclude(
+        # Même règle que _apply_scope_to_invoice_qs, adaptée à MonthlySynthesis
+        # (source = FK vers SonatelInvoice).
+        needs_review = CertificationResult.objects.filter(
+            invoice=OuterRef("source"),
+            status=CertificationResult.Status.NEEDS_REVIEW,
+        )
+        return qs.filter(Exists(needs_review)).exclude(
             source__payment_status=SonatelInvoice.PaymentStatus.PAID
         )
 
@@ -595,6 +611,7 @@ class ImportBatchViewSet(viewsets.GenericViewSet, mixins.ListModelMixin):
     queryset = ImportBatch.objects.all().order_by("-imported_at")
     serializer_class = ImportBatchSerializer
     parser_classes = (MultiPartParser, FormParser)
+    
 
     @action(methods=["get"], detail=True, url_path="issues")
     def issues(self, request, pk=None):
@@ -1029,8 +1046,13 @@ class SonatelBillingStatsAPIView(APIView):
             Q(payment_status=SonatelInvoice.PaymentStatus.PAID)
             | Q(status=SonatelInvoice.Status.VALIDATED)
         )
+        # "Contestée" = résultat de certification "À analyser" (NEEDS_REVIEW),
+        # voir la même remarque Exists() que dans _apply_scope_to_invoice_qs.
         contested_filter = (
-            Q(status=SonatelInvoice.Status.CONTESTED)
+            Q(Exists(CertificationResult.objects.filter(
+                invoice=OuterRef("pk"),
+                status=CertificationResult.Status.NEEDS_REVIEW,
+            )))
             & ~Q(payment_status=SonatelInvoice.PaymentStatus.PAID)
         )
         created_filter = (

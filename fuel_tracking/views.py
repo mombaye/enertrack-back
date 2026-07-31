@@ -7,6 +7,7 @@ from math import ceil
 
 logger = logging.getLogger(__name__)
 
+from django.core.cache import cache
 from django.db.models import Count, Max, Q, Sum
 from django.utils import timezone
 from django.utils.dateparse import parse_date
@@ -42,7 +43,52 @@ ANOMALY_CODES = [
     "HIGH_MONITORING_UNAVAILABILITY",
 ]
 
+# Durée de cache des lectures vers des sources externes lentes (Mongo ENOC,
+# Snowflake) — ces référentiels/relevés changent rarement d'une requête à
+# l'autre, donc on peut les servir depuis Redis sans repayer la latence réseau.
+CACHE_TTL_EXTERNAL_REF = 1800  # 30 min
+
 SITE_MODEL_CACHE = None
+
+
+def _cached_batch(cache_prefix, ids, ttl, fetch_missing):
+    """
+    Récupère un batch de valeurs (une par id) depuis le cache Redis, et n'appelle
+    `fetch_missing(missing_ids)` — coûteux (connexion Mongo/Snowflake) — que pour
+    les ids absents du cache. Une fois qu'un site a été résolu pour une clé donnée
+    (ex: site+mois), les requêtes suivantes (autre filtre, autre page, autre
+    utilisateur) sont servies instantanément depuis le cache.
+
+    `fetch_missing` peut lever une exception (source externe indisponible) :
+    elle est propagée telle quelle, rien n'est mis en cache dans ce cas — on ne
+    veut jamais figer une panne temporaire comme "pas de données" pendant 30 min.
+    """
+    ids = sorted({str(i).strip() for i in ids if i and str(i).strip()})
+    if not ids:
+        return {}
+
+    keys = {i: f"{cache_prefix}:{i}" for i in ids}
+    cached = cache.get_many(list(keys.values()))
+
+    result = {}
+    missing_ids = []
+    for i in ids:
+        key = keys[i]
+        if key in cached:
+            result[i] = cached[key]
+        else:
+            missing_ids.append(i)
+
+    if missing_ids:
+        fresh = fetch_missing(missing_ids)
+        to_cache = {}
+        for i in missing_ids:
+            value = fresh.get(i)
+            result[i] = value
+            to_cache[keys[i]] = value
+        cache.set_many(to_cache, timeout=ttl)
+
+    return result
 
 
 def _get_site_model():
@@ -185,18 +231,19 @@ def _load_enoc_mongo_refs(site_ids):
     MongoDB ENOC — indépendant des mouvements carburant du mois, contourne
     l'API REST ENOC (en panne). Tolérant aux pannes : retourne des dicts vides
     si MongoDB est injoignable plutôt que de casser tout l'endpoint.
-    """
-    clean_ids = sorted({str(sid).strip() for sid in site_ids if sid and str(sid).strip()})
-    if not clean_ids:
-        return {}, {}, {}
 
-    try:
+    Mis en cache par site (30 min) : chaque appel ouvre plusieurs connexions
+    Mongo (une par collection), donc seuls les sites absents du cache
+    déclenchent un aller-retour réseau — les requêtes suivantes (autre filtre,
+    autre page, autre utilisateur) sont servies instantanément.
+    """
+    def fetch_missing(missing_ids):
         from fuel_tracking.services.enoc_mongo_service import EnocMongoService
         from fuel_tracking.services.genset_curve_matching import match_genset_curve
         from fuel_tracking.services.cph_matrix_matching import match_cph_target
 
         svc = EnocMongoService()
-        ge_assets = svc.get_ge_assets(clean_ids)
+        ge_assets = svc.get_ge_assets(missing_ids)
 
         for assets in ge_assets.values():
             for asset in assets:
@@ -205,10 +252,36 @@ def _load_enoc_mongo_refs(site_ids):
                 )
                 asset["cph_target"] = match_cph_target(asset.get("brand"), asset.get("power_kva"))
 
-        return svc.get_sites_ref(clean_ids), ge_assets, svc.get_fuel_targets(clean_ids)
+        sites_ref = svc.get_sites_ref(missing_ids)
+        fuel_targets = svc.get_fuel_targets(missing_ids)
+
+        return {
+            sid: {
+                "site_ref": sites_ref.get(sid),
+                "ge_assets": ge_assets.get(sid, []),
+                "fuel_target": fuel_targets.get(sid),
+            }
+            for sid in missing_ids
+        }
+
+    try:
+        by_site = _cached_batch("fuel:enoc_mongo_ref", site_ids, CACHE_TTL_EXTERNAL_REF, fetch_missing)
     except Exception as e:
         logger.warning("[fuel_tracking] Référentiel MongoDB ENOC indisponible: %s", e)
         return {}, {}, {}
+
+    sites_ref, ge_assets, fuel_targets = {}, {}, {}
+    for sid, payload in by_site.items():
+        if not payload:
+            continue
+        if payload.get("site_ref"):
+            sites_ref[sid] = payload["site_ref"]
+        if payload.get("ge_assets"):
+            ge_assets[sid] = payload["ge_assets"]
+        if payload.get("fuel_target") is not None:
+            fuel_targets[sid] = payload["fuel_target"]
+
+    return sites_ref, ge_assets, fuel_targets
 
 
 def _load_rh_initial(country, site_ids, prev_month, prev_start, prev_end):
