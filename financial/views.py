@@ -2248,7 +2248,6 @@ class SuiviConsoView(APIView):
                 conso_kwh=Sum("conso"),
                 montant_ht=Sum("montant_hors_tva"),
                 montant_energie=Sum("montant_energie"),
-                nb_jours=Sum("days_covered"),
             )
             .order_by("source__site__site_id", "year", "month")
         )
@@ -2424,21 +2423,20 @@ class SuiviConsoView(APIView):
                 if not ev or ev.get("marge_statut") != statut.upper():
                     continue
 
-            nb_jours = (
-                bill.get("nb_jours")
-                or est.get("nb_jours_mois")
-                or calendar.monthrange(year, month)[1]
-            )
+            # nb_jours = nombre de jours calendaires du mois considéré, point.
+            # Plus aucune dépendance aux données de facturation (period_start/
+            # end, days_covered, nb_jours_factures...) : c'était la source de
+            # tous les bugs précédents (doublement, factures dupliquées, etc.).
+            nb_jours = calendar.monthrange(year, month)[1]
 
-            # Cible catalogue
+            # Cible catalogue : conso_target = nb_jours × cible_kwh_j
             cible_j = ev.get("fee_rule__cible_kwh_j")
             cible_fix = ev.get("fee_rule__cible_kwh")
-            nb_j_fact = ev.get("nb_jours_factures") or nb_jours
 
             if cible_j is not None:
                 try:
                     conso_target = str(
-                        (_d(cible_j) * _d(nb_j_fact)).quantize(
+                        (_d(cible_j) * _d(nb_jours)).quantize(
                             Decimal("0.001"),
                             rounding=ROUND_HALF_UP,
                         )
