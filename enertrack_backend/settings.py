@@ -207,6 +207,9 @@ CACHES = {
 # juste loggés en console pour ne jamais bloquer le workflow tant que le SMTP n'est pas configuré.
 EMAIL_BACKEND = os.environ.get("EMAIL_BACKEND", "django.core.mail.backends.console.EmailBackend")
 DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "noreply@enertrack.local")
+
+# URL du frontend, utilisée dans les emails transactionnels (compte créé/désactivé...)
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://egrid.camusatsn.com")
 EMAIL_HOST = os.environ.get("EMAIL_HOST", "")
 EMAIL_PORT = int(os.environ.get("EMAIL_PORT", 587))
 EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", "")

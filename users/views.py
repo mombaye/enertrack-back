@@ -10,6 +10,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.views import TokenObtainPairView
 
+from .emails import send_account_created_email, send_account_deactivated_email
 from .models import CustomUser
 from .serializers import (
     CustomTokenObtainPairSerializer,
@@ -102,8 +103,12 @@ class UserViewSet(
 
     def perform_create(self, serializer):
         _require_admin(self.request.user)
+        # Capturé avant .save() : UserCreateSerializer.create() consomme (pop) le
+        # mot de passe du validated_data au moment de créer l'utilisateur.
+        password = serializer.validated_data.get("password")
         user = serializer.save()
         logger.info(f"[USERS] Créé par {self.request.user}: {user.username} (role={user.role})")
+        send_account_created_email(user, password)
 
     def perform_update(self, serializer):
         _require_admin(self.request.user)
@@ -148,6 +153,8 @@ class UserViewSet(
         user.save(update_fields=["is_active"])
         action_str = "activé" if user.is_active else "désactivé"
         logger.info(f"[USERS] {user.username} {action_str} par {request.user}")
+        if not user.is_active:
+            send_account_deactivated_email(user)
         return Response({
             "id":        user.id,
             "username":  user.username,
