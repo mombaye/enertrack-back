@@ -59,7 +59,11 @@ services:
     build:
       context: .
       dockerfile: docker/backend/Dockerfile
-    command: python manage.py runserver 0.0.0.0:8000
+    # Au démarrage : recalcule FinancialEvaluation sur les 3 derniers mois
+    # (correctifs de calcul repris automatiquement, sans passer par le
+    # bouton "Recalculer" de l'UI) puis lance le serveur. Le `;` (pas `&&`)
+    # garantit que le serveur démarre même si le recalcul échoue.
+    command: sh -c "python manage.py recompute_financial_evaluations --months=3; python manage.py runserver 0.0.0.0:8000"
     volumes:
       - .:/code
     ports:

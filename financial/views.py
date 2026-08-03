@@ -1029,8 +1029,351 @@ class SiteMonthlyLoadUpdateView(APIView):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# VIEW 3 : Calcul batch FinancialEvaluation
+# Calcul batch FinancialEvaluation pour un (year, month) donné.
+# Extrait de FinancialEvaluateView.post() pour être réutilisable depuis la
+# commande de management recompute_financial_evaluations (recalcul automatique
+# au démarrage du conteneur, cf. docker-compose.yml).
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _run_financial_evaluation(year: int, month: int) -> dict:
+    from django.db.models import Min
+
+    links = (
+        ContractSiteLink.objects
+        .select_related("site")
+        .filter(
+            site__invoice_payment__iexact="Aktivco",
+            site__grid_fee=True,
+        )
+    )
+
+    contract_ids = list(links.values_list("numero_compte_contrat", flat=True))
+    site_pks = list(links.values_list("site_id", flat=True))
+
+    # ─────────────────────────────────────────────────────────────
+    # 1) Loads mensuels
+    # ─────────────────────────────────────────────────────────────
+    load_map: dict[int, int] = dict(
+        SiteMonthlyLoad.objects
+        .filter(year=year, month=month)
+        .values_list("site_id", "load_w")
+    )
+
+    # ─────────────────────────────────────────────────────────────
+    # 2) Factures PAID / UNPAID / BRUTES
+    # ─────────────────────────────────────────────────────────────
+    billing_qs = (
+        BillingMonthlySynthesis.objects
+        .filter(
+            numero_compte_contrat__in=contract_ids,
+            year=year,
+            month=month,
+        )
+        .exclude(source__payment_status="OUT_OF_SCOPE")
+        .values("numero_compte_contrat")
+        .annotate(
+            montant_paid=Sum(
+                "montant_hors_tva",
+                filter=Q(source__payment_status="PAID"),
+            ),
+            montant_unpaid=Sum(
+                "montant_hors_tva",
+                filter=Q(source__payment_status="UNPAID"),
+            ),
+            montant_raw=Sum(
+                "montant_hors_tva",
+                filter=Q(source__payment_status__in=["PAID", "UNPAID"]),
+            ),
+            paid_count=Count(
+                "source_id",
+                filter=Q(source__payment_status="PAID"),
+                distinct=True,
+            ),
+            unpaid_count=Count(
+                "source_id",
+                filter=Q(source__payment_status="UNPAID"),
+                distinct=True,
+            ),
+            raw_count=Count(
+                "source_id",
+                filter=Q(source__payment_status__in=["PAID", "UNPAID"]),
+                distinct=True,
+            ),
+            first_period_start=Min("period_start"),
+            last_period_end=Max("period_end"),
+        )
+    )
+
+    billing_map = {
+        r["numero_compte_contrat"]: r
+        for r in billing_qs
+    }
+
+    # ─────────────────────────────────────────────────────────────
+    # 3) Estimations du mois
+    # ─────────────────────────────────────────────────────────────
+    estimation_qs = (
+        EstimationResult.objects
+        .select_related("batch", "site")
+        .filter(
+            batch__year=year,
+            batch__month=month,
+            batch__status="DONE",
+            site_id__in=site_pks,
+        )
+    )
+
+    estimation_map = {
+        e.site_id: e
+        for e in estimation_qs
+    }
+
+    evaluations_to_upsert = []
+
+    stats = {
+        "processed": 0,
+        "ok": 0,
+        "nok": 0,
+        "no_load": 0,
+        "no_fee_rule": 0,
+        "no_data": 0,
+        "official_paid": 0,
+        "provisional_raw_unpaid": 0,
+        "provisional_estimation": 0,
+        "raw_invoice_available": 0,
+        "estimation_available": 0,
+        "hors_catalogue": 0,
+        "periode_courte": 0,
+    }
+
+    # ─────────────────────────────────────────────────────────────
+    # 4) Calcul par site
+    # ─────────────────────────────────────────────────────────────
+    for link in links:
+        site = link.site
+        acc = link.numero_compte_contrat
+
+        bill = billing_map.get(acc, {})
+        estimation = estimation_map.get(site.pk)
+
+        paid_count = int(bill.get("paid_count") or 0)
+        unpaid_count = int(bill.get("unpaid_count") or 0)
+        raw_count = int(bill.get("raw_count") or 0)
+
+        montant_paid = _d(bill.get("montant_paid"))
+        montant_unpaid = _d(bill.get("montant_unpaid"))
+        montant_raw = _d(bill.get("montant_raw"))
+
+        montant_estime = None
+        estimation_source = None
+
+        if estimation and estimation.montant_estime is not None:
+            montant_estime = _d(estimation.montant_estime)
+            estimation_source = estimation.source_utilisee
+            stats["estimation_available"] += 1
+
+        if raw_count > 0:
+            stats["raw_invoice_available"] += 1
+
+        # ── Load ─────────────────────────────────────────────────
+        load_w = load_map.get(site.pk) or site.analysis_load
+        if not load_w:
+            stats["no_load"] += 1
+            load_w = None
+
+        # ── Règle redevance ─────────────────────────────────────
+        typo = site.billing_typology or site.installed_typology or site.ordered_typology
+        conf = _norm_config(site.site_type)
+
+        rule, hors_cat = None, False
+        if load_w and typo and conf:
+            rule, hors_cat = _get_fee_rule(typo, conf, load_w)
+
+        if not rule:
+            stats["no_fee_rule"] += 1
+            redevance = None
+        else:
+            redevance = rule.redevance
+            if hors_cat:
+                stats["hors_catalogue"] += 1
+
+        # ── Nombre de jours facture ─────────────────────────────
+        # Clamp à la fenêtre calendaire du mois : first_period_start/
+        # last_period_end viennent d'un Min()/Max() sur toutes les
+        # factures rattachées à (year, month) — si plusieurs factures
+        # non calendaires (cycles Sénélec non alignés) sont rattachées
+        # au même mois, l'écart brut peut dépasser 30j et gonfler la
+        # cible de conso (cible_kwh_j × nb_jours) très au-delà du
+        # mois réel. Même correctif que SiteMargeDetailView.
+        p_start = bill.get("first_period_start")
+        p_end = bill.get("last_period_end")
+
+        if p_start and p_end:
+            from datetime import date as _date
+            _m_last = calendar.monthrange(year, month)[1]
+            _month_s = _date(year, month, 1)
+            _month_e = _date(year, month, _m_last)
+            eff_start = max(p_start, _month_s)
+            eff_end = min(p_end, _month_e)
+            nb_jours = max(0, (eff_end - eff_start).days + 1)
+        else:
+            nb_jours = calendar.monthrange(year, month)[1]
+
+        periode_courte = bool(raw_count > 0 and nb_jours < 15)
+        if periode_courte:
+            stats["periode_courte"] += 1
+
+        # ── Marges comparatives ─────────────────────────────────
+        marge_facture_brute = None
+        marge_estimee = None
+
+        if redevance is not None and raw_count > 0:
+            marge_facture_brute = _q3(_d(redevance) - _d(montant_raw))
+
+        if redevance is not None and montant_estime is not None:
+            marge_estimee = _q3(_d(redevance) - _d(montant_estime))
+
+        # ── Choix du montant principal de calcul ─────────────────
+        montant_base_calcul = None
+        calculation_source = FinancialEvaluation.CalculationSource.NO_DATA
+        is_provisional = True
+        warning = None
+
+        if paid_count > 0:
+            montant_base_calcul = montant_paid
+            calculation_source = FinancialEvaluation.CalculationSource.PAID_INVOICE
+            is_provisional = False
+            stats["official_paid"] += 1
+
+            if unpaid_count > 0:
+                warning = (
+                    "Certaines factures du mois restent non payées. "
+                    "Le calcul officiel utilise uniquement les factures payées."
+                )
+
+        elif unpaid_count > 0:
+            montant_base_calcul = montant_unpaid
+            calculation_source = FinancialEvaluation.CalculationSource.RAW_UNPAID_INVOICE
+            is_provisional = True
+            stats["provisional_raw_unpaid"] += 1
+            warning = (
+                "Factures du mois non payées : calcul provisoire basé sur les factures brutes. "
+                "Une comparaison avec l'estimation est disponible."
+            )
+
+        elif montant_estime is not None:
+            montant_base_calcul = montant_estime
+            calculation_source = FinancialEvaluation.CalculationSource.ESTIMATION_ONLY
+            is_provisional = True
+            stats["provisional_estimation"] += 1
+            warning = (
+                "Aucune facture disponible pour ce mois : calcul provisoire basé sur l'estimation."
+            )
+
+        else:
+            stats["no_data"] += 1
+            warning = (
+                "Aucune facture payée, aucune facture brute et aucune estimation disponible."
+            )
+
+        # ── Calcul marge principale ──────────────────────────────
+        if periode_courte and montant_base_calcul is not None and calculation_source in (
+            FinancialEvaluation.CalculationSource.PAID_INVOICE,
+            FinancialEvaluation.CalculationSource.RAW_UNPAID_INVOICE,
+        ):
+            marge = DEC0
+            statut = FinancialEvaluation.MargeStatut.OK
+
+        elif redevance is not None and montant_base_calcul is not None:
+            marge = _q3(_d(redevance) - _d(montant_base_calcul))
+            statut = (
+                FinancialEvaluation.MargeStatut.OK
+                if marge >= DEC0
+                else FinancialEvaluation.MargeStatut.NOK
+            )
+        else:
+            marge = None
+            statut = None
+
+        evaluations_to_upsert.append({
+            "site": site,
+            "year": year,
+            "month": month,
+
+            "load_w": load_w,
+            "typology": typo,
+            "configuration": conf,
+
+            "fee_rule": rule,
+            "fee_rule_load_w": rule.load_w if rule else None,
+            "redevance": redevance,
+            "hors_catalogue": hors_cat,
+
+            # Compatibilité ancienne UI :
+            # montant_htva_reel = montant réellement utilisé pour calculer la marge
+            "montant_htva_reel": montant_base_calcul,
+
+            # Nouvelle traçabilité
+            "calculation_source": calculation_source,
+            "is_provisional": is_provisional,
+            "calculation_warning": warning,
+
+            "montant_base_calcul": montant_base_calcul,
+            "montant_factures_payees": montant_paid if paid_count > 0 else None,
+            "montant_factures_brutes": montant_raw if raw_count > 0 else None,
+            "montant_factures_non_payees": montant_unpaid if unpaid_count > 0 else None,
+            "montant_estime": montant_estime,
+
+            "marge_facture_brute": marge_facture_brute,
+            "marge_estimee": marge_estimee,
+
+            "paid_invoice_count": paid_count,
+            "unpaid_invoice_count": unpaid_count,
+            "raw_invoice_count": raw_count,
+
+            "has_invoice_for_month": raw_count > 0,
+            "has_unpaid_invoice": unpaid_count > 0,
+            "estimation_source": estimation_source,
+
+            "marge": marge,
+            "marge_statut": statut,
+            "periode_courte": periode_courte,
+            "nb_jours_factures": nb_jours,
+        })
+
+        stats["processed"] += 1
+
+        if statut == FinancialEvaluation.MargeStatut.OK:
+            stats["ok"] += 1
+        elif statut == FinancialEvaluation.MargeStatut.NOK:
+            stats["nok"] += 1
+
+    # ─────────────────────────────────────────────────────────────
+    # 5) Upsert + recalcul récurrence
+    # ─────────────────────────────────────────────────────────────
+    with transaction.atomic():
+        for ev in evaluations_to_upsert:
+            site = ev.pop("site")
+
+            obj, _ = FinancialEvaluation.objects.update_or_create(
+                site=site,
+                year=year,
+                month=month,
+                defaults=ev,
+            )
+
+            nb_nok, rec_type = _compute_recurrence(site.pk, year, month)
+
+            if obj.recurrence_mois_nok != nb_nok or obj.recurrence_type != rec_type:
+                obj.recurrence_mois_nok = nb_nok
+                obj.recurrence_type = rec_type
+                obj.save(update_fields=["recurrence_mois_nok", "recurrence_type"])
+
+    return {
+        "message": f"Évaluation financière {year}-{month:02d} terminée.",
+        **stats,
+    }
+
 
 class FinancialEvaluateView(APIView):
     """
@@ -1046,8 +1389,6 @@ class FinancialEvaluateView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, *args, **kwargs):
-        from django.db.models import Min
-
         year = request.data.get("year")
         month = request.data.get("month")
 
@@ -1061,331 +1402,8 @@ class FinancialEvaluateView(APIView):
         except (ValueError, TypeError):
             return Response({"detail": "year/month invalides."}, status=400)
 
-        links = (
-            ContractSiteLink.objects
-            .select_related("site")
-            .filter(
-                site__invoice_payment__iexact="Aktivco",
-                site__grid_fee=True,
-            )
-        )
-
-        contract_ids = list(links.values_list("numero_compte_contrat", flat=True))
-        site_pks = list(links.values_list("site_id", flat=True))
-
-        # ─────────────────────────────────────────────────────────────
-        # 1) Loads mensuels
-        # ─────────────────────────────────────────────────────────────
-        load_map: dict[int, int] = dict(
-            SiteMonthlyLoad.objects
-            .filter(year=year, month=month)
-            .values_list("site_id", "load_w")
-        )
-
-        # ─────────────────────────────────────────────────────────────
-        # 2) Factures PAID / UNPAID / BRUTES
-        # ─────────────────────────────────────────────────────────────
-        billing_qs = (
-            BillingMonthlySynthesis.objects
-            .filter(
-                numero_compte_contrat__in=contract_ids,
-                year=year,
-                month=month,
-            )
-            .exclude(source__payment_status="OUT_OF_SCOPE")
-            .values("numero_compte_contrat")
-            .annotate(
-                montant_paid=Sum(
-                    "montant_hors_tva",
-                    filter=Q(source__payment_status="PAID"),
-                ),
-                montant_unpaid=Sum(
-                    "montant_hors_tva",
-                    filter=Q(source__payment_status="UNPAID"),
-                ),
-                montant_raw=Sum(
-                    "montant_hors_tva",
-                    filter=Q(source__payment_status__in=["PAID", "UNPAID"]),
-                ),
-                paid_count=Count(
-                    "source_id",
-                    filter=Q(source__payment_status="PAID"),
-                    distinct=True,
-                ),
-                unpaid_count=Count(
-                    "source_id",
-                    filter=Q(source__payment_status="UNPAID"),
-                    distinct=True,
-                ),
-                raw_count=Count(
-                    "source_id",
-                    filter=Q(source__payment_status__in=["PAID", "UNPAID"]),
-                    distinct=True,
-                ),
-                first_period_start=Min("period_start"),
-                last_period_end=Max("period_end"),
-            )
-        )
-
-        billing_map = {
-            r["numero_compte_contrat"]: r
-            for r in billing_qs
-        }
-
-        # ─────────────────────────────────────────────────────────────
-        # 3) Estimations du mois
-        # ─────────────────────────────────────────────────────────────
-        estimation_qs = (
-            EstimationResult.objects
-            .select_related("batch", "site")
-            .filter(
-                batch__year=year,
-                batch__month=month,
-                batch__status="DONE",
-                site_id__in=site_pks,
-            )
-        )
-
-        estimation_map = {
-            e.site_id: e
-            for e in estimation_qs
-        }
-
-        evaluations_to_upsert = []
-
-        stats = {
-            "processed": 0,
-            "ok": 0,
-            "nok": 0,
-            "no_load": 0,
-            "no_fee_rule": 0,
-            "no_data": 0,
-            "official_paid": 0,
-            "provisional_raw_unpaid": 0,
-            "provisional_estimation": 0,
-            "raw_invoice_available": 0,
-            "estimation_available": 0,
-            "hors_catalogue": 0,
-            "periode_courte": 0,
-        }
-
-        # ─────────────────────────────────────────────────────────────
-        # 4) Calcul par site
-        # ─────────────────────────────────────────────────────────────
-        for link in links:
-            site = link.site
-            acc = link.numero_compte_contrat
-
-            bill = billing_map.get(acc, {})
-            estimation = estimation_map.get(site.pk)
-
-            paid_count = int(bill.get("paid_count") or 0)
-            unpaid_count = int(bill.get("unpaid_count") or 0)
-            raw_count = int(bill.get("raw_count") or 0)
-
-            montant_paid = _d(bill.get("montant_paid"))
-            montant_unpaid = _d(bill.get("montant_unpaid"))
-            montant_raw = _d(bill.get("montant_raw"))
-
-            montant_estime = None
-            estimation_source = None
-
-            if estimation and estimation.montant_estime is not None:
-                montant_estime = _d(estimation.montant_estime)
-                estimation_source = estimation.source_utilisee
-                stats["estimation_available"] += 1
-
-            if raw_count > 0:
-                stats["raw_invoice_available"] += 1
-
-            # ── Load ─────────────────────────────────────────────────
-            load_w = load_map.get(site.pk) or site.analysis_load
-            if not load_w:
-                stats["no_load"] += 1
-                load_w = None
-
-            # ── Règle redevance ─────────────────────────────────────
-            typo = site.billing_typology or site.installed_typology or site.ordered_typology
-            conf = _norm_config(site.site_type)
-
-            rule, hors_cat = None, False
-            if load_w and typo and conf:
-                rule, hors_cat = _get_fee_rule(typo, conf, load_w)
-
-            if not rule:
-                stats["no_fee_rule"] += 1
-                redevance = None
-            else:
-                redevance = rule.redevance
-                if hors_cat:
-                    stats["hors_catalogue"] += 1
-
-            # ── Nombre de jours facture ─────────────────────────────
-            p_start = bill.get("first_period_start")
-            p_end = bill.get("last_period_end")
-
-            if p_start and p_end:
-                nb_jours = (p_end - p_start).days + 1
-            else:
-                nb_jours = calendar.monthrange(year, month)[1]
-
-            periode_courte = bool(raw_count > 0 and nb_jours < 15)
-            if periode_courte:
-                stats["periode_courte"] += 1
-
-            # ── Marges comparatives ─────────────────────────────────
-            marge_facture_brute = None
-            marge_estimee = None
-
-            if redevance is not None and raw_count > 0:
-                marge_facture_brute = _q3(_d(redevance) - _d(montant_raw))
-
-            if redevance is not None and montant_estime is not None:
-                marge_estimee = _q3(_d(redevance) - _d(montant_estime))
-
-            # ── Choix du montant principal de calcul ─────────────────
-            montant_base_calcul = None
-            calculation_source = FinancialEvaluation.CalculationSource.NO_DATA
-            is_provisional = True
-            warning = None
-
-            if paid_count > 0:
-                montant_base_calcul = montant_paid
-                calculation_source = FinancialEvaluation.CalculationSource.PAID_INVOICE
-                is_provisional = False
-                stats["official_paid"] += 1
-
-                if unpaid_count > 0:
-                    warning = (
-                        "Certaines factures du mois restent non payées. "
-                        "Le calcul officiel utilise uniquement les factures payées."
-                    )
-
-            elif unpaid_count > 0:
-                montant_base_calcul = montant_unpaid
-                calculation_source = FinancialEvaluation.CalculationSource.RAW_UNPAID_INVOICE
-                is_provisional = True
-                stats["provisional_raw_unpaid"] += 1
-                warning = (
-                    "Factures du mois non payées : calcul provisoire basé sur les factures brutes. "
-                    "Une comparaison avec l'estimation est disponible."
-                )
-
-            elif montant_estime is not None:
-                montant_base_calcul = montant_estime
-                calculation_source = FinancialEvaluation.CalculationSource.ESTIMATION_ONLY
-                is_provisional = True
-                stats["provisional_estimation"] += 1
-                warning = (
-                    "Aucune facture disponible pour ce mois : calcul provisoire basé sur l'estimation."
-                )
-
-            else:
-                stats["no_data"] += 1
-                warning = (
-                    "Aucune facture payée, aucune facture brute et aucune estimation disponible."
-                )
-
-            # ── Calcul marge principale ──────────────────────────────
-            if periode_courte and montant_base_calcul is not None and calculation_source in (
-                FinancialEvaluation.CalculationSource.PAID_INVOICE,
-                FinancialEvaluation.CalculationSource.RAW_UNPAID_INVOICE,
-            ):
-                marge = DEC0
-                statut = FinancialEvaluation.MargeStatut.OK
-
-            elif redevance is not None and montant_base_calcul is not None:
-                marge = _q3(_d(redevance) - _d(montant_base_calcul))
-                statut = (
-                    FinancialEvaluation.MargeStatut.OK
-                    if marge >= DEC0
-                    else FinancialEvaluation.MargeStatut.NOK
-                )
-            else:
-                marge = None
-                statut = None
-
-            evaluations_to_upsert.append({
-                "site": site,
-                "year": year,
-                "month": month,
-
-                "load_w": load_w,
-                "typology": typo,
-                "configuration": conf,
-
-                "fee_rule": rule,
-                "fee_rule_load_w": rule.load_w if rule else None,
-                "redevance": redevance,
-                "hors_catalogue": hors_cat,
-
-                # Compatibilité ancienne UI :
-                # montant_htva_reel = montant réellement utilisé pour calculer la marge
-                "montant_htva_reel": montant_base_calcul,
-
-                # Nouvelle traçabilité
-                "calculation_source": calculation_source,
-                "is_provisional": is_provisional,
-                "calculation_warning": warning,
-
-                "montant_base_calcul": montant_base_calcul,
-                "montant_factures_payees": montant_paid if paid_count > 0 else None,
-                "montant_factures_brutes": montant_raw if raw_count > 0 else None,
-                "montant_factures_non_payees": montant_unpaid if unpaid_count > 0 else None,
-                "montant_estime": montant_estime,
-
-                "marge_facture_brute": marge_facture_brute,
-                "marge_estimee": marge_estimee,
-
-                "paid_invoice_count": paid_count,
-                "unpaid_invoice_count": unpaid_count,
-                "raw_invoice_count": raw_count,
-
-                "has_invoice_for_month": raw_count > 0,
-                "has_unpaid_invoice": unpaid_count > 0,
-                "estimation_source": estimation_source,
-
-                "marge": marge,
-                "marge_statut": statut,
-                "periode_courte": periode_courte,
-                "nb_jours_factures": nb_jours,
-            })
-
-            stats["processed"] += 1
-
-            if statut == FinancialEvaluation.MargeStatut.OK:
-                stats["ok"] += 1
-            elif statut == FinancialEvaluation.MargeStatut.NOK:
-                stats["nok"] += 1
-
-        # ─────────────────────────────────────────────────────────────
-        # 5) Upsert + recalcul récurrence
-        # ─────────────────────────────────────────────────────────────
-        with transaction.atomic():
-            for ev in evaluations_to_upsert:
-                site = ev.pop("site")
-
-                obj, _ = FinancialEvaluation.objects.update_or_create(
-                    site=site,
-                    year=year,
-                    month=month,
-                    defaults=ev,
-                )
-
-                nb_nok, rec_type = _compute_recurrence(site.pk, year, month)
-
-                if obj.recurrence_mois_nok != nb_nok or obj.recurrence_type != rec_type:
-                    obj.recurrence_mois_nok = nb_nok
-                    obj.recurrence_type = rec_type
-                    obj.save(update_fields=["recurrence_mois_nok", "recurrence_type"])
-
-        return Response(
-            {
-                "message": f"Évaluation financière {year}-{month:02d} terminée.",
-                **stats,
-            },
-            status=status.HTTP_200_OK,
-        )
+        result = _run_financial_evaluation(year, month)
+        return Response(result, status=status.HTTP_200_OK)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # VIEW 4b : Agrégats stats (pour les cards) — séparé de la liste paginée
