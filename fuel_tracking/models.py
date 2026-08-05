@@ -430,3 +430,44 @@ class FuelCommandeSynthese(models.Model):
 
     def __str__(self):
         return f"{self.month_year} · {self.group_type} · {self.label}"
+
+
+class FuelSuiviCommandeSite(models.Model):
+    """
+    Snapshot mensuel par site de la feuille "Suivis commande" du fichier
+    Excel "Commande FUEL ESCO SENEGAL <mois>" — import brut, sans recalcul,
+    limité aux colonnes mises en évidence en bleu (fond bleu, thème "Accent 1")
+    dans le fichier source : ce sont les variables que l'équipe Ops considère
+    importantes sur cette feuille très large (139 colonnes au total). Même
+    fichier que FuelCommandeSynthese, même mois — importé en même temps.
+    """
+
+    month_year = models.CharField(max_length=7, db_index=True)  # YYYY-MM
+
+    site_id = models.CharField(max_length=64, db_index=True)
+    site_name = models.CharField(max_length=255, null=True, blank=True)
+    typologie_contractuelle = models.CharField(max_length=128, null=True, blank=True)
+    load_commande = models.DecimalField(**DECIMAL_KWARGS)
+    indoor_outdoor = models.CharField(max_length=32, null=True, blank=True)
+    longitude = models.FloatField(null=True, blank=True)
+    batch = models.CharField(max_length=128, null=True, blank=True)
+    typologie_facturee = models.CharField(max_length=128, null=True, blank=True)
+    conso_moy_jour_l = models.DecimalField(**DECIMAL_KWARGS)
+    commande_sans_marge_l = models.DecimalField(**DECIMAL_KWARGS)
+    commande_avec_marge_l = models.DecimalField(**DECIMAL_KWARGS)
+    estimation_stock_final_l = models.DecimalField(**DECIMAL_KWARGS)
+    typo_operations = models.CharField(max_length=128, null=True, blank=True)
+
+    source_filename = models.CharField(max_length=255, null=True, blank=True)
+    imported_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        verbose_name = "Suivi commande carburant par site (import mensuel)"
+        verbose_name_plural = "Suivis commande carburant par site (imports mensuels)"
+        ordering = ["-month_year", "site_id"]
+        indexes = [
+            models.Index(fields=["month_year", "site_id"]),
+        ]
+
+    def __str__(self):
+        return f"{self.month_year} · {self.site_id}"

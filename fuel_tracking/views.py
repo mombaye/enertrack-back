@@ -94,9 +94,15 @@ class FuelCommandeSyntheseImportView(APIView):
     l'utilisateur au moment de l'upload — obligatoires, pas de détection
     automatique depuis le fichier ici (peu fiable d'un mois à l'autre, voir
     fuel_tracking/services/commande_synthese_import.py). On enregistre le
-    fichier tel quel dans data_imports/ (traçabilité) puis on en extrait la
-    feuille "Synthèse Commande" via le même parseur que la commande de
-    gestion import_commande_synthese : import brut, sans recalcul.
+    fichier tel quel dans data_imports/ (traçabilité) puis on en extrait :
+      - la feuille "Synthèse Commande" (import brut, voir
+        commande_synthese_import.py) ;
+      - la feuille "Suivis commande" (import brut des colonnes mises en
+        bleu dans le fichier source uniquement, voir
+        suivi_commande_import.py), pour le même mois.
+    Si la 2e feuille échoue (absente/renommée un mois donné), on ne bloque
+    pas l'import de la Synthèse Commande — l'échec est juste signalé dans
+    la réponse.
     """
     parser_classes = [MultiPartParser]
     permission_classes = [IsAuthenticated]
@@ -109,6 +115,10 @@ class FuelCommandeSyntheseImportView(APIView):
             CommandeSyntheseImportError,
             import_commande_synthese_file,
             validate_month_year,
+        )
+        from fuel_tracking.services.suivi_commande_import import (
+            SuiviCommandeImportError,
+            import_suivi_commande_file,
         )
 
         f = request.FILES.get("file")
@@ -148,4 +158,117 @@ class FuelCommandeSyntheseImportView(APIView):
             logger.exception("Échec import Synthèse Commande depuis %s", f.name)
             return Response({"detail": f"Erreur lors de la lecture du fichier : {e}"}, status=400)
 
-        return Response({"month_year": resolved_month_year, "rows_imported": rows_imported, "filename": f.name})
+        suivi_commande_rows_imported = None
+        suivi_commande_error = None
+        try:
+            suivi_commande_rows_imported = import_suivi_commande_file(str(dest_path), month_year=resolved_month_year)
+        except SuiviCommandeImportError as e:
+            suivi_commande_error = str(e)
+        except Exception as e:
+            logger.exception("Échec import Suivis commande depuis %s", f.name)
+            suivi_commande_error = f"Erreur lors de la lecture de la feuille Suivis commande : {e}"
+
+        return Response({
+            "month_year": resolved_month_year,
+            "rows_imported": rows_imported,
+            "filename": f.name,
+            "suivi_commande_rows_imported": suivi_commande_rows_imported,
+            "suivi_commande_error": suivi_commande_error,
+        })
+
+
+class FuelSuiviCommandeListView(APIView):
+    """
+    GET /api/fuel-tracking/suivi-commande/?month=YYYY-MM&search=&page=&limit=
+
+    Liste paginée du snapshot par site (FuelSuiviCommandeSite) — import brut
+    des colonnes mises en bleu de la feuille "Suivis commande", sans
+    recalcul. Sans mois demandé (ou si absent), retourne le mois le plus
+    récent disponible. `search` filtre sur site_id/site_name (icontains).
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from fuel_tracking.models import FuelSuiviCommandeSite
+
+        available_months = list(
+            FuelSuiviCommandeSite.objects.order_by("-month_year")
+            .values_list("month_year", flat=True)
+            .distinct()
+        )
+
+        month = request.query_params.get("month")
+        if not month:
+            if not available_months:
+                return Response({"month_year": None, "data": [], "pagination": None, "available_months": [], "kpis": None})
+            month = available_months[0]
+
+        qs = FuelSuiviCommandeSite.objects.filter(month_year=month).order_by("site_id")
+
+        search = (request.query_params.get("search") or "").strip()
+        if search:
+            from django.db.models import Q
+            qs = qs.filter(Q(site_id__icontains=search) | Q(site_name__icontains=search))
+
+        from django.db.models import Count, Sum
+        agg = qs.aggregate(
+            total_sites=Count("id"),
+            total_conso_moy_jour_l=Sum("conso_moy_jour_l"),
+            total_commande_sans_marge_l=Sum("commande_sans_marge_l"),
+            total_commande_avec_marge_l=Sum("commande_avec_marge_l"),
+            total_estimation_stock_final_l=Sum("estimation_stock_final_l"),
+        )
+        total = agg["total_sites"]
+        kpis = {
+            "total_sites": total,
+            "total_conso_moy_jour_l": float(agg["total_conso_moy_jour_l"] or 0),
+            "total_commande_sans_marge_l": float(agg["total_commande_sans_marge_l"] or 0),
+            "total_commande_avec_marge_l": float(agg["total_commande_avec_marge_l"] or 0),
+            "total_estimation_stock_final_l": float(agg["total_estimation_stock_final_l"] or 0),
+        }
+
+        try:
+            page = max(1, int(request.query_params.get("page", 1)))
+        except ValueError:
+            page = 1
+        try:
+            limit = min(200, max(1, int(request.query_params.get("limit", 50))))
+        except ValueError:
+            limit = 50
+
+        start = (page - 1) * limit
+        rows = qs[start:start + limit]
+
+        def serialize(row):
+            return {
+                "site_id": row.site_id,
+                "site_name": row.site_name,
+                "typologie_contractuelle": row.typologie_contractuelle,
+                "load_commande": float(row.load_commande),
+                "indoor_outdoor": row.indoor_outdoor,
+                "longitude": row.longitude,
+                "batch": row.batch,
+                "typologie_facturee": row.typologie_facturee,
+                "conso_moy_jour_l": float(row.conso_moy_jour_l),
+                "commande_sans_marge_l": float(row.commande_sans_marge_l),
+                "commande_avec_marge_l": float(row.commande_avec_marge_l),
+                "estimation_stock_final_l": float(row.estimation_stock_final_l),
+                "typo_operations": row.typo_operations,
+            }
+
+        total_pages = max(1, (total + limit - 1) // limit)
+
+        return Response({
+            "month_year": month,
+            "data": [serialize(r) for r in rows],
+            "pagination": {
+                "page": page,
+                "limit": limit,
+                "total": total,
+                "totalPages": total_pages,
+                "hasNext": page < total_pages,
+                "hasPrev": page > 1,
+            },
+            "available_months": available_months,
+            "kpis": kpis,
+        })
