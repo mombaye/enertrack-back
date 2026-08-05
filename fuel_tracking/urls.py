@@ -3,6 +3,8 @@
 from django.urls import path
 
 from fuel_tracking.views import (
+    FuelCommandeSyntheseImportView,
+    FuelCommandeSyntheseView,
     FuelCphMatrixView,
     FuelEfmsDashboardView,
     FuelEfmsMonthlyListView,
@@ -26,5 +28,7 @@ urlpatterns = [
     path("sync-runs/", FuelSyncRunsView.as_view(), name="fuel-sync-runs"),
     path("sites/", FuelSiteReferenceView.as_view(), name="fuel-site-reference"),
     path("cph-matrix/", FuelCphMatrixView.as_view(), name="fuel-cph-matrix"),
+    path("commande-synthese/", FuelCommandeSyntheseView.as_view(), name="fuel-commande-synthese"),
+    path("commande-synthese/import/", FuelCommandeSyntheseImportView.as_view(), name="fuel-commande-synthese-import"),
     path("export/", FuelTrackingExportView.as_view(), name="fuel-tracking-export"),
 ]

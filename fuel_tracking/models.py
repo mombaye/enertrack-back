@@ -376,3 +376,57 @@ class CphMatrixPoint(models.Model):
 
     def __str__(self):
         return f"{self.engine_family} {self.dg_capacity_kva} kVA @ {float(self.charge_pct):.0%} = {self.cph_l_h} L/h"
+
+
+class FuelCommandeSynthese(models.Model):
+    """
+    Snapshot mensuel de la feuille "Synthèse Commande" du fichier Excel
+    "Commande FUEL ESCO SENEGAL <mois>.xlsb" — import brut, sans recalcul :
+    chaque ligne reprend telle quelle une ligne du tableau (par catégorie/
+    batch ou par typologie facturée), avec les colonnes du mois courant,
+    du mois précédent, et l'écart, déjà calculées dans le fichier source.
+    """
+
+    class GroupType(models.TextChoices):
+        CATEGORIE = "CATEGORIE", "Par catégorie / batch"
+        TYPOLOGIE = "TYPOLOGIE", "Par typologie facturée"
+
+    month_year = models.CharField(max_length=7, db_index=True)  # mois courant, YYYY-MM
+    prev_month_year = models.CharField(max_length=7, null=True, blank=True)
+
+    group_type = models.CharField(max_length=16, choices=GroupType.choices, db_index=True)
+    order_index = models.IntegerField()  # ordre d'apparition dans la feuille source
+    label = models.CharField(max_length=128)
+    is_total_row = models.BooleanField(default=False)  # TOTAL SITES / TOTAL COMMANDE / etc.
+
+    # Mois courant
+    nb_sites = models.DecimalField(**DECIMAL_KWARGS)
+    commande_normale_l = models.DecimalField(**DECIMAL_KWARGS)
+    commande_hivernale_l = models.DecimalField(**DECIMAL_KWARGS)
+    total_l = models.DecimalField(**DECIMAL_KWARGS)
+
+    # Mois précédent
+    nb_sites_prev = models.DecimalField(**DECIMAL_KWARGS)
+    commande_normale_prev_l = models.DecimalField(**DECIMAL_KWARGS)
+    commande_hivernale_prev_l = models.DecimalField(**DECIMAL_KWARGS)
+    total_prev_l = models.DecimalField(**DECIMAL_KWARGS)
+
+    # Écart (déjà calculé dans le fichier source)
+    ecart_sites = models.DecimalField(**DECIMAL_KWARGS)
+    ecart_qte_l = models.DecimalField(**DECIMAL_KWARGS)
+
+    commentaires = models.TextField(null=True, blank=True)
+
+    source_filename = models.CharField(max_length=255, null=True, blank=True)
+    imported_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        verbose_name = "Synthèse commande carburant (import mensuel)"
+        verbose_name_plural = "Synthèses commande carburant (imports mensuels)"
+        ordering = ["-month_year", "group_type", "order_index"]
+        indexes = [
+            models.Index(fields=["month_year", "group_type"]),
+        ]
+
+    def __str__(self):
+        return f"{self.month_year} · {self.group_type} · {self.label}"
