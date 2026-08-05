@@ -2591,7 +2591,13 @@ class SuiviConsoView(APIView):
 
         try:
             page = max(1, int(request.query_params.get("page", 1)))
-            page_size = min(500, max(25, int(request.query_params.get("page_size", 100))))
+            # Plafond élevé (20000) pour permettre au frontend de récupérer
+            # tout le jeu de résultats en 1 seul appel quand il construit les
+            # graphiques d'évolution — result_rows est déjà entièrement
+            # recalculé à chaque requête (voir plus haut), donc paginer par
+            # petits lots (ex: 500) pour tout récupérer forçait des dizaines
+            # d'appels qui refaisaient chacun tout le calcul depuis zéro.
+            page_size = min(20000, max(25, int(request.query_params.get("page_size", 100))))
         except (ValueError, TypeError):
             page, page_size = 1, 100
 
