@@ -26,6 +26,7 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument("--file", required=True, help="Chemin du fichier (relatif au conteneur)")
         parser.add_argument("--month-year", help="Forcer le mois courant au format YYYY-MM (sinon déduit du fichier)")
+        parser.add_argument("--prev-month-year", help="Forcer le mois précédent au format YYYY-MM (sinon mois courant - 1)")
         parser.add_argument("--dry-run", action="store_true")
 
     def handle(self, *args, **options):
@@ -39,7 +40,10 @@ class Command(BaseCommand):
 
         try:
             objects, month_year, prev_ym = parse_commande_synthese(
-                path, month_year=options.get("month_year"), log=self.stdout.write
+                path,
+                month_year=options.get("month_year"),
+                prev_month_year=options.get("prev_month_year"),
+                log=self.stdout.write,
             )
         except (CommandeSyntheseImportError, FileNotFoundError) as e:
             raise CommandError(str(e))

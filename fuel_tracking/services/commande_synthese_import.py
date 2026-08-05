@@ -23,8 +23,14 @@ Colonnes (0-indexées, telles que renvoyées par pyxlsb/openpyxl) :
   I(8)=cmde hivernale précédent         J(9)=total précédent
   K(10)=écart sites   L(11)=écart qté   N(13)=commentaires
 
-Le mois courant/précédent est déduit des libellés du fichier ("Août" /
-"Juillet") + de l'année trouvée dans le nom du fichier (sinon année en cours).
+Le mois courant et le mois précédent sont fournis explicitement par
+l'appelant (obligatoire côté API — voir FuelCommandeSyntheseImportView) :
+la détection automatique depuis les libellés du fichier ("Août" / "Juillet")
+s'est révélée peu fiable (feuille pas toujours structurée pareil d'un mois
+à l'autre), d'où le choix de laisser l'utilisateur les préciser lui-même au
+moment de l'upload plutôt que de deviner. La commande de gestion garde une
+détection automatique en repli, pratique pour les imports en ligne de
+commande, mais accepte aussi --month-year/--prev-month-year en override.
 
 Formats supportés : .xlsb (pyxlsb) et .xlsx/.xlsm (openpyxl) — le fichier
 client est habituellement un .xlsb, mais on reste robuste à un export .xlsx.
@@ -76,11 +82,21 @@ def month_label_to_yyyymm(label, year):
     return f"{year:04d}-{month:02d}"
 
 
-def prev_month_year(yyyymm):
+def derive_prev_month_year(yyyymm):
+    """Mois précédent par défaut (repli CLI uniquement) — yyyymm - 1 mois."""
     year, month = (int(x) for x in yyyymm.split("-"))
     if month == 1:
         return f"{year - 1:04d}-12"
     return f"{year:04d}-{month - 1:02d}"
+
+
+MONTH_YEAR_RE = re.compile(r"^\d{4}-\d{2}$")
+
+
+def validate_month_year(value: str, field_label: str) -> str:
+    if not value or not MONTH_YEAR_RE.match(value):
+        raise CommandeSyntheseImportError(f"{field_label} invalide (attendu YYYY-MM) : {value!r}")
+    return value
 
 
 def _read_sheet_grid(path: str) -> dict:
@@ -119,12 +135,16 @@ def _read_sheet_grid(path: str) -> dict:
     return grid
 
 
-def parse_commande_synthese(path: str, month_year: str | None = None, log=None):
+def parse_commande_synthese(path: str, month_year: str | None = None, prev_month_year: str | None = None, log=None):
     """
     Parse le fichier à `path` et retourne (objects, month_year, prev_month_year)
     — `objects` est une liste d'instances FuelCommandeSynthese non sauvegardées.
     `log` est un callable optionnel (ex: self.stdout.write) pour tracer la
     progression ligne par ligne (utilisé par la commande de gestion).
+
+    `month_year`/`prev_month_year` doivent normalement être fournis par
+    l'appelant (voir docstring module) ; à défaut, on retente une détection
+    automatique depuis le fichier (repli CLI).
     """
     log = log or (lambda msg: None)
 
@@ -135,7 +155,9 @@ def parse_commande_synthese(path: str, month_year: str | None = None, log=None):
     max_row = max(r for r, _ in grid.keys())
     filename = path.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
 
-    if not month_year:
+    if month_year:
+        validate_month_year(month_year, "Mois courant")
+    else:
         year_match = re.search(r"(20\d{2})", filename)
         year = int(year_match.group(1)) if year_match else timezone.now().year
         month_label = grid.get((2, COL_NB_SITES))  # ligne sous-en-tête ("Août")
@@ -144,7 +166,11 @@ def parse_commande_synthese(path: str, month_year: str | None = None, log=None):
             raise CommandeSyntheseImportError(
                 f"Impossible de déduire le mois courant (libellé trouvé : {month_label!r})."
             )
-    prev_ym = prev_month_year(month_year)
+
+    if prev_month_year:
+        prev_ym = validate_month_year(prev_month_year, "Mois précédent")
+    else:
+        prev_ym = derive_prev_month_year(month_year)
     log(f"  Mois courant : {month_year}  |  Mois précédent : {prev_ym}")
 
     objects = []
@@ -204,9 +230,19 @@ def parse_commande_synthese(path: str, month_year: str | None = None, log=None):
     return objects, month_year, prev_ym
 
 
-def import_commande_synthese_file(path: str, month_year: str | None = None, log=None) -> tuple[int, str]:
-    """Parse + écrit en base (remplace les lignes existantes du mois). Retourne (nb_lignes, month_year)."""
-    objects, resolved_month_year, _ = parse_commande_synthese(path, month_year=month_year, log=log)
+def import_commande_synthese_file(
+    path: str, month_year: str | None = None, prev_month_year: str | None = None, log=None
+) -> tuple[int, str]:
+    """
+    Parse + écrit en base. Ne remplace QUE les lignes du mois détecté dans ce
+    fichier (resolved_month_year) — les autres mois déjà importés restent
+    intacts, chacun reste consultable via ?month=YYYY-MM. Réimporter le même
+    mois (ex: nouveau brouillon) remplace proprement ses lignes, sans toucher
+    aux autres mois stockés.
+    """
+    objects, resolved_month_year, _ = parse_commande_synthese(
+        path, month_year=month_year, prev_month_year=prev_month_year, log=log
+    )
 
     FuelCommandeSynthese.objects.filter(month_year=resolved_month_year).delete()
     FuelCommandeSynthese.objects.bulk_create(objects, batch_size=500)

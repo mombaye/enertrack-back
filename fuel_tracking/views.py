@@ -33,12 +33,23 @@ class FuelCommandeSyntheseView(APIView):
     def get(self, request):
         from fuel_tracking.models import FuelCommandeSynthese
 
+        available_months = list(
+            FuelCommandeSynthese.objects.order_by("-month_year")
+            .values_list("month_year", flat=True)
+            .distinct()
+        )
+
         month = request.query_params.get("month")
         if not month:
-            latest = FuelCommandeSynthese.objects.order_by("-month_year").values_list("month_year", flat=True).first()
-            if not latest:
-                return Response({"month_year": None, "prev_month_year": None, "categorie": [], "typologie": []})
-            month = latest
+            if not available_months:
+                return Response({
+                    "month_year": None,
+                    "prev_month_year": None,
+                    "categorie": [],
+                    "typologie": [],
+                    "available_months": [],
+                })
+            month = available_months[0]
 
         rows = FuelCommandeSynthese.objects.filter(month_year=month).order_by("group_type", "order_index")
 
@@ -68,19 +79,24 @@ class FuelCommandeSyntheseView(APIView):
             "prev_month_year": prev_month,
             "categorie": categorie_rows,
             "typologie": typologie_rows,
+            "available_months": available_months,
         })
 
 
 class FuelCommandeSyntheseImportView(APIView):
     """
-    POST /api/fuel-tracking/commande-synthese/import/  (multipart, champ "file")
+    POST /api/fuel-tracking/commande-synthese/import/
+    (multipart, champs "file", "month_year", "prev_month_year")
 
     Upload du classeur Excel mensuel complet "Commande FUEL ESCO SENEGAL
-    <mois>.xlsb" (ou .xlsx) — bouton "Importer" du frontend. On enregistre le
+    <mois>.xlsb" (ou .xlsx) — bouton "Importer" du frontend. Le mois courant
+    et le mois précédent (ex: Août / Juillet) sont fournis explicitement par
+    l'utilisateur au moment de l'upload — obligatoires, pas de détection
+    automatique depuis le fichier ici (peu fiable d'un mois à l'autre, voir
+    fuel_tracking/services/commande_synthese_import.py). On enregistre le
     fichier tel quel dans data_imports/ (traçabilité) puis on en extrait la
     feuille "Synthèse Commande" via le même parseur que la commande de
-    gestion import_commande_synthese (voir fuel_tracking/services/
-    commande_synthese_import.py) : import brut, sans recalcul.
+    gestion import_commande_synthese : import brut, sans recalcul.
     """
     parser_classes = [MultiPartParser]
     permission_classes = [IsAuthenticated]
@@ -92,6 +108,7 @@ class FuelCommandeSyntheseImportView(APIView):
         from fuel_tracking.services.commande_synthese_import import (
             CommandeSyntheseImportError,
             import_commande_synthese_file,
+            validate_month_year,
         )
 
         f = request.FILES.get("file")
@@ -101,6 +118,16 @@ class FuelCommandeSyntheseImportView(APIView):
         allowed_ext = (".xlsb", ".xlsx", ".xlsm")
         if not f.name.lower().endswith(allowed_ext):
             return Response({"detail": f"Format non supporté. Attendu : {', '.join(allowed_ext)}"}, status=400)
+
+        month_year = request.data.get("month_year")
+        prev_month_year = request.data.get("prev_month_year")
+        try:
+            validate_month_year(month_year, "Mois concerné")
+            validate_month_year(prev_month_year, "Mois précédent")
+        except CommandeSyntheseImportError as e:
+            return Response({"detail": str(e)}, status=400)
+        if month_year == prev_month_year:
+            return Response({"detail": "Le mois concerné et le mois précédent doivent être différents."}, status=400)
 
         dest_dir = Path(settings.BASE_DIR) / "data_imports"
         dest_dir.mkdir(parents=True, exist_ok=True)
@@ -112,11 +139,13 @@ class FuelCommandeSyntheseImportView(APIView):
                 out.write(chunk)
 
         try:
-            rows_imported, month_year = import_commande_synthese_file(str(dest_path))
+            rows_imported, resolved_month_year = import_commande_synthese_file(
+                str(dest_path), month_year=month_year, prev_month_year=prev_month_year
+            )
         except CommandeSyntheseImportError as e:
             return Response({"detail": str(e)}, status=400)
         except Exception as e:
             logger.exception("Échec import Synthèse Commande depuis %s", f.name)
             return Response({"detail": f"Erreur lors de la lecture du fichier : {e}"}, status=400)
 
-        return Response({"month_year": month_year, "rows_imported": rows_imported, "filename": f.name})
+        return Response({"month_year": resolved_month_year, "rows_imported": rows_imported, "filename": f.name})
