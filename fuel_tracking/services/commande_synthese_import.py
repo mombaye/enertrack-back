@@ -135,7 +135,10 @@ def _read_sheet_grid(path: str) -> dict:
     return grid
 
 
-def parse_commande_synthese(path: str, month_year: str | None = None, prev_month_year: str | None = None, log=None):
+def parse_commande_synthese(
+    path: str, month_year: str | None = None, prev_month_year: str | None = None, log=None,
+    grid: dict | None = None,
+):
     """
     Parse le fichier à `path` et retourne (objects, month_year, prev_month_year)
     — `objects` est une liste d'instances FuelCommandeSynthese non sauvegardées.
@@ -145,10 +148,14 @@ def parse_commande_synthese(path: str, month_year: str | None = None, prev_month
     `month_year`/`prev_month_year` doivent normalement être fournis par
     l'appelant (voir docstring module) ; à défaut, on retente une détection
     automatique depuis le fichier (repli CLI).
+
+    `grid` : grille {(row, col): value} déjà lue (voir xlsb_utils.read_workbook_grids)
+    — évite de rouvrir le fichier si l'appelant l'a déjà fait pour une autre
+    feuille du même classeur. Si absent, le fichier est lu ici comme avant.
     """
     log = log or (lambda msg: None)
 
-    grid = _read_sheet_grid(path)
+    grid = grid if grid is not None else _read_sheet_grid(path)
     if not grid:
         raise CommandeSyntheseImportError("La feuille Synthèse Commande est vide.")
 
@@ -231,7 +238,8 @@ def parse_commande_synthese(path: str, month_year: str | None = None, prev_month
 
 
 def import_commande_synthese_file(
-    path: str, month_year: str | None = None, prev_month_year: str | None = None, log=None
+    path: str, month_year: str | None = None, prev_month_year: str | None = None, log=None,
+    grid: dict | None = None,
 ) -> tuple[int, str]:
     """
     Parse + écrit en base. Ne remplace QUE les lignes du mois détecté dans ce
@@ -241,7 +249,7 @@ def import_commande_synthese_file(
     aux autres mois stockés.
     """
     objects, resolved_month_year, _ = parse_commande_synthese(
-        path, month_year=month_year, prev_month_year=prev_month_year, log=log
+        path, month_year=month_year, prev_month_year=prev_month_year, log=log, grid=grid,
     )
 
     FuelCommandeSynthese.objects.filter(month_year=resolved_month_year).delete()

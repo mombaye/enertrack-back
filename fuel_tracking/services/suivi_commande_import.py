@@ -94,15 +94,19 @@ def _str_or_none(v):
     return s or None
 
 
-def parse_suivi_commande(path: str, month_year: str, log=None):
+def parse_suivi_commande(path: str, month_year: str, log=None, grid: dict | None = None):
     """
     Parse le fichier à `path` et retourne une liste d'instances
     FuelSuiviCommandeSite non sauvegardées (une par site). `log` est un
     callable optionnel pour tracer la progression.
+
+    `grid` : grille déjà lue (voir xlsb_utils.read_workbook_grids) — évite de
+    rouvrir le fichier si l'appelant l'a déjà fait pour une autre feuille du
+    même classeur. Si absent, le fichier est lu ici comme avant.
     """
     log = log or (lambda msg: None)
 
-    grid = _read_sheet_grid(path)
+    grid = grid if grid is not None else _read_sheet_grid(path)
     if not grid:
         raise SuiviCommandeImportError("La feuille Suivis commande est vide.")
 
@@ -145,9 +149,9 @@ def parse_suivi_commande(path: str, month_year: str, log=None):
     return objects
 
 
-def import_suivi_commande_file(path: str, month_year: str, log=None) -> int:
+def import_suivi_commande_file(path: str, month_year: str, log=None, grid: dict | None = None) -> int:
     """Parse + écrit en base. Ne remplace que les lignes du mois donné."""
-    objects = parse_suivi_commande(path, month_year=month_year, log=log)
+    objects = parse_suivi_commande(path, month_year=month_year, log=log, grid=grid)
 
     FuelSuiviCommandeSite.objects.filter(month_year=month_year).delete()
     FuelSuiviCommandeSite.objects.bulk_create(objects, batch_size=1000)

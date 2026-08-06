@@ -112,14 +112,17 @@ class FuelCommandeSyntheseImportView(APIView):
         from pathlib import Path
 
         from fuel_tracking.services.commande_synthese_import import (
+            SHEET_NAME as COMMANDE_SYNTHESE_SHEET_NAME,
             CommandeSyntheseImportError,
             import_commande_synthese_file,
             validate_month_year,
         )
         from fuel_tracking.services.suivi_commande_import import (
+            SHEET_NAME as SUIVI_COMMANDE_SHEET_NAME,
             SuiviCommandeImportError,
             import_suivi_commande_file,
         )
+        from fuel_tracking.services.xlsb_utils import read_workbook_grids
 
         f = request.FILES.get("file")
         if not f:
@@ -148,9 +151,21 @@ class FuelCommandeSyntheseImportView(APIView):
             for chunk in f.chunks():
                 out.write(chunk)
 
+        # Le classeur est lu une seule fois pour les deux feuilles (au lieu de le
+        # rouvrir/redécompresser une fois par import) — un .xlsb de plusieurs Mo
+        # coûte déjà cher en upload, inutile de doubler le temps de lecture serveur.
+        try:
+            grids = read_workbook_grids(
+                str(dest_path), [COMMANDE_SYNTHESE_SHEET_NAME, SUIVI_COMMANDE_SHEET_NAME]
+            )
+        except Exception as e:
+            logger.exception("Échec lecture du classeur depuis %s", f.name)
+            return Response({"detail": f"Erreur lors de la lecture du fichier : {e}"}, status=400)
+
         try:
             rows_imported, resolved_month_year = import_commande_synthese_file(
-                str(dest_path), month_year=month_year, prev_month_year=prev_month_year
+                str(dest_path), month_year=month_year, prev_month_year=prev_month_year,
+                grid=grids.get(COMMANDE_SYNTHESE_SHEET_NAME),
             )
         except CommandeSyntheseImportError as e:
             return Response({"detail": str(e)}, status=400)
@@ -161,7 +176,10 @@ class FuelCommandeSyntheseImportView(APIView):
         suivi_commande_rows_imported = None
         suivi_commande_error = None
         try:
-            suivi_commande_rows_imported = import_suivi_commande_file(str(dest_path), month_year=resolved_month_year)
+            suivi_commande_rows_imported = import_suivi_commande_file(
+                str(dest_path), month_year=resolved_month_year,
+                grid=grids.get(SUIVI_COMMANDE_SHEET_NAME),
+            )
         except SuiviCommandeImportError as e:
             suivi_commande_error = str(e)
         except Exception as e:
