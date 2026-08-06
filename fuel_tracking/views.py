@@ -195,6 +195,96 @@ class FuelCommandeSyntheseImportView(APIView):
         })
 
 
+class FuelCommandeSyntheseHistoryView(APIView):
+    """
+    GET /api/fuel-tracking/commande-synthese/history/
+
+    Historique des imports — un import correspond à un mois (month_year), qui
+    regroupe les lignes écrites dans FuelCommandeSynthese et/ou
+    FuelSuiviCommandeSite lors du même upload (voir
+    FuelCommandeSyntheseImportView). Un mois peut n'apparaître que dans l'une
+    des deux tables si l'autre feuille a échoué à l'import (voir
+    suivi_commande_error) — on liste quand même le mois dans ce cas.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from django.db.models import Count, Max
+
+        from fuel_tracking.models import FuelCommandeSynthese, FuelSuiviCommandeSite
+
+        cs_map = {
+            g["month_year"]: g
+            for g in FuelCommandeSynthese.objects.values("month_year").annotate(
+                prev_month_year=Max("prev_month_year"),
+                filename=Max("source_filename"),
+                imported_at=Max("imported_at"),
+                n=Count("id"),
+            )
+        }
+        sv_map = {
+            g["month_year"]: g
+            for g in FuelSuiviCommandeSite.objects.values("month_year").annotate(
+                filename=Max("source_filename"),
+                imported_at=Max("imported_at"),
+                n=Count("id"),
+            )
+        }
+
+        results = []
+        for month_year in sorted(set(cs_map) | set(sv_map), reverse=True):
+            cs = cs_map.get(month_year)
+            sv = sv_map.get(month_year)
+            timestamps = [g["imported_at"] for g in (cs, sv) if g and g["imported_at"]]
+            results.append({
+                "month_year": month_year,
+                "prev_month_year": cs["prev_month_year"] if cs else None,
+                "filename": (cs["filename"] if cs else None) or (sv["filename"] if sv else None),
+                "imported_at": max(timestamps) if timestamps else None,
+                "rows_commande_synthese": cs["n"] if cs else 0,
+                "rows_suivi_commande": sv["n"] if sv else 0,
+            })
+
+        return Response({"results": results})
+
+    def delete(self, request):
+        """
+        DELETE /api/fuel-tracking/commande-synthese/history/?month=YYYY-MM
+
+        Supprime toutes les données importées (Synthèse Commande + Suivis
+        commande) pour le mois donné. Le fichier source archivé dans
+        data_imports/ n'est pas supprimé (traçabilité).
+        """
+        from fuel_tracking.models import FuelCommandeSynthese, FuelSuiviCommandeSite
+        from fuel_tracking.services.commande_synthese_import import (
+            CommandeSyntheseImportError,
+            validate_month_year,
+        )
+
+        month_year = request.query_params.get("month")
+        try:
+            validate_month_year(month_year, "Mois")
+        except CommandeSyntheseImportError as e:
+            return Response({"detail": str(e)}, status=400)
+
+        cs_qs = FuelCommandeSynthese.objects.filter(month_year=month_year)
+        sv_qs = FuelSuiviCommandeSite.objects.filter(month_year=month_year)
+        cs_count = cs_qs.count()
+        sv_count = sv_qs.count()
+
+        if cs_count == 0 and sv_count == 0:
+            return Response({"detail": f"Aucune donnée importée trouvée pour {month_year}."}, status=404)
+
+        cs_qs.delete()
+        sv_qs.delete()
+
+        return Response({
+            "month_year": month_year,
+            "deleted_commande_synthese": cs_count,
+            "deleted_suivi_commande": sv_count,
+        })
+
+
 class FuelSuiviCommandeListView(APIView):
     """
     GET /api/fuel-tracking/suivi-commande/?month=YYYY-MM&search=&page=&limit=
