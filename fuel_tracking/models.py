@@ -471,3 +471,107 @@ class FuelSuiviCommandeSite(models.Model):
 
     def __str__(self):
         return f"{self.month_year} · {self.site_id}"
+
+
+class FuelConsommationMonthly(models.Model):
+    """
+    Consommation carburant mensuelle par site — automatisée, jointure de 3
+    sources (voir fuel_tracking/services/fuel_consommation_snowflake.py et la
+    commande sync_fuel_consommation) :
+      - Snowflake DB_GFMS_PROD.GOLD.CONSUMPTION_FUEL / AVGSPECIFICFUELCONSO_L_KWH
+        (agrégées sur le mois, jointes à SITE_FILTERED pour résoudre site_id) ;
+      - ENOC (FuelEnocMovement, demandes de ravitaillement validées par le
+        fuel manager, déjà synchronisées via sync_enoc_fuel_movements) ;
+      - fichiers mensuels remontés par les gardiens (pas encore intégré —
+        colonnes prévues mais laissées vides tant que le format n'est pas défini).
+
+    Contrairement à FuelCommandeSynthese/FuelSuiviCommandeSite (import manuel,
+    verbatim), ce modèle est calculé : re-synchroniser un mois remplace
+    entièrement ses lignes (mêmes garanties que FinancialConsoMonthly).
+    """
+
+    month_year = models.CharField(max_length=7, db_index=True)  # YYYY-MM
+    year = models.IntegerField(db_index=True)
+    month = models.IntegerField(db_index=True)
+
+    site_id = models.CharField(max_length=64, db_index=True)
+    site_name = models.CharField(max_length=255, null=True, blank=True)
+    country = models.CharField(max_length=64, null=True, blank=True, db_index=True)
+
+    # Snowflake — DB_GFMS_PROD.GOLD.SITE_FILTERED (dimension site)
+    typology = models.CharField(max_length=64, null=True, blank=True)
+    site_type = models.CharField(max_length=64, null=True, blank=True)
+    dg_count = models.CharField(max_length=16, null=True, blank=True, help_text="Nombre de groupes électrogènes installés sur le site.")
+    power_supply = models.CharField(max_length=64, null=True, blank=True, help_text="Ex: Grid+DG, DG+Solar, Grid+DG+Solar.")
+
+    # Snowflake — DB_GFMS_PROD.GOLD.CONSUMPTION_FUEL
+    conso_snowflake_l = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
+    nb_jours_data = models.IntegerField(default=0, help_text="Nombre de jours du mois avec une valeur de consommation remontée.")
+
+    # Snowflake — DB_GFMS_PROD.GOLD.AVGSPECIFICFUELCONSO_L_KWH
+    conso_specifique_moy_l_kwh = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+
+    # Snowflake — DB_GFMS_PROD.GOLD.GFMS_FUEL_SENSOR_MONITORING_DATA (dernier statut connu du mois)
+    sensor_status = models.CharField(max_length=32, null=True, blank=True)
+
+    # ENOC — agrégé depuis FuelEnocMovement sur le même mois/site
+    enoc_qte_demandee_l = models.DecimalField(max_digits=18, decimal_places=3, default=0)
+    enoc_qte_validee_l = models.DecimalField(max_digits=18, decimal_places=3, default=0)
+    enoc_qte_ajoutee_l = models.DecimalField(max_digits=18, decimal_places=3, default=0)
+    enoc_nb_demandes = models.IntegerField(default=0)
+
+    # Jointure "concrète" : conso mesurée (capteur) vs quantité réellement ajoutée (ENOC)
+    ecart_conso_vs_enoc_l = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
+
+    synced_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Consommation carburant mensuelle (automatisée)"
+        verbose_name_plural = "Consommations carburant mensuelles (automatisées)"
+        ordering = ["-year", "-month", "site_id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["month_year", "site_id"],
+                name="uniq_fuel_consommation_monthly_month_site",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["month_year", "site_id"]),
+            models.Index(fields=["year", "month"]),
+        ]
+
+    def __str__(self):
+        return f"{self.month_year} · {self.site_id} · conso={self.conso_snowflake_l}"
+
+
+class FuelConsommationSyncRun(models.Model):
+    """
+    Traçabilité des exécutions de sync_fuel_consommation (jointure Snowflake
+    DB_GFMS_PROD.GOLD) — permet à l'UI d'afficher si la source Snowflake est
+    "connectée" (dernière synchro réussie avec des lignes) et, en cas d'échec,
+    le message d'erreur exact plutôt qu'un simple "0 lignes" ambigu.
+    """
+
+    class Status(models.TextChoices):
+        RUNNING = "RUNNING", "En cours"
+        SUCCESS = "SUCCESS", "Succès"
+        FAILED = "FAILED", "Échec"
+
+    month_from = models.CharField(max_length=7, null=True, blank=True)
+    month_to = models.CharField(max_length=7, null=True, blank=True)
+
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.RUNNING, db_index=True)
+
+    sites_fetched = models.IntegerField(default=0)
+
+    started_at = models.DateTimeField(default=timezone.now)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    error_message = models.TextField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-started_at"]
+
+    def __str__(self):
+        return f"Fuel Consommation sync {self.month_from}→{self.month_to} [{self.status}]"

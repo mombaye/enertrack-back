@@ -193,6 +193,22 @@ CELERY_RESULT_BACKEND = 'redis://redis:6379/0'
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 
+# Planification (nécessite le service "beat" — voir docker-compose.yml) :
+# suivi-carburant Consommation, toutes les 5 min sur le mois en cours, pour
+# rattraper rapidement les nouvelles données Snowflake/ENOC.
+from celery.schedules import crontab  # noqa: E402
+
+CELERY_BEAT_SCHEDULE = {
+    'fuel-consommation-sync-5min': {
+        'task': 'fuel_tracking.sync_fuel_consommation_current_month',
+        'schedule': crontab(minute='*/5'),
+    },
+    'fuel-enoc-sync-5min': {
+        'task': 'fuel_tracking.sync_enoc_fuel_movements_current_month',
+        'schedule': crontab(minute='*/5'),
+    },
+}
+
 # Cache Redis (DB 1, distincte du broker Celery en DB 0) — utilisé notamment pour
 # mettre en cache les lectures vers des sources externes lentes (Mongo ENOC,
 # Snowflake) afin que l'utilisateur ne ressente pas leur latence réseau.

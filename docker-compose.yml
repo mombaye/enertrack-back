@@ -93,6 +93,25 @@ services:
         condition: service_healthy
     restart: always
 
+  # Planificateur (CELERY_BEAT_SCHEDULE dans settings.py) — déclenche les
+  # tâches périodiques (ex: sync consommation carburant/5 min), exécutées
+  # ensuite par le worker "celery" ci-dessus.
+  celery-beat:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    command: celery -A enertrack_backend beat --loglevel=info
+    volumes:
+      - .:/code
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: always
+
 volumes:
   postgres_data:
 
