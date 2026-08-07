@@ -9,7 +9,7 @@ from django.utils import timezone
 from django.utils.dateparse import parse_datetime, parse_date
 
 from fuel_tracking.models import FuelEnocMovement, FuelEnocSyncRun
-from fuel_tracking.services.enoc_client import EnocFuelClient
+from fuel_tracking.services.enoc_mongo_service import fetch_fuel_movements
 
 
 def to_decimal(value, default=None):
@@ -225,36 +225,14 @@ class Command(BaseCommand):
         self.stdout.write("═" * 80 + "\n")
 
         try:
-            client = EnocFuelClient()
-
-            all_items = []
-            page = 1
-
-            while True:
-                response = client.get_operations(
-                    start_date=start_date,
-                    end_date=end_date,
-                    updated_since=updated_since,
-                    site=site,
-                    zone=zone,
-                    page=page,
-                    limit=limit,
-                )
-
-                items = response.get("data") or []
-                pagination = response.get("pagination") or {}
-
-                self.stdout.write(
-                    f"  Page {page} : {len(items)} lignes reçues "
-                    f"/ total {pagination.get('total', '?')}"
-                )
-
-                all_items.extend(items)
-
-                if not pagination.get("hasNext"):
-                    break
-
-                page += 1
+            # L'API REST ENOC (port 8002) est bloquée par filtrage IP côté ENOC
+            # (erreur 403 "IP non autorisée") — on lit directement leur base
+            # MongoDB (fuel_requests + fuel_operations), qui alimente cette
+            # même API. Pas de filtrage par date ici (voir docstring du
+            # service) : --start-date/--end-date/--site/--zone/--limit sont
+            # acceptés pour compatibilité CLI mais actuellement sans effet.
+            all_items = fetch_fuel_movements()
+            self.stdout.write(f"  {len(all_items)} mouvement(s) lus depuis MongoDB ENOC (fuel_requests + fuel_operations)")
 
             payloads = []
 
@@ -269,7 +247,7 @@ class Command(BaseCommand):
             raw_payload_count = len(payloads)
             payloads, duplicate_count = deduplicate_payloads(payloads)
 
-            self.stdout.write(f"\n  Total mouvements SQL/API reçus : {raw_payload_count}")
+            self.stdout.write(f"\n  Total mouvements Mongo reçus   : {raw_payload_count}")
             self.stdout.write(f"  Total mouvements uniques       : {len(payloads)}")
 
             if duplicate_count:

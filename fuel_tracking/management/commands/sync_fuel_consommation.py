@@ -21,6 +21,7 @@ from django.db.models import Count, Sum
 from django.utils import timezone
 
 from fuel_tracking.models import FuelConsommationMonthly, FuelConsommationSyncRun, FuelEnocMovement
+from fuel_tracking.services.enoc_mongo_service import fetch_estimated_consumption, fetch_genset_reference
 from fuel_tracking.services.fuel_consommation_snowflake import fetch_monthly_consumption
 
 
@@ -74,6 +75,18 @@ class Command(BaseCommand):
                 status=FuelConsommationSyncRun.Status.RUNNING,
             )
 
+        # Référentiel GE ENOC (sites.nb_ge + ge_assets INSTALLED) — pas
+        # dépendant du mois, une seule lecture pour toute la commande.
+        # Si ENOC est injoignable, on continue avec Snowflake seul (le flag
+        # ENOC reste False partout) plutôt que de bloquer toute la sync.
+        try:
+            genset_ref_enoc = fetch_genset_reference()
+            self.stdout.write(f"  Référentiel GE ENOC : {len(genset_ref_enoc)} site(s), "
+                               f"{sum(1 for v in genset_ref_enoc.values() if v['has_genset'])} avec GE.\n")
+        except Exception as e:
+            self.stdout.write(self.style.WARNING(f"  Référentiel GE ENOC indisponible ({e}) — Snowflake seul utilisé.\n"))
+            genset_ref_enoc = {}
+
         total_created = 0
         total_updated = 0
         total_sites_fetched = 0
@@ -108,7 +121,26 @@ class Command(BaseCommand):
             enoc_by_site = {row["site_id"]: row for row in enoc_rows}
             self.stdout.write(f"  {len(enoc_by_site)} site(s) avec mouvements ENOC.")
 
-            all_site_ids = set(snowflake_data) | set(enoc_by_site)
+            # Conso ESTIMÉE (pas mesurée) depuis les relevés de niveau ENOC —
+            # voir les réserves dans enoc_mongo_service.fetch_estimated_consumption.
+            try:
+                conso_estimee_by_site = fetch_estimated_consumption(year, mo)
+            except Exception as e:
+                self.stdout.write(self.style.WARNING(f"  Estimation ENOC (relevés de niveau) indisponible : {e}"))
+                conso_estimee_by_site = {}
+            self.stdout.write(f"  {len(conso_estimee_by_site)} site(s) avec conso ESTIMÉE (relevés de niveau ENOC).")
+
+            # Sites que ENOC signale avec GE mais que Snowflake ne connaît pas
+            # (hors périmètre SITE_FILTERED, ou nouveau site pas encore
+            # remonté côté Snowflake) — inclus pour une vue complète, mais
+            # seulement ceux avec GE (sinon on réintroduit tout le bruit des
+            # milliers de sites sans GE qu'on vient de filtrer).
+            enoc_only_ge_sites = {
+                sid for sid, v in genset_ref_enoc.items()
+                if v["has_genset"] and sid not in snowflake_data
+            }
+
+            all_site_ids = set(snowflake_data) | set(enoc_by_site) | enoc_only_ge_sites
             if not all_site_ids:
                 self.stdout.write(self.style.WARNING(f"  Aucune donnée (Snowflake + ENOC) pour {month_year}, mois sauté."))
                 continue
@@ -117,10 +149,26 @@ class Command(BaseCommand):
             for site_id in all_site_ids:
                 sf = snowflake_data.get(site_id, {})
                 en = enoc_by_site.get(site_id, {})
+                ge = genset_ref_enoc.get(site_id, {})
+                est = conso_estimee_by_site.get(site_id, {})
 
                 conso_l = sf.get("conso_snowflake_l")
                 ajoutee_l = en.get("qte_ajoutee")
                 ecart = (conso_l - ajoutee_l) if (conso_l is not None and ajoutee_l is not None) else None
+
+                # Estimation Snowflake (delta niveau de cuve TANK_LEVEL_AVG +
+                # ravitaillements ENOC entre les 2 relevés) — un résultat
+                # négatif indique une incohérence, écarté plutôt qu'affiché.
+                niveau_debut = sf.get("niveau_debut")
+                niveau_fin = sf.get("niveau_fin")
+                conso_estimee_sf = None
+                if niveau_debut is not None and niveau_fin is not None:
+                    conso_estimee_sf = (niveau_debut - niveau_fin) + (ajoutee_l or 0)
+                    if conso_estimee_sf < 0:
+                        conso_estimee_sf = None
+
+                has_genset_sf = bool(sf.get("has_genset"))
+                has_genset_enoc = bool(ge.get("has_genset"))
 
                 objects.append(FuelConsommationMonthly(
                     month_year=month_year,
@@ -133,8 +181,16 @@ class Command(BaseCommand):
                     site_type=sf.get("site_type"),
                     dg_count=sf.get("dg_count"),
                     power_supply=sf.get("power_supply"),
+                    has_genset_snowflake=has_genset_sf,
+                    has_genset_enoc=has_genset_enoc,
+                    nb_ge_enoc=ge.get("nb_ge"),
+                    has_genset=has_genset_sf or has_genset_enoc,
                     conso_snowflake_l=conso_l,
                     nb_jours_data=sf.get("nb_jours_data") or 0,
+                    conso_estimee_snowflake_l=conso_estimee_sf,
+                    conso_estimee_snowflake_nb_releves=sf.get("niveau_nb_releves"),
+                    conso_estimee_enoc_l=est.get("conso_estimee_l"),
+                    conso_estimee_nb_releves=est.get("nb_releves"),
                     conso_specifique_moy_l_kwh=sf.get("conso_specifique_moy_l_kwh"),
                     sensor_status=sf.get("sensor_status"),
                     enoc_qte_demandee_l=en.get("qte_demandee") or 0,
@@ -169,7 +225,10 @@ class Command(BaseCommand):
                     unique_fields=["month_year", "site_id"],
                     update_fields=[
                         "site_name", "country", "typology", "site_type", "dg_count", "power_supply",
+                        "has_genset_snowflake", "has_genset_enoc", "nb_ge_enoc", "has_genset",
                         "conso_snowflake_l", "nb_jours_data",
+                        "conso_estimee_snowflake_l", "conso_estimee_snowflake_nb_releves",
+                        "conso_estimee_enoc_l", "conso_estimee_nb_releves",
                         "conso_specifique_moy_l_kwh", "sensor_status",
                         "enoc_qte_demandee_l", "enoc_qte_validee_l", "enoc_qte_ajoutee_l",
                         "enoc_nb_demandes", "ecart_conso_vs_enoc_l", "synced_at",

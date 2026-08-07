@@ -18,12 +18,15 @@ logger = logging.getLogger(__name__)
 
 class FuelConsommationListView(APIView):
     """
-    GET /api/fuel-tracking/consommation/?month=YYYY-MM&search=&country=&page=&limit=
+    GET /api/fuel-tracking/consommation/?month=YYYY-MM&search=&country=&has_genset=&page=&limit=
 
     Liste paginée de la Consommation carburant mensuelle par site
     (FuelConsommationMonthly) — automatisée (Snowflake + ENOC), voir
     sync_fuel_consommation. Sans mois demandé, retourne le mois le plus
     récent disponible. `search` filtre sur site_id/site_name (icontains).
+    `has_genset=true|false` filtre les sites avec/sans groupe électrogène
+    (seuls ceux avec GE peuvent avoir une conso fuel) ; omis, retourne tous
+    les sites du pays.
     """
     permission_classes = [IsAuthenticated]
 
@@ -75,16 +78,37 @@ class FuelConsommationListView(APIView):
         if country:
             qs = qs.filter(country=country)
 
+        # Répartition avec/sans GE calculée AVANT le filtre has_genset lui-même,
+        # pour que le sélecteur du frontend puisse toujours afficher les 2
+        # effectifs (ex: "Avec GE (373)" / "Sans GE (2949)"), qu'un filtre soit
+        # actif ou non.
+        ge_counts = qs.aggregate(
+            sites_avec_ge=Count("id", filter=Q(has_genset=True)),
+            sites_sans_ge=Count("id", filter=Q(has_genset=False)),
+            sites_ge_enoc_only=Count("id", filter=Q(has_genset_enoc=True, has_genset_snowflake=False)),
+        )
+
+        has_genset_param = (request.query_params.get("has_genset") or "").strip().lower()
+        if has_genset_param in ("true", "1"):
+            qs = qs.filter(has_genset=True)
+        elif has_genset_param in ("false", "0"):
+            qs = qs.filter(has_genset=False)
+
         agg = qs.aggregate(
             total_sites=Count("id"),
             sites_avec_conso=Count("id", filter=Q(conso_snowflake_l__isnull=False)),
+            sites_avec_estimation=Count("id", filter=Q(conso_estimee_snowflake_l__isnull=False) | Q(conso_estimee_enoc_l__isnull=False)),
             total_conso_snowflake_l=Sum("conso_snowflake_l"),
             total_enoc_qte_ajoutee_l=Sum("enoc_qte_ajoutee_l"),
             total_enoc_nb_demandes=Sum("enoc_nb_demandes"),
         )
         kpis = {
             "total_sites": agg["total_sites"],
+            "sites_avec_ge": ge_counts["sites_avec_ge"],
+            "sites_sans_ge": ge_counts["sites_sans_ge"],
+            "sites_ge_enoc_only": ge_counts["sites_ge_enoc_only"],
             "sites_avec_conso": agg["sites_avec_conso"],
+            "sites_avec_estimation": agg["sites_avec_estimation"],
             "total_conso_snowflake_l": float(agg["total_conso_snowflake_l"] or 0),
             "total_enoc_qte_ajoutee_l": float(agg["total_enoc_qte_ajoutee_l"] or 0),
             "total_enoc_nb_demandes": agg["total_enoc_nb_demandes"] or 0,
@@ -112,8 +136,16 @@ class FuelConsommationListView(APIView):
                 "site_type": row.site_type,
                 "dg_count": row.dg_count,
                 "power_supply": row.power_supply,
+                "has_genset": row.has_genset,
+                "has_genset_snowflake": row.has_genset_snowflake,
+                "has_genset_enoc": row.has_genset_enoc,
+                "nb_ge_enoc": row.nb_ge_enoc,
                 "conso_snowflake_l": float(row.conso_snowflake_l) if row.conso_snowflake_l is not None else None,
                 "nb_jours_data": row.nb_jours_data,
+                "conso_estimee_snowflake_l": float(row.conso_estimee_snowflake_l) if row.conso_estimee_snowflake_l is not None else None,
+                "conso_estimee_snowflake_nb_releves": row.conso_estimee_snowflake_nb_releves,
+                "conso_estimee_enoc_l": float(row.conso_estimee_enoc_l) if row.conso_estimee_enoc_l is not None else None,
+                "conso_estimee_nb_releves": row.conso_estimee_nb_releves,
                 "conso_specifique_moy_l_kwh": float(row.conso_specifique_moy_l_kwh) if row.conso_specifique_moy_l_kwh is not None else None,
                 "sensor_status": row.sensor_status,
                 "enoc_qte_demandee_l": float(row.enoc_qte_demandee_l),

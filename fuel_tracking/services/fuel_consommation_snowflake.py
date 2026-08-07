@@ -28,7 +28,20 @@ Tables sources :
     état du capteur — couvre beaucoup plus de sites que les 2 tables de conso
     ci-dessus (un site "MONITORED" n'a pas forcément assez de points de
     mesure valides pour produire une conso mensuelle calculée).
-  Le ID de ces 3 tables est un identifiant numérique interne (DATA_ID), pas
+  - TANK_LEVEL_AVG (ID, DATE, TANK_LEVEL_AVG) : niveau moyen de cuve/jour —
+    exploré le 07/08 après avoir constaté que CONSUMPTION_FUEL est vide pour
+    la quasi-totalité des sites Sénégal malgré un capteur "MONITORED" (voir
+    fuel_tracking/services/enoc_mongo_service.py pour le même problème côté
+    ENOC). Contrairement à CONSUMPTION_FUEL (5 sites couverts) ou aux
+    relevés ENOC (import historique figé, 8 sites), TANK_LEVEL_AVG couvre
+    315 sites avec GE sur 483 et semble alimentée en continu comme le reste
+    de Snowflake — bien meilleure source pour une estimation par delta de
+    niveau. Le calcul (niveau début - fin + ravitaillements ENOC entre les
+    deux) se fait dans sync_fuel_consommation.py, pas ici : ce module ne
+    renvoie que les niveaux bruts début/fin, la combinaison avec les
+    ravitaillements ENOC (déjà en base Postgres à ce stade) est plus propre
+    côté commande de sync.
+  Le ID de ces 4 tables est un identifiant numérique interne (DATA_ID), pas
   le site_id texte (ex: "SN0876") ; la jointure passe par SITE_FILTERED.
 """
 import calendar as _cal
@@ -48,11 +61,11 @@ FUEL_SCHEMA = "GOLD"
 # plusieurs pays (Burkina Faso, Tchad, Cameroun, Côte d'Ivoire...) — on ne
 # récupère que le Sénégal pour rester dans le périmètre attendu.
 #
-# On filtre aussi sur DG_COUNT > 0 (site avec au moins un groupe électrogène) :
+# Tous les sites Sénégal sont récupérés (avec et sans GE) — le filtre "avec
+# GE uniquement" (site ayant au moins un groupe électrogène, seuls capables
+# de consommer du fuel) se fait côté app via le champ has_genset, pas ici :
 # vérifié au 07/08, sur 3322 sites Sénégal, ~2949 sont Solar/Grid seuls
-# (DG_COUNT=0, aucune conso fuel possible par construction) — ne garder que
-# les ~373 sites avec GE évite un tableau pollué de sites structurellement
-# sans conso.
+# (DG_COUNT=0).
 COUNTRY_SCOPE = "Senegal"
 
 
@@ -100,7 +113,6 @@ def fetch_monthly_consumption(year: int, month: int) -> dict[str, dict]:
                            ROW_NUMBER() OVER (PARTITION BY DATA_ID ORDER BY SITE_ID) AS rn
                     FROM {db_schema}.SITE_FILTERED
                     WHERE COUNTRY = %(country)s
-                      AND TRY_CAST(DG_COUNT AS NUMBER) > 0
                 )
                 WHERE rn = 1
             ),
@@ -121,18 +133,44 @@ def fetch_monthly_consumption(year: int, month: int) -> dict[str, dict]:
                 FROM {db_schema}.GFMS_FUEL_SENSOR_MONITORING_DATA
                 WHERE DATE >= %(d_start)s AND DATE <= %(d_end)s
                 QUALIFY ROW_NUMBER() OVER (PARTITION BY TRY_CAST(ID AS NUMBER) ORDER BY DATE DESC) = 1
+            ),
+            niveau AS (
+                SELECT
+                    ID,
+                    MIN_BY(TANK_LEVEL_AVG, DATE) AS niveau_debut,
+                    MAX_BY(TANK_LEVEL_AVG, DATE) AS niveau_fin,
+                    COUNT(DATE) AS nb_releves
+                FROM {db_schema}.TANK_LEVEL_AVG
+                WHERE DATE >= %(d_start)s AND DATE <= %(d_end)s
+                  AND TANK_LEVEL_AVG IS NOT NULL
+                  -- Plafond de plausibilité : aucune cuve de secours ne dépasse
+                  -- 50 000 L. Constaté au 07/08 : certains sites ont des
+                  -- relevés clairement corrompus (ex: DKR_2853 oscillant entre
+                  -- 346 L et 20 000 000 L d'un jour à l'autre) — sans ce filtre,
+                  -- MIN_BY/MAX_BY ci-dessous produisaient des "estimations" de
+                  -- plusieurs millions de litres.
+                  AND TANK_LEVEL_AVG > 0 AND TANK_LEVEL_AVG <= 50000
+                GROUP BY ID
+                HAVING COUNT(DATE) >= 2
             )
             SELECT
                 s.SITE_ID, s.SITE_NAME, s.COUNTRY, s.TYPOLOGY, s.SITE_TYPE, s.DG_COUNT, s.POWER_SUPPLY,
-                c.total_l, c.nb_jours, sp.avg_val, ca.status
+                c.total_l, c.nb_jours, sp.avg_val, ca.status,
+                n.niveau_debut, n.niveau_fin, n.nb_releves
             FROM site_dim s
             LEFT JOIN conso c ON c.ID = s.DATA_ID
             LEFT JOIN specifique sp ON sp.ID = s.DATA_ID
             LEFT JOIN capteur ca ON ca.data_id = s.DATA_ID
+            LEFT JOIN niveau n ON n.ID = s.DATA_ID
         """, {"country": COUNTRY_SCOPE, "d_start": d_start, "d_end": d_end})
 
         result: dict[str, dict] = {}
-        for site_id, site_name, country, typology, site_type, dg_count, power_supply, total_l, nb_jours, avg_val, status in cursor.fetchall():
+        for (site_id, site_name, country, typology, site_type, dg_count, power_supply,
+             total_l, nb_jours, avg_val, status, niveau_debut, niveau_fin, nb_releves) in cursor.fetchall():
+            try:
+                has_genset = float(dg_count) > 0 if dg_count is not None else False
+            except (TypeError, ValueError):
+                has_genset = False
             result[site_id] = {
                 "site_name": site_name,
                 "country": country,
@@ -140,10 +178,14 @@ def fetch_monthly_consumption(year: int, month: int) -> dict[str, dict]:
                 "site_type": site_type,
                 "dg_count": dg_count,
                 "power_supply": power_supply,
+                "has_genset": has_genset,
                 "conso_snowflake_l": Decimal(str(total_l)) if total_l is not None else None,
                 "nb_jours_data": int(nb_jours or 0),
                 "conso_specifique_moy_l_kwh": Decimal(str(avg_val)) if avg_val is not None else None,
                 "sensor_status": status,
+                "niveau_debut": Decimal(str(niveau_debut)) if niveau_debut is not None else None,
+                "niveau_fin": Decimal(str(niveau_fin)) if niveau_fin is not None else None,
+                "niveau_nb_releves": int(nb_releves) if nb_releves is not None else None,
             }
         return result
     finally:

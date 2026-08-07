@@ -504,9 +504,31 @@ class FuelConsommationMonthly(models.Model):
     dg_count = models.CharField(max_length=16, null=True, blank=True, help_text="Nombre de groupes électrogènes installés sur le site.")
     power_supply = models.CharField(max_length=64, null=True, blank=True, help_text="Ex: Grid+DG, DG+Solar, Grid+DG+Solar.")
 
+    # Présence GE — jointure Snowflake (dg_count) + ENOC (sites.nb_ge et
+    # ge_assets, voir enoc_mongo_service.fetch_genset_reference) : les 2
+    # sources se recoupent en grande partie mais chacune couvre des sites que
+    # l'autre manque, d'où l'union plutôt qu'une seule source.
+    has_genset_snowflake = models.BooleanField(default=False, help_text="dg_count > 0 côté Snowflake.")
+    has_genset_enoc = models.BooleanField(default=False, help_text="sites.nb_ge > 0 ou ge_assets INSTALLED côté ENOC.")
+    nb_ge_enoc = models.IntegerField(null=True, blank=True, help_text="Nombre de GE déclaré côté ENOC (sites.nb_ge).")
+    has_genset = models.BooleanField(default=False, db_index=True, help_text="has_genset_snowflake OU has_genset_enoc — seuls ces sites peuvent avoir une conso fuel.")
+
     # Snowflake — DB_GFMS_PROD.GOLD.CONSUMPTION_FUEL
     conso_snowflake_l = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
     nb_jours_data = models.IntegerField(default=0, help_text="Nombre de jours du mois avec une valeur de consommation remontée.")
+
+    # ESTIMATIONS (pas une mesure directe) déduites d'un delta de niveau de
+    # cuve — deux sources indépendantes, gardées séparées (caveats différents) :
+    #   - Snowflake TANK_LEVEL_AVG : alimentée en continu, 315 sites Sénégal
+    #     avec GE couverts (07/08) — la plus fiable des deux.
+    #   - ENOC fuel_level_readings : import historique ponctuel figé, 8 sites
+    #     couverts (07/08) — voir enoc_mongo_service.fetch_estimated_consumption.
+    # Dans les deux cas : niveau début - niveau fin + ravitaillements ENOC
+    # entre les deux dates, calculé dans sync_fuel_consommation.py.
+    conso_estimee_snowflake_l = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
+    conso_estimee_snowflake_nb_releves = models.IntegerField(null=True, blank=True)
+    conso_estimee_enoc_l = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
+    conso_estimee_nb_releves = models.IntegerField(null=True, blank=True)
 
     # Snowflake — DB_GFMS_PROD.GOLD.AVGSPECIFICFUELCONSO_L_KWH
     conso_specifique_moy_l_kwh = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
