@@ -2187,6 +2187,8 @@ class SuiviConsoView(APIView):
     # ── Handler principal ─────────────────────────────────────────────────────
 
     def get(self, request):
+        from financial.models import FinancialConsoMonthly, FinancialConsoSyncRun
+
         ys, ms, ye, me = self._parse_period(request)
         period_q = self._period_q(ys, ms, ye, me)
 
@@ -2195,6 +2197,25 @@ class SuiviConsoView(APIView):
         typo = request.query_params.get("typology")
         statut = request.query_params.get("statut")
         export = request.query_params.get("export")
+
+        # Statut des sources (Snowflake Grid/ACM, SQL Server Solaire) — dernière
+        # exécution de sync_financial_conso, pour le badge de connexion affiché
+        # en haut de la page (même principe que fuel-tracking/consommation).
+        last_run = FinancialConsoSyncRun.objects.exclude(
+            status=FinancialConsoSyncRun.Status.RUNNING
+        ).order_by("-started_at").first()
+        sources = {
+            "snowflake": {
+                "connected": bool(last_run) and not bool(last_run.snowflake_error),
+                "last_run_at": (last_run.finished_at or last_run.started_at) if last_run else None,
+                "error": last_run.snowflake_error if last_run else None,
+            },
+            "solar": {
+                "connected": bool(last_run) and not bool(last_run.solar_error),
+                "last_run_at": (last_run.finished_at or last_run.started_at) if last_run else None,
+                "error": last_run.solar_error if last_run else None,
+            },
+        }
 
         def fmt(v):
             if v is None:
@@ -2350,6 +2371,45 @@ class SuiviConsoView(APIView):
                 "site_name": r["site__name"],
                 "zone": r["site__zone"],
             }
+
+        # ─────────────────────────────────────────────────────────────
+        # 2b) FinancialConsoMonthly (Snowflake Grid/ACM/Solaire synchronisé) —
+        # ajoute aussi les sites×mois qui n'ont NI facture NI estimation mais
+        # ont une donnée Snowflake synchronisée (ex : périmètre découvert via
+        # site_scope_snowflake.py, pas encore facturé). Avant ce bloc, un tel
+        # site×mois était invisible : all_keys ne venait que de billing/
+        # estimation, FinancialConsoMonthly ne servait qu'à ENRICHIR des
+        # lignes déjà là (cf. bloc "4) eFMS / ACM / Grid / Solar" plus bas).
+        # ─────────────────────────────────────────────────────────────
+        fcm_qs = FinancialConsoMonthly.objects.select_related("site").filter(
+            period_q,
+            site__isnull=False,
+        )
+
+        if zone:
+            fcm_qs = fcm_qs.filter(site__zone=zone.upper())
+
+        if search:
+            fcm_qs = fcm_qs.filter(
+                Q(site__site_id__icontains=search) | Q(site__name__icontains=search)
+            )
+
+        if typo:
+            fcm_qs = fcm_qs.filter(
+                Q(site__billing_typology__icontains=typo)
+                | Q(site__installed_typology__icontains=typo)
+                | Q(site__ordered_typology__icontains=typo)
+            )
+
+        for r in fcm_qs.values("site__site_id", "site__name", "site__zone", "year", "month"):
+            sid = r["site__site_id"]
+            key = (sid, r["year"], r["month"])
+            all_keys.add(key)
+            site_meta.setdefault(sid, {
+                "site_id": sid,
+                "site_name": r["site__name"],
+                "zone": r["site__zone"],
+            })
 
         site_ids_in_result = {sid for sid, _, _ in all_keys}
 
@@ -2609,6 +2669,7 @@ class SuiviConsoView(APIView):
             "page_size": page_size,
             "pages": (total + page_size - 1) // page_size if page_size else 1,
             "results": result_rows[offset: offset + page_size],
+            "sources": sources,
         })
 
 

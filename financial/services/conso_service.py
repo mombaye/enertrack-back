@@ -7,13 +7,17 @@ pour un site sur une plage de mois.
 
 Stratégie par mois :
   1. LOCAL  → CertificationResult (déjà calculé lors d'un batch de certification)
-  2. SYNC   → FinancialConsoMonthly (synchronisé depuis Snowflake/SQL Server par
-              la commande `sync_financial_conso` — plus AUCUN appel Snowflake/SQL
-              Server live dans le chemin de requête HTTP, cf. migration
-              perf du 2026-07)
+  2. SYNC   → FinancialConsoMonthly (synchronisé depuis Snowflake par la commande
+              `sync_financial_conso` — plus AUCUN appel Snowflake live dans le
+              chemin de requête HTTP, cf. migration perf du 2026-07)
 
-`_fetch_remote_bulk` (les anciennes requêtes live Snowflake + SQL Server,
-chunkées 400 sites) n'est plus appelée que par la commande de synchronisation
+Depuis le 2026-08 : plus AUCUNE source SQL Server — le Solaire venait de
+SQL2-ProdDB.silver.fact_solar_mth (en pratique injoignable, jamais mis à
+jour dans cet environnement) et a été remplacé par une table Snowflake
+équivalente, sur la même base que Grid/ACM (voir `_fetch_remote_bulk`).
+
+`_fetch_remote_bulk` (les requêtes live Snowflake, chunkées 400 sites)
+n'est plus appelée que par la commande de synchronisation
 `financial/management/commands/sync_financial_conso.py` — jamais depuis une vue.
 
 Retourne un dict {month: ConsoMonthData} consommable directement dans SiteMargeDetailView.
@@ -181,60 +185,55 @@ class FinancialConsoService:
         month_start: int,
         year_end: int,
         month_end: int,
-    ) -> dict[tuple, dict]:
+    ) -> tuple[dict[tuple, dict], dict[str, str | None]]:
         """
-        Requête bulk EN DIRECT : Snowflake (Grid + ACM) et SQL2-ProdDB (Solar).
+        Requête bulk EN DIRECT, exclusivement Snowflake — plus aucune source
+        SQL Server (cf. bascule du 2026-08 : le Solaire venait de SQL2-ProdDB.
+        silver.fact_solar_mth, injoignable en pratique et non mis à jour ;
+        remplacé par DB_GFMS_PROD.GOLD.JOIN_SOLAR_PRODUCTION_AND_MONITORING_
+        AVAILABILITY, sur la même base Snowflake que le module carburant,
+        vérifié à jour au jour le jour).
 
         N'est appelée QUE par `sync_financial_conso` (management command) pour
         alimenter FinancialConsoMonthly — plus jamais depuis une vue HTTP.
 
-        Retourne :
-            { (site_id, year, month): {
+        Retourne (result, errors) :
+            result : { (site_id, year, month): {
                 "fms_grid_kwh": Decimal|None,
                 "fms_acm_kwh":  Decimal|None,
                 "solar_kwh":    float|None,
                 "unavail_hours": float|None,
                 "grid_mode":    "exact"|"extrapol"|"none",
             }}
+            errors : {"snowflake": str|None, "solar": str|None} — message
+            d'erreur si la requête correspondante a échoué, None si elle a
+            répondu (même sans donnée pour la période demandée). Les 2 clés
+            restent distinctes bien que sur la même connexion Snowflake : la
+            table Solaire (JOIN_SOLAR_PRODUCTION_AND_MONITORING_AVAILABILITY)
+            peut échouer indépendamment de GRID_REPORT/AC_METER (renommage,
+            schéma modifié, etc.).
         """
         import calendar as _cal
         from datetime import date as _date
-        import pyodbc
+
+        from certification.services.snowflake_service import SnowflakeService
 
         if not site_ids:
-            return {}
+            return {}, {"snowflake": None, "solar": None}
 
         CHUNK_SIZE = 400
         MIN_PTS    = 3
         MIN_DENSE  = 20
 
-        host     = getattr(settings, "EFMS_SQL_HOST",     "172.30.0.149")
-        port     = int(getattr(settings, "EFMS_SQL_PORT",  1433))
-        user     = getattr(settings, "EFMS_SQL_USER",     "")
-        password = getattr(settings, "EFMS_SQL_PASSWORD", "")
-        driver   = getattr(settings, "EFMS_SQL_DRIVER",   "ODBC Driver 17 for SQL Server")
-        timeout  = int(getattr(settings, "EFMS_SQL_TIMEOUT", 15))
-
-        def _conn_str(database: str) -> str:
-            return (
-                f"DRIVER={{{driver}}};"
-                f"SERVER={host},{port};"
-                f"DATABASE={database};"
-                f"UID={user};PWD={password};"
-                "TrustServerCertificate=yes;"
-                f"Connection Timeout={timeout};"
-            )
-
         d_start = _date(year_start, month_start, 1)
         d_end   = _date(year_end, month_end, _cal.monthrange(year_end, month_end)[1])
 
         result: dict[tuple, dict] = {}
+        errors: dict[str, str | None] = {"snowflake": None, "solar": None}
 
-        # ── Grid + ACM — Snowflake (DB_GFMS_ANALYTICS_PROD.GOLD) ────────────────
+        # ── Grid + ACM + Solaire — Snowflake ─────────────────────────────────
         conn1 = None
         try:
-            from certification.services.snowflake_service import SnowflakeService
-
             sf = SnowflakeService()
             conn1 = sf._connect()
             cursor = conn1.cursor()
@@ -317,6 +316,7 @@ class FinancialConsoService:
 
         except Exception as e:
             logger.warning("[ConsoService sync] Erreur Snowflake Grid/ACM : %s", e)
+            errors["snowflake"] = str(e)
         finally:
             if conn1:
                 try:
@@ -324,57 +324,52 @@ class FinancialConsoService:
                 except Exception:
                     pass
 
-        # ── SQL2 : Solar ──────────────────────────────────────────────────────
+        # ── Solaire — Snowflake (DB_GFMS_PROD.GOLD), même base que le module
+        # carburant. Remplace l'ancienne source SQL2-ProdDB.silver.fact_solar_mth
+        # (injoignable en pratique, cf. 2026-08). Jointure sur SITES_FILTERED_FIXED
+        # (DATA_ID) fournie et vérifiée manuellement — donnée journalière, agrégée
+        # ici en mensuel comme GRID_REPORT. Connexion Snowflake séparée de celle
+        # du bloc Grid/ACM ci-dessus pour que ce bloc puisse réussir même si le
+        # premier a échoué (ou l'inverse) — 2 échecs indépendants possibles.
         conn2 = None
         try:
-            period_start = f"{year_start}-{month_start:02d}"
-            period_end   = f"{year_end}-{month_end:02d}"
-
-            conn2  = pyodbc.connect(_conn_str("SQL2-ProdDB"), timeout=timeout)
+            conn2 = SnowflakeService()._connect()
             cursor = conn2.cursor()
 
             for chunk_start in range(0, len(site_ids), CHUNK_SIZE):
                 chunk = site_ids[chunk_start: chunk_start + CHUNK_SIZE]
-                ph    = ",".join("?" * len(chunk))
+                ph    = ",".join(["%s"] * len(chunk))
 
                 cursor.execute(f"""
                     SELECT
-                        site_id,
-                        month_year,
-                        solar_production_kwh_mth,
-                        monitoring_unavailability_hours
-                    FROM [SQL2-ProdDB].[silver].[fact_solar_mth]
-                    WHERE site_id IN ({ph})
-                      AND month_year >= ?
-                      AND month_year <= ?
-                """, (*chunk, period_start, period_end))
+                        sites.SITE_ID,
+                        YEAR(production.DATE)                          AS yr,
+                        MONTH(production.DATE)                         AS mo,
+                        SUM(production.SOLAR_PRODUCTION_KWH_DAY)       AS solar_kwh,
+                        SUM(production.MONITORING_UNAVAILABILITY_HOURS) AS unavail_h,
+                        COUNT(production.DATE)                         AS nb_pts
+                    FROM DB_GFMS_PROD.GOLD.JOIN_SOLAR_PRODUCTION_AND_MONITORING_AVAILABILITY production
+                    JOIN DB_GFMS_PROD.GOLD.SITES_FILTERED_FIXED sites
+                      ON sites.DATA_ID = production.ID
+                    WHERE sites.SITE_ID IN ({ph})
+                      AND production.DATE >= %s AND production.DATE <= %s
+                      AND production.SOLAR_PRODUCTION_KWH_DAY IS NOT NULL
+                    GROUP BY sites.SITE_ID, YEAR(production.DATE), MONTH(production.DATE)
+                """, tuple(chunk) + (d_start, d_end))
 
                 for row in cursor.fetchall():
-                    sid      = row[0]
-                    my       = row[1]   # datetime ou string "2025-03"
-                    solar_v  = row[2]
-                    unavail  = row[3]
-
-                    try:
-                        if hasattr(my, "month"):
-                            yr, mo = my.year, my.month
-                        else:
-                            yr_s, mo_s = str(my).split("-")
-                            yr, mo = int(yr_s), int(mo_s)
-                    except Exception:
-                        continue
-
+                    sid, yr, mo, solar_v, unavail, nb = row[0], int(row[1]), int(row[2]), row[3], row[4], int(row[5])
                     key = (sid, yr, mo)
                     if key not in result:
                         result[key] = {"fms_grid_kwh": None, "fms_acm_kwh": None, "solar_kwh": None, "unavail_hours": None, "grid_mode": "none"}
-
-                    if solar_v is not None:
+                    if solar_v is not None and nb >= MIN_PTS:
                         result[key]["solar_kwh"] = float(solar_v)
                     if unavail is not None:
                         result[key]["unavail_hours"] = float(unavail)
 
         except Exception as e:
-            logger.warning("[ConsoService sync] Erreur SQL2 Solar : %s", e)
+            logger.warning("[ConsoService sync] Erreur Snowflake Solaire : %s", e)
+            errors["solar"] = str(e)
         finally:
             if conn2:
                 try:
@@ -382,7 +377,7 @@ class FinancialConsoService:
                 except Exception:
                     pass
 
-        return result
+        return result, errors
 
     # ── ÉTAPE 1 : local ──────────────────────────────────────────────────────
 

@@ -1,11 +1,12 @@
 # financial/management/commands/sync_financial_conso.py
 """
-Synchronise la conso FMS/ACM (Snowflake) + solaire (SQL Server fact_solar_mth)
+Synchronise la conso FMS/ACM/Solaire (100% Snowflake depuis le 2026-08 — plus
+aucune source SQL Server, cf. financial/services/conso_service.py::_fetch_remote_bulk)
 vers FinancialConsoMonthly (Postgres) — même pattern que
 fuel_tracking/management/commands/sync_efms_fuel.py.
 
 Objectif : que financial/services/conso_service.py ne fasse plus JAMAIS
-d'appel Snowflake/SQL Server live pendant une requête HTTP (SuiviConsoView,
+d'appel Snowflake live pendant une requête HTTP (SuiviConsoView,
 SiteMargeDetailView) — tout est précalculé ici et lu depuis Postgres ensuite.
 """
 from django.core.management.base import BaseCommand
@@ -16,6 +17,7 @@ from billing.models import ContractSiteLink
 from core.models import Site
 from financial.models import FinancialConsoMonthly, FinancialConsoSyncRun
 from financial.services.conso_service import FinancialConsoService
+from financial.services.site_scope_snowflake import fetch_aktivco_site_scope
 
 
 def parse_month(value: str) -> tuple[int, int]:
@@ -58,7 +60,7 @@ class Command(BaseCommand):
         )
 
         self.stdout.write("\n" + "═" * 80)
-        self.stdout.write("  SYNC CONSO FINANCIER (Snowflake + SQL Server) → EnerTrack")
+        self.stdout.write("  SYNC CONSO FINANCIER (100% Snowflake) → EnerTrack")
         self.stdout.write("═" * 80)
         self.stdout.write(f"  From month : {from_month}")
         self.stdout.write(f"  To month   : {to_month}")
@@ -68,7 +70,9 @@ class Command(BaseCommand):
         try:
             # ── Périmètre : mêmes sites que FinancialEvaluateView ──────────────
             # (Aktivco + grid_fee) — pas tout le catalogue (~3000 sites), seulement
-            # ceux réellement suivis en marge financière.
+            # ceux réellement suivis en marge financière. C'est le périmètre exact
+            # de production : nécessite le catalogue local (core.Site/
+            # billing.ContractSiteLink), alimenté via /admin/sites (import Excel).
             links = ContractSiteLink.objects.filter(
                 site__invoice_payment__iexact="Aktivco",
                 site__grid_fee=True,
@@ -79,7 +83,40 @@ class Command(BaseCommand):
                 site_map[link.site.site_id] = link.site_id
 
             site_ids = list(site_map.keys())
-            self.stdout.write(f"  Sites en périmètre : {len(site_ids)}")
+
+            # ── Repli Snowflake : si le catalogue local n'a pas encore été
+            # importé (site_map vide), on prend le périmètre Aktivco directement
+            # depuis Snowflake (SITES_FILTERED_FIXED.CLIENT = 'AktivCo') — voir
+            # financial/services/site_scope_snowflake.py. Volontairement plus
+            # large que le vrai périmètre prod (pas de recroisement grid_fee,
+            # qui n'existe pas sur Snowflake) : sert la visibilité en local en
+            # attendant l'import réel, PAS à utiliser tel quel en prod.
+            used_snowflake_scope = False
+            if not site_ids:
+                self.stdout.write(self.style.WARNING(
+                    "  Catalogue local vide (core.Site/ContractSiteLink) — "
+                    "repli sur le périmètre Aktivco Snowflake (sans grid_fee)."
+                ))
+                valid_zones = {c[0] for c in Site.ZONE_CHOICES}
+                aktivco_sites = fetch_aktivco_site_scope(country="Senegal")
+                for row in aktivco_sites:
+                    # Le préfixe du site_id (ex: "DKR_2878" -> "DKR") correspond
+                    # exactement aux codes ZONE_CHOICES — vérifié le 2026-08.
+                    prefix = row["site_id"].split("_", 1)[0].upper()
+                    zone = prefix if prefix in valid_zones else None
+                    site_obj, created = Site.objects.get_or_create(
+                        site_id=row["site_id"],
+                        defaults={"name": row["site_name"], "invoice_payment": "AktivCo", "country": "sen", "zone": zone},
+                    )
+                    if not created and not site_obj.zone and zone:
+                        site_obj.zone = zone
+                        site_obj.save(update_fields=["zone"])
+                    site_map[site_obj.site_id] = site_obj.pk
+                site_ids = list(site_map.keys())
+                used_snowflake_scope = True
+
+            self.stdout.write(f"  Sites en périmètre : {len(site_ids)}"
+                               + ("  (source : Snowflake CLIENT=AktivCo, sans grid_fee)" if used_snowflake_scope else "  (source : catalogue local, Aktivco + grid_fee)"))
 
             if not site_ids:
                 self.stdout.write(self.style.WARNING("  Aucun site en périmètre — rien à synchroniser."))
@@ -88,14 +125,21 @@ class Command(BaseCommand):
                 sync_run.save()
                 return
 
-            self.stdout.write("  Requête Snowflake (GRID_REPORT/AC_METER) + SQL Server (fact_solar_mth)...")
-            remote = FinancialConsoService._fetch_remote_bulk(
+            self.stdout.write("  Requête Snowflake (GRID_REPORT/AC_METER/SOLAR — plus aucune source SQL Server)...")
+            remote, source_errors = FinancialConsoService._fetch_remote_bulk(
                 site_ids=site_ids,
                 year_start=year_start,
                 month_start=month_start,
                 year_end=year_end,
                 month_end=month_end,
             )
+
+            sync_run.snowflake_error = source_errors.get("snowflake")
+            sync_run.solar_error = source_errors.get("solar")
+            if source_errors.get("snowflake"):
+                self.stdout.write(self.style.WARNING(f"  Snowflake (Grid/ACM) injoignable : {source_errors['snowflake']}"))
+            if source_errors.get("solar"):
+                self.stdout.write(self.style.WARNING(f"  Snowflake (Solaire) injoignable : {source_errors['solar']}"))
 
             raw_count = len(remote)
             self.stdout.write(f"  Lignes (site, année, mois) récupérées : {raw_count}")

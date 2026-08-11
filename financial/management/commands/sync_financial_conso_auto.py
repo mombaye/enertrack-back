@@ -1,6 +1,5 @@
 # financial/management/commands/sync_financial_conso_auto.py
 """Synchronise automatiquement les derniers mois disponibles (fenêtre glissante)."""
-from django.conf import settings
 from django.core.management import call_command
 from django.core.management.base import BaseCommand
 from django.db.models import Max
@@ -52,30 +51,27 @@ class Command(BaseCommand):
             except Exception:
                 pass
 
-    def _latest_month_sql2_solar(self) -> str | None:
-        import pyodbc
+    def _latest_month_snowflake_solar(self) -> str | None:
+        """
+        Depuis le 2026-08, le Solaire vient de Snowflake (DB_GFMS_PROD.GOLD.
+        JOIN_SOLAR_PRODUCTION_AND_MONITORING_AVAILABILITY) et non plus de
+        SQL2-ProdDB.silver.fact_solar_mth (SQL Server, en pratique injoignable
+        et jamais mis à jour) — voir financial/services/conso_service.py.
+        """
+        from certification.services.snowflake_service import SnowflakeService
 
-        host     = getattr(settings, "EFMS_SQL_HOST", "172.30.0.149")
-        port     = int(getattr(settings, "EFMS_SQL_PORT", 1433))
-        user     = getattr(settings, "EFMS_SQL_USER", "")
-        password = getattr(settings, "EFMS_SQL_PASSWORD", "")
-        driver   = getattr(settings, "EFMS_SQL_DRIVER", "ODBC Driver 17 for SQL Server")
-
-        conn_str = (
-            f"DRIVER={{{driver}}};SERVER={host},{port};DATABASE=SQL2-ProdDB;"
-            f"UID={user};PWD={password};TrustServerCertificate=yes;Connection Timeout=8;"
-        )
-        conn = pyodbc.connect(conn_str, timeout=8)
+        sf = SnowflakeService()
+        conn = sf._connect()
         try:
             cursor = conn.cursor()
-            cursor.execute("SELECT MAX(month_year) FROM [SQL2-ProdDB].[silver].[fact_solar_mth]")
+            cursor.execute(
+                "SELECT MAX(DATE) FROM DB_GFMS_PROD.GOLD.JOIN_SOLAR_PRODUCTION_AND_MONITORING_AVAILABILITY"
+            )
             row = cursor.fetchone()
             if not row or not row[0]:
                 return None
-            my = row[0]
-            if hasattr(my, "month"):
-                return format_month(my.year, my.month)
-            return str(my)
+            d = row[0]
+            return format_month(d.year, d.month)
         finally:
             try:
                 conn.close()
@@ -103,31 +99,25 @@ class Command(BaseCommand):
 
         solar_month = None
         try:
-            solar_month = self._latest_month_sql2_solar()
+            solar_month = self._latest_month_snowflake_solar()
         except Exception as e:
-            self.stdout.write(self.style.WARNING(f"  Erreur lecture SQL Server fact_solar_mth : {e}"))
+            self.stdout.write(self.style.WARNING(f"  Erreur lecture Snowflake Solaire : {e}"))
 
         if not grid_month and not solar_month:
             self.stdout.write(self.style.WARNING("\n  Aucun mois disponible côté source.\n"))
             return
 
-        # ✅ Le Grid/ACM (Snowflake, quotidien) pilote la fenêtre à synchroniser
-        # — on ne bloque plus sur le Solaire (SQL Server fact_solar_mth, qui a
-        # son propre retard de publication, souvent 1-2 mois derrière). Avant
-        # ce fix, un `min()` des deux sources faisait plafonner tout le sync
-        # (Grid ET ACM inclus) au mois du composant le plus en retard, alors
-        # que Grid/ACM étaient déjà à jour au jour le jour. Le Solaire reste
-        # simplement à 0 pour les mois où sa source n'a pas encore publié,
-        # et se remplira tout seul au prochain run une fois disponible
-        # (sync_financial_conso fait un upsert, donc un mois déjà synchronisé
-        # se complète automatiquement sans double-compte).
+        # Grid/ACM et Solaire viennent tous les 2 de Snowflake désormais (plus
+        # aucune source SQL Server) — les 2 sont alimentés au jour le jour, donc
+        # plus de décalage structurel entre les 2 comme du temps de SQL2-ProdDB.
+        # Le Grid/ACM pilote quand même la fenêtre par défaut (léger écart
+        # possible si l'une des 2 tables Snowflake a un retard ponctuel).
         latest_complete_month = grid_month or solar_month
         if solar_month and solar_month < latest_complete_month:
             self.stdout.write(
                 self.style.WARNING(
-                    f"  Solaire (SQL Server) en retard : dernier mois publié {solar_month}, "
-                    f"Grid/ACM (Snowflake) déjà à {latest_complete_month} — synchronisé quand même, "
-                    "solaire à 0 en attendant que la source rattrape."
+                    f"  Solaire (Snowflake) en retard : dernier mois publié {solar_month}, "
+                    f"Grid/ACM (Snowflake) déjà à {latest_complete_month} — synchronisé quand même."
                 )
             )
         self.stdout.write(f"  Dernier mois retenu (piloté par Grid/ACM) : {latest_complete_month}")

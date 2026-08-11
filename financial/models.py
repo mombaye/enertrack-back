@@ -322,6 +322,15 @@ class FinancialConsoSyncRun(models.Model):
 
     error_message = models.TextField(null=True, blank=True)
 
+    # Statut par source — _fetch_remote_bulk interroge Snowflake (Grid/ACM) et
+    # SQL Server (Solaire) séparément, chacun dans son propre try/except (une
+    # panne de l'un n'empêche jamais l'autre d'être synchronisé). error_message
+    # ci-dessus ne reflète qu'un échec de la commande dans son ensemble ; ces
+    # 2 champs permettent d'afficher le vrai statut de CHAQUE source (ex: le
+    # badge "SQL Server déconnecté" sur /financial/suivi-conso).
+    snowflake_error = models.TextField(null=True, blank=True)
+    solar_error     = models.TextField(null=True, blank=True)
+
     class Meta:
         ordering = ["-started_at"]
 
