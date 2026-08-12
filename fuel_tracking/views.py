@@ -147,7 +147,16 @@ class FuelConsommationListView(APIView):
                 "conso_estimee_enoc_l": float(row.conso_estimee_enoc_l) if row.conso_estimee_enoc_l is not None else None,
                 "conso_estimee_nb_releves": row.conso_estimee_nb_releves,
                 "conso_specifique_moy_l_kwh": float(row.conso_specifique_moy_l_kwh) if row.conso_specifique_moy_l_kwh is not None else None,
+                "ge_prod_kwh": float(row.ge_prod_kwh) if row.ge_prod_kwh is not None else None,
                 "sensor_status": row.sensor_status,
+                # Colonnes qualité VW_FUEL_REPORT — audit (spec 2026-08).
+                "quality_status": row.quality_status,
+                "raw_point_count": row.raw_point_count,
+                "valid_point_count": row.valid_point_count,
+                "isolated_spike_count": row.isolated_spike_count,
+                "over_capacity_point_count": row.over_capacity_point_count,
+                "refill_detected": row.refill_detected,
+                "estimated_refill_volume_l": float(row.estimated_refill_volume_l) if row.estimated_refill_volume_l is not None else None,
                 "enoc_qte_demandee_l": float(row.enoc_qte_demandee_l),
                 "enoc_qte_validee_l": float(row.enoc_qte_validee_l),
                 "enoc_qte_ajoutee_l": float(row.enoc_qte_ajoutee_l),
@@ -169,4 +178,121 @@ class FuelConsommationListView(APIView):
             "available_months": available_months,
             "sources": sources,
             "kpis": kpis,
+        })
+
+
+class FuelConsommationDashboardView(APIView):
+    """
+    GET /api/fuel-tracking/consommation/dashboard/?month=YYYY-MM&from_month=YYYY-MM&to_month=YYYY-MM
+
+    Alimente l'onglet Dashboard. Périmètre restreint aux sites AVEC GE
+    (has_genset=True) : seuls eux peuvent avoir une consommation fuel,
+    inclure les sites sans GE ne ferait que diluer les totaux avec des
+    lignes structurellement vides.
+
+    Portée de `months`/`monthly`/`top_sites` (priorité dans cet ordre,
+    spec 2026-08) :
+      1. `from_month` + `to_month` fournis ensemble → cette plage exacte.
+      2. sinon `month` seul (même sélecteur que l'onglet Suivis
+         Consommations) fourni et explicitement choisi par l'utilisateur
+         → ce seul mois.
+      3. sinon (aucun paramètre) → les 3 derniers mois disponibles par
+         défaut (comparatif), jamais tout l'historique.
+    """
+    permission_classes = [IsAuthenticated]
+
+    @staticmethod
+    def _month_stats(qs, month_year):
+        from django.db.models import Count, Q, Sum
+
+        agg = qs.aggregate(
+            nb_sites_ge=Count("id"),
+            nb_sites_avec_conso=Count("id", filter=Q(conso_snowflake_l__isnull=False)),
+            nb_sites_monitored=Count("id", filter=Q(sensor_status="MONITORED")),
+            total_conso_snowflake_l=Sum("conso_snowflake_l"),
+            total_enoc_qte_ajoutee_l=Sum("enoc_qte_ajoutee_l"),
+            total_enoc_nb_demandes=Sum("enoc_nb_demandes"),
+            nb_sites_enoc_ajoutee=Count("id", filter=Q(enoc_qte_ajoutee_l__gt=0)),
+            # Ratio pondéré (pas une moyenne de ratios) — seulement les lignes
+            # où les 2 valeurs existent, même principe que le calcul par site
+            # (cf. fuel_consommation_snowflake.py).
+            specif_num=Sum("conso_snowflake_l", filter=Q(conso_snowflake_l__isnull=False, ge_prod_kwh__isnull=False)),
+            specif_den=Sum("ge_prod_kwh", filter=Q(conso_snowflake_l__isnull=False, ge_prod_kwh__isnull=False)),
+        )
+        specif_num = agg["specif_num"]
+        specif_den = agg["specif_den"]
+        conso_specifique = (
+            float(specif_num) / float(specif_den)
+            if specif_num is not None and specif_den not in (None, 0)
+            else None
+        )
+        return {
+            "month_year": month_year,
+            "nb_sites_ge": agg["nb_sites_ge"],
+            "nb_sites_avec_conso": agg["nb_sites_avec_conso"],
+            "nb_sites_monitored": agg["nb_sites_monitored"],
+            "total_conso_snowflake_l": float(agg["total_conso_snowflake_l"] or 0),
+            "total_enoc_qte_ajoutee_l": float(agg["total_enoc_qte_ajoutee_l"] or 0),
+            "total_enoc_nb_demandes": agg["total_enoc_nb_demandes"] or 0,
+            "nb_sites_enoc_ajoutee": agg["nb_sites_enoc_ajoutee"],
+            "conso_specifique_moy_l_kwh": conso_specifique,
+        }
+
+    @staticmethod
+    def _top_sites(qs, limit=10):
+        from django.db.models import Count, Sum
+
+        rows = (
+            qs.exclude(conso_snowflake_l__isnull=True)
+            .values("site_id", "site_name")
+            .annotate(
+                total_conso_l=Sum("conso_snowflake_l"),
+                nb_mois_avec_conso=Count("id"),
+            )
+            .order_by("-total_conso_l")[:limit]
+        )
+        return [
+            {
+                "site_id": r["site_id"],
+                "site_name": r["site_name"],
+                "total_conso_l": float(r["total_conso_l"] or 0),
+                "nb_mois_avec_conso": r["nb_mois_avec_conso"],
+            }
+            for r in rows
+        ]
+
+    def get(self, request):
+        from fuel_tracking.models import FuelConsommationMonthly
+
+        base_qs = FuelConsommationMonthly.objects.filter(has_genset=True)
+        all_months = list(
+            base_qs.order_by("month_year").values_list("month_year", flat=True).distinct()
+        )
+        total_ge_sites = base_qs.filter(month_year=all_months[-1]).count() if all_months else 0
+
+        requested_month = (request.query_params.get("month") or "").strip()
+        from_month = (request.query_params.get("from_month") or "").strip()
+        to_month = (request.query_params.get("to_month") or "").strip()
+
+        if from_month and to_month:
+            trend_months = [m for m in all_months if from_month <= m <= to_month]
+        elif requested_month:
+            trend_months = [m for m in all_months if m == requested_month]
+        else:
+            trend_months = all_months[-3:]
+
+        trend_qs = base_qs.filter(month_year__in=trend_months)
+
+        monthly = [
+            self._month_stats(trend_qs.filter(month_year=my), my)
+            for my in trend_months
+        ]
+        top_sites = self._top_sites(trend_qs)
+
+        return Response({
+            "months": trend_months,
+            "monthly": monthly,
+            "top_sites": top_sites,
+            "total_ge_sites": total_ge_sites,
+            "available_months": all_months,
         })

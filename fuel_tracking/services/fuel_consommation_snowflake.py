@@ -1,48 +1,59 @@
 # fuel_tracking/services/fuel_consommation_snowflake.py
 """
-Consommation carburant mensuelle par site depuis Snowflake DB_GFMS_PROD.GOLD
-(base de production distincte de DB_GFMS_ANALYTICS_PROD utilisée par
-financial/conso_service.py pour l'électricité — voir exploration du 07/08).
+Consommation carburant mensuelle par site depuis Snowflake.
 
-La requête part de la DIMENSION SITE (tous les sites Sénégal, SITE_FILTERED)
-et fait un LEFT JOIN vers les 3 tables de fait — et non l'inverse. Avec un
-JOIN direct depuis les tables de fait (version précédente), un site sans
-donnée de conso ce mois-là disparaissait complètement de son propre nom/
-typologie dès qu'il n'apparaissait dans aucune des 3 tables de fait en
-premier : constaté au 07/08, seuls 5 sites sur 3253 avaient un nom de site
-correctement rempli, alors que la table de statut capteur couvrait ~382
-sites — le nom de site n'était rempli que pour les 5 sites qui avaient une
-ligne CONSUMPTION_FUEL, jamais pour les sites vus uniquement via les 2
-autres tables. Partir de SITE_FILTERED (tous les sites) et faire les LEFT
-JOIN garantit un nom de site pour CHAQUE site du périmètre, que sa conso
-soit renseignée ou non.
+Depuis le 2026-08 (spec "Correction des 3 colonnes carburant") : la Conso
+mesurée vient de DB_GFMS_ANALYTICS_DEV.GOLD.VW_FUEL_REPORT (vue quotidienne
+qui joint déjà site/GE et nettoie pics isolés, valeurs négatives,
+dépassements de capacité) au lieu de DB_GFMS_PROD.GOLD.CONSUMPTION_FUEL
+(quasi vide, ~5 sites couverts sur 3253 — abandonnée). ATTENTION : la spec
+demandait un filtre QUALITY_STATUS = 'VALID', mais vérifié en base le
+2026-08 : la colonne ne prend QUE les valeurs 'OK' / 'NO_VALID_LEVEL' /
+'LOW_QUALITY' — jamais 'VALID'. Filtrer sur 'VALID' littéral aurait rendu
+la colonne vide à 100%. Corrigé ici pour filtrer sur 'OK'.
+
+La requête part de la DIMENSION SITE (tous les sites Sénégal, SITE_FILTERED,
+DB_GFMS_PROD.GOLD) et fait un LEFT JOIN vers les tables de fait — et non
+l'inverse. Avec un JOIN direct depuis les tables de fait (version
+précédente), un site sans donnée de conso ce mois-là disparaissait
+complètement de son propre nom/typologie dès qu'il n'apparaissait dans
+aucune table de fait en premier : constaté au 07/08, seuls 5 sites sur 3253
+avaient un nom de site correctement rempli. Partir de SITE_FILTERED (tous
+les sites) et faire les LEFT JOIN garantit un nom de site pour CHAQUE site
+du périmètre, que sa conso soit renseignée ou non.
 
 Tables sources :
-  - SITE_FILTERED (DATA_ID, SITE_ID, SITE_NAME, COUNTRY, TYPOLOGY, SITE_TYPE,
-    DG_COUNT, POWER_SUPPLY, ...) : dimension site, base de la requête.
-    Contient quelques doublons de DATA_ID (8697 lignes pour 8403 DATA_ID
-    distincts au 07/08) — dédupliqué ici via QUALIFY ROW_NUMBER()=1.
-  - CONSUMPTION_FUEL (ID, DATE, CONSUMPTION_FUEL) : conso carburant/jour.
-  - AVGSPECIFICFUELCONSO_L_KWH (ID, DATE, valeur) : conso spécifique L/kWh/jour.
-  - GFMS_FUEL_SENSOR_MONITORING_DATA (DATE, ID, FUEL_SENSOR_MONITORING_STATUS) :
-    état du capteur — couvre beaucoup plus de sites que les 2 tables de conso
-    ci-dessus (un site "MONITORED" n'a pas forcément assez de points de
-    mesure valides pour produire une conso mensuelle calculée).
-  - TANK_LEVEL_AVG (ID, DATE, TANK_LEVEL_AVG) : niveau moyen de cuve/jour —
-    exploré le 07/08 après avoir constaté que CONSUMPTION_FUEL est vide pour
-    la quasi-totalité des sites Sénégal malgré un capteur "MONITORED" (voir
-    fuel_tracking/services/enoc_mongo_service.py pour le même problème côté
-    ENOC). Contrairement à CONSUMPTION_FUEL (5 sites couverts) ou aux
-    relevés ENOC (import historique figé, 8 sites), TANK_LEVEL_AVG couvre
-    315 sites avec GE sur 483 et semble alimentée en continu comme le reste
-    de Snowflake — bien meilleure source pour une estimation par delta de
-    niveau. Le calcul (niveau début - fin + ravitaillements ENOC entre les
-    deux) se fait dans sync_fuel_consommation.py, pas ici : ce module ne
-    renvoie que les niveaux bruts début/fin, la combinaison avec les
-    ravitaillements ENOC (déjà en base Postgres à ce stade) est plus propre
-    côté commande de sync.
-  Le ID de ces 4 tables est un identifiant numérique interne (DATA_ID), pas
-  le site_id texte (ex: "SN0876") ; la jointure passe par SITE_FILTERED.
+  - SITE_FILTERED (DB_GFMS_PROD.GOLD ; DATA_ID, SITE_ID, SITE_NAME, COUNTRY,
+    TYPOLOGY, SITE_TYPE, DG_COUNT, POWER_SUPPLY, ...) : dimension site, base
+    de la requête. Contient quelques doublons de DATA_ID — dédupliqué ici
+    via QUALIFY ROW_NUMBER()=1.
+  - VW_FUEL_REPORT (DB_GFMS_ANALYTICS_DEV.GOLD ; DATA_ID, COUNTRY, SITE_ID,
+    DATE, QUALITY_STATUS, VALID_POINT_COUNT, RAW_POINT_COUNT,
+    ISOLATED_SPIKE_COUNT, OVER_CAPACITY_POINT_COUNT, DROP_DETECTED,
+    ESTIMATED_DROP_VOLUME_L, REFILL_DETECTED, ESTIMATED_REFILL_VOLUME_L) :
+    conso mesurée quotidienne (baisse de niveau détectée = consommation
+    réelle), déjà nettoyée des pics isolés / valeurs négatives / dépassements
+    de capacité. Colonnes qualité conservées pour audit dans l'API.
+  - GE_PROD_KWH (DB_GFMS_PROD.GOLD ; ID, DATE, GE_PROD_KWH) : production
+    électrique du groupe électrogène/jour — sert au calcul de la conso
+    spécifique (L/kWh), au ratio pondéré mensuel (SUM/SUM), pas une moyenne
+    de ratios journaliers.
+  - GFMS_FUEL_SENSOR_MONITORING_DATA (DB_GFMS_PROD.GOLD) : état du capteur,
+    conservé tel quel pour la colonne "Statut capteur" (distinct de
+    QUALITY_STATUS qui est un indicateur de qualité par jour, pas un statut
+    de capteur global).
+  - TANK_LEVEL_AVG (DB_GFMS_PROD.GOLD) : niveau moyen de cuve/jour — sert
+    UNIQUEMENT à l'estimation par delta (conso_estimee_snowflake_l, calculée
+    dans sync_fuel_consommation.py), distincte de la conso MESURÉE via
+    VW_FUEL_REPORT ci-dessus. Les 2 indicateurs restent séparés, jamais
+    fusionnés (cf. spec 2026-08 : "ne pas remplacer une consommation
+    mesurée Snowflake par une quantité ENOC : ce sont deux indicateurs
+    distincts" — même principe appliqué ici entre les 2 sources Snowflake).
+
+  VW_FUEL_REPORT est sur DB_GFMS_ANALYTICS_DEV (pas PROD) — c'est la base
+  indiquée dans la spec, vérifiée accessible avec les mêmes identifiants.
+  Le ID/DATA_ID de ces tables est un identifiant numérique interne, pas le
+  site_id texte (ex: "SN0876") ; la jointure passe par SITE_FILTERED.
 """
 import calendar as _cal
 import logging
@@ -55,6 +66,7 @@ logger = logging.getLogger(__name__)
 
 FUEL_DATABASE = "DB_GFMS_PROD"
 FUEL_SCHEMA = "GOLD"
+FUEL_REPORT_DATABASE = "DB_GFMS_ANALYTICS_DEV"  # VW_FUEL_REPORT — base distincte de FUEL_DATABASE
 
 # Périmètre actuel du module fuel-tracking : Sénégal uniquement (voir
 # "Commande FUEL ESCO SENEGAL", historique du module). Snowflake couvre
@@ -94,8 +106,16 @@ def fetch_monthly_consumption(year: int, month: int) -> dict[str, dict]:
     """
     Retourne {site_id: {site_name, country, typology, site_type, dg_count,
     power_supply, conso_snowflake_l, nb_jours_data, conso_specifique_moy_l_kwh,
-    sensor_status}} — une entrée pour CHAQUE site du périmètre (Sénégal),
-    même sans donnée de conso ce mois-là.
+    sensor_status, quality_status, valid_point_count, raw_point_count,
+    isolated_spike_count, over_capacity_point_count, refill_detected,
+    estimated_refill_volume_l}} — une entrée pour CHAQUE site du périmètre
+    (Sénégal), même sans donnée de conso ce mois-là.
+
+    conso_specifique_moy_l_kwh est le ratio pondéré mensuel SUM(conso)/
+    SUM(production GE), PAS une moyenne de ratios journaliers (cf. spec
+    2026-08) — calculé ici en Python à partir des 2 sommes déjà agrégées
+    par la requête, plutôt qu'en SQL, pour éviter toute division par une
+    valeur nulle côté Snowflake.
     """
     d_start = date(year, month, 1)
     d_end = date(year, month, _cal.monthrange(year, month)[1])
@@ -104,6 +124,7 @@ def fetch_monthly_consumption(year: int, month: int) -> dict[str, dict]:
     try:
         cursor = conn.cursor()
         db_schema = f"{FUEL_DATABASE}.{FUEL_SCHEMA}"
+        report_schema = f"{FUEL_REPORT_DATABASE}.{FUEL_SCHEMA}"
 
         cursor.execute(f"""
             WITH site_dim AS (
@@ -116,17 +137,39 @@ def fetch_monthly_consumption(year: int, month: int) -> dict[str, dict]:
                 )
                 WHERE rn = 1
             ),
+            -- Conso MESURÉE — VW_FUEL_REPORT (base ANALYTICS_DEV, indiquée par
+            -- la spec). QUALITY_STATUS filtré sur 'OK' (valeur réelle vérifiée
+            -- en base — la spec mentionnait 'VALID', qui n'existe pas dans la
+            -- colonne, ça aurait rendu la conso systematiquement vide).
             conso AS (
-                SELECT ID, SUM(CONSUMPTION_FUEL) AS total_l, COUNT(DATE) AS nb_jours
-                FROM {db_schema}.CONSUMPTION_FUEL
-                WHERE DATE >= %(d_start)s AND DATE <= %(d_end)s AND CONSUMPTION_FUEL IS NOT NULL
-                GROUP BY ID
+                SELECT
+                    DATA_ID,
+                    SUM(CASE
+                        WHEN QUALITY_STATUS = 'OK' AND VALID_POINT_COUNT >= 2 AND DROP_DETECTED = TRUE
+                        THEN ESTIMATED_DROP_VOLUME_L
+                    END) AS total_l,
+                    COUNT(CASE
+                        WHEN QUALITY_STATUS = 'OK' AND VALID_POINT_COUNT >= 2 AND DROP_DETECTED = TRUE
+                        THEN 1
+                    END) AS nb_jours,
+                    SUM(RAW_POINT_COUNT) AS raw_point_count,
+                    SUM(VALID_POINT_COUNT) AS valid_point_count,
+                    SUM(ISOLATED_SPIKE_COUNT) AS isolated_spike_count,
+                    SUM(OVER_CAPACITY_POINT_COUNT) AS over_capacity_point_count,
+                    MAX(IFF(REFILL_DETECTED, 1, 0)) AS refill_detected,
+                    SUM(ESTIMATED_REFILL_VOLUME_L) AS estimated_refill_volume_l,
+                    MAX_BY(QUALITY_STATUS, DATE) AS quality_status
+                FROM {report_schema}.VW_FUEL_REPORT
+                WHERE COUNTRY = %(country)s AND DATE >= %(d_start)s AND DATE <= %(d_end)s
+                GROUP BY DATA_ID
             ),
-            specifique AS (
-                SELECT ID, AVG(AVGSPECIFICFUELCONSO_L_KWH) AS avg_val
-                FROM {db_schema}.AVGSPECIFICFUELCONSO_L_KWH
-                WHERE DATE >= %(d_start)s AND DATE <= %(d_end)s AND AVGSPECIFICFUELCONSO_L_KWH IS NOT NULL
+            -- Production GE — pour la conso spécifique (ratio pondéré mensuel).
+            ge_prod AS (
+                SELECT ID, SUM(GE_PROD_KWH) AS ge_prod_kwh
+                FROM {db_schema}.GE_PROD_KWH
+                WHERE DATE >= %(d_start)s AND DATE <= %(d_end)s AND GE_PROD_KWH IS NOT NULL
                 GROUP BY ID
+                HAVING SUM(GE_PROD_KWH) > 0
             ),
             capteur AS (
                 SELECT TRY_CAST(ID AS NUMBER) AS data_id, FUEL_SENSOR_MONITORING_STATUS AS status
@@ -155,22 +198,34 @@ def fetch_monthly_consumption(year: int, month: int) -> dict[str, dict]:
             )
             SELECT
                 s.SITE_ID, s.SITE_NAME, s.COUNTRY, s.TYPOLOGY, s.SITE_TYPE, s.DG_COUNT, s.POWER_SUPPLY,
-                c.total_l, c.nb_jours, sp.avg_val, ca.status,
-                n.niveau_debut, n.niveau_fin, n.nb_releves
+                c.total_l, c.nb_jours, ca.status,
+                n.niveau_debut, n.niveau_fin, n.nb_releves,
+                gp.ge_prod_kwh,
+                c.raw_point_count, c.valid_point_count, c.isolated_spike_count,
+                c.over_capacity_point_count, c.refill_detected, c.estimated_refill_volume_l, c.quality_status
             FROM site_dim s
-            LEFT JOIN conso c ON c.ID = s.DATA_ID
-            LEFT JOIN specifique sp ON sp.ID = s.DATA_ID
+            LEFT JOIN conso c ON c.DATA_ID = s.DATA_ID
+            LEFT JOIN ge_prod gp ON gp.ID = s.DATA_ID
             LEFT JOIN capteur ca ON ca.data_id = s.DATA_ID
             LEFT JOIN niveau n ON n.ID = s.DATA_ID
         """, {"country": COUNTRY_SCOPE, "d_start": d_start, "d_end": d_end})
 
         result: dict[str, dict] = {}
         for (site_id, site_name, country, typology, site_type, dg_count, power_supply,
-             total_l, nb_jours, avg_val, status, niveau_debut, niveau_fin, nb_releves) in cursor.fetchall():
+             total_l, nb_jours, status, niveau_debut, niveau_fin, nb_releves, ge_prod_kwh,
+             raw_point_count, valid_point_count, isolated_spike_count,
+             over_capacity_point_count, refill_detected, estimated_refill_volume_l, quality_status) in cursor.fetchall():
             try:
                 has_genset = float(dg_count) > 0 if dg_count is not None else False
             except (TypeError, ValueError):
                 has_genset = False
+
+            conso_l = Decimal(str(total_l)) if total_l is not None else None
+            # Ratio pondéré mensuel — pas de moyenne de ratios journaliers.
+            conso_specifique = None
+            if conso_l is not None and ge_prod_kwh is not None and ge_prod_kwh > 0:
+                conso_specifique = (conso_l / Decimal(str(ge_prod_kwh))).quantize(Decimal("0.001"))
+
             result[site_id] = {
                 "site_name": site_name,
                 "country": country,
@@ -179,10 +234,18 @@ def fetch_monthly_consumption(year: int, month: int) -> dict[str, dict]:
                 "dg_count": dg_count,
                 "power_supply": power_supply,
                 "has_genset": has_genset,
-                "conso_snowflake_l": Decimal(str(total_l)) if total_l is not None else None,
+                "conso_snowflake_l": conso_l,
                 "nb_jours_data": int(nb_jours or 0),
-                "conso_specifique_moy_l_kwh": Decimal(str(avg_val)) if avg_val is not None else None,
+                "conso_specifique_moy_l_kwh": conso_specifique,
+                "ge_prod_kwh": Decimal(str(ge_prod_kwh)) if ge_prod_kwh is not None else None,
                 "sensor_status": status,
+                "quality_status": quality_status,
+                "raw_point_count": int(raw_point_count) if raw_point_count is not None else None,
+                "valid_point_count": int(valid_point_count) if valid_point_count is not None else None,
+                "isolated_spike_count": int(isolated_spike_count) if isolated_spike_count is not None else None,
+                "over_capacity_point_count": int(over_capacity_point_count) if over_capacity_point_count is not None else None,
+                "refill_detected": bool(refill_detected) if refill_detected is not None else False,
+                "estimated_refill_volume_l": Decimal(str(estimated_refill_volume_l)) if estimated_refill_volume_l is not None else None,
                 "niveau_debut": Decimal(str(niveau_debut)) if niveau_debut is not None else None,
                 "niveau_fin": Decimal(str(niveau_fin)) if niveau_fin is not None else None,
                 "niveau_nb_releves": int(nb_releves) if nb_releves is not None else None,

@@ -475,13 +475,17 @@ class FuelSuiviCommandeSite(models.Model):
 
 class FuelConsommationMonthly(models.Model):
     """
-    Consommation carburant mensuelle par site — automatisée, jointure de 3
-    sources (voir fuel_tracking/services/fuel_consommation_snowflake.py et la
-    commande sync_fuel_consommation) :
-      - Snowflake DB_GFMS_PROD.GOLD.CONSUMPTION_FUEL / AVGSPECIFICFUELCONSO_L_KWH
-        (agrégées sur le mois, jointes à SITE_FILTERED pour résoudre site_id) ;
+    Consommation carburant mensuelle par site — automatisée, jointure de
+    plusieurs sources (voir fuel_tracking/services/fuel_consommation_snowflake.py
+    et la commande sync_fuel_consommation) :
+      - Snowflake DB_GFMS_ANALYTICS_DEV.GOLD.VW_FUEL_REPORT (conso MESURÉE,
+        depuis le 2026-08) + DB_GFMS_PROD.GOLD.GE_PROD_KWH (conso spécifique,
+        ratio pondéré) ; agrégées sur le mois, jointes à SITE_FILTERED pour
+        résoudre site_id ;
       - ENOC (FuelEnocMovement, demandes de ravitaillement validées par le
-        fuel manager, déjà synchronisées via sync_enoc_fuel_movements) ;
+        fuel manager, déjà synchronisées via sync_enoc_fuel_movements ; plus
+        fetch_estimated_consumption pour conso_estimee_enoc_l, filtré depuis
+        le 2026-08 sur les ravitaillements liés à une demande validée) ;
       - fichiers mensuels remontés par les gardiens (pas encore intégré —
         colonnes prévues mais laissées vides tant que le format n'est pas défini).
 
@@ -513,7 +517,10 @@ class FuelConsommationMonthly(models.Model):
     nb_ge_enoc = models.IntegerField(null=True, blank=True, help_text="Nombre de GE déclaré côté ENOC (sites.nb_ge).")
     has_genset = models.BooleanField(default=False, db_index=True, help_text="has_genset_snowflake OU has_genset_enoc — seuls ces sites peuvent avoir une conso fuel.")
 
-    # Snowflake — DB_GFMS_PROD.GOLD.CONSUMPTION_FUEL
+    # Snowflake — DB_GFMS_ANALYTICS_DEV.GOLD.VW_FUEL_REPORT (conso MESURÉE,
+    # depuis le 2026-08 — remplace CONSUMPTION_FUEL, quasi vide). Un jour ne
+    # compte que si QUALITY_STATUS='OK' ET VALID_POINT_COUNT>=2 ET
+    # DROP_DETECTED=TRUE (voir fuel_consommation_snowflake.py).
     conso_snowflake_l = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
     nb_jours_data = models.IntegerField(default=0, help_text="Nombre de jours du mois avec une valeur de consommation remontée.")
 
@@ -530,11 +537,27 @@ class FuelConsommationMonthly(models.Model):
     conso_estimee_enoc_l = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
     conso_estimee_nb_releves = models.IntegerField(null=True, blank=True)
 
-    # Snowflake — DB_GFMS_PROD.GOLD.AVGSPECIFICFUELCONSO_L_KWH
+    # Conso spécifique — ratio pondéré mensuel SUM(conso_snowflake_l)/
+    # SUM(ge_prod_kwh), PAS une moyenne de ratios journaliers (remplace
+    # AVGSPECIFICFUELCONSO_L_KWH, abandonnée). ge_prod_kwh vient de
+    # DB_GFMS_PROD.GOLD.GE_PROD_KWH. Vide si le site n'a pas de production
+    # GE ce mois-là (conso mesurée conservée quand même).
     conso_specifique_moy_l_kwh = models.DecimalField(max_digits=12, decimal_places=6, null=True, blank=True)
+    ge_prod_kwh = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True, help_text="Production GE du mois (DB_GFMS_PROD.GOLD.GE_PROD_KWH), utilisée pour la conso spécifique.")
 
     # Snowflake — DB_GFMS_PROD.GOLD.GFMS_FUEL_SENSOR_MONITORING_DATA (dernier statut connu du mois)
     sensor_status = models.CharField(max_length=32, null=True, blank=True)
+
+    # Colonnes qualité VW_FUEL_REPORT — conservées pour audit (spec 2026-08),
+    # agrégées sur le mois (SUM des compteurs journaliers, sauf quality_status
+    # qui est la valeur du dernier jour du mois).
+    quality_status = models.CharField(max_length=32, null=True, blank=True, help_text="QUALITY_STATUS VW_FUEL_REPORT du dernier jour du mois (OK / NO_VALID_LEVEL / LOW_QUALITY).")
+    raw_point_count = models.IntegerField(null=True, blank=True)
+    valid_point_count = models.IntegerField(null=True, blank=True)
+    isolated_spike_count = models.IntegerField(null=True, blank=True)
+    over_capacity_point_count = models.IntegerField(null=True, blank=True)
+    refill_detected = models.BooleanField(default=False, help_text="Au moins un ravitaillement détecté sur le mois (REFILL_DETECTED VW_FUEL_REPORT).")
+    estimated_refill_volume_l = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
 
     # ENOC — agrégé depuis FuelEnocMovement sur le même mois/site
     enoc_qte_demandee_l = models.DecimalField(max_digits=18, decimal_places=3, default=0)

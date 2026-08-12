@@ -96,7 +96,7 @@ class Command(BaseCommand):
             month_year = f"{year:04d}-{mo:02d}"
             self.stdout.write(f"\n── {month_year} ──")
 
-            self.stdout.write("  Requête Snowflake (CONSUMPTION_FUEL / AVGSPECIFICFUELCONSO_L_KWH / capteur)...")
+            self.stdout.write("  Requête Snowflake (VW_FUEL_REPORT / GE_PROD_KWH / capteur)...")
             try:
                 snowflake_data = fetch_monthly_consumption(year, mo)
             except Exception as e:
@@ -192,7 +192,15 @@ class Command(BaseCommand):
                     conso_estimee_enoc_l=est.get("conso_estimee_l"),
                     conso_estimee_nb_releves=est.get("nb_releves"),
                     conso_specifique_moy_l_kwh=sf.get("conso_specifique_moy_l_kwh"),
+                    ge_prod_kwh=sf.get("ge_prod_kwh"),
                     sensor_status=sf.get("sensor_status"),
+                    quality_status=sf.get("quality_status"),
+                    raw_point_count=sf.get("raw_point_count"),
+                    valid_point_count=sf.get("valid_point_count"),
+                    isolated_spike_count=sf.get("isolated_spike_count"),
+                    over_capacity_point_count=sf.get("over_capacity_point_count"),
+                    refill_detected=sf.get("refill_detected") or False,
+                    estimated_refill_volume_l=sf.get("estimated_refill_volume_l"),
                     enoc_qte_demandee_l=en.get("qte_demandee") or 0,
                     enoc_qte_validee_l=en.get("qte_validee") or 0,
                     enoc_qte_ajoutee_l=en.get("qte_ajoutee") or 0,
@@ -229,7 +237,10 @@ class Command(BaseCommand):
                         "conso_snowflake_l", "nb_jours_data",
                         "conso_estimee_snowflake_l", "conso_estimee_snowflake_nb_releves",
                         "conso_estimee_enoc_l", "conso_estimee_nb_releves",
-                        "conso_specifique_moy_l_kwh", "sensor_status",
+                        "conso_specifique_moy_l_kwh", "ge_prod_kwh", "sensor_status",
+                        "quality_status", "raw_point_count", "valid_point_count",
+                        "isolated_spike_count", "over_capacity_point_count",
+                        "refill_detected", "estimated_refill_volume_l",
                         "enoc_qte_demandee_l", "enoc_qte_validee_l", "enoc_qte_ajoutee_l",
                         "enoc_nb_demandes", "ecart_conso_vs_enoc_l", "synced_at",
                     ],

@@ -269,10 +269,22 @@ def fetch_estimated_consumption(year: int, month: int) -> dict[str, dict]:
 
     Principe : pour un site avec >= 2 relevés valides dans le mois,
     conso_estimee = (niveau au 1er relevé) - (niveau au dernier relevé)
-                    + (litres ajoutés entre les deux, via fuel_operations)
+                    + (litres ajoutés entre les deux, via fuel_operations
+                       VALIDÉS par le fuel manager — voir filtre ci-dessous)
     Un résultat négatif indique une incohérence (ravitaillement non
     enregistré, relevé erroné...) — retourné à None plutôt qu'un chiffre
     trompeur.
+
+    Filtre de validation (ajouté 2026-08, spec "Correction des 3 colonnes
+    carburant") : seuls les ravitaillements (`fuel_operations`) rattachés à
+    une demande (`fuel_requests`) au statut 'done' ou 'validated' comptent
+    dans le total ajouté. Avant ce correctif, TOUS les `fuel_operations` de
+    la période étaient sommés sans regarder le statut de la demande liée —
+    `fuel_requests.status` a 4 valeurs réelles : done/pending/rejected/
+    validated (vérifié en base), 'pending'/'rejected' ne doivent pas compter
+    comme carburant réellement ajouté. Les opérations sans demande liée du
+    tout (ex: PONCTION directe, cf. fetch_fuel_movements) sont conservées :
+    l'existence même de l'opération signifie qu'elle a été exécutée.
 
     Retourne {site_id: {"conso_estimee_l": Decimal|None, "nb_releves": int,
     "date_debut": str, "date_fin": str}}.
@@ -286,6 +298,14 @@ def fetch_estimated_consumption(year: int, month: int) -> dict[str, dict]:
     client = _connect()
     try:
         db = client[settings.ENOC_MONGO_DB_NAME]
+
+        # Codes de demande validés par le fuel manager (status done/validated)
+        # + ensemble de TOUS les codes connus (pour distinguer "non validé"
+        # d'"aucune demande liée du tout").
+        validated_codes = set(
+            db.fuel_requests.distinct("request_code", {"status": {"$in": ["done", "validated"]}})
+        )
+        all_known_codes = set(db.fuel_requests.distinct("request_code"))
 
         readings_by_site: dict[str, list[tuple]] = {}
         cursor = db.fuel_level_readings.find({
@@ -327,6 +347,10 @@ def fetch_estimated_consumption(year: int, month: int) -> dict[str, dict]:
                 {"$match": {
                     "site_id": site_id,
                     "operation_date": {"$gte": first_date, "$lte": last_date},
+                    "$or": [
+                        {"request_code": {"$in": list(validated_codes)}},
+                        {"request_code": {"$nin": list(all_known_codes)}},
+                    ],
                 }},
                 {"$group": {"_id": None, "total": {"$sum": "$quantity_added_liters"}}},
             ])
