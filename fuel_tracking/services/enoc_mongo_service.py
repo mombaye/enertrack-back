@@ -367,3 +367,45 @@ def fetch_estimated_consumption(year: int, month: int) -> dict[str, dict]:
         return result
     finally:
         client.close()
+
+
+def fetch_stock_readings() -> dict[str, dict]:
+    """
+    Dernier relevé de niveau de cuve PAR SITE — pour l'onglet Suivis Stock,
+    distinct de fetch_estimated_consumption (qui calcule un DELTA entre 2
+    relevés pour estimer une conso). Ici on veut juste le niveau le plus
+    récent connu, tel quel.
+
+    Mêmes garde-fous que fetch_estimated_consumption : relevés avec
+    level_liters=0 ET level_cm=None écartés (valeur par défaut probable de
+    l'import historique, pas une vraie mesure — voir KLD_0001 par exemple).
+
+    Retourne {site_id: {"stock_enoc_l": float, "date": str}}.
+    """
+    client = _connect()
+    try:
+        db = client[settings.ENOC_MONGO_DB_NAME]
+
+        result: dict[str, dict] = {}
+        cursor = db.fuel_level_readings.find({
+            "tanks.level_liters": {"$ne": None},
+        }).sort("date_releve", -1)
+
+        for doc in cursor:
+            site_id = doc.get("site_id")
+            date_str = doc.get("date_releve")
+            if not site_id or not date_str or site_id in result:
+                continue  # déjà vu un relevé plus récent pour ce site (tri desc)
+            tanks = doc.get("tanks") or []
+            liters = [
+                t.get("level_liters") for t in tanks
+                if t.get("level_liters") is not None
+                and not (t.get("level_liters") == 0 and t.get("level_cm") is None)
+            ]
+            if not liters:
+                continue
+            result[site_id] = {"stock_enoc_l": sum(liters), "date": date_str}
+
+        return result
+    finally:
+        client.close()

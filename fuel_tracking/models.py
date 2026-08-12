@@ -620,3 +620,85 @@ class FuelConsommationSyncRun(models.Model):
 
     def __str__(self):
         return f"Fuel Consommation sync {self.month_from}→{self.month_to} [{self.status}]"
+
+
+class FuelStockSnapshot(models.Model):
+    """
+    Stock carburant ACTUEL par site — contrairement à FuelConsommationMonthly
+    (une somme sur un mois), le stock est un état à un instant T : une seule
+    ligne par site (pas de clé mois), remplacée en totalité à chaque sync
+    (voir sync_fuel_stock) plutôt qu'accumulée dans le temps.
+
+    Jointure de 2 sources indépendantes, jamais fusionnées (même principe que
+    Consommation — cf. spec 2026-08) :
+      - Snowflake DB_GFMS_ANALYTICS_DEV.GOLD.VW_FUEL_REPORT : dernier relevé
+        physiquement valide PAR SITE sur une fenêtre glissante de 30 jours
+        (LAST_VALID_LEVEL/CAPACITY_L) — un jour calendaire fixe unique ne
+        couvre que ~150/483 sites GE (vérifié le 2026-08), la fenêtre par
+        site remonte à 182/483.
+      - ENOC fuel_level_readings (import historique figé, MongoDB) : dernier
+        relevé par site, mêmes garde-fous que l'estimation de conso
+        (level_liters=0 + level_cm=None écarté comme valeur par défaut).
+    """
+
+    site_id = models.CharField(max_length=64, unique=True, db_index=True)
+    site_name = models.CharField(max_length=255, null=True, blank=True)
+    country = models.CharField(max_length=64, null=True, blank=True, db_index=True)
+
+    typology = models.CharField(max_length=64, null=True, blank=True)
+    site_type = models.CharField(max_length=64, null=True, blank=True)
+    dg_count = models.CharField(max_length=16, null=True, blank=True)
+    power_supply = models.CharField(max_length=64, null=True, blank=True)
+
+    has_genset_snowflake = models.BooleanField(default=False)
+    has_genset_enoc = models.BooleanField(default=False)
+    nb_ge_enoc = models.IntegerField(null=True, blank=True)
+    has_genset = models.BooleanField(default=False, db_index=True)
+
+    # Snowflake — VW_FUEL_REPORT, dernier relevé valide (fenêtre 30j)
+    stock_snowflake_l = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
+    capacity_snowflake_l = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
+    stock_snowflake_pct = models.DecimalField(max_digits=6, decimal_places=1, null=True, blank=True, help_text="stock_snowflake_l / capacity_snowflake_l, en %.")
+    stock_snowflake_date = models.DateField(null=True, blank=True, help_text="Date du relevé (peut être antérieure à aujourd'hui — dernier relevé disponible dans la fenêtre).")
+    quality_status = models.CharField(max_length=32, null=True, blank=True)
+
+    # ENOC — fuel_level_readings, dernier relevé (import historique figé)
+    stock_enoc_l = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
+    stock_enoc_date = models.DateField(null=True, blank=True)
+
+    synced_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Stock carburant (automatisé)"
+        verbose_name_plural = "Stocks carburant (automatisés)"
+        ordering = ["site_id"]
+        indexes = [
+            models.Index(fields=["has_genset"]),
+        ]
+
+    def __str__(self):
+        return f"{self.site_id} · stock={self.stock_snowflake_l}"
+
+
+class FuelStockSyncRun(models.Model):
+    """Traçabilité des exécutions de sync_fuel_stock (même principe que FuelConsommationSyncRun)."""
+
+    class Status(models.TextChoices):
+        RUNNING = "RUNNING", "En cours"
+        SUCCESS = "SUCCESS", "Succès"
+        FAILED = "FAILED", "Échec"
+
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.RUNNING, db_index=True)
+    sites_fetched = models.IntegerField(default=0)
+
+    started_at = models.DateTimeField(default=timezone.now)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    error_message = models.TextField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-started_at"]
+
+    def __str__(self):
+        return f"Fuel Stock sync [{self.status}]"

@@ -296,3 +296,117 @@ class FuelConsommationDashboardView(APIView):
             "total_ge_sites": total_ge_sites,
             "available_months": all_months,
         })
+
+
+class FuelStockListView(APIView):
+    """
+    GET /api/fuel-tracking/stock/?search=&has_genset=&page=&limit=
+
+    Stock carburant ACTUEL par site (FuelStockSnapshot) — jointure Snowflake
+    (VW_FUEL_REPORT) + ENOC (fuel_level_readings), voir sync_fuel_stock. Pas
+    de notion de mois : une seule ligne par site, remplacée à chaque sync.
+    `has_genset=true|false` filtre les sites avec/sans GE (seuls les sites
+    avec GE consomment/stockent du fuel) ; omis, retourne tous les sites.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from django.db.models import Count, Q
+
+        from fuel_tracking.models import FuelStockSnapshot, FuelStockSyncRun, FuelEnocSyncRun
+
+        last_sf_run = FuelStockSyncRun.objects.order_by("-started_at").first()
+        last_enoc_run = FuelEnocSyncRun.objects.order_by("-started_at").first()
+        sources = {
+            "snowflake": {
+                "connected": bool(last_sf_run and last_sf_run.status == FuelStockSyncRun.Status.SUCCESS),
+                "last_status": last_sf_run.status if last_sf_run else None,
+                "last_run_at": (last_sf_run.finished_at or last_sf_run.started_at) if last_sf_run else None,
+                "error": last_sf_run.error_message if last_sf_run else None,
+            },
+            "enoc": {
+                "connected": bool(last_enoc_run and last_enoc_run.status == FuelEnocSyncRun.Status.SUCCESS and last_enoc_run.rows_fetched > 0),
+                "last_status": last_enoc_run.status if last_enoc_run else None,
+                "last_run_at": (last_enoc_run.finished_at or last_enoc_run.started_at) if last_enoc_run else None,
+                "error": last_enoc_run.error_message if last_enoc_run else None,
+            },
+        }
+
+        qs = FuelStockSnapshot.objects.all().order_by("site_id")
+
+        search = (request.query_params.get("search") or "").strip()
+        if search:
+            qs = qs.filter(Q(site_id__icontains=search) | Q(site_name__icontains=search))
+
+        ge_counts = qs.aggregate(
+            sites_avec_ge=Count("id", filter=Q(has_genset=True)),
+            sites_sans_ge=Count("id", filter=Q(has_genset=False)),
+        )
+
+        has_genset_param = (request.query_params.get("has_genset") or "").strip().lower()
+        if has_genset_param in ("true", "1"):
+            qs = qs.filter(has_genset=True)
+        elif has_genset_param in ("false", "0"):
+            qs = qs.filter(has_genset=False)
+
+        agg = qs.aggregate(
+            total_sites=Count("id"),
+            sites_avec_stock_snowflake=Count("id", filter=Q(stock_snowflake_l__isnull=False)),
+            sites_avec_stock_enoc=Count("id", filter=Q(stock_enoc_l__isnull=False)),
+        )
+        kpis = {
+            "total_sites": agg["total_sites"],
+            "sites_avec_ge": ge_counts["sites_avec_ge"],
+            "sites_sans_ge": ge_counts["sites_sans_ge"],
+            "sites_avec_stock_snowflake": agg["sites_avec_stock_snowflake"],
+            "sites_avec_stock_enoc": agg["sites_avec_stock_enoc"],
+        }
+
+        try:
+            page = max(1, int(request.query_params.get("page", 1)))
+        except ValueError:
+            page = 1
+        try:
+            limit = min(200, max(1, int(request.query_params.get("limit", 50))))
+        except ValueError:
+            limit = 50
+
+        total = agg["total_sites"]
+        total_pages = max(1, (total + limit - 1) // limit)
+        start = (page - 1) * limit
+        rows = qs[start:start + limit]
+
+        def serialize(row):
+            return {
+                "site_id": row.site_id,
+                "site_name": row.site_name,
+                "typology": row.typology,
+                "site_type": row.site_type,
+                "dg_count": row.dg_count,
+                "power_supply": row.power_supply,
+                "has_genset": row.has_genset,
+                "has_genset_snowflake": row.has_genset_snowflake,
+                "has_genset_enoc": row.has_genset_enoc,
+                "nb_ge_enoc": row.nb_ge_enoc,
+                "stock_snowflake_l": float(row.stock_snowflake_l) if row.stock_snowflake_l is not None else None,
+                "capacity_snowflake_l": float(row.capacity_snowflake_l) if row.capacity_snowflake_l is not None else None,
+                "stock_snowflake_pct": float(row.stock_snowflake_pct) if row.stock_snowflake_pct is not None else None,
+                "stock_snowflake_date": row.stock_snowflake_date,
+                "quality_status": row.quality_status,
+                "stock_enoc_l": float(row.stock_enoc_l) if row.stock_enoc_l is not None else None,
+                "stock_enoc_date": row.stock_enoc_date,
+            }
+
+        return Response({
+            "data": [serialize(r) for r in rows],
+            "pagination": {
+                "page": page,
+                "limit": limit,
+                "total": total,
+                "totalPages": total_pages,
+                "hasNext": page < total_pages,
+                "hasPrev": page > 1,
+            },
+            "sources": sources,
+            "kpis": kpis,
+        })
