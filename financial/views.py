@@ -2594,50 +2594,78 @@ class SuiviConsoView(APIView):
             import io as _io
             from django.http import HttpResponse
 
+            # Catalogue complet des colonnes exportables (clé → libellé), dans
+            # l'ordre canonique d'écriture. Le frontend affiche un modal pour
+            # que l'utilisateur choisisse un sous-ensemble via ?columns=a,b,c ;
+            # sans ce paramètre (anciens liens, appels directs), on retombe sur
+            # DEFAULT_EXPORT_KEYS qui reproduit exactement l'ancien export figé.
+            EXPORT_COLUMNS: list[tuple[str, str]] = [
+                ("site_id", "Site ID"),
+                ("site_name", "Nom"),
+                ("zone", "Zone"),
+                ("year", "Année"),
+                ("month", "Mois"),
+                ("nb_jours", "Nb Jours"),
+                ("typology", "Typologie"),
+                ("load_w", "Load (W)"),
+                ("conso_facturee_kwh", "Conso facturée kWh"),
+                ("montant_ht", "Montant HT"),
+                ("montant_energie", "Montant énergie"),
+                ("cout_moyen_kwh", "Coût moyen kWh"),
+                ("conso_estimee_kwh", "Conso estimée kWh"),
+                ("montant_estime", "Montant estimé"),
+                ("source_estimation", "Source estimation"),
+                ("est_acm_kwh", "Estim. ACM kWh"),
+                ("est_grid_kwh", "Estim. Grid kWh"),
+                ("est_histo_kwh", "Estim. Historique 30j kWh"),
+                ("est_target_kwh", "Estim. Target kWh"),
+                ("est_theorique_kwh", "Estim. Théorique kWh"),
+                ("fms_grid_kwh", "FMS Grid kWh"),
+                ("fms_acm_kwh", "FMS ACM kWh"),
+                ("solar_kwh", "Solar kWh"),
+                ("solar_target", "Solar Target kWh"),
+                ("unavail_hours", "Heures indisponibilité"),
+                ("conso_target", "Conso Target kWh"),
+                ("redevance", "Redevance"),
+                ("marge", "Marge"),
+                ("marge_statut", "Statut"),
+                ("recurrence_type", "Récurrence"),
+                ("hors_catalogue", "Hors Cat."),
+            ]
+            DEFAULT_EXPORT_KEYS = [
+                "site_id", "site_name", "zone", "year", "month", "nb_jours",
+                "conso_facturee_kwh", "conso_estimee_kwh", "source_estimation",
+                "fms_grid_kwh", "fms_acm_kwh", "solar_kwh", "solar_target",
+                "montant_ht", "montant_estime", "marge_statut", "recurrence_type",
+                "hors_catalogue", "typology", "load_w",
+            ]
+
+            valid_keys = {k for k, _ in EXPORT_COLUMNS}
+            requested = request.query_params.get("columns")
+            if requested:
+                requested_keys = {k for k in requested.split(",") if k}
+                selected_keys = requested_keys & valid_keys
+            else:
+                selected_keys = set(DEFAULT_EXPORT_KEYS)
+
+            if not selected_keys:
+                selected_keys = set(DEFAULT_EXPORT_KEYS)
+
+            # Conserve l'ordre canonique de EXPORT_COLUMNS, pas celui envoyé
+            # par le front (l'utilisateur choisit un sous-ensemble, pas un ordre).
+            ordered_columns = [(k, label) for k, label in EXPORT_COLUMNS if k in selected_keys]
+
+            def cell(rr, key):
+                if key == "hors_catalogue":
+                    return "OUI" if rr.get(key) else ""
+                v = rr.get(key)
+                return v if v not in (None, "") else ""
+
             buf = _io.StringIO()
             w = csv.writer(buf)
-
-            w.writerow([
-                "Site ID", "Nom", "Zone", "Année", "Mois", "Nb Jours",
-                "Conso facturée kWh",
-                "Conso estimée kWh",
-                "Source estimation",
-                "FMS Grid kWh",
-                "FMS ACM kWh",
-                "Solar kWh",
-                "Solar Target kWh",
-                "Montant HT",
-                "Montant estimé",
-                "Statut",
-                "Récurrence",
-                "Hors Cat.",
-                "Typologie",
-                "Load (W)",
-            ])
-
+            w.writerow([label for _, label in ordered_columns])
             for rr in result_rows:
-                w.writerow([
-                    rr["site_id"],
-                    rr["site_name"] or "",
-                    rr["zone"] or "",
-                    rr["year"],
-                    rr["month"],
-                    rr["nb_jours"],
-                    rr["conso_facturee_kwh"] or "",
-                    rr["conso_estimee_kwh"] or "",
-                    rr["source_estimation"] or "",
-                    rr["fms_grid_kwh"] or "",
-                    rr["fms_acm_kwh"] or "",
-                    rr["solar_kwh"] or "",
-                    rr["solar_target"] or "",
-                    rr["montant_ht"] or "",
-                    rr["montant_estime"] or "",
-                    rr["marge_statut"] or "",
-                    rr["recurrence_type"] or "",
-                    "OUI" if rr["hors_catalogue"] else "",
-                    rr["typology"] or "",
-                    rr["load_w"] or "",
-                ])
+                w.writerow([cell(rr, k) for k, _ in ordered_columns])
 
             suffix = f"{ys}{ms:02d}-{ye}{me:02d}"
             resp = HttpResponse(buf.getvalue(), content_type="text/csv; charset=utf-8-sig")

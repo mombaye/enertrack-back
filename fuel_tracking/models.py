@@ -487,7 +487,11 @@ class FuelConsommationMonthly(models.Model):
         fetch_estimated_consumption pour conso_estimee_enoc_l, filtré depuis
         le 2026-08 sur les ravitaillements liés à une demande validée) ;
       - fichiers mensuels remontés par les gardiens (pas encore intégré —
-        colonnes prévues mais laissées vides tant que le format n'est pas défini).
+        colonnes prévues mais laissées vides tant que le format n'est pas défini) ;
+      - pipeline CPH (fuel_tracking/services/fuel_cph_snowflake.py + commande
+        sync_fuel_cph) : estimation par télémétrie GFMS_DATA_TRACKER_NC pour les
+        sites sans capteur de cuve fiable — voir FuelCphGeDaily pour le détail
+        journalier, ces colonnes ne sont que l'agrégat mensuel affiché en liste.
 
     Contrairement à FuelCommandeSynthese/FuelSuiviCommandeSite (import manuel,
     verbatim), ce modèle est calculé : re-synchroniser un mois remplace
@@ -567,6 +571,35 @@ class FuelConsommationMonthly(models.Model):
 
     # Jointure "concrète" : conso mesurée (capteur) vs quantité réellement ajoutée (ENOC)
     ecart_conso_vs_enoc_l = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
+
+    # Estimation CPH (télémétrie GFMS_DATA_TRACKER_NC) — troisième source
+    # d'estimation, indépendante des deux ci-dessus, pour les GE sans capteur
+    # de cuve fiable. Agrégat mensuel calculé par sync_fuel_cph à partir du
+    # détail journalier FuelCphGeDaily (voir ce modèle pour l'audit complet).
+    # "Sans litre inventé" : conso_estimee_cph_l n'additionne QUE les jours au
+    # statut OK ; cph_calculation_status/cph_status_breakdown expliquent
+    # pourquoi les autres jours n'ont produit aucun litre.
+    conso_estimee_cph_l = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
+    cph_l_per_h_moy = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True, help_text="Moyenne du CPH (L/h) sur les jours OK du mois.")
+    cph_nb_jours_ok = models.IntegerField(null=True, blank=True, help_text="Nombre de jours du mois avec un statut OK (litres produits).")
+    cph_nb_jours_calcules = models.IntegerField(null=True, blank=True, help_text="Nombre de jours du mois avec au moins un intervalle GE détecté (OK ou non).")
+    cph_calculation_status = models.CharField(max_length=48, null=True, blank=True, help_text="Statut dominant du mois (OK, BATTERY_DATA_NOT_READY, MISSING_PARAMETER, ...).")
+    cph_status_breakdown = models.JSONField(default=dict, blank=True, help_text='Répartition des statuts journaliers, ex. {"OK": 27, "BATTERY_DATA_NOT_READY": 2}.')
+    cph_runtime_h_total = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, help_text="Somme du runtime GE sur le mois — voir cph_runtime_source pour la source utilisée.")
+    cph_runtime_source = models.CharField(
+        max_length=24, null=True, blank=True,
+        help_text=(
+            "Origine de cph_runtime_h_total, priorité documentée dans la spec CPH "
+            "(DSE > DG-On calculé) : TRACKER_5MIN (compteur GFMS_DATA_TRACKER_NC, "
+            "seule source alimentant aussi le calcul des litres) ; DSE_CONTROLLER "
+            "(GENSET_REPORT.DG_RUNTIME_CONTROLLER, utilisé en secours quand le "
+            "compteur 5 min n'est jamais remonté par le site) ; DG_ON_CALCULATED "
+            "(GENSET_REPORT.DG_RUNTIME_CALCULATED, dernier recours). Les 2 sources "
+            "de secours donnent un Running Time mais PAS une estimation de litres "
+            "(qui nécessite l'énergie du compteur 5 min, pas juste sa durée)."
+        ),
+    )
+    cph_ge_type = models.CharField(max_length=160, null=True, blank=True, help_text="Marque + modèle du GE (Snowflake SITE_DG.VENDOR/GENSET_TYPE), auto-sourcé — voir fuel_cph_snowflake.fetch_site_ge_specs.")
 
     synced_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
@@ -702,3 +735,158 @@ class FuelStockSyncRun(models.Model):
 
     def __str__(self):
         return f"Fuel Stock sync [{self.status}]"
+
+
+class FuelCphGeParameter(models.Model):
+    """
+    Fichier de référence GE — paramètres fixes nécessaires au calcul CPH
+    (fuel_tracking/services/fuel_cph_snowflake.py), un par site et par
+    période de validité (une seule fiche active à une date donnée).
+
+    Chargé via la commande import_cph_ge_parameters (upsert par
+    site_id+valid_from — jamais un remplacement complet : contrairement à
+    CphMatrixPoint/FuelSiteScope, ce modèle est temporel et l'historique
+    clôturé (valid_to renseigné) doit être conservé pour pouvoir ré-exécuter
+    ou auditer des mois passés).
+
+    valid_to = None signifie "toujours active depuis valid_from".
+
+    pge_kva/power_factor NE SONT PAS demandés au fichier — ils sont
+    auto-sourcés depuis Snowflake SITE_DG (KVA réel par site, vérifié sur les
+    10 sites pilotes) et n'affectent de toute façon PAS le calcul des litres
+    (seulement l'indicateur informatif GE_LOAD_PERCENT/OVER_CAPACITY) — voir
+    fuel_tracking/services/fuel_cph_snowflake.py::fetch_site_ge_specs. Ces 2
+    champs restent ici en secours/override manuel uniquement (ex: SITE_DG
+    absent ou erroné pour un site donné), jamais requis à l'import.
+
+    rectifier_efficiency_ratio/spc_l_per_kwh, en revanche, SONT requis : ils
+    entrent directement dans le calcul des litres, et aucune source Snowflake
+    fiable n'a été trouvée pour les dériver automatiquement (vérifié 2026-08 :
+    RECTIFIER_EFFICIENCY en télémétrie n'a que ~9.5% de couverture sur les
+    sites pilotes ; GE_PROD_KWH, censé permettre de déduire un SPC empirique
+    via conso_specifique_moy_l_kwh, est lui-même trop peu fiable pour la
+    quasi-totalité des sites — valeurs aberrantes jusqu'à 6665 L/kWh
+    constatées, contre un ordre de grandeur réaliste de 0.2-0.4 L/kWh).
+    """
+
+    site_id = models.CharField(max_length=64, db_index=True)
+    valid_from = models.DateField()
+    valid_to = models.DateField(null=True, blank=True)
+
+    pge_kva = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, help_text="Puissance nominale du GE, en kVA. Optionnel — auto-sourcé depuis Snowflake SITE_DG si absent.")
+    power_factor = models.DecimalField(max_digits=4, decimal_places=3, null=True, blank=True, help_text="Cos φ, strictement entre 0 et 1. Optionnel — 0.8 (valeur standard) utilisé si absent.")
+    rectifier_efficiency_ratio = models.DecimalField(max_digits=4, decimal_places=3, help_text="Rendement du redresseur, strictement entre 0 et 1. Requis — entre dans le calcul des litres.")
+    spc_l_per_kwh = models.DecimalField(max_digits=8, decimal_places=4, help_text="Consommation spécifique du GE, en L/kWh. Requis — entre dans le calcul des litres.")
+
+    ge_type = models.CharField(max_length=128, blank=True, help_text="Optionnel — auto-sourcé depuis Snowflake SITE_DG.GENSET_TYPE si absent.")
+    parameter_source = models.CharField(max_length=128, blank=True, help_text="Traçabilité : nom/version du fichier métier d'origine.")
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Paramètres GE (CPH)"
+        verbose_name_plural = "Paramètres GE (CPH)"
+        ordering = ["site_id", "valid_from"]
+        constraints = [
+            models.UniqueConstraint(fields=["site_id", "valid_from"], name="uniq_cph_param_site_validfrom"),
+        ]
+        indexes = [
+            models.Index(fields=["site_id", "valid_to"]),
+        ]
+
+    def __str__(self):
+        return f"{self.site_id} · {self.valid_from} → {self.valid_to or '…'}"
+
+
+class FuelCphGeDaily(models.Model):
+    """
+    Détail journalier du calcul CPH par site — source de vérité et piste
+    d'audit derrière les agrégats mensuels de FuelConsommationMonthly
+    (conso_estimee_cph_l et champs associés). Une ligne par (site_id, date),
+    que le statut soit OK ou non : c'est ce qui permet de comprendre "pourquoi
+    le chiffre du site X est bas ce mois-ci" sans re-requêter Snowflake.
+
+    Reproduit la sortie attendue par la spec de déploiement CPH (section 2.2) :
+    énergies (site, batterie DC/AC, GE totale), runtime (compteur tracker vs
+    contrôleur DSE), CPH et litres estimés, statut de calcul.
+
+    "Sans litre inventé" : estimated_consumption_l et cph_estimated_lph ne
+    sont renseignés que si calculation_status == "OK".
+    """
+
+    class Status(models.TextChoices):
+        OK = "OK", "OK"
+        NO_VALID_RUNTIME = "NO_VALID_RUNTIME", "Aucun runtime métier valide"
+        RUNTIME_NOT_VALIDATED = "RUNTIME_NOT_VALIDATED_FOR_INTERVAL_CPH", "Runtime non validé pour le CPH"
+        MISSING_LOAD_POWER = "MISSING_LOAD_POWER", "LOAD_POWER indisponible"
+        BATTERY_DATA_NOT_READY = "BATTERY_DATA_NOT_READY", "Données batterie insuffisantes"
+        MISSING_PARAMETER = "MISSING_PARAMETER", "Paramètres GE manquants"
+        OVER_CAPACITY = "OVER_CAPACITY", "Charge GE > capacité déclarée"
+
+    site_id = models.CharField(max_length=64, db_index=True)
+    date = models.DateField(db_index=True)
+
+    # Détection d'intervalles (GFMS_DATA_TRACKER_NC, run_minutes 1-10 et
+    # elapsed_minutes 1-10) + comparaison au runtime DSE (GENSET_REPORT.
+    # DG_RUNTIME_CONTROLLER), tolérance 0.15h.
+    ge_intervals = models.IntegerField(default=0)
+    valid_battery_intervals = models.IntegerField(default=0)
+    dg_runtime_interval_h = models.DecimalField(max_digits=10, decimal_places=3, null=True, blank=True)
+    dg_runtime_controller_h = models.DecimalField(max_digits=10, decimal_places=3, null=True, blank=True)
+
+    # Énergies (kWh), intégrées uniquement pendant les intervalles GE actifs
+    site_load_energy_kwh = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    battery_dc_energy_kwh = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    battery_charge_ac_energy_kwh = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    total_ge_energy_kwh = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    average_ge_power_kw = models.DecimalField(max_digits=10, decimal_places=4, null=True, blank=True)
+
+    # Résultat carburant (uniquement si calculation_status == OK)
+    cph_estimated_lph = models.DecimalField(max_digits=10, decimal_places=4, null=True, blank=True)
+    estimated_consumption_l = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
+    ge_load_percent = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True, help_text="100 × average_ge_power_kw / (PGE_KVA × power_factor). Informatif, ne divise pas le CPH.")
+
+    calculation_status = models.CharField(max_length=48, choices=Status.choices, db_index=True)
+
+    synced_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        verbose_name = "Détail CPH journalier"
+        verbose_name_plural = "Détails CPH journaliers"
+        ordering = ["-date", "site_id"]
+        constraints = [
+            models.UniqueConstraint(fields=["site_id", "date"], name="uniq_cph_daily_site_date"),
+        ]
+        indexes = [
+            models.Index(fields=["site_id", "date"]),
+        ]
+
+    def __str__(self):
+        return f"{self.site_id} · {self.date} · {self.calculation_status}"
+
+
+class FuelCphSyncRun(models.Model):
+    """Traçabilité des exécutions de sync_fuel_cph (même principe que FuelConsommationSyncRun)."""
+
+    class Status(models.TextChoices):
+        RUNNING = "RUNNING", "En cours"
+        SUCCESS = "SUCCESS", "Succès"
+        FAILED = "FAILED", "Échec"
+
+    month_from = models.CharField(max_length=7, null=True, blank=True)
+    month_to = models.CharField(max_length=7, null=True, blank=True)
+
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.RUNNING, db_index=True)
+    sites_fetched = models.IntegerField(default=0)
+
+    started_at = models.DateTimeField(default=timezone.now)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    error_message = models.TextField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-started_at"]
+
+    def __str__(self):
+        return f"Fuel CPH sync {self.month_from}→{self.month_to} [{self.status}]"

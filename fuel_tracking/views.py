@@ -33,11 +33,27 @@ class FuelConsommationListView(APIView):
     def get(self, request):
         from django.db.models import Count, Q, Sum
 
+        from django.utils import timezone
+
         from fuel_tracking.models import (
+            FuelCphGeParameter,
             FuelConsommationMonthly,
             FuelConsommationSyncRun,
             FuelEnocSyncRun,
         )
+
+        # Statut du fichier de référence CPH (FuelCphGeParameter) — pas une
+        # connectivité live comme Snowflake/ENOC, mais l'UI a besoin de savoir
+        # si le fichier a été chargé pour expliquer pourquoi conso_estimee_cph_l
+        # est vide partout (MISSING_PARAMETER) tant qu'il ne l'est pas.
+        today = timezone.now().date()
+        cph_params_qs = FuelCphGeParameter.objects.all()
+        cph_parameters = {
+            "sites_configures": cph_params_qs.filter(
+                valid_from__lte=today
+            ).exclude(valid_to__lt=today).values("site_id").distinct().count(),
+            "dernier_import": cph_params_qs.order_by("-updated_at").values_list("updated_at", flat=True).first(),
+        }
 
         available_months = list(
             FuelConsommationMonthly.objects.order_by("-month_year")
@@ -65,7 +81,7 @@ class FuelConsommationListView(APIView):
         month = request.query_params.get("month")
         if not month:
             if not available_months:
-                return Response({"month_year": None, "data": [], "pagination": None, "available_months": [], "kpis": None, "sources": sources})
+                return Response({"month_year": None, "data": [], "pagination": None, "available_months": [], "kpis": None, "sources": sources, "cph_parameters": cph_parameters})
             month = available_months[0]
 
         qs = FuelConsommationMonthly.objects.filter(month_year=month).order_by("site_id")
@@ -162,6 +178,18 @@ class FuelConsommationListView(APIView):
                 "enoc_qte_ajoutee_l": float(row.enoc_qte_ajoutee_l),
                 "enoc_nb_demandes": row.enoc_nb_demandes,
                 "ecart_conso_vs_enoc_l": float(row.ecart_conso_vs_enoc_l) if row.ecart_conso_vs_enoc_l is not None else None,
+                # Estimation CPH (télémétrie GFMS_DATA_TRACKER_NC) — troisième
+                # source, indépendante des 2 ci-dessus, pour les GE sans
+                # capteur de cuve fiable. Voir sync_fuel_cph/FuelCphGeDaily.
+                "conso_estimee_cph_l": float(row.conso_estimee_cph_l) if row.conso_estimee_cph_l is not None else None,
+                "cph_l_per_h_moy": float(row.cph_l_per_h_moy) if row.cph_l_per_h_moy is not None else None,
+                "cph_nb_jours_ok": row.cph_nb_jours_ok,
+                "cph_nb_jours_calcules": row.cph_nb_jours_calcules,
+                "cph_calculation_status": row.cph_calculation_status,
+                "cph_status_breakdown": row.cph_status_breakdown,
+                "cph_runtime_h_total": float(row.cph_runtime_h_total) if row.cph_runtime_h_total is not None else None,
+                "cph_runtime_source": row.cph_runtime_source,
+                "cph_ge_type": row.cph_ge_type,
             }
 
         return Response({
@@ -178,6 +206,7 @@ class FuelConsommationListView(APIView):
             "available_months": available_months,
             "sources": sources,
             "kpis": kpis,
+            "cph_parameters": cph_parameters,
         })
 
 
