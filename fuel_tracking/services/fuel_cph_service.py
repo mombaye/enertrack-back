@@ -29,6 +29,7 @@ from fuel_tracking.services.fuel_cph_snowflake import (
     fetch_daily_tracker_energy,
     fetch_monthly_runtime_fallback,
     fetch_site_ge_specs,
+    fetch_site_rectifier_efficiency,
 )
 
 BATTERY_COVERAGE_MIN = Decimal("0.95")
@@ -62,7 +63,12 @@ def _params_for_date(entries: list[tuple], d: date) -> FuelCphGeParameter | None
     return None
 
 
-def compute_daily_status(energies: dict, params: FuelCphGeParameter | None, ge_specs: dict | None = None) -> tuple[str, dict]:
+def compute_daily_status(
+    energies: dict,
+    params: FuelCphGeParameter | None,
+    ge_specs: dict | None = None,
+    rectifier_efficiency_fallback: Decimal | None = None,
+) -> tuple[str, dict]:
     """
     Applique les gardes de qualité et le calcul CPH pour un (site, date).
 
@@ -72,6 +78,14 @@ def compute_daily_status(energies: dict, params: FuelCphGeParameter | None, ge_s
     sur DEFAULT_POWER_FACTOR (0.8) si absent. Les deux ne servent QU'à
     l'indicateur informatif ge_load_percent/OVER_CAPACITY — jamais au calcul
     des litres, donc leur absence ne bloque jamais un résultat OK.
+
+    `rectifier_efficiency_fallback` (optionnel) vient de Snowflake
+    GFMS_DATA_TRACKER_NC (fetch_site_rectifier_efficiency, moyenne du mois) —
+    utilisé si `params.rectifier_efficiency_ratio` n'est pas renseigné dans
+    le fichier. Contrairement à pge_kva/power_factor, ce champ ENTRE dans le
+    calcul des litres : si ni le fichier ni Snowflake ne le fournissent,
+    aucun litre ne peut être produit (MISSING_PARAMETER), même avec un SPC
+    valide.
     """
     ge_intervals = energies.get("ge_intervals") or 0
     dg_runtime_interval_h = energies.get("dg_runtime_interval_h")
@@ -86,6 +100,10 @@ def compute_daily_status(energies: dict, params: FuelCphGeParameter | None, ge_s
     if params is None:
         return "MISSING_PARAMETER", dict(_EMPTY_RESULT)
 
+    rectifier_efficiency_ratio = params.rectifier_efficiency_ratio if params.rectifier_efficiency_ratio is not None else rectifier_efficiency_fallback
+    if rectifier_efficiency_ratio is None or params.spc_l_per_kwh is None:
+        return "MISSING_PARAMETER", dict(_EMPTY_RESULT)
+
     if Decimal(valid_battery_intervals) / Decimal(ge_intervals) < BATTERY_COVERAGE_MIN:
         return "BATTERY_DATA_NOT_READY", dict(_EMPTY_RESULT)
 
@@ -95,7 +113,7 @@ def compute_daily_status(energies: dict, params: FuelCphGeParameter | None, ge_s
     if abs(dg_runtime_interval_h - dg_runtime_controller_h) > RUNTIME_TOLERANCE_H:
         return "RUNTIME_NOT_VALIDATED_FOR_INTERVAL_CPH", dict(_EMPTY_RESULT)
 
-    battery_ac = (battery_dc_energy_kwh or Decimal("0")) / params.rectifier_efficiency_ratio
+    battery_ac = (battery_dc_energy_kwh or Decimal("0")) / rectifier_efficiency_ratio
     total_ge = site_load_energy_kwh + battery_ac
     avg_power = total_ge / dg_runtime_interval_h
     cph_lph = (avg_power * params.spc_l_per_kwh).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
@@ -137,6 +155,7 @@ def compute_monthly_cph_estimates(year: int, month: int, site_ids: list[str] | N
     raw = fetch_daily_tracker_energy(year, month, site_ids=site_ids)
     params_by_site = _load_active_parameters(list(raw.keys()))
     ge_specs_by_site = fetch_site_ge_specs(list(raw.keys()))
+    rectifier_fallback_by_site = fetch_site_rectifier_efficiency(year, month, list(raw.keys()))
 
     daily_rows: list[dict] = []
     monthly: dict[str, dict] = {}
@@ -144,6 +163,7 @@ def compute_monthly_cph_estimates(year: int, month: int, site_ids: list[str] | N
     for site_id, days in raw.items():
         entries = params_by_site.get(site_id, [])
         ge_specs = ge_specs_by_site.get(site_id)
+        rectifier_fallback = rectifier_fallback_by_site.get(site_id)
         status_counts: Counter = Counter()
         ok_consumptions: list[Decimal] = []
         ok_cphs: list[Decimal] = []
@@ -151,7 +171,7 @@ def compute_monthly_cph_estimates(year: int, month: int, site_ids: list[str] | N
 
         for d, energies in sorted(days.items()):
             params = _params_for_date(entries, d)
-            status, computed = compute_daily_status(energies, params, ge_specs)
+            status, computed = compute_daily_status(energies, params, ge_specs, rectifier_fallback)
             status_counts[status] += 1
 
             # Le runtime GE (compteur tracker) est compté sur TOUS les jours

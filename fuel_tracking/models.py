@@ -759,14 +759,23 @@ class FuelCphGeParameter(models.Model):
     champs restent ici en secours/override manuel uniquement (ex: SITE_DG
     absent ou erroné pour un site donné), jamais requis à l'import.
 
-    rectifier_efficiency_ratio/spc_l_per_kwh, en revanche, SONT requis : ils
-    entrent directement dans le calcul des litres, et aucune source Snowflake
-    fiable n'a été trouvée pour les dériver automatiquement (vérifié 2026-08 :
-    RECTIFIER_EFFICIENCY en télémétrie n'a que ~9.5% de couverture sur les
-    sites pilotes ; GE_PROD_KWH, censé permettre de déduire un SPC empirique
-    via conso_specifique_moy_l_kwh, est lui-même trop peu fiable pour la
-    quasi-totalité des sites — valeurs aberrantes jusqu'à 6665 L/kWh
-    constatées, contre un ordre de grandeur réaliste de 0.2-0.4 L/kWh).
+    rectifier_efficiency_ratio, comme pge_kva/power_factor, est maintenant
+    OPTIONNEL (2026-08) : auto-sourcé depuis la moyenne mensuelle Snowflake
+    GFMS_DATA_TRACKER_NC.RECTIFIER_EFFICIENCY si absent du fichier — voir
+    fuel_cph_snowflake.fetch_site_rectifier_efficiency. Couverture vérifiée
+    ~46% des sites Sénégal avec GE, valeurs plausibles (médiane ~70%). Reste
+    ici en override manuel si besoin (ex: télémétrie absente/douteuse pour un
+    site donné).
+
+    spc_l_per_kwh, en revanche, reste le SEUL champ vraiment requis : il
+    entre directement dans le calcul des litres et AUCUNE source Snowflake
+    fiable n'a été trouvée pour le dériver automatiquement (vérifié 2026-08,
+    2 méthodes indépendantes : GE_PROD_KWH, censé permettre un SPC empirique
+    via conso_specifique_moy_l_kwh, reste trop peu fiable même en ne gardant
+    que les sites à production GE substantielle — valeurs de 0.58 à 5.69
+    L/kWh sur les 8 seuls points disponibles, contre un ordre de grandeur
+    réaliste de 0.2-0.4 L/kWh ; aucune table de référence déjà en base
+    — CphMatrixPoint, GensetFuelCurve — n'est peuplée).
     """
 
     site_id = models.CharField(max_length=64, db_index=True)
@@ -775,8 +784,8 @@ class FuelCphGeParameter(models.Model):
 
     pge_kva = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, help_text="Puissance nominale du GE, en kVA. Optionnel — auto-sourcé depuis Snowflake SITE_DG si absent.")
     power_factor = models.DecimalField(max_digits=4, decimal_places=3, null=True, blank=True, help_text="Cos φ, strictement entre 0 et 1. Optionnel — 0.8 (valeur standard) utilisé si absent.")
-    rectifier_efficiency_ratio = models.DecimalField(max_digits=4, decimal_places=3, help_text="Rendement du redresseur, strictement entre 0 et 1. Requis — entre dans le calcul des litres.")
-    spc_l_per_kwh = models.DecimalField(max_digits=8, decimal_places=4, help_text="Consommation spécifique du GE, en L/kWh. Requis — entre dans le calcul des litres.")
+    rectifier_efficiency_ratio = models.DecimalField(max_digits=4, decimal_places=3, null=True, blank=True, help_text="Rendement du redresseur, strictement entre 0 et 1. Optionnel — moyenne mensuelle Snowflake (RECTIFIER_EFFICIENCY) utilisée si absent.")
+    spc_l_per_kwh = models.DecimalField(max_digits=8, decimal_places=4, help_text="Consommation spécifique du GE, en L/kWh. SEUL champ requis — entre dans le calcul des litres, aucune source Snowflake fiable.")
 
     ge_type = models.CharField(max_length=128, blank=True, help_text="Optionnel — auto-sourcé depuis Snowflake SITE_DG.GENSET_TYPE si absent.")
     parameter_source = models.CharField(max_length=128, blank=True, help_text="Traçabilité : nom/version du fichier métier d'origine.")

@@ -189,6 +189,61 @@ def fetch_monthly_runtime_fallback(year: int, month: int, site_ids: list[str] | 
         conn.close()
 
 
+def fetch_site_rectifier_efficiency(year: int, month: int, site_ids: list[str]) -> dict[str, Decimal]:
+    """
+    site_id -> Decimal ratio (0-1) — moyenne mensuelle de RECTIFIER_EFFICIENCY
+    (GFMS_DATA_TRACKER_NC, colonne en %, 0-100), NULLIF(...,0) pour exclure
+    les zéros (traités comme une absence de mesure plutôt qu'un vrai 0%
+    d'efficacité, cohérent avec le traitement des placeholders ailleurs dans
+    ce module). Repli utilisé quand FuelCphGeParameter.rectifier_efficiency_ratio
+    n'est pas renseigné dans le fichier de référence.
+
+    Couverture vérifiée 2026-08 sur les 483 sites Sénégal avec GE : ~46%
+    (171/372 avec au moins une mesure), valeurs plausibles (médiane ~70%,
+    9-95%) — assez fiable pour servir de repli, contrairement à SPC_L_PER_KWH
+    qui n'a aucune source Snowflake exploitable (voir fuel_cph_service.py).
+    """
+    if not site_ids:
+        return {}
+    d_start = date(year, month, 1)
+    d_end_excl = date(year + (1 if month == 12 else 0), 1 if month == 12 else month + 1, 1)
+
+    conn = _connect()
+    try:
+        cursor = conn.cursor()
+        db_schema = f"{FUEL_DATABASE}.{FUEL_SCHEMA}"
+        data_ids = _resolve_data_ids(cursor, db_schema, site_ids)
+        if not data_ids:
+            return {}
+
+        cursor.execute(f"""
+            WITH site_dim AS (
+                SELECT DATA_ID, SITE_ID
+                FROM (
+                    SELECT DATA_ID, SITE_ID,
+                           ROW_NUMBER() OVER (PARTITION BY DATA_ID ORDER BY SITE_ID) AS rn
+                    FROM {db_schema}.SITE_FILTERED
+                    WHERE COUNTRY = %(country)s
+                )
+                WHERE rn = 1
+            )
+            SELECT s.SITE_ID, AVG(NULLIF(t.RECTIFIER_EFFICIENCY, 0)) AS avg_eff
+            FROM {db_schema}.GFMS_DATA_TRACKER_NC t
+            JOIN site_dim s ON s.DATA_ID = t.ID
+            WHERE t."TIMESTAMP" >= %(d_start)s AND t."TIMESTAMP" < %(d_end_excl)s
+              AND t.ID IN ({','.join(str(d) for d in data_ids)})
+            GROUP BY s.SITE_ID
+            HAVING AVG(NULLIF(t.RECTIFIER_EFFICIENCY, 0)) IS NOT NULL
+        """, {"country": COUNTRY_SCOPE, "d_start": d_start, "d_end_excl": d_end_excl})
+
+        return {
+            site_id: (Decimal(str(avg_eff)) / Decimal("100")).quantize(Decimal("0.001"))
+            for site_id, avg_eff in cursor.fetchall()
+        }
+    finally:
+        conn.close()
+
+
 def _resolve_data_ids(cursor, db_schema: str, site_ids: list[str]) -> list[int]:
     """SITE_ID -> DATA_ID via SITE_FILTERED, par lots de CHUNK_SIZE (même
     principe que SnowflakeService._chunks — IN() Snowflake reste praticable

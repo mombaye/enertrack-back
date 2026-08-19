@@ -1,17 +1,21 @@
 # fuel_tracking/management/commands/import_cph_ge_parameters.py
 """
 Importe le fichier de référence des paramètres GE (CPH_GE_PARAMETERS) dans
-FuelCphGeParameter — colonnes requises : SITE_ID, VALID_FROM,
-RECTIFIER_EFFICIENCY_RATIO, SPC_L_PER_KWH (les 2 seuls paramètres qui entrent
-réellement dans le calcul des litres — voir FuelConsommationMonthly/
-FuelCphGeParameter docstrings pour le détail de cette vérification 2026-08).
+FuelCphGeParameter — colonne requise : SITE_ID, VALID_FROM, SPC_L_PER_KWH.
+SPC_L_PER_KWH est le SEUL paramètre qui n'a aucune source Snowflake fiable
+(voir FuelCphGeParameter docstring pour le détail de la vérification 2026-08)
+— sans lui, aucun litre ne peut être calculé, quoi qu'il arrive.
 
-Colonnes optionnelles : VALID_TO, PGE_KVA, POWER_FACTOR, GE_TYPE,
-PARAMETER_SOURCE. PGE_KVA/GE_TYPE ne sont normalement PAS nécessaires — ils
-sont auto-sourcés depuis Snowflake SITE_DG à chaque calcul (voir
-fuel_cph_snowflake.fetch_site_ge_specs) ; ces colonnes du fichier ne servent
-qu'à surcharger cette valeur pour un site donné si besoin. POWER_FACTOR
-retombe sur 0.8 (standard) si absent.
+Colonnes optionnelles : VALID_TO, PGE_KVA, POWER_FACTOR, RECTIFIER_EFFICIENCY_RATIO,
+GE_TYPE, PARAMETER_SOURCE. PGE_KVA/GE_TYPE sont auto-sourcés depuis Snowflake
+SITE_DG à chaque calcul (fuel_cph_snowflake.fetch_site_ge_specs) — ces
+colonnes ne servent qu'à surcharger la valeur pour un site donné si besoin.
+POWER_FACTOR retombe sur 0.8 (standard) si absent. RECTIFIER_EFFICIENCY_RATIO
+retombe sur la moyenne mensuelle Snowflake (fetch_site_rectifier_efficiency,
+~46% de couverture Sénégal vérifiée 2026-08) si absent — contrairement à
+PGE_KVA/POWER_FACTOR, ce champ entre dans le calcul des litres : s'il manque
+à la fois du fichier ET de Snowflake pour un site donné, ce site reste
+MISSING_PARAMETER malgré un SPC valide.
 
 Contrairement à import_cph_matrix.py (remplacement complet), ce modèle est
 TEMPOREL : un ré-import ne doit jamais supprimer l'historique déjà clôturé
@@ -89,12 +93,12 @@ class Command(BaseCommand):
         c_type = _pick(df.columns, "ge_type")
         c_source = _pick(df.columns, "parameter_source")
 
-        # Seuls SITE_ID/VALID_FROM/RECTIFIER_EFFICIENCY_RATIO/SPC_L_PER_KWH
-        # sont requis : PGE_KVA/POWER_FACTOR/GE_TYPE sont auto-sourcés depuis
-        # Snowflake SITE_DG à chaque calcul, pas ici (voir docstring module).
+        # Seul SITE_ID/VALID_FROM/SPC_L_PER_KWH est requis : PGE_KVA/
+        # POWER_FACTOR/GE_TYPE/RECTIFIER_EFFICIENCY_RATIO sont tous
+        # auto-sourcés depuis Snowflake à chaque calcul si absents du
+        # fichier (voir docstring module).
         required = [
-            ("site_id", c_site), ("valid_from", c_from),
-            ("rectifier_efficiency_ratio", c_eff), ("spc_l_per_kwh", c_spc),
+            ("site_id", c_site), ("valid_from", c_from), ("spc_l_per_kwh", c_spc),
         ]
         missing = [k for k, v in required if not v]
         if missing:
@@ -117,12 +121,12 @@ class Command(BaseCommand):
                 site_id = str(row[c_site]).strip()
                 valid_from = pd.to_datetime(row[c_from]).date()
                 valid_to = pd.to_datetime(row[c_to]).date() if c_to and pd.notna(row.get(c_to)) else None
-                # PGE_KVA/POWER_FACTOR optionnels — auto-sourcés depuis
-                # Snowflake SITE_DG à chaque calcul si absents ici (voir
-                # docstring module). None si colonne absente ou cellule vide.
+                # PGE_KVA/POWER_FACTOR/RECTIFIER_EFFICIENCY_RATIO optionnels —
+                # auto-sourcés depuis Snowflake à chaque calcul si absents ici
+                # (voir docstring module). None si colonne absente ou cellule vide.
                 pge_kva = Decimal(str(row[c_kva])) if c_kva and pd.notna(row.get(c_kva)) else None
                 power_factor = Decimal(str(row[c_pf])) if c_pf and pd.notna(row.get(c_pf)) else None
-                rectifier_efficiency_ratio = Decimal(str(row[c_eff]))
+                rectifier_efficiency_ratio = Decimal(str(row[c_eff])) if c_eff and pd.notna(row.get(c_eff)) else None
                 spc_l_per_kwh = Decimal(str(row[c_spc]))
                 ge_type = str(row[c_type]).strip() if c_type and pd.notna(row.get(c_type)) else ""
                 parameter_source = str(row[c_source]).strip() if c_source and pd.notna(row.get(c_source)) else ""
@@ -139,8 +143,8 @@ class Command(BaseCommand):
             if power_factor is not None and not (0 < power_factor <= 1):
                 errors.append({"row": excel_row, "site_id": site_id, "error": "POWER_FACTOR doit être dans ]0, 1] si renseigné"})
                 continue
-            if not (0 < rectifier_efficiency_ratio <= 1):
-                errors.append({"row": excel_row, "site_id": site_id, "error": "RECTIFIER_EFFICIENCY_RATIO doit être dans ]0, 1]"})
+            if rectifier_efficiency_ratio is not None and not (0 < rectifier_efficiency_ratio <= 1):
+                errors.append({"row": excel_row, "site_id": site_id, "error": "RECTIFIER_EFFICIENCY_RATIO doit être dans ]0, 1] si renseigné"})
                 continue
             if spc_l_per_kwh <= 0:
                 errors.append({"row": excel_row, "site_id": site_id, "error": "SPC_L_PER_KWH doit être > 0"})
