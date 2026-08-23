@@ -601,6 +601,82 @@ class FuelConsommationMonthly(models.Model):
     )
     cph_ge_type = models.CharField(max_length=160, null=True, blank=True, help_text="Marque + modèle du GE (Snowflake SITE_DG.VENDOR/GENSET_TYPE), auto-sourcé — voir fuel_cph_snowflake.fetch_site_ge_specs.")
 
+    # Dernière valeur connue sur le mois — visibles sur la page Suivis
+    # Consommation pour audit visuel (spec section 2.2/7), stable en
+    # pratique (une fiche FuelCphGeParameter ne change pas d'un jour à
+    # l'autre). Détail journalier complet dans FuelCphGeDaily.
+    cph_pge_kva = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    cph_power_factor = models.DecimalField(max_digits=4, decimal_places=3, null=True, blank=True)
+    cph_spc_l_per_kwh = models.DecimalField(max_digits=8, decimal_places=4, null=True, blank=True)
+
+    # Fichier métier validé ("Base août 26 validée", feuille "KPIs par site")
+    # — 4e source, jamais fusionnée avec les colonnes Snowflake/ENOC/CPH
+    # ci-dessus (même principe partout dans ce modèle) : une resynchro
+    # Snowflake réécrirait typology/site_type à chaque cron, donc "le
+    # fichier prime" s'applique en LECTURE (FuelConsommationListView.
+    # serialize()), jamais en écrasant les champs Snowflake eux-mêmes.
+    # conso_fichier_l/ge_runtime_fichier_h/ge_prod_fichier_kwh sont la
+    # valeur ANNUELLE du fichier ÷ 12 (le fichier ne donne pas de détail
+    # mensuel réel) — une moyenne annuelle répétée sur janvier→mois
+    # courant, pas 12 vraies mesures mensuelles distinctes.
+    zone_fichier = models.CharField(max_length=32, null=True, blank=True)
+    typology_fichier = models.CharField(max_length=64, null=True, blank=True, help_text="Typologie réelle (Base GE.xlsx, colonne H).")
+    typo_simple_fichier = models.CharField(max_length=64, null=True, blank=True, help_text="Typo simple (Base GE.xlsx, colonne I).")
+    site_type_fichier = models.CharField(max_length=64, null=True, blank=True, help_text="On-Grid / Off-Grid (Base GE.xlsx, colonne M).")
+    type_ge_fichier = models.CharField(max_length=160, null=True, blank=True, help_text="Type de GE — marque/modèle (Base GE.xlsx, colonne N).")
+    batch_operationnel_fichier = models.CharField(max_length=64, null=True, blank=True)
+    facturation_active_fichier = models.BooleanField(null=True, blank=True, help_text="Statut Facturation (Oui/Non) du fichier.")
+    load_fichier_w = models.DecimalField(max_digits=10, decimal_places=1, null=True, blank=True, help_text="Load (load reelle used), en W.")
+    conso_fichier_l = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True, help_text="Genset fuel conso [L/Month] du fichier (Base GE.xlsx, colonne P) — total déclaratif mensuel, distinct de conso_estimee_fichier_l (calcul CPH interne au fichier).")
+    ge_runtime_fichier_h = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, help_text="Durée de fonctionnement du GE en h, valeur du mois telle que fournie par le fichier (Base GE.xlsx, colonne X) — pas de ÷12, ce fichier donne déjà un total mensuel (contrairement à l'ancien fichier annuel).")
+    ge_prod_fichier_kwh = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True, help_text="Genset Production [kWh/y] du fichier ÷ 12.")
+    fichier_source = models.CharField(max_length=160, null=True, blank=True, help_text="Nom/version du fichier d'origine, traçabilité.")
+
+    # Champs supplémentaires Base GE.xlsx (2026-08, colonnes O/T/V/Y/AF) — le
+    # fichier devient la source AFFICHÉE de ces mesures pour Suivis
+    # Consommation (au lieu du pipeline CPH Snowflake, trop partiel : 201/483
+    # sites seulement). pge_kva_fichier est dupliqué depuis
+    # FuelCphGeParameter.pge_kva (déjà alimenté par import_base_ge) pour
+    # rester disponible même sur les sites où sync_fuel_cph n'a produit
+    # aucun jour OK — jamais fusionné avec cph_pge_kva (Snowflake SITE_DG).
+    pge_kva_fichier = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, help_text="Puissance GE (KVA), Base GE.xlsx colonne O.")
+    ge_load_pct_fichier = models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True, help_text="GE load percentage en %, Base GE.xlsx colonne T.")
+    cph_lph_fichier = models.DecimalField(max_digits=10, decimal_places=4, null=True, blank=True, help_text="Cph en L/h, Base GE.xlsx colonne V.")
+    conso_estimee_fichier_l = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True, help_text="Consommation de carburant en L, Base GE.xlsx colonne Y — renseigné pour seulement 5 des 469 lignes (valeurs 2,3,4,5,6h en colonne Running Time, motif manifestement factice/exemple) : conservé pour audit, mais PLUS utilisé pour la colonne affichée Conso estimée (voir conso_estimee_aout26_l et conso_estimee_cph_l).")
+    conso_mesuree_fichier_l = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True, help_text="Fuel Consumption (L), Base GE.xlsx colonne AF — même limitation que conso_estimee_fichier_l (5/469 lignes). Conservé pour audit ; la colonne affichée Conso mesurée vue vient de Snowflake (conso_snowflake_l).")
+
+    # "Base août 26 validée" (feuille KPIs par site) — 2e fichier, comble les
+    # trous laissés par Base GE.xlsx sur running time/conso estimée (colonnes
+    # X/Y quasi vides, 5/469 lignes réelles) avec une couverture complète sur
+    # ses 443 sites (⊂ les 469 de Base GE.xlsx). Valeurs déjà mensuelles pour
+    # conso_estimee_aout26_l (le fichier fournit directement L/y ET L/mois) ;
+    # ge_runtime_aout26_h = Genset running time [hrs/yr] ÷ 12 (pas de
+    # décomposition mensuelle dans le fichier).
+    conso_estimee_aout26_l = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True, help_text="Genset fuel conso, valeur mensuelle déjà calculée dans le fichier (Base août 26 validée, colonne K).")
+    ge_runtime_aout26_h = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, help_text="Genset running time [hrs/yr] ÷ 12 (Base août 26 validée, colonne L).")
+
+    # Détail énergie CPH (télémétrie GFMS_DATA_TRACKER_NC) — agrégat mensuel
+    # (SUM des jours OK/OVER_CAPACITY uniquement, même garde que
+    # conso_estimee_cph_l) du détail journalier FuelCphGeDaily. Absent du
+    # fichier Base GE.xlsx (aucune colonne équivalente) : seule source
+    # possible pour ces 4 métriques, voir fuel_cph_service.py.
+    cph_site_load_energy_kwh = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True, help_text="Énergie site (charge) cumulée sur les jours OK du mois, kWh.")
+    cph_battery_dc_energy_kwh = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True, help_text="Énergie de recharge batterie côté DC cumulée sur les jours OK du mois, kWh.")
+    cph_battery_ac_energy_kwh = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True, help_text="Énergie de recharge batterie côté AC (DC ÷ rendement redresseur) cumulée sur les jours OK du mois, kWh.")
+    cph_total_ge_energy_kwh = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True, help_text="Énergie totale fournie par le GE (site + recharge batterie AC) cumulée sur les jours OK du mois, kWh.")
+
+    # Relevés manuels des sociétés de gardiennage ("Synthèse Conso Fuel",
+    # onglet "Synthese conso fuel") — 5e source, pour les sites SANS capteur
+    # Snowflake (sensor_status != MONITORED) ni télémétrie GE exploitable.
+    # Fichier mensuel distinct par nature (relevé physique de jauge par un
+    # gardien, pas une mesure automatisée) : jamais fusionné avec
+    # conso_snowflake_l, utilisé seulement en repli à l'affichage (voir
+    # FuelConsommationListView.serialize()) quand Snowflake n'a rien.
+    conso_gardien_l = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True, help_text='"Qtité cons considéréé (L)" du fichier de gardiennage — relevé de jauge validé par le gardien/technicien, retenu pour le mois.')
+    gardien_statut = models.CharField(max_length=32, null=True, blank=True, help_text='"Statut Conso Fuel" du fichier (OK / OK SOUS RESERVE).')
+    gardien_date_releve_finale = models.CharField(max_length=32, null=True, blank=True, help_text="Date de Relevé Finale telle que fournie par le fichier (texte brut, formats mixtes) — vide si la période n'était pas encore clôturée à l'export du fichier.")
+    gardien_source = models.CharField(max_length=200, null=True, blank=True, help_text="Nom/onglet du fichier de gardiennage d'origine, traçabilité.")
+
     synced_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -816,12 +892,32 @@ class FuelCphGeDaily(models.Model):
     que le statut soit OK ou non : c'est ce qui permet de comprendre "pourquoi
     le chiffre du site X est bas ce mois-ci" sans re-requêter Snowflake.
 
-    Reproduit la sortie attendue par la spec de déploiement CPH (section 2.2) :
-    énergies (site, batterie DC/AC, GE totale), runtime (compteur tracker vs
-    contrôleur DSE), CPH et litres estimés, statut de calcul.
+    Reproduit EXACTEMENT le schéma de sortie documenté par la spec (section
+    2.2 du deployment spec / "Sortie attendue" de l'IT handoff) : COUNTRY,
+    SITE_ID, DATE, DATA_ID, DG_RUNTIME_BUSINESS_H(+SOURCE), DG_RUNTIME_INTERVAL_H
+    (+STATUS), les énergies, PGE_KVA/POWER_FACTOR/GE_LOAD_PERCENT, SPC_L_PER_KWH,
+    CPH_ESTIMATED_LPH, ESTIMATED_CONSUMPTION_L, CALCULATION_STATUS.
+
+    Deux runtimes distincts, jamais confondus (spec section 6, "ne pas
+    mélanger les deux besoins") :
+      - dg_runtime_controller_h (DSE seul) : utilisé UNIQUEMENT pour valider
+        que dg_runtime_interval_h (compteur tracker) est fiable ce jour-là
+        (tolérance 0.15h) — conditionne le calcul des litres.
+      - dg_runtime_business_h/source (DSE > DG-On calculé > redresseur 5 min
+        pour les hybrides solaire+GE sans DSE) : le runtime "métier" à
+        afficher, pas utilisé pour valider les litres.
+    Les deux compteurs GENSET_REPORT sont bornés à [0, 24]h à la source
+    (Snowflake) : des valeurs aberrantes jusqu'à ~1,2 million d'heures pour
+    une seule journée ont été constatées (2026-08, compteur cumulatif mal
+    réinitialisé) — nullifiées avant d'atteindre cette table.
+
+    pge_kva/power_factor/spc_l_per_kwh sont les valeurs RÉELLEMENT utilisées
+    ce jour-là (fichier de référence ou repli Snowflake), stockées ici pour
+    audit complet — distinctes de FuelCphGeParameter qui ne garde que la
+    définition de référence, pas la valeur appliquée par jour.
 
     "Sans litre inventé" : estimated_consumption_l et cph_estimated_lph ne
-    sont renseignés que si calculation_status == "OK".
+    sont renseignés que si calculation_status == "OK" (ou "OVER_CAPACITY").
     """
 
     class Status(models.TextChoices):
@@ -833,8 +929,10 @@ class FuelCphGeDaily(models.Model):
         MISSING_PARAMETER = "MISSING_PARAMETER", "Paramètres GE manquants"
         OVER_CAPACITY = "OVER_CAPACITY", "Charge GE > capacité déclarée"
 
+    country = models.CharField(max_length=64, null=True, blank=True, db_index=True)
     site_id = models.CharField(max_length=64, db_index=True)
     date = models.DateField(db_index=True)
+    data_id = models.IntegerField(null=True, blank=True, help_text="Traçabilité Snowflake (SITE_FILTERED.DATA_ID) — pas la clé métier, voir contrainte (site_id, date).")
 
     # Détection d'intervalles (GFMS_DATA_TRACKER_NC, run_minutes 1-10 et
     # elapsed_minutes 1-10) + comparaison au runtime DSE (GENSET_REPORT.
@@ -842,7 +940,13 @@ class FuelCphGeDaily(models.Model):
     ge_intervals = models.IntegerField(default=0)
     valid_battery_intervals = models.IntegerField(default=0)
     dg_runtime_interval_h = models.DecimalField(max_digits=10, decimal_places=3, null=True, blank=True)
-    dg_runtime_controller_h = models.DecimalField(max_digits=10, decimal_places=3, null=True, blank=True)
+    dg_runtime_interval_status = models.CharField(max_length=24, null=True, blank=True, help_text="VALID si dg_runtime_interval_h > 0 (énergie intégrable ce jour), NO_INTERVALS sinon.")
+    dg_runtime_controller_h = models.DecimalField(max_digits=10, decimal_places=3, null=True, blank=True, help_text="DSE (GENSET_REPORT.DG_RUNTIME_CONTROLLER) — sert UNIQUEMENT à valider dg_runtime_interval_h, jamais au runtime affiché.")
+
+    # Runtime "métier" à 3 sources (DSE > DG-On calculé > redresseur 5 min) —
+    # colonne d'AFFICHAGE, distincte de dg_runtime_controller_h ci-dessus.
+    dg_runtime_business_h = models.DecimalField(max_digits=10, decimal_places=3, null=True, blank=True)
+    dg_runtime_business_source = models.CharField(max_length=24, null=True, blank=True, help_text="DSE_CONTROLLER, DG_ON_CALCULATED, RECTIFIER_STATUS_5MIN ou NO_VALID_RUNTIME.")
 
     # Énergies (kWh), intégrées uniquement pendant les intervalles GE actifs
     site_load_energy_kwh = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
@@ -850,6 +954,11 @@ class FuelCphGeDaily(models.Model):
     battery_charge_ac_energy_kwh = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
     total_ge_energy_kwh = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
     average_ge_power_kw = models.DecimalField(max_digits=10, decimal_places=4, null=True, blank=True)
+
+    # Paramètres GE réellement appliqués ce jour (fichier ou repli Snowflake)
+    pge_kva = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    power_factor = models.DecimalField(max_digits=4, decimal_places=3, null=True, blank=True)
+    spc_l_per_kwh = models.DecimalField(max_digits=8, decimal_places=4, null=True, blank=True)
 
     # Résultat carburant (uniquement si calculation_status == OK)
     cph_estimated_lph = models.DecimalField(max_digits=10, decimal_places=4, null=True, blank=True)

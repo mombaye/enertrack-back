@@ -16,6 +16,71 @@ from rest_framework.views import APIView
 logger = logging.getLogger(__name__)
 
 
+def _file_site_ids():
+    """
+    Site_id des sites présents dans les fichiers de référence partagés
+    (Base GE.xlsx / Base août 26 validée, superset/sous-ensemble l'un de
+    l'autre — voir import_base_ge.py). fichier_source n'est écrit QUE par
+    import_base_ge, sur le(s) mois où la commande a été lancée — interroger
+    sur TOUT l'historique (pas juste le mois demandé) rend le périmètre de
+    sites indépendant du mois filtré, sinon changer de mois dans l'UI
+    renverrait 0 site pour tout mois où l'import fichier n'a pas tourné.
+    Utilisé à la fois par FuelConsommationListView et
+    FuelConsommationDashboardView pour qu'ils partagent EXACTEMENT le même
+    périmètre de sites.
+    """
+    from fuel_tracking.models import FuelConsommationMonthly
+
+    return list(
+        FuelConsommationMonthly.objects.filter(fichier_source__isnull=False)
+        .values_list("site_id", flat=True)
+        .distinct()
+    )
+
+
+def _file_ge_site_ids():
+    """
+    Site_id des sites du fichier de référence (Base GE.xlsx) dont la colonne
+    "Typo simple" mentionne GE (ex: "SOLAIRE+GE", "SECTEUR+SOLAIRE+GE",
+    "SECTEUR+GE") — demande explicite (2026-08) : ne plus considérer TOUS
+    les sites du fichier comme des sites GE par défaut, se fier au contenu
+    réel de Typo simple. Un site du fichier dont Typo simple ne mentionne
+    PAS GE compterait Sans GE malgré sa présence dans le fichier (aucun cas
+    de ce type sur les 469 lignes actuelles — vérifié 2026-08 — mais la
+    règle reste celle-ci, pas "présent dans le fichier = GE").
+    Découpage sur "+" (pas un simple "GE" in typo) pour éviter un faux
+    positif sur un futur libellé qui contiendrait la sous-chaîne "GE" sans
+    que ce soit le token GE lui-même.
+    """
+    from fuel_tracking.models import FuelConsommationMonthly
+
+    rows = (
+        FuelConsommationMonthly.objects.filter(fichier_source__isnull=False, typo_simple_fichier__isnull=False)
+        .values_list("site_id", "typo_simple_fichier")
+        .distinct()
+    )
+    return {
+        site_id for site_id, typo in rows
+        if "GE" in [p.strip() for p in typo.split("+")]
+    }
+
+
+def _effective_ge_q(file_ge_site_ids):
+    """
+    Condition "site avec GE" à utiliser pour tout ce qui touche à
+    Suivis Consommation / Dashboard. Un site compte Avec GE si Snowflake OU
+    ENOC le confirme (has_genset), OU si sa Typo simple (Base GE.xlsx)
+    mentionne GE (voir _file_ge_site_ids) — même si Snowflake (DG_COUNT=0)
+    et ENOC n'ont ni l'un ni l'autre de fiche GE pour lui (45 sites dans ce
+    cas, vérifié 2026-08). has_genset (Snowflake OU ENOC) reste affiché tel
+    quel ailleurs (ge_detection) pour la transparence, mais ne sert plus
+    seul à décider Avec GE / Sans GE.
+    """
+    from django.db.models import Q
+
+    return Q(has_genset=True) | Q(site_id__in=file_ge_site_ids)
+
+
 class FuelConsommationListView(APIView):
     """
     GET /api/fuel-tracking/consommation/?month=YYYY-MM&search=&country=&has_genset=&page=&limit=
@@ -81,10 +146,44 @@ class FuelConsommationListView(APIView):
         month = request.query_params.get("month")
         if not month:
             if not available_months:
-                return Response({"month_year": None, "data": [], "pagination": None, "available_months": [], "kpis": None, "sources": sources, "cph_parameters": cph_parameters})
+                return Response({"month_year": None, "data": [], "pagination": None, "available_months": [], "kpis": None, "sources": sources, "cph_parameters": cph_parameters, "ge_detection": None})
             month = available_months[0]
 
+        # Suivis Consommation (2026-08) — périmètre à nouveau TOUT le réseau
+        # (retour arrière explicite sur la restriction "sites du fichier
+        # uniquement" : 59 sites reconnus GE par Snowflake/ENOC étaient
+        # exclus car absents des fichiers, demande "on veut toutes les
+        # données selon le filtre"). Les filtres Avec GE/Sans GE/Avec GE mais
+        # pas de données portent donc à nouveau sur le plein effectif — voir
+        # `ge_detection` plus bas pour le détail Snowflake/ENOC/fichier.
         qs = FuelConsommationMonthly.objects.filter(month_year=month).order_by("site_id")
+
+        # Recoupement Snowflake/ENOC/fichiers — calculé sur TOUT le mois
+        # (avant les filtres search/country/has_genset, comme ge_counts),
+        # pour expliquer d'où viennent les effectifs Avec GE/Sans GE et où
+        # se situent les 469 sites des fichiers de référence par rapport aux
+        # 483 sites GE réseau (voir échange avec l'utilisateur, 2026-08).
+        file_site_ids = set(_file_site_ids())
+        file_ge_site_ids = _file_ge_site_ids()
+        detection_base = FuelConsommationMonthly.objects.filter(month_year=month)
+        detection_agg = detection_base.aggregate(
+            total_sites=Count("id"),
+            avec_ge=Count("id", filter=Q(has_genset=True)),
+            sans_ge=Count("id", filter=Q(has_genset=False)),
+            avec_ge_snowflake=Count("id", filter=Q(has_genset_snowflake=True)),
+            avec_ge_enoc=Count("id", filter=Q(has_genset_enoc=True)),
+            vus_seulement_enoc=Count("id", filter=Q(has_genset_enoc=True, has_genset_snowflake=False)),
+            vus_seulement_snowflake=Count("id", filter=Q(has_genset_snowflake=True, has_genset_enoc=False)),
+            vus_par_les_deux=Count("id", filter=Q(has_genset_snowflake=True, has_genset_enoc=True)),
+        )
+        ge_site_ids = set(detection_base.filter(has_genset=True).values_list("site_id", flat=True))
+        ge_detection = {
+            **detection_agg,
+            "sites_dans_fichier": len(file_site_ids),
+            "dans_fichier_et_ge": len(file_site_ids & ge_site_ids),
+            "dans_fichier_sans_ge": len(file_site_ids - ge_site_ids),
+            "ge_hors_fichier": len(ge_site_ids - file_site_ids),
+        }
 
         search = (request.query_params.get("search") or "").strip()
         if search:
@@ -97,18 +196,35 @@ class FuelConsommationListView(APIView):
         # Répartition avec/sans GE calculée AVANT le filtre has_genset lui-même,
         # pour que le sélecteur du frontend puisse toujours afficher les 2
         # effectifs (ex: "Avec GE (373)" / "Sans GE (2949)"), qu'un filtre soit
-        # actif ou non.
+        # actif ou non. "Avec GE" utilise effective_ge_q (Snowflake/ENOC OU
+        # Typo simple du fichier Base GE.xlsx mentionne GE — voir
+        # _effective_ge_q/_file_ge_site_ids). "Avec GE mais aucune donnée" =
+        # avec GE ET Conso estimée ET Conso mesurée vue (Snowflake OU
+        # gardiennage, voir conso_mesuree_source de serialize()) sont TOUTES
+        # LES DEUX manquantes — demande explicite (2026-08 : "cela doit
+        # prendre parmi les GE ceux qui n'ont pas de données de Conso
+        # estimée (L) / Conso mesurée vue (L)"). Running Time n'entre plus
+        # dans ce critère. Running Time/Conso estimée viennent
+        # EXCLUSIVEMENT du pipeline CPH Snowflake — plus de repli sur Base
+        # août 26 validée, qui n'est plus utilisée par ce tableau.
+        effective_ge_q = _effective_ge_q(file_ge_site_ids)
+        incomplete_q = effective_ge_q & (
+            Q(conso_estimee_cph_l__isnull=True) & Q(conso_snowflake_l__isnull=True) & Q(conso_gardien_l__isnull=True)
+        )
         ge_counts = qs.aggregate(
-            sites_avec_ge=Count("id", filter=Q(has_genset=True)),
-            sites_sans_ge=Count("id", filter=Q(has_genset=False)),
+            sites_avec_ge=Count("id", filter=effective_ge_q),
+            sites_sans_ge=Count("id", filter=~effective_ge_q),
             sites_ge_enoc_only=Count("id", filter=Q(has_genset_enoc=True, has_genset_snowflake=False)),
+            sites_avec_ge_incomplet=Count("id", filter=incomplete_q),
         )
 
         has_genset_param = (request.query_params.get("has_genset") or "").strip().lower()
         if has_genset_param in ("true", "1"):
-            qs = qs.filter(has_genset=True)
+            qs = qs.filter(effective_ge_q)
         elif has_genset_param in ("false", "0"):
-            qs = qs.filter(has_genset=False)
+            qs = qs.filter(~effective_ge_q)
+        elif has_genset_param == "incomplete":
+            qs = qs.filter(incomplete_q)
 
         agg = qs.aggregate(
             total_sites=Count("id"),
@@ -123,6 +239,7 @@ class FuelConsommationListView(APIView):
             "sites_avec_ge": ge_counts["sites_avec_ge"],
             "sites_sans_ge": ge_counts["sites_sans_ge"],
             "sites_ge_enoc_only": ge_counts["sites_ge_enoc_only"],
+            "sites_avec_ge_incomplet": ge_counts["sites_avec_ge_incomplet"],
             "sites_avec_conso": agg["sites_avec_conso"],
             "sites_avec_estimation": agg["sites_avec_estimation"],
             "total_conso_snowflake_l": float(agg["total_conso_snowflake_l"] or 0),
@@ -145,14 +262,75 @@ class FuelConsommationListView(APIView):
         rows = qs[start:start + limit]
 
         def serialize(row):
+            # Suivis Consommation (2026-08) — demande explicite : "toute la
+            # base fixe est prise du fichier Base GE" (identité/typologie
+            # ci-dessous) ; "pour les autres [colonnes calculées], respecter
+            # les informations de Snowflake" — Running Time et Conso estimée
+            # viennent EXCLUSIVEMENT du pipeline CPH Snowflake (télémétrie
+            # GFMS_DATA_TRACKER_NC), plus de repli sur Base août 26 validée.
+            # Base GE.xlsx colonnes X/Y (Running Time/Conso estimée propres
+            # au fichier) restent ignorées ici : renseignées pour 5 des 469
+            # lignes seulement, motif manifestement factice (2,3,4,5,6h).
+            runtime_h = row.cph_runtime_h_total
+            runtime_source = f"snowflake_{(row.cph_runtime_source or '').lower()}" if runtime_h is not None else None
+
+            conso_estimee = row.conso_estimee_cph_l
+            estimee_source = "cph_snowflake" if conso_estimee is not None else None
+
+            # Conso mesurée vue : Snowflake (capteur automatisé, priorité 1)
+            # > relevé de gardiennage (jauge physique relevée manuellement,
+            # priorité 2) — pour les sites sans capteur Snowflake fiable
+            # (demande explicite 2026-08 : "pouvons-nous prendre les valeurs
+            # de ce fichier pour les sites avec aucune supervision"). Fichier
+            # importé mois par mois (import_gardien_conso) : vide sur les
+            # mois où aucun fichier de gardiennage n'a encore été fourni.
+            if row.conso_snowflake_l is not None:
+                conso_mesuree, mesuree_source = row.conso_snowflake_l, "snowflake"
+            elif row.conso_gardien_l is not None:
+                conso_mesuree, mesuree_source = row.conso_gardien_l, "gardiennage"
+            else:
+                conso_mesuree, mesuree_source = None, None
+
+            ecart_l = None
+            ecart_pct = None
+            if conso_estimee is not None and conso_mesuree is not None:
+                ecart_l = float(conso_mesuree - conso_estimee)
+                if conso_mesuree:
+                    ecart_pct = round(ecart_l / float(conso_mesuree) * 100, 2)
+
+            # Commentaire — explique en clair, pour les valeurs manquantes de
+            # CETTE ligne, pourquoi (aucune des sources disponibles ne l'a
+            # fournie), plutôt que de laisser deviner depuis une cellule
+            # vide. Rien à dire quand tout est renseigné.
+            comment_parts = []
+            if runtime_h is None:
+                comment_parts.append("Running Time : non déduit par le pipeline CPH Snowflake ce mois-ci (ni compteur télémétrie 5 min, ni contrôleur DSE, ni DG-On calculé).")
+            if conso_estimee is None:
+                comment_parts.append("Conso estimée : pipeline CPH Snowflake sans résultat ce mois-ci (voir cph_calculation_status).")
+            if conso_mesuree is None:
+                comment_parts.append("Conso mesurée vue : aucune baisse de niveau de cuve fiable détectée par Snowflake (VW_FUEL_REPORT), et aucun relevé de gardiennage disponible pour ce site ce mois-ci.")
+            commentaire = " ".join(comment_parts) or None
+
+            # Demande explicite (2026-08) : pour les sites du fichier, se
+            # fier à Typo simple ("SOLAIRE+GE", etc.) plutôt qu'à la seule
+            # présence dans le fichier. has_genset_snowflake/_enoc restent
+            # les valeurs brutes (transparence, voir ge_detection), mais le
+            # has_genset AFFICHÉ inclut aussi les sites dont Typo simple
+            # mentionne GE — 45 sites du fichier n'ont ni DG_COUNT>0 ni fiche
+            # ENOC, et comptent quand même Avec GE ici (leur Typo simple
+            # mentionne bien GE).
+            has_genset_effective = bool(row.has_genset) or row.site_id in file_ge_site_ids
+
             return {
                 "site_id": row.site_id,
                 "site_name": row.site_name,
-                "typology": row.typology,
-                "site_type": row.site_type,
+                "typology": row.typology_fichier or row.typology,
+                "typologie_simple": row.typo_simple_fichier,
+                "site_type": row.site_type_fichier or row.site_type,
+                "type_ge": row.type_ge_fichier or row.cph_ge_type,
                 "dg_count": row.dg_count,
                 "power_supply": row.power_supply,
-                "has_genset": row.has_genset,
+                "has_genset": has_genset_effective,
                 "has_genset_snowflake": row.has_genset_snowflake,
                 "has_genset_enoc": row.has_genset_enoc,
                 "nb_ge_enoc": row.nb_ge_enoc,
@@ -190,6 +368,39 @@ class FuelConsommationListView(APIView):
                 "cph_runtime_h_total": float(row.cph_runtime_h_total) if row.cph_runtime_h_total is not None else None,
                 "cph_runtime_source": row.cph_runtime_source,
                 "cph_ge_type": row.cph_ge_type,
+                "cph_pge_kva": float(row.cph_pge_kva) if row.cph_pge_kva is not None else None,
+                "cph_power_factor": float(row.cph_power_factor) if row.cph_power_factor is not None else None,
+                "cph_spc_l_per_kwh": float(row.cph_spc_l_per_kwh) if row.cph_spc_l_per_kwh is not None else None,
+                # 4e source — fichier métier validé (Base GE.xlsx), jamais
+                # fusionnée avec conso_snowflake_l/conso_estimee_cph_l.
+                "conso_fichier_l": float(row.conso_fichier_l) if row.conso_fichier_l is not None else None,
+                "fichier_source": row.fichier_source,
+                # Colonnes Suivis Consommation affichées (2026-08) — sourcées
+                # de Base GE.xlsx pour tout ce que le fichier fournit ;
+                # Énergie site/Batterie DC/Batterie AC/Énergie GE viennent du
+                # pipeline CPH Snowflake (FuelCphGeDaily agrégé), seule source
+                # pour ces 4 métriques, absentes du fichier.
+                "pge_kva_fichier": float(row.pge_kva_fichier) if row.pge_kva_fichier is not None else None,
+                "ge_load_pct_fichier": float(row.ge_load_pct_fichier) if row.ge_load_pct_fichier is not None else None,
+                "cph_lph_fichier": float(row.cph_lph_fichier) if row.cph_lph_fichier is not None else None,
+                # Valeurs résolues (priorité fichier(s) > Snowflake, voir
+                # commentaire en tête de serialize()) — jamais les colonnes
+                # brutes Base GE.xlsx X/Y (quasi vides, voir help_text du
+                # modèle).
+                "ge_runtime_fichier_h": float(runtime_h) if runtime_h is not None else None,
+                "ge_runtime_source": runtime_source,
+                "conso_estimee_fichier_l": float(conso_estimee) if conso_estimee is not None else None,
+                "conso_estimee_source": estimee_source,
+                "conso_mesuree_fichier_l": float(conso_mesuree) if conso_mesuree is not None else None,
+                "conso_mesuree_source": mesuree_source,
+                "gardien_statut": row.gardien_statut,
+                "ecart_fichier_l": ecart_l,
+                "ecart_fichier_pct": ecart_pct,
+                "cph_site_load_energy_kwh": float(row.cph_site_load_energy_kwh) if row.cph_site_load_energy_kwh is not None else None,
+                "cph_battery_dc_energy_kwh": float(row.cph_battery_dc_energy_kwh) if row.cph_battery_dc_energy_kwh is not None else None,
+                "cph_battery_ac_energy_kwh": float(row.cph_battery_ac_energy_kwh) if row.cph_battery_ac_energy_kwh is not None else None,
+                "cph_total_ge_energy_kwh": float(row.cph_total_ge_energy_kwh) if row.cph_total_ge_energy_kwh is not None else None,
+                "commentaire": commentaire,
             }
 
         return Response({
@@ -207,6 +418,7 @@ class FuelConsommationListView(APIView):
             "sources": sources,
             "kpis": kpis,
             "cph_parameters": cph_parameters,
+            "ge_detection": ge_detection,
         })
 
 
@@ -214,10 +426,14 @@ class FuelConsommationDashboardView(APIView):
     """
     GET /api/fuel-tracking/consommation/dashboard/?month=YYYY-MM&from_month=YYYY-MM&to_month=YYYY-MM
 
-    Alimente l'onglet Dashboard. Périmètre restreint aux sites AVEC GE
-    (has_genset=True) : seuls eux peuvent avoir une consommation fuel,
-    inclure les sites sans GE ne ferait que diluer les totaux avec des
-    lignes structurellement vides.
+    Alimente l'onglet Dashboard. Périmètre IDENTIQUE à Suivis Consommation
+    (FuelConsommationListView) : _effective_ge_q (Snowflake/ENOC OU site du
+    fichier Base GE.xlsx) — sinon les 2 onglets afficheraient des totaux
+    décalés (demande explicite : "les données de la partie Dashboard
+    doivent être les mêmes que sur Suivis Consommations"). Le
+    total_conso_estimee_cph_l ci-dessous vient exclusivement du pipeline CPH
+    Snowflake, comme la colonne "Conso estimée" de la liste, pour que les 2
+    totaux concordent.
 
     Portée de `months`/`monthly`/`top_sites` (priorité dans cet ordre,
     spec 2026-08) :
@@ -231,8 +447,23 @@ class FuelConsommationDashboardView(APIView):
     permission_classes = [IsAuthenticated]
 
     @staticmethod
-    def _month_stats(qs, month_year):
+    def _month_stats(qs, month_year, file_ge_site_ids):
         from django.db.models import Count, Q, Sum
+
+        # Conso estimée / Running Time viennent EXCLUSIVEMENT du pipeline CPH
+        # Snowflake (demande explicite 2026-08 : "pour les autres [colonnes
+        # calculées], respecter les informations de Snowflake") — même
+        # champs que FuelConsommationListView.serialize(), plus de repli sur
+        # Base août 26 validée, pour que le total ici corresponde
+        # exactement à la somme de la colonne "Conso estimée" de Suivis
+        # Consommation sur le même mois. nb_sites_incomplet utilise
+        # EXACTEMENT la même définition que le filtre "Avec GE mais aucune
+        # donnée" de FuelConsommationListView (incomplete_q) : Conso estimée
+        # ET Conso mesurée vue (Snowflake OU gardiennage) toutes les deux
+        # manquantes — Running Time n'entre plus dans ce critère.
+        incomplete_q = _effective_ge_q(file_ge_site_ids) & (
+            Q(conso_estimee_cph_l__isnull=True) & Q(conso_snowflake_l__isnull=True) & Q(conso_gardien_l__isnull=True)
+        )
 
         agg = qs.aggregate(
             nb_sites_ge=Count("id"),
@@ -247,6 +478,9 @@ class FuelConsommationDashboardView(APIView):
             # (cf. fuel_consommation_snowflake.py).
             specif_num=Sum("conso_snowflake_l", filter=Q(conso_snowflake_l__isnull=False, ge_prod_kwh__isnull=False)),
             specif_den=Sum("ge_prod_kwh", filter=Q(conso_snowflake_l__isnull=False, ge_prod_kwh__isnull=False)),
+            total_conso_estimee_cph_l=Sum("conso_estimee_cph_l"),
+            nb_sites_avec_cph=Count("id", filter=Q(conso_estimee_cph_l__isnull=False)),
+            nb_sites_incomplet=Count("id", filter=incomplete_q),
         )
         specif_num = agg["specif_num"]
         specif_den = agg["specif_den"]
@@ -265,6 +499,9 @@ class FuelConsommationDashboardView(APIView):
             "total_enoc_nb_demandes": agg["total_enoc_nb_demandes"] or 0,
             "nb_sites_enoc_ajoutee": agg["nb_sites_enoc_ajoutee"],
             "conso_specifique_moy_l_kwh": conso_specifique,
+            "total_conso_estimee_cph_l": float(agg["total_conso_estimee_cph_l"] or 0),
+            "nb_sites_avec_cph": agg["nb_sites_avec_cph"],
+            "nb_sites_incomplet": agg["nb_sites_incomplet"],
         }
 
     @staticmethod
@@ -291,13 +528,34 @@ class FuelConsommationDashboardView(APIView):
         ]
 
     def get(self, request):
-        from fuel_tracking.models import FuelConsommationMonthly
+        from django.utils import timezone
 
-        base_qs = FuelConsommationMonthly.objects.filter(has_genset=True)
+        from fuel_tracking.models import FuelCphGeParameter, FuelConsommationMonthly
+
+        # effective_ge_q (Snowflake/ENOC OU Typo simple du fichier Base
+        # GE.xlsx mentionne GE, voir _effective_ge_q/_file_ge_site_ids) —
+        # même périmètre que FuelConsommationListView pour que les 2 onglets
+        # affichent des totaux identiques. Pas le réseau entier (3 356
+        # sites) : les sites sans GE n'ont structurellement aucune conso
+        # fuel possible, ça diluerait le sens de cette page.
+        file_ge_site_ids = _file_ge_site_ids()
+        base_qs = FuelConsommationMonthly.objects.filter(_effective_ge_q(file_ge_site_ids))
         all_months = list(
             base_qs.order_by("month_year").values_list("month_year", flat=True).distinct()
         )
         total_ge_sites = base_qs.filter(month_year=all_months[-1]).count() if all_months else 0
+
+        # Statut du fichier de référence CPH — même logique que
+        # FuelConsommationListView, pour que le dashboard explique
+        # immédiatement pourquoi la conso CPH est vide (ou pas).
+        today = timezone.now().date()
+        cph_params_qs = FuelCphGeParameter.objects.all()
+        cph_parameters = {
+            "sites_configures": cph_params_qs.filter(
+                valid_from__lte=today
+            ).exclude(valid_to__lt=today).values("site_id").distinct().count(),
+            "dernier_import": cph_params_qs.order_by("-updated_at").values_list("updated_at", flat=True).first(),
+        }
 
         requested_month = (request.query_params.get("month") or "").strip()
         from_month = (request.query_params.get("from_month") or "").strip()
@@ -313,7 +571,7 @@ class FuelConsommationDashboardView(APIView):
         trend_qs = base_qs.filter(month_year__in=trend_months)
 
         monthly = [
-            self._month_stats(trend_qs.filter(month_year=my), my)
+            self._month_stats(trend_qs.filter(month_year=my), my, file_ge_site_ids)
             for my in trend_months
         ]
         top_sites = self._top_sites(trend_qs)
@@ -324,6 +582,7 @@ class FuelConsommationDashboardView(APIView):
             "top_sites": top_sites,
             "total_ge_sites": total_ge_sites,
             "available_months": all_months,
+            "cph_parameters": cph_parameters,
         })
 
 
@@ -367,9 +626,17 @@ class FuelStockListView(APIView):
         if search:
             qs = qs.filter(Q(site_id__icontains=search) | Q(site_name__icontains=search))
 
+        # Calculés AVANT le filtre has_genset (comme ge_counts) : ces 3
+        # compteurs décrivent toujours le périmètre "avec GE" réel, qu'un
+        # filtre has_genset=false soit demandé ou non — évite qu'ils
+        # retombent à 0 par contradiction avec le filtre actif. Seuils
+        # identiques à FillBar (StockSheet.tsx) : critique <15%, alerte <40%.
         ge_counts = qs.aggregate(
             sites_avec_ge=Count("id", filter=Q(has_genset=True)),
             sites_sans_ge=Count("id", filter=Q(has_genset=False)),
+            sites_stock_critique=Count("id", filter=Q(has_genset=True, stock_snowflake_pct__lt=15)),
+            sites_stock_alerte=Count("id", filter=Q(has_genset=True, stock_snowflake_pct__gte=15, stock_snowflake_pct__lt=40)),
+            sites_sans_aucun_stock=Count("id", filter=Q(has_genset=True, stock_snowflake_l__isnull=True, stock_enoc_l__isnull=True)),
         )
 
         has_genset_param = (request.query_params.get("has_genset") or "").strip().lower()
@@ -389,6 +656,9 @@ class FuelStockListView(APIView):
             "sites_sans_ge": ge_counts["sites_sans_ge"],
             "sites_avec_stock_snowflake": agg["sites_avec_stock_snowflake"],
             "sites_avec_stock_enoc": agg["sites_avec_stock_enoc"],
+            "sites_stock_critique": ge_counts["sites_stock_critique"],
+            "sites_stock_alerte": ge_counts["sites_stock_alerte"],
+            "sites_sans_aucun_stock": ge_counts["sites_sans_aucun_stock"],
         }
 
         try:

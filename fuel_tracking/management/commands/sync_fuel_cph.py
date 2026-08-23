@@ -21,10 +21,13 @@ from fuel_tracking.models import FuelCphGeDaily, FuelCphSyncRun, FuelConsommatio
 from fuel_tracking.services.fuel_cph_service import compute_monthly_cph_estimates
 
 DAILY_UPDATE_FIELDS = [
+    "country", "data_id",
     "ge_intervals", "valid_battery_intervals",
-    "dg_runtime_interval_h", "dg_runtime_controller_h",
+    "dg_runtime_interval_h", "dg_runtime_interval_status", "dg_runtime_controller_h",
+    "dg_runtime_business_h", "dg_runtime_business_source",
     "site_load_energy_kwh", "battery_dc_energy_kwh", "battery_charge_ac_energy_kwh",
     "total_ge_energy_kwh", "average_ge_power_kw",
+    "pge_kva", "power_factor", "spc_l_per_kwh",
     "cph_estimated_lph", "estimated_consumption_l", "ge_load_percent",
     "calculation_status", "synced_at",
 ]
@@ -33,6 +36,9 @@ MONTHLY_UPDATE_FIELDS = [
     "conso_estimee_cph_l", "cph_l_per_h_moy", "cph_nb_jours_ok",
     "cph_nb_jours_calcules", "cph_calculation_status", "cph_status_breakdown",
     "cph_runtime_h_total", "cph_runtime_source", "cph_ge_type",
+    "cph_pge_kva", "cph_power_factor", "cph_spc_l_per_kwh",
+    "cph_site_load_energy_kwh", "cph_battery_dc_energy_kwh",
+    "cph_battery_ac_energy_kwh", "cph_total_ge_energy_kwh",
 ]
 
 
@@ -127,17 +133,25 @@ class Command(BaseCommand):
 
             daily_objects = [
                 FuelCphGeDaily(
+                    country=row.get("country"),
                     site_id=row["site_id"],
                     date=row["date"],
+                    data_id=row.get("data_id"),
                     ge_intervals=row["ge_intervals"],
                     valid_battery_intervals=row["valid_battery_intervals"],
                     dg_runtime_interval_h=row["dg_runtime_interval_h"],
+                    dg_runtime_interval_status=row["dg_runtime_interval_status"],
                     dg_runtime_controller_h=row["dg_runtime_controller_h"],
+                    dg_runtime_business_h=row.get("dg_runtime_business_h"),
+                    dg_runtime_business_source=row.get("dg_runtime_business_source"),
                     site_load_energy_kwh=row["site_load_energy_kwh"],
                     battery_dc_energy_kwh=row["battery_dc_energy_kwh"],
                     battery_charge_ac_energy_kwh=row["battery_charge_ac_energy_kwh"],
                     total_ge_energy_kwh=row["total_ge_energy_kwh"],
                     average_ge_power_kw=row["average_ge_power_kw"],
+                    pge_kva=row["pge_kva"],
+                    power_factor=row["power_factor"],
+                    spc_l_per_kwh=row["spc_l_per_kwh"],
                     cph_estimated_lph=row["cph_estimated_lph"],
                     estimated_consumption_l=row["estimated_consumption_l"],
                     ge_load_percent=row["ge_load_percent"],
@@ -177,6 +191,13 @@ class Command(BaseCommand):
                     fc.cph_runtime_h_total = agg["cph_runtime_h_total"]
                     fc.cph_runtime_source = agg["cph_runtime_source"]
                     fc.cph_ge_type = agg["cph_ge_type"]
+                    fc.cph_pge_kva = agg["cph_pge_kva"]
+                    fc.cph_power_factor = agg["cph_power_factor"]
+                    fc.cph_spc_l_per_kwh = agg["cph_spc_l_per_kwh"]
+                    fc.cph_site_load_energy_kwh = agg["cph_site_load_energy_kwh"]
+                    fc.cph_battery_dc_energy_kwh = agg["cph_battery_dc_energy_kwh"]
+                    fc.cph_battery_ac_energy_kwh = agg["cph_battery_ac_energy_kwh"]
+                    fc.cph_total_ge_energy_kwh = agg["cph_total_ge_energy_kwh"]
                     to_update.append(fc)
 
                 if to_update:

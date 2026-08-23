@@ -265,16 +265,47 @@ def _resolve_data_ids(cursor, db_schema: str, site_ids: list[str]) -> list[int]:
     return data_ids
 
 
+def _resolve_business_runtime(dse_h, dg_on_h, rectifier_h, is_hybrid_solar_ge) -> tuple[Decimal | None, str]:
+    """
+    Priorité exacte de la spec (section 6) : DSE en premier quel que soit le
+    profil du site ; à défaut, DG-On calculé pour les sites NON hybrides
+    solaire+GE ; à défaut, runtime redresseur (5 min) pour les hybrides
+    solaire+GE sans DSE. `is_hybrid_solar_ge` vient de VW_INVOICE_DATA_REPORT
+    (DG='Yes' AND Solar='Yes') — absent (None) traité comme non-hybride (cas
+    très majoritaire observé, ~92% des sites avec GE ET solaire sont déjà
+    hybrides quand le drapeau est connu, mais l'absence de ligne elle-même
+    est le cas courant hors GE, donc pas un signal fiable de solaire).
+    """
+    if dse_h is not None and 0 <= dse_h <= 24:
+        return dse_h, "DSE_CONTROLLER"
+    if not is_hybrid_solar_ge and dg_on_h is not None and 0 <= dg_on_h <= 24:
+        return dg_on_h, "DG_ON_CALCULATED"
+    if is_hybrid_solar_ge and rectifier_h is not None:
+        return rectifier_h, "RECTIFIER_STATUS_5MIN"
+    return None, "NO_VALID_RUNTIME"
+
+
 def fetch_daily_tracker_energy(year: int, month: int, site_ids: list[str] | None = None) -> dict[str, dict[date, dict]]:
     """
     Retourne {site_id: {date: {
+        country, data_id,
         ge_intervals, valid_battery_intervals,
         dg_runtime_interval_h, dg_runtime_controller_h,
+        dg_runtime_business_h, dg_runtime_business_source,
         site_load_energy_kwh, battery_dc_energy_kwh,
     }}} — uniquement les (site, date) avec au moins un intervalle GE détecté
     ce jour-là (contrairement à fetch_monthly_consumption, pas une ligne par
     site pour chaque jour du mois : un site sans marche GE ce jour n'a
     simplement pas d'entrée).
+
+    dg_runtime_controller_h (DSE) reste la valeur utilisée pour la
+    validation de l'intervalle (tolérance 0.15h, spec section 6) — jamais
+    remplacée par le repli. dg_runtime_business_h/source est le runtime
+    "métier" à 3 sources (DSE > DG-On calculé > redresseur 5 min pour les
+    hybrides solaire+GE sans DSE), calculé jour par jour via
+    _resolve_business_runtime — c'est la colonne DG_RUNTIME_BUSINESS_H/
+    DG_RUNTIME_BUSINESS_SOURCE du schéma de sortie documenté (spec section
+    2.2), distincte de la validation d'intervalle.
 
     `site_ids`, si fourni, restreint le scan de GFMS_DATA_TRACKER_NC (coûteux
     à l'échelle du pays — voir avertissement de volume ci-dessous) à ces
@@ -297,6 +328,7 @@ def fetch_daily_tracker_energy(year: int, month: int, site_ids: list[str] | None
         genset_schema = f"{GENSET_DATABASE}.{GENSET_SCHEMA}"
 
         data_id_filter_sql = ""
+        site_id_filter_sql = ""
         if site_ids:
             data_ids = _resolve_data_ids(cursor, db_schema, site_ids)
             if not data_ids:
@@ -305,12 +337,18 @@ def fetch_daily_tracker_energy(year: int, month: int, site_ids: list[str] | None
             # entrée utilisateur) — interpolation directe sûre, même principe
             # que les noms de table/schéma qualifiés ailleurs dans ce module.
             data_id_filter_sql = f"AND t.ID IN ({','.join(str(d) for d in data_ids)})"
+            site_placeholders = ",".join(f"%(rsid{j})s" for j in range(len(site_ids)))
+            site_id_filter_sql = f"AND SITE_ID IN ({site_placeholders})"
+
+        params = {"country": COUNTRY_SCOPE, "d_start": d_start, "d_end_excl": d_end_excl}
+        if site_ids:
+            params.update({f"rsid{j}": sid for j, sid in enumerate(site_ids)})
 
         cursor.execute(f"""
             WITH site_dim AS (
-                SELECT DATA_ID, SITE_ID
+                SELECT DATA_ID, SITE_ID, COUNTRY
                 FROM (
-                    SELECT DATA_ID, SITE_ID,
+                    SELECT DATA_ID, SITE_ID, COUNTRY,
                            ROW_NUMBER() OVER (PARTITION BY DATA_ID ORDER BY SITE_ID) AS rn
                     FROM {db_schema}.SITE_FILTERED
                     WHERE COUNTRY = %(country)s
@@ -361,26 +399,67 @@ def fetch_daily_tracker_energy(year: int, month: int, site_ids: list[str] | None
                     SUM(battery_dc_kw * run_minutes / 60.0) AS battery_dc_energy_kwh
                 FROM ge_active_intervals
                 GROUP BY data_id, day
+            ),
+            rectifier_daily AS (
+                -- Runtime redresseur (spec section 3/6) : DB_GFMS_PROD.GOLD.
+                -- RECTIFIER_EFFICIENCY_STATUS, colonne RECTIFIER_STATUS en
+                -- Good/Aged/Warning/Down (PAS le RECTIFIER_STATUS binaire de
+                -- GFMS_DATA_TRACKER_NC — table distincte, vérifiée 2026-08).
+                SELECT SITE_ID, CAST("TIMESTAMP" AS DATE) AS day,
+                       COUNT_IF(RECTIFIER_STATUS IN ('Good','Aged','Warning')) * 5.0 / 60 AS runtime_h
+                FROM {db_schema}.RECTIFIER_EFFICIENCY_STATUS
+                WHERE COUNTRY = %(country)s AND "TIMESTAMP" >= %(d_start)s AND "TIMESTAMP" < %(d_end_excl)s
+                  {site_id_filter_sql}
+                GROUP BY SITE_ID, CAST("TIMESTAMP" AS DATE)
+            ),
+            hybrid_daily AS (
+                -- Classification hybride solaire+GE (spec section 6) :
+                -- VW_INVOICE_DATA_REPORT.DG/Solar, grain (Site ID, Date).
+                SELECT "Site ID" AS SITE_ID, "Date" AS day,
+                       ("DG" = 'Yes' AND "Solar" = 'Yes') AS is_hybrid_solar_ge
+                FROM {genset_schema}.VW_INVOICE_DATA_REPORT
+                WHERE "Country" = %(country)s AND "Date" >= %(d_start)s AND "Date" < %(d_end_excl)s
+                  {site_id_filter_sql}
             )
             SELECT
-                s.SITE_ID, d.day, d.ge_intervals, d.valid_battery_intervals,
+                s.SITE_ID, s.COUNTRY, d.data_id, d.day, d.ge_intervals, d.valid_battery_intervals,
                 d.dg_runtime_interval_h, d.site_load_energy_kwh, d.battery_dc_energy_kwh,
-                g.DG_RUNTIME_CONTROLLER
+                -- Bornage 0-24h à la source : DG_RUNTIME_CONTROLLER/CALCULATED
+                -- contiennent parfois des valeurs aberrantes (constaté 2026-08 :
+                -- jusqu'à 1 192 095 h pour UNE journée — clairement un compteur
+                -- cumulatif mal réinitialisé, pas un runtime journalier réel).
+                -- Nullifié ici plutôt que filtré en Python pour qu'aucune valeur
+                -- corrompue ne soit jamais stockée, même rejetée.
+                CASE WHEN g.DG_RUNTIME_CONTROLLER BETWEEN 0 AND 24 THEN g.DG_RUNTIME_CONTROLLER END AS DG_RUNTIME_CONTROLLER,
+                CASE WHEN g.DG_RUNTIME_CALCULATED BETWEEN 0 AND 24 THEN g.DG_RUNTIME_CALCULATED END AS DG_RUNTIME_CALCULATED,
+                r.runtime_h AS rectifier_runtime_h, h.is_hybrid_solar_ge
             FROM daily_energy d
             JOIN site_dim s ON s.DATA_ID = d.data_id
             LEFT JOIN {genset_schema}.GENSET_REPORT g
                 ON g.DATA_ID = d.data_id AND g.REPORT_DATE = d.day
-        """, {"country": COUNTRY_SCOPE, "d_start": d_start, "d_end_excl": d_end_excl})
+            LEFT JOIN rectifier_daily r ON r.SITE_ID = s.SITE_ID AND r.day = d.day
+            LEFT JOIN hybrid_daily h ON h.SITE_ID = s.SITE_ID AND h.day = d.day
+        """, params)
 
         result: dict[str, dict[date, dict]] = {}
-        for (site_id, day, ge_intervals, valid_battery_intervals,
+        for (site_id, country, data_id, day, ge_intervals, valid_battery_intervals,
              dg_runtime_interval_h, site_load_energy_kwh, battery_dc_energy_kwh,
-             dg_runtime_controller_h) in cursor.fetchall():
+             dse_h, dg_on_h, rectifier_h, is_hybrid_solar_ge) in cursor.fetchall():
+
+            dse_dec = Decimal(str(dse_h)) if dse_h is not None else None
+            dg_on_dec = Decimal(str(dg_on_h)) if dg_on_h is not None else None
+            rectifier_dec = Decimal(str(rectifier_h)).quantize(Decimal("0.01")) if rectifier_h is not None else None
+            business_h, business_source = _resolve_business_runtime(dse_dec, dg_on_dec, rectifier_dec, bool(is_hybrid_solar_ge))
+
             result.setdefault(site_id, {})[day] = {
+                "country": country,
+                "data_id": int(data_id) if data_id is not None else None,
                 "ge_intervals": int(ge_intervals or 0),
                 "valid_battery_intervals": int(valid_battery_intervals or 0),
                 "dg_runtime_interval_h": Decimal(str(dg_runtime_interval_h)) if dg_runtime_interval_h is not None else None,
-                "dg_runtime_controller_h": Decimal(str(dg_runtime_controller_h)) if dg_runtime_controller_h is not None else None,
+                "dg_runtime_controller_h": dse_dec,
+                "dg_runtime_business_h": business_h,
+                "dg_runtime_business_source": business_source,
                 "site_load_energy_kwh": Decimal(str(site_load_energy_kwh)) if site_load_energy_kwh is not None else None,
                 "battery_dc_energy_kwh": Decimal(str(battery_dc_energy_kwh)) if battery_dc_energy_kwh is not None else None,
             }

@@ -14,9 +14,14 @@ qui s'applique) :
      date pour ce site (impossible de convertir l'énergie en litres).
   3. BATTERY_DATA_NOT_READY — moins de 95% des intervalles GE avec une
      mesure batterie valide.
-  4. NO_VALID_RUNTIME / RUNTIME_NOT_VALIDATED_FOR_INTERVAL_CPH — pas de
-     runtime DSE de contrôle, ou écart > 0.15h avec le runtime déduit du
-     compteur tracker.
+  4. NO_VALID_RUNTIME — aucune source de runtime métier valide DU TOUT
+     (ni DSE, ni DG-On calculé, ni redresseur 5 min).
+     RUNTIME_NOT_VALIDATED_FOR_INTERVAL_CPH — un runtime métier existe mais
+     le compteur tracker n'est pas comparable : soit le DSE spécifiquement
+     est absent (spec section 6 : "conserver la règle métier de runtime
+     mais publier RUNTIME_NOT_VALIDATED... tant qu'un contrôle équivalent de
+     l'intervalle n'est pas livré"), soit le DSE existe mais s'écarte de
+     plus de 0.15h du runtime déduit du compteur tracker.
   5. OK (ou OVER_CAPACITY, informatif — charge GE calculée > 100% de la
      capacité déclarée, litres quand même produits).
 """
@@ -43,6 +48,9 @@ _EMPTY_RESULT = {
     "cph_estimated_lph": None,
     "estimated_consumption_l": None,
     "ge_load_percent": None,
+    "pge_kva": None,
+    "power_factor": None,
+    "spc_l_per_kwh": None,
 }
 
 
@@ -90,6 +98,7 @@ def compute_daily_status(
     ge_intervals = energies.get("ge_intervals") or 0
     dg_runtime_interval_h = energies.get("dg_runtime_interval_h")
     dg_runtime_controller_h = energies.get("dg_runtime_controller_h")
+    dg_runtime_business_h = energies.get("dg_runtime_business_h")
     site_load_energy_kwh = energies.get("site_load_energy_kwh")
     battery_dc_energy_kwh = energies.get("battery_dc_energy_kwh")
     valid_battery_intervals = energies.get("valid_battery_intervals") or 0
@@ -100,27 +109,36 @@ def compute_daily_status(
     if params is None:
         return "MISSING_PARAMETER", dict(_EMPTY_RESULT)
 
+    # PGE_KVA/POWER_FACTOR résolus dès ici (fichier > Snowflake > défaut) pour
+    # être tracés dans TOUTES les issues à partir de ce point, y compris les
+    # jours rejetés — traçabilité complète (spec section 2.2), même si ces 2
+    # champs ne conditionnent jamais le calcul des litres lui-même.
+    pge_kva = params.pge_kva if params.pge_kva is not None else (ge_specs or {}).get("pge_kva")
+    power_factor = params.power_factor if params.power_factor is not None else DEFAULT_POWER_FACTOR
+    traced = dict(_EMPTY_RESULT, pge_kva=pge_kva, power_factor=power_factor, spc_l_per_kwh=params.spc_l_per_kwh)
+
     rectifier_efficiency_ratio = params.rectifier_efficiency_ratio if params.rectifier_efficiency_ratio is not None else rectifier_efficiency_fallback
     if rectifier_efficiency_ratio is None or params.spc_l_per_kwh is None:
-        return "MISSING_PARAMETER", dict(_EMPTY_RESULT)
+        return "MISSING_PARAMETER", traced
 
     if Decimal(valid_battery_intervals) / Decimal(ge_intervals) < BATTERY_COVERAGE_MIN:
-        return "BATTERY_DATA_NOT_READY", dict(_EMPTY_RESULT)
+        return "BATTERY_DATA_NOT_READY", traced
 
+    # DSE absent : le runtime métier (DG-On/redresseur) peut exister sans
+    # pouvoir valider le compteur tracker faute de DSE — spec section 6.
     if dg_runtime_controller_h is None:
-        return "NO_VALID_RUNTIME", dict(_EMPTY_RESULT)
+        if dg_runtime_business_h is None:
+            return "NO_VALID_RUNTIME", traced
+        return "RUNTIME_NOT_VALIDATED_FOR_INTERVAL_CPH", traced
 
     if abs(dg_runtime_interval_h - dg_runtime_controller_h) > RUNTIME_TOLERANCE_H:
-        return "RUNTIME_NOT_VALIDATED_FOR_INTERVAL_CPH", dict(_EMPTY_RESULT)
+        return "RUNTIME_NOT_VALIDATED_FOR_INTERVAL_CPH", traced
 
     battery_ac = (battery_dc_energy_kwh or Decimal("0")) / rectifier_efficiency_ratio
     total_ge = site_load_energy_kwh + battery_ac
     avg_power = total_ge / dg_runtime_interval_h
     cph_lph = (avg_power * params.spc_l_per_kwh).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
     consumption_l = (total_ge * params.spc_l_per_kwh).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
-
-    pge_kva = params.pge_kva if params.pge_kva is not None else (ge_specs or {}).get("pge_kva")
-    power_factor = params.power_factor if params.power_factor is not None else DEFAULT_POWER_FACTOR
 
     ge_load_pct = None
     if pge_kva and power_factor:
@@ -137,6 +155,9 @@ def compute_daily_status(
         "cph_estimated_lph": cph_lph,
         "estimated_consumption_l": consumption_l,
         "ge_load_percent": ge_load_pct,
+        "pge_kva": pge_kva,
+        "power_factor": power_factor,
+        "spc_l_per_kwh": params.spc_l_per_kwh,
     }
 
 
@@ -168,11 +189,25 @@ def compute_monthly_cph_estimates(year: int, month: int, site_ids: list[str] | N
         ok_consumptions: list[Decimal] = []
         ok_cphs: list[Decimal] = []
         runtime_total = Decimal("0")
+        last_pge_kva = last_power_factor = last_spc = None
+        site_load_total = battery_dc_total = battery_ac_total = total_ge_total = Decimal("0")
+        has_energy_detail = False
 
         for d, energies in sorted(days.items()):
             params = _params_for_date(entries, d)
             status, computed = compute_daily_status(energies, params, ge_specs, rectifier_fallback)
             status_counts[status] += 1
+
+            # Dernière valeur connue de PGE_KVA/POWER_FACTOR/SPC_L_PER_KWH sur
+            # le mois — stable en pratique (une fiche FuelCphGeParameter ne
+            # change pas d'un jour à l'autre), affichée telle quelle pour
+            # audit visuel sur la page (spec section 2.2/7).
+            if computed.get("spc_l_per_kwh") is not None:
+                last_spc = computed["spc_l_per_kwh"]
+            if computed.get("pge_kva") is not None:
+                last_pge_kva = computed["pge_kva"]
+            if computed.get("power_factor") is not None:
+                last_power_factor = computed["power_factor"]
 
             # Le runtime GE (compteur tracker) est compté sur TOUS les jours
             # détectés, OK ou non — il reflète le fonctionnement réel du GE
@@ -184,11 +219,17 @@ def compute_monthly_cph_estimates(year: int, month: int, site_ids: list[str] | N
             if status in ("OK", "OVER_CAPACITY") and computed["estimated_consumption_l"] is not None:
                 ok_consumptions.append(computed["estimated_consumption_l"])
                 ok_cphs.append(computed["cph_estimated_lph"])
+                has_energy_detail = True
+                site_load_total += energies.get("site_load_energy_kwh") or Decimal("0")
+                battery_dc_total += energies.get("battery_dc_energy_kwh") or Decimal("0")
+                battery_ac_total += computed["battery_charge_ac_energy_kwh"] or Decimal("0")
+                total_ge_total += computed["total_ge_energy_kwh"] or Decimal("0")
 
             daily_rows.append({
                 "site_id": site_id,
                 "date": d,
                 **energies,
+                "dg_runtime_interval_status": "VALID" if energies.get("dg_runtime_interval_h") else "NO_INTERVALS",
                 "calculation_status": status,
                 **computed,
             })
@@ -218,6 +259,13 @@ def compute_monthly_cph_estimates(year: int, month: int, site_ids: list[str] | N
             "cph_runtime_h_total": runtime_total.quantize(Decimal("0.01")) if runtime_total > 0 else None,
             "cph_runtime_source": "TRACKER_5MIN" if runtime_total > 0 else None,
             "cph_ge_type": (ge_specs or {}).get("ge_type"),
+            "cph_pge_kva": last_pge_kva,
+            "cph_power_factor": last_power_factor,
+            "cph_spc_l_per_kwh": last_spc,
+            "cph_site_load_energy_kwh": site_load_total.quantize(Decimal("0.001")) if has_energy_detail else None,
+            "cph_battery_dc_energy_kwh": battery_dc_total.quantize(Decimal("0.001")) if has_energy_detail else None,
+            "cph_battery_ac_energy_kwh": battery_ac_total.quantize(Decimal("0.001")) if has_energy_detail else None,
+            "cph_total_ge_energy_kwh": total_ge_total.quantize(Decimal("0.001")) if has_energy_detail else None,
         }
 
     # Repli Running Time (GENSET_REPORT, priorité DSE > DG-On calculé) — pour
@@ -253,6 +301,13 @@ def compute_monthly_cph_estimates(year: int, month: int, site_ids: list[str] | N
                         "cph_runtime_h_total": fb["runtime_h"],
                         "cph_runtime_source": fb["source"],
                         "cph_ge_type": (ge_specs or {}).get("ge_type"),
+                        "cph_pge_kva": (ge_specs or {}).get("pge_kva"),
+                        "cph_power_factor": None,
+                        "cph_spc_l_per_kwh": None,
+                        "cph_site_load_energy_kwh": None,
+                        "cph_battery_dc_energy_kwh": None,
+                        "cph_battery_ac_energy_kwh": None,
+                        "cph_total_ge_energy_kwh": None,
                     }
 
     return {"daily": daily_rows, "monthly": monthly}
