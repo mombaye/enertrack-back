@@ -1,5 +1,11 @@
 ml/models/*.pkl
 .env
 .secrets/
-data_imports/
+# Fichiers de référence carburant suivis explicitement (voir plus bas) —
+# tout le reste de ce dossier (brouillons, exports ponctuels non encore
+# reliés à une commande d'import) reste ignoré par défaut.
+data_imports/*
+!data_imports/base_ge.xlsx
+!data_imports/base_aout_26.xlsx
+!data_imports/synthese_conso_fuel_juillet_2026.xlsb
 celerybeat-schedule
