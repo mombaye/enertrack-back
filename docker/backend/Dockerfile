@@ -29,4 +29,10 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY . .
 
-CMD ["gunicorn", "enertrack_backend.wsgi:application", "--bind", "0.0.0.0:8000"]
+# Imports fichiers Suivi Carburant — rejoue les mêmes commandes qu'en local
+# à chaque démarrage du conteneur (idempotent : update_or_create/get_or_create,
+# sans risque à être relancé), pour que la prod ait les mêmes données que le
+# local sans étape manuelle après déploiement. Un nouveau fichier mensuel
+# (nouveau nom, nouveau --month) doit être ajouté ici ET commité dans
+# data_imports/ (voir .gitignore) — pas de mise à jour automatique du mois.
+CMD ["sh", "-c", "python manage.py import_base_ge --file=data_imports/base_ge.xlsx --month=2026-08; python manage.py import_kpis_par_site --file=data_imports/base_aout_26.xlsx --month=2026-08; python manage.py import_gardien_conso --file=data_imports/synthese_conso_fuel_juillet_2026.xlsb --month=2026-07; gunicorn enertrack_backend.wsgi:application --bind 0.0.0.0:8000"]
