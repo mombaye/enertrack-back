@@ -8,4 +8,5 @@ data_imports/*
 !data_imports/base_ge.xlsx
 !data_imports/base_aout_26.xlsx
 !data_imports/synthese_conso_fuel_juillet_2026.xlsb
+!data_imports/commande_fuel_aout_2026.xlsb
 celerybeat-schedule

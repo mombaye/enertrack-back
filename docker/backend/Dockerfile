@@ -7,18 +7,27 @@ ENV PYTHONUNBUFFERED=1
 WORKDIR /code
 
 # ── 1. Drivers système + ODBC Microsoft ──────────────────────────
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Retries (Acquire::Retries côté apt, boucle côté curl) : l'installation du
+# driver ODBC dépend d'un réseau externe (packages.microsoft.com) — le seul
+# point du build qui peut échouer sur un aléa réseau transitoire côté
+# serveur de déploiement, sans que ce soit un bug de la recette elle-même.
+RUN apt-get update -o Acquire::Retries=5 && apt-get install -y --no-install-recommends \
         curl \
         gnupg2 \
         apt-transport-https \
         unixodbc \
         unixodbc-dev \
-    && curl -sSL https://packages.microsoft.com/keys/microsoft.asc \
-        | gpg --dearmor > /usr/share/keyrings/microsoft.gpg \
+    && for i in 1 2 3 4 5; do \
+        curl -fsSL --retry 5 --retry-delay 3 --retry-connrefused \
+            https://packages.microsoft.com/keys/microsoft.asc \
+            | gpg --dearmor > /usr/share/keyrings/microsoft.gpg \
+        && break || { echo "curl microsoft.asc failed (attempt $i/5), retrying..."; sleep 5; }; \
+    done \
+    && test -s /usr/share/keyrings/microsoft.gpg \
     && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] \
         https://packages.microsoft.com/debian/11/prod bullseye main" \
         > /etc/apt/sources.list.d/mssql-release.list \
-    && apt-get update \
+    && apt-get update -o Acquire::Retries=5 \
     && ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql17 \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
