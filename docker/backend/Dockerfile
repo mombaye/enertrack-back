@@ -35,4 +35,4 @@ COPY . .
 # local sans étape manuelle après déploiement. Un nouveau fichier mensuel
 # (nouveau nom, nouveau --month) doit être ajouté ici ET commité dans
 # data_imports/ (voir .gitignore) — pas de mise à jour automatique du mois.
-CMD ["sh", "-c", "python manage.py import_base_ge --file=data_imports/base_ge.xlsx --month=2026-08; python manage.py import_kpis_par_site --file=data_imports/base_aout_26.xlsx --month=2026-08; python manage.py import_gardien_conso --file=data_imports/synthese_conso_fuel_juillet_2026.xlsb --month=2026-07; gunicorn enertrack_backend.wsgi:application --bind 0.0.0.0:8000"]
+CMD ["sh", "-c", "python manage.py import_base_ge --file=data_imports/base_ge.xlsx --month=2026-08; python manage.py import_kpis_par_site --file=data_imports/base_aout_26.xlsx --month=2026-08; python manage.py import_gardien_conso --file=data_imports/synthese_conso_fuel_juillet_2026.xlsb --month=2026-07; python manage.py import_commande_fuel --file=data_imports/commande_fuel_aout_2026.xlsb --month=2026-08; gunicorn enertrack_backend.wsgi:application --bind 0.0.0.0:8000"]

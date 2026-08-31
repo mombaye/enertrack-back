@@ -65,6 +65,40 @@ def _file_ge_site_ids():
     }
 
 
+def _compute_ge_detection(month):
+    """
+    Recoupement Snowflake/ENOC/fichiers pour un mois donné — factorisé pour
+    être partagé entre FuelConsommationListView (panneau interactif,
+    cliquable) et FuelConsommationDashboardView (même panneau, lecture
+    seule, voir DashboardSheet). Toujours calculé sur TOUT le mois, avant
+    tout filtre search/country/has_genset.
+    """
+    from django.db.models import Count, Q
+
+    from fuel_tracking.models import FuelConsommationMonthly
+
+    file_site_ids = set(_file_site_ids())
+    detection_base = FuelConsommationMonthly.objects.filter(month_year=month)
+    detection_agg = detection_base.aggregate(
+        total_sites=Count("id"),
+        avec_ge=Count("id", filter=Q(has_genset=True)),
+        sans_ge=Count("id", filter=Q(has_genset=False)),
+        avec_ge_snowflake=Count("id", filter=Q(has_genset_snowflake=True)),
+        avec_ge_enoc=Count("id", filter=Q(has_genset_enoc=True)),
+        vus_seulement_enoc=Count("id", filter=Q(has_genset_enoc=True, has_genset_snowflake=False)),
+        vus_seulement_snowflake=Count("id", filter=Q(has_genset_snowflake=True, has_genset_enoc=False)),
+        vus_par_les_deux=Count("id", filter=Q(has_genset_snowflake=True, has_genset_enoc=True)),
+    )
+    ge_site_ids = set(detection_base.filter(has_genset=True).values_list("site_id", flat=True))
+    return {
+        **detection_agg,
+        "sites_dans_fichier": len(file_site_ids),
+        "dans_fichier_et_ge": len(file_site_ids & ge_site_ids),
+        "dans_fichier_sans_ge": len(file_site_ids - ge_site_ids),
+        "ge_hors_fichier": len(ge_site_ids - file_site_ids),
+    }
+
+
 def _effective_ge_q(file_ge_site_ids):
     """
     Condition "site avec GE" à utiliser pour tout ce qui touche à
@@ -158,32 +192,36 @@ class FuelConsommationListView(APIView):
         # `ge_detection` plus bas pour le détail Snowflake/ENOC/fichier.
         qs = FuelConsommationMonthly.objects.filter(month_year=month).order_by("site_id")
 
-        # Recoupement Snowflake/ENOC/fichiers — calculé sur TOUT le mois
-        # (avant les filtres search/country/has_genset, comme ge_counts),
-        # pour expliquer d'où viennent les effectifs Avec GE/Sans GE et où
-        # se situent les 469 sites des fichiers de référence par rapport aux
-        # 483 sites GE réseau (voir échange avec l'utilisateur, 2026-08).
+        # Recoupement Snowflake/ENOC/fichiers — voir _compute_ge_detection,
+        # partagé avec FuelConsommationDashboardView pour que les 2 panneaux
+        # (interactif ici, lecture seule sur le Dashboard) affichent
+        # exactement les mêmes chiffres.
         file_site_ids = set(_file_site_ids())
         file_ge_site_ids = _file_ge_site_ids()
-        detection_base = FuelConsommationMonthly.objects.filter(month_year=month)
-        detection_agg = detection_base.aggregate(
-            total_sites=Count("id"),
-            avec_ge=Count("id", filter=Q(has_genset=True)),
-            sans_ge=Count("id", filter=Q(has_genset=False)),
-            avec_ge_snowflake=Count("id", filter=Q(has_genset_snowflake=True)),
-            avec_ge_enoc=Count("id", filter=Q(has_genset_enoc=True)),
-            vus_seulement_enoc=Count("id", filter=Q(has_genset_enoc=True, has_genset_snowflake=False)),
-            vus_seulement_snowflake=Count("id", filter=Q(has_genset_snowflake=True, has_genset_enoc=False)),
-            vus_par_les_deux=Count("id", filter=Q(has_genset_snowflake=True, has_genset_enoc=True)),
-        )
-        ge_site_ids = set(detection_base.filter(has_genset=True).values_list("site_id", flat=True))
-        ge_detection = {
-            **detection_agg,
-            "sites_dans_fichier": len(file_site_ids),
-            "dans_fichier_et_ge": len(file_site_ids & ge_site_ids),
-            "dans_fichier_sans_ge": len(file_site_ids - ge_site_ids),
-            "ge_hors_fichier": len(ge_site_ids - file_site_ids),
+        ge_detection = _compute_ge_detection(month)
+
+        # Filtre "détection" — clic sur une case du panneau GeDetectionPanel
+        # (2026-08) : affiche directement dans le tableau les sites qui
+        # composent ce chiffre, plutôt que de laisser deviner. Mêmes clés
+        # que ge_detection ci-dessus (sauf total_sites = pas de filtre).
+        # Exclusif du filtre has_genset (Tous/Avec GE/Sans GE/Avec GE mais
+        # aucune donnée) — les 2 filtres ne sont jamais combinés.
+        detection_filters = {
+            "avec_ge": Q(has_genset=True),
+            "sans_ge": Q(has_genset=False),
+            "avec_ge_snowflake": Q(has_genset_snowflake=True),
+            "avec_ge_enoc": Q(has_genset_enoc=True),
+            "vus_seulement_enoc": Q(has_genset_enoc=True, has_genset_snowflake=False),
+            "vus_seulement_snowflake": Q(has_genset_snowflake=True, has_genset_enoc=False),
+            "vus_par_les_deux": Q(has_genset_snowflake=True, has_genset_enoc=True),
+            "sites_dans_fichier": Q(site_id__in=file_site_ids),
+            "dans_fichier_et_ge": Q(site_id__in=file_site_ids, has_genset=True),
+            "dans_fichier_sans_ge": Q(site_id__in=file_site_ids, has_genset=False),
+            "ge_hors_fichier": Q(has_genset=True) & ~Q(site_id__in=file_site_ids),
         }
+        detection_param = (request.query_params.get("detection") or "").strip()
+        if detection_param in detection_filters:
+            qs = qs.filter(detection_filters[detection_param])
 
         search = (request.query_params.get("search") or "").strip()
         if search:
@@ -576,6 +614,12 @@ class FuelConsommationDashboardView(APIView):
         ]
         top_sites = self._top_sites(trend_qs)
 
+        # Même panneau "Détection GE" que Suivis Consommation (voir
+        # _compute_ge_detection), en lecture seule ici — scope sur le
+        # DERNIER mois de la plage affichée, comme le camembert "Couverture
+        # des sites" (lastStats côté frontend).
+        ge_detection = _compute_ge_detection(trend_months[-1]) if trend_months else None
+
         return Response({
             "months": trend_months,
             "monthly": monthly,
@@ -583,6 +627,140 @@ class FuelConsommationDashboardView(APIView):
             "total_ge_sites": total_ge_sites,
             "available_months": all_months,
             "cph_parameters": cph_parameters,
+            "ge_detection": ge_detection,
+        })
+
+
+class FuelCommandeView(APIView):
+    """
+    GET /api/fuel-tracking/commandes/?month=YYYY-MM&search=&page=&limit=
+
+    Commande carburant mensuelle — import mensuel brut (pas de synchro
+    automatisée : commande décidée par l'équipe Ops dans un fichier Excel,
+    voir import_commande_fuel), lecture seule ici, aucun upload sur cette
+    page. Combine :
+      - FuelCommandeSynthese : 2 blocs de synthèse (par catégorie/batch, par
+        typologie facturée), mois courant vs précédent + écart déjà
+        calculés dans le fichier source.
+      - FuelSuiviCommandeSite : détail par site (conso moyenne, commande
+        sans/avec marge, stock final estimé).
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from django.db.models import Count, Q, Sum
+
+        from fuel_tracking.models import FuelCommandeSynthese, FuelSuiviCommandeSite
+
+        available_months = list(
+            FuelSuiviCommandeSite.objects.order_by("-month_year").values_list("month_year", flat=True).distinct()
+        )
+
+        month = (request.query_params.get("month") or "").strip()
+        if not month:
+            if not available_months:
+                return Response({
+                    "month_year": None, "available_months": [], "synthese": {"categorie": [], "typologie": []},
+                    "sites": {"data": [], "pagination": None, "kpis": None},
+                })
+            month = available_months[0]
+
+        def serialize_synthese(row):
+            return {
+                "label": row.label,
+                "is_total_row": row.is_total_row,
+                "nb_sites": float(row.nb_sites),
+                "commande_normale_l": float(row.commande_normale_l),
+                "commande_hivernale_l": float(row.commande_hivernale_l),
+                "total_l": float(row.total_l),
+                "nb_sites_prev": float(row.nb_sites_prev),
+                "commande_normale_prev_l": float(row.commande_normale_prev_l),
+                "commande_hivernale_prev_l": float(row.commande_hivernale_prev_l),
+                "total_prev_l": float(row.total_prev_l),
+                "ecart_sites": float(row.ecart_sites),
+                "ecart_qte_l": float(row.ecart_qte_l),
+                "commentaires": row.commentaires,
+            }
+
+        synth_qs = FuelCommandeSynthese.objects.filter(month_year=month).order_by("group_type", "order_index")
+        prev_month_year = synth_qs.values_list("prev_month_year", flat=True).first()
+        synthese = {
+            "categorie": [serialize_synthese(r) for r in synth_qs.filter(group_type=FuelCommandeSynthese.GroupType.CATEGORIE)],
+            "typologie": [serialize_synthese(r) for r in synth_qs.filter(group_type=FuelCommandeSynthese.GroupType.TYPOLOGIE)],
+        }
+
+        sites_qs = FuelSuiviCommandeSite.objects.filter(month_year=month).order_by("site_id")
+
+        search = (request.query_params.get("search") or "").strip()
+        if search:
+            sites_qs = sites_qs.filter(Q(site_id__icontains=search) | Q(site_name__icontains=search))
+
+        # "Rupture de stock prévue" — estimation_stock_final_l < 0, calculée
+        # AVANT le filtre search pour un KPI stable qu'une recherche soit
+        # active ou non (même principe que ge_counts ailleurs dans ce fichier).
+        kpis_qs = FuelSuiviCommandeSite.objects.filter(month_year=month)
+        kpis = kpis_qs.aggregate(
+            total_sites=Count("id"),
+            total_commande_avec_marge_l=Sum("commande_avec_marge_l"),
+            total_commande_sans_marge_l=Sum("commande_sans_marge_l"),
+            nb_sites_commande_positive=Count("id", filter=Q(commande_avec_marge_l__gt=0)),
+            nb_sites_stock_negatif=Count("id", filter=Q(estimation_stock_final_l__lt=0)),
+        )
+        kpis = {
+            "total_sites": kpis["total_sites"],
+            "total_commande_avec_marge_l": float(kpis["total_commande_avec_marge_l"] or 0),
+            "total_commande_sans_marge_l": float(kpis["total_commande_sans_marge_l"] or 0),
+            "nb_sites_commande_positive": kpis["nb_sites_commande_positive"],
+            "nb_sites_stock_negatif": kpis["nb_sites_stock_negatif"],
+        }
+
+        try:
+            page = max(1, int(request.query_params.get("page", 1)))
+        except ValueError:
+            page = 1
+        try:
+            limit = min(200, max(1, int(request.query_params.get("limit", 50))))
+        except ValueError:
+            limit = 50
+
+        total = sites_qs.count()
+        total_pages = max(1, (total + limit - 1) // limit)
+        start = (page - 1) * limit
+        rows = sites_qs[start:start + limit]
+
+        def serialize_site(row):
+            return {
+                "site_id": row.site_id,
+                "site_name": row.site_name,
+                "typologie_contractuelle": row.typologie_contractuelle,
+                "load_commande": float(row.load_commande),
+                "indoor_outdoor": row.indoor_outdoor,
+                "batch": row.batch,
+                "typologie_facturee": row.typologie_facturee,
+                "typo_operations": row.typo_operations,
+                "conso_moy_jour_l": float(row.conso_moy_jour_l),
+                "commande_sans_marge_l": float(row.commande_sans_marge_l),
+                "commande_avec_marge_l": float(row.commande_avec_marge_l),
+                "estimation_stock_final_l": float(row.estimation_stock_final_l),
+            }
+
+        return Response({
+            "month_year": month,
+            "prev_month_year": prev_month_year,
+            "available_months": available_months,
+            "synthese": synthese,
+            "sites": {
+                "data": [serialize_site(r) for r in rows],
+                "pagination": {
+                    "page": page,
+                    "limit": limit,
+                    "total": total,
+                    "totalPages": total_pages,
+                    "hasNext": page < total_pages,
+                    "hasPrev": page > 1,
+                },
+                "kpis": kpis,
+            },
         })
 
 
@@ -676,6 +854,22 @@ class FuelStockListView(APIView):
         rows = qs[start:start + limit]
 
         def serialize(row):
+            # Commentaire — explique en clair pourquoi le stock manque pour
+            # ce site, plutôt que de laisser deviner depuis une cellule
+            # vide (même principe que Suivis Consommation, 2026-08).
+            comment_parts = []
+            if row.stock_snowflake_l is None:
+                comment_parts.append(
+                    "Stock Snowflake : aucun relevé de niveau de cuve physiquement valide sur la fenêtre glissante de 30 jours "
+                    "(VW_FUEL_REPORT) — capteur absent, en panne, ou site jamais couvert par ce flux."
+                )
+            if row.stock_enoc_l is None:
+                comment_parts.append(
+                    "Stock ENOC : aucun relevé disponible pour ce site (collecte historique ponctuelle, pas un flux continu — "
+                    "seuls certains sites ont été relevés au moins une fois)."
+                )
+            commentaire = " ".join(comment_parts) or None
+
             return {
                 "site_id": row.site_id,
                 "site_name": row.site_name,
@@ -694,6 +888,7 @@ class FuelStockListView(APIView):
                 "quality_status": row.quality_status,
                 "stock_enoc_l": float(row.stock_enoc_l) if row.stock_enoc_l is not None else None,
                 "stock_enoc_date": row.stock_enoc_date,
+                "commentaire": commentaire,
             }
 
         return Response({
