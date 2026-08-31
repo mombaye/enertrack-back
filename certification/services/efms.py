@@ -8,7 +8,12 @@ from datetime import date, timedelta
 from decimal import Decimal
 from typing import Optional
 
-import pyodbc
+# pyodbc importé localement (voir _open_connection/diagnose), pas ici : ce
+# module doit rester importable même sans le driver ODBC système
+# (unixodbc/msodbcsql17) installé — EfmsService n'est plus la voie
+# d'accès aux données en production (SnowflakeEfmsService en hérite
+# seulement pour réutiliser _delta_to_conso/_sum_to_conso, du pur calcul,
+# jamais pyodbc), seuls les diagnostics eFMS manuels en ont encore besoin.
 from django.conf import settings
 from django.core.cache import cache
 
@@ -79,6 +84,7 @@ class EfmsService:
         )
 
     def _open_connection(self):
+        import pyodbc
         from certification.models import EfmsConnectionLog
 
         last_error = None
@@ -654,6 +660,7 @@ class EfmsService:
 
     def diagnose(self) -> dict:
         import socket
+        import pyodbc
         result = {
             "host": self.host, "port": self.port, "db": self.db,
             "driver": self.driver, "user": self.user,

@@ -7,7 +7,9 @@ from datetime import date, timedelta
 from decimal import Decimal
 from typing import Optional
 
-import pyodbc
+# pyodbc importé localement dans les méthodes qui l'utilisent — voir
+# certification/services/efms.py pour le raisonnement (module diagnostic
+# uniquement, ne doit pas exiger le driver ODBC système pour être importé).
 from django.conf import settings
 
 logger = logging.getLogger(__name__)
@@ -109,6 +111,7 @@ class EfmsService:
         )
 
     def _open_connection(self):
+        import pyodbc
         from certification.models import EfmsConnectionLog
 
         last_error = None
@@ -485,6 +488,7 @@ class EfmsService:
 
     def diagnose(self) -> dict:
         import socket
+        import pyodbc
         result = {
             "host": self.host, "port": self.port, "db": self.db,
             "driver": self.driver, "user": self.user,

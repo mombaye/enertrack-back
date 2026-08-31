@@ -6,33 +6,22 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /code
 
-# ── 1. Drivers système + ODBC Microsoft ──────────────────────────
-# Retries (Acquire::Retries côté apt, boucle côté curl) : l'installation du
-# driver ODBC dépend d'un réseau externe (packages.microsoft.com) — le seul
-# point du build qui peut échouer sur un aléa réseau transitoire côté
-# serveur de déploiement, sans que ce soit un bug de la recette elle-même.
-RUN apt-get update -o Acquire::Retries=5 && apt-get install -y --no-install-recommends \
-        curl \
-        gnupg2 \
-        apt-transport-https \
-        unixodbc \
-        unixodbc-dev \
-    && for i in 1 2 3 4 5; do \
-        curl -fsSL --retry 5 --retry-delay 3 --retry-connrefused \
-            https://packages.microsoft.com/keys/microsoft.asc \
-            | gpg --dearmor > /usr/share/keyrings/microsoft.gpg \
-        && break || { echo "curl microsoft.asc failed (attempt $i/5), retrying..."; sleep 5; }; \
-    done \
-    && test -s /usr/share/keyrings/microsoft.gpg \
-    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] \
-        https://packages.microsoft.com/debian/11/prod bullseye main" \
-        > /etc/apt/sources.list.d/mssql-release.list \
-    && apt-get update -o Acquire::Retries=5 \
-    && ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql17 \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+# Pas de driver ODBC Microsoft installé ici (retiré 2026-08) : le build de
+# prod échouait, réseau sortant indisponible même vers les dépôts Debian de
+# base (deb.debian.org) — pas juste packages.microsoft.com, donc aucun
+# apt-get quel qu'il soit ne peut aboutir dans cet environnement de build.
+# Vérifié que rien dans le chemin de service en production n'en a besoin :
+# EfmsService (pyodbc/SQL Server) est un chemin legacy remplacé par
+# SnowflakeEfmsService pour toute donnée réellement servie ; seuls 2
+# commandes de diagnostic manuel (diagnose_efms, export_efms_2025)
+# utilisent encore pyodbc.connect(), désormais importé localement dans ces
+# méthodes (voir certification/services/efms.py) pour que le reste de
+# l'app (Celery, Django) reste important sans le driver système.
+# Si ces diagnostics redeviennent nécessaires, installer unixodbc/
+# msodbcsql17 dans une image séparée une fois l'accès réseau du serveur de
+# build résolu côté infra — pas dans cette image.
 
-# ── 2. Dépendances Python ─────────────────────────────────────────
+# ── Dépendances Python ─────────────────────────────────────────
 COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
