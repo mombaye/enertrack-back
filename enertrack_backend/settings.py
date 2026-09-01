@@ -195,7 +195,12 @@ CELERY_TASK_SERIALIZER = 'json'
 
 # Planification (nécessite le service "beat" — voir docker-compose.yml) :
 # suivi-carburant Consommation, toutes les 5 min sur le mois en cours, pour
-# rattraper rapidement les nouvelles données Snowflake/ENOC.
+# rattraper rapidement les nouvelles données Snowflake/ENOC. CPH (Running
+# Time/Type de GE/Énergie site télémétrie) et Stock étaient absentes d'ici
+# jusqu'au 2026-08 — jamais synchronisées automatiquement en prod, d'où ces
+# colonnes vides malgré Consommation/ENOC qui tournaient bien. CPH est plus
+# coûteuse (télémétrie 5 min sur tous les sites) et n'a pas besoin d'une
+# fraîcheur à la minute (agrégat mensuel) : toutes les 30 min suffit.
 from celery.schedules import crontab  # noqa: E402
 
 CELERY_BEAT_SCHEDULE = {
@@ -205,6 +210,14 @@ CELERY_BEAT_SCHEDULE = {
     },
     'fuel-enoc-sync-5min': {
         'task': 'fuel_tracking.sync_enoc_fuel_movements_current_month',
+        'schedule': crontab(minute='*/5'),
+    },
+    'fuel-cph-sync-30min': {
+        'task': 'fuel_tracking.sync_fuel_cph_current_month',
+        'schedule': crontab(minute='*/30'),
+    },
+    'fuel-stock-sync-5min': {
+        'task': 'fuel_tracking.sync_fuel_stock_current',
         'schedule': crontab(minute='*/5'),
     },
 }
