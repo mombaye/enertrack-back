@@ -130,14 +130,16 @@ class FuelConsommationListView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        from django.db.models import Count, Q, Sum
+        from django.db.models import Count, Max, Q, Sum
 
         from django.utils import timezone
 
         from fuel_tracking.models import (
+            FuelCphGeDaily,
             FuelCphGeParameter,
             FuelConsommationMonthly,
             FuelConsommationSyncRun,
+            FuelEnocMovement,
             FuelEnocSyncRun,
         )
 
@@ -162,17 +164,31 @@ class FuelConsommationListView(APIView):
 
         last_sf_run = FuelConsommationSyncRun.objects.order_by("-started_at").first()
         last_enoc_run = FuelEnocSyncRun.objects.order_by("-started_at").first()
+
+        # Date de la donnée elle-même (pas l'heure d'exécution de la synchro,
+        # qui ne dit rien sur la fraîcheur réelle de la source) — ex: la
+        # synchro peut tourner toutes les 5 min et toujours "réussir", alors
+        # que la source Snowflake (GFMS_DATA_TRACKER_NC) n'a plus publié de
+        # nouvelle ligne depuis des jours (coupure repérée le 2026-09 sur
+        # août : dernière ligne le 20/08 alors que la synchro, elle, tourne
+        # bien tous les jours). CPH est la donnée Snowflake la plus fine
+        # (journalière) disponible ici, donc le signal le plus révélateur.
+        snowflake_last_data = FuelCphGeDaily.objects.aggregate(v=Max("date"))["v"]
+        enoc_last_data = FuelEnocMovement.objects.aggregate(v=Max("operation_date"))["v"]
+
         sources = {
             "snowflake": {
                 "connected": bool(last_sf_run and last_sf_run.status == FuelConsommationSyncRun.Status.SUCCESS),
                 "last_status": last_sf_run.status if last_sf_run else None,
                 "last_run_at": (last_sf_run.finished_at or last_sf_run.started_at) if last_sf_run else None,
+                "last_data_date": snowflake_last_data,
                 "error": last_sf_run.error_message if last_sf_run else None,
             },
             "enoc": {
                 "connected": bool(last_enoc_run and last_enoc_run.status == FuelEnocSyncRun.Status.SUCCESS and last_enoc_run.rows_fetched > 0),
                 "last_status": last_enoc_run.status if last_enoc_run else None,
                 "last_run_at": (last_enoc_run.finished_at or last_enoc_run.started_at) if last_enoc_run else None,
+                "last_data_date": enoc_last_data,
                 "error": last_enoc_run.error_message if last_enoc_run else None,
             },
         }
