@@ -220,6 +220,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'fuel_tracking.sync_fuel_stock_current',
         'schedule': crontab(minute='*/5'),
     },
+    'financial-conso-sync-30min': {
+        'task': 'financial.sync_financial_conso_auto',
+        'schedule': crontab(minute='*/30'),
+    },
 }
 
 # Cache Redis (DB 1, distincte du broker Celery en DB 0) — utilisé notamment pour
