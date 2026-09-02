@@ -764,6 +764,199 @@ class FuelCommandeView(APIView):
         })
 
 
+class FuelCommandeEstimationView(APIView):
+    """
+    GET /api/fuel-tracking/commandes/estimation/?marge=0.15
+
+    Estimation carburant du mois suivant — indépendante de l'import manuel
+    Ops (FuelSuiviCommandeSite) : calculée à partir des données automatisées
+    déjà en base (FuelConsommationMonthly, FuelStockSnapshot), pas d'un
+    fichier Excel décidé à la main.
+
+    Logique d'estimateur (pas juste une moyenne brute) :
+      1. Conso/jour "meilleure valeur" par mois — même priorité que
+         FuelConsommationListView.serialize() : mesurée (Snowflake, puis
+         gardiennage) > estimée CPH (télémétrie) > estimée fichier "Base
+         août 26". Jamais deux sources mélangées dans un même mois.
+      2. Moyenne PONDÉRÉE sur les mois disponibles (le plus récent pèse le
+         plus), calculée en L/JOUR (pas en L/mois) pour ne pas fausser la
+         projection entre un mois de 28 et un mois de 31 jours.
+      3. Niveau de confiance par site — un estimateur communique une
+         incertitude, pas juste un chiffre : "Élevée" (≥2 mois de conso
+         MESURÉE, variation raisonnable entre mois), "Moyenne" (1 mois
+         mesuré, ou ≥2 mois mais volatils, ou repli CPH/fichier), "Faible"
+         (un seul mois et non mesuré, ou aucun stock actuel connu).
+      4. Projection = conso/jour pondérée × nb jours du mois cible.
+      5. Commande = besoin (projection − stock actuel), plafonnée par la
+         place réellement disponible dans la cuve (jamais plus que
+         capacité − stock).
+      6. Repère de validation : comparaison à la dernière commande décidée
+         par Ops (FuelSuiviCommandeSite) quand elle existe, pour juger si le
+         modèle est dans le bon ordre de grandeur.
+    """
+    permission_classes = [IsAuthenticated]
+
+    MARGIN_DEFAULT = 0.15
+    # Poids décroissants du mois le plus récent au plus ancien — normalisés
+    # au nombre de mois réellement disponibles pour ce site (voir _weighted_rate).
+    WEIGHTS_BY_HISTORY_LEN = {1: [1.0], 2: [0.6, 0.4], 3: [0.5, 0.3, 0.2]}
+    MAX_MONTHS_HISTORY = 3
+    HIGH_VARIANCE_THRESHOLD = 0.35  # coefficient de variation au-delà duquel on rétrograde la confiance
+
+    def get(self, request):
+        import calendar
+        from datetime import date
+
+        from django.db.models import Q
+
+        from fuel_tracking.models import FuelConsommationMonthly, FuelStockSnapshot, FuelSuiviCommandeSite
+
+        try:
+            marge = float(request.query_params.get("marge", self.MARGIN_DEFAULT))
+        except ValueError:
+            marge = self.MARGIN_DEFAULT
+        marge = max(0.0, marge)
+
+        available_months = sorted(
+            FuelConsommationMonthly.objects.order_by("-month_year")
+            .values_list("month_year", flat=True).distinct()
+        )[-self.MAX_MONTHS_HISTORY:]
+
+        if not available_months:
+            return Response({
+                "target_month": None, "source_months": [], "marge_pct": marge,
+                "kpis": None, "sites": [],
+            })
+
+        latest_year, latest_month = (int(x) for x in available_months[-1].split("-"))
+        target_year, target_month_num = (latest_year + 1, 1) if latest_month == 12 else (latest_year, latest_month + 1)
+        target_month = f"{target_year:04d}-{target_month_num:02d}"
+        nb_jours_cible = calendar.monthrange(target_year, target_month_num)[1]
+
+        rows = FuelConsommationMonthly.objects.filter(
+            month_year__in=available_months, has_genset=True,
+        ).values(
+            "site_id", "site_name", "month_year", "year", "month",
+            "conso_snowflake_l", "conso_gardien_l",
+            "conso_estimee_cph_l", "conso_estimee_aout26_l",
+        )
+
+        by_site: dict[str, dict] = {}
+        for r in rows:
+            entry = by_site.setdefault(r["site_id"], {"site_name": r["site_name"], "months": {}})
+            if r["conso_snowflake_l"] is not None:
+                conso, source, measured = r["conso_snowflake_l"], "snowflake", True
+            elif r["conso_gardien_l"] is not None:
+                conso, source, measured = r["conso_gardien_l"], "gardiennage", True
+            elif r["conso_estimee_cph_l"] is not None:
+                conso, source, measured = r["conso_estimee_cph_l"], "cph", False
+            elif r["conso_estimee_aout26_l"] is not None:
+                conso, source, measured = r["conso_estimee_aout26_l"], "fichier", False
+            else:
+                continue
+            nb_j = calendar.monthrange(r["year"], r["month"])[1]
+            entry["months"][r["month_year"]] = {
+                "conso_l": float(conso), "conso_jour_l": float(conso) / nb_j,
+                "source": source, "measured": measured,
+            }
+
+        stock_by_site = {
+            s.site_id: s for s in FuelStockSnapshot.objects.filter(site_id__in=by_site.keys(), has_genset=True)
+        }
+
+        last_ops_month = FuelSuiviCommandeSite.objects.order_by("-month_year").values_list("month_year", flat=True).first()
+        ops_ref = {}
+        if last_ops_month:
+            ops_ref = {
+                s.site_id: float(s.commande_avec_marge_l)
+                for s in FuelSuiviCommandeSite.objects.filter(month_year=last_ops_month)
+            }
+
+        results = []
+        for site_id, entry in by_site.items():
+            months_sorted = sorted(entry["months"].items())  # chronologique, du plus ancien au plus récent
+            history = [m for _, m in months_sorted][-self.MAX_MONTHS_HISTORY:]
+            if not history:
+                continue
+
+            weights = self.WEIGHTS_BY_HISTORY_LEN.get(len(history), self.WEIGHTS_BY_HISTORY_LEN[1])
+            # weights[0] = poids du plus récent → on parcourt l'historique à l'envers
+            rates = [h["conso_jour_l"] for h in reversed(history)]
+            conso_jour_ponderee = sum(w * r for w, r in zip(weights, rates))
+
+            nb_measured = sum(1 for h in history if h["measured"])
+            moyenne = sum(rates) / len(rates)
+            variance_cv = (
+                (sum((r - moyenne) ** 2 for r in rates) / len(rates)) ** 0.5 / moyenne
+                if moyenne > 0 and len(rates) > 1 else 0.0
+            )
+
+            stock_row = stock_by_site.get(site_id)
+            stock_l = float(stock_row.stock_snowflake_l) if stock_row and stock_row.stock_snowflake_l is not None else (
+                float(stock_row.stock_enoc_l) if stock_row and stock_row.stock_enoc_l is not None else None
+            )
+            capacity_l = float(stock_row.capacity_snowflake_l) if stock_row and stock_row.capacity_snowflake_l is not None else None
+
+            if len(history) >= 2 and nb_measured >= 2 and variance_cv <= self.HIGH_VARIANCE_THRESHOLD and stock_l is not None:
+                confiance = "Élevée"
+            elif stock_l is None or (len(history) == 1 and not history[0]["measured"]):
+                confiance = "Faible"
+            else:
+                confiance = "Moyenne"
+
+            conso_proj_l = conso_jour_ponderee * nb_jours_cible
+            stock_connu = stock_l if stock_l is not None else 0.0
+            commande_sans_marge_l = max(0.0, conso_proj_l - stock_connu)
+            commande_avec_marge_l = commande_sans_marge_l * (1 + marge)
+            place_disponible = max(0.0, capacity_l - stock_connu) if capacity_l is not None else None
+            commande_finale_l = min(commande_avec_marge_l, place_disponible) if place_disponible is not None else commande_avec_marge_l
+            stock_final_estime_l = stock_connu + commande_finale_l - conso_proj_l
+
+            results.append({
+                "site_id": site_id,
+                "site_name": entry["site_name"],
+                "nb_mois_historique": len(history),
+                "sources_historique": [h["source"] for h in history],
+                "conso_jour_ponderee_l": round(conso_jour_ponderee, 2),
+                "conso_projetee_l": round(conso_proj_l, 1),
+                "stock_actuel_l": round(stock_l, 1) if stock_l is not None else None,
+                "stock_connu": stock_l is not None,
+                "capacite_cuve_l": round(capacity_l, 1) if capacity_l is not None else None,
+                "commande_sans_marge_l": round(commande_sans_marge_l, 1),
+                "commande_avec_marge_l": round(commande_finale_l, 1),
+                "plafonnee_par_capacite": place_disponible is not None and commande_avec_marge_l > place_disponible,
+                "stock_final_estime_l": round(stock_final_estime_l, 1),
+                "confiance": confiance,
+                "commande_ops_reference_l": ops_ref.get(site_id),
+            })
+
+        results.sort(key=lambda r: r["commande_avec_marge_l"], reverse=True)
+
+        search = (request.query_params.get("search") or "").strip().lower()
+        if search:
+            results = [r for r in results if search in r["site_id"].lower() or search in (r["site_name"] or "").lower()]
+
+        total_commande_l = sum(r["commande_avec_marge_l"] for r in results)
+        total_ops_ref_l = sum(v for v in ops_ref.values()) if ops_ref else None
+        kpis = {
+            "nb_sites": len(results),
+            "total_commande_estimee_l": round(total_commande_l, 0),
+            "nb_sites_rupture_prevue": sum(1 for r in results if r["stock_final_estime_l"] < 0),
+            "nb_sites_confiance_faible": sum(1 for r in results if r["confiance"] == "Faible"),
+            "nb_sites_confiance_elevee": sum(1 for r in results if r["confiance"] == "Élevée"),
+            "total_commande_ops_reference_l": round(total_ops_ref_l, 0) if total_ops_ref_l else None,
+            "ops_reference_month": last_ops_month,
+        }
+
+        return Response({
+            "target_month": target_month,
+            "source_months": available_months,
+            "marge_pct": marge,
+            "kpis": kpis,
+            "sites": results,
+        })
+
+
 class FuelStockListView(APIView):
     """
     GET /api/fuel-tracking/stock/?search=&has_genset=&page=&limit=

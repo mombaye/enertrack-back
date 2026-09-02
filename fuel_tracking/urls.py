@@ -2,11 +2,18 @@
 
 from django.urls import path
 
-from fuel_tracking.views import FuelCommandeView, FuelConsommationDashboardView, FuelConsommationListView, FuelStockListView
+from fuel_tracking.views import (
+    FuelCommandeEstimationView,
+    FuelCommandeView,
+    FuelConsommationDashboardView,
+    FuelConsommationListView,
+    FuelStockListView,
+)
 
 urlpatterns = [
     path("consommation/dashboard/", FuelConsommationDashboardView.as_view(), name="fuel-consommation-dashboard"),
     path("consommation/", FuelConsommationListView.as_view(), name="fuel-consommation"),
     path("stock/", FuelStockListView.as_view(), name="fuel-stock"),
+    path("commandes/estimation/", FuelCommandeEstimationView.as_view(), name="fuel-commandes-estimation"),
     path("commandes/", FuelCommandeView.as_view(), name="fuel-commandes"),
 ]
