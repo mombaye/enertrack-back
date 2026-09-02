@@ -20,7 +20,7 @@ from .serializers import (
     EfmsConnectionLogSerializer,
 )
 from .tasks import launch_certification_batch
-from .services.efms import EfmsService
+from .services.snowflake_efms import SnowflakeEfmsService as EfmsService
 
 logger = logging.getLogger(__name__)
 
@@ -323,8 +323,8 @@ class EfmsHealthCheckView(APIView):
         return Response(
             {
                 "efms_reachable": ok,
-                "host":           efms.host,
-                "port":           efms.port,
+                "host":           efms.sf.account,
+                "port":           None,
                 "checked_at":     timezone.now().isoformat(),
             },
             status=status.HTTP_200_OK if ok else status.HTTP_503_SERVICE_UNAVAILABLE,
