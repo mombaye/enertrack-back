@@ -808,6 +808,7 @@ class FuelCommandeEstimationView(APIView):
         from datetime import date
 
         from django.db.models import Q
+        from django.utils import timezone
 
         from fuel_tracking.models import FuelConsommationMonthly, FuelStockSnapshot, FuelSuiviCommandeSite
 
@@ -817,8 +818,17 @@ class FuelCommandeEstimationView(APIView):
             marge = self.MARGIN_DEFAULT
         marge = max(0.0, marge)
 
+        # Exclut le mois calendaire EN COURS, même s'il a déjà quelques
+        # lignes (alimentées en continu par la synchro Celery du mois
+        # courant) : tant qu'il n'est pas terminé, ce n'est pas un mois de
+        # référence fiable pour la moyenne pondérée, et il fausserait la
+        # cible (mois suivant le dernier mois COMPLET, pas le mois suivant
+        # "aujourd'hui") — ex. le 2026-09-02, la cible doit être 2026-09
+        # (juste après août, dernier mois complet), pas 2026-10.
+        current_month = timezone.now().strftime("%Y-%m")
         available_months = sorted(
-            FuelConsommationMonthly.objects.order_by("-month_year")
+            FuelConsommationMonthly.objects.filter(month_year__lt=current_month)
+            .order_by("-month_year")
             .values_list("month_year", flat=True).distinct()
         )[-self.MAX_MONTHS_HISTORY:]
 
