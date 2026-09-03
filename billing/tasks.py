@@ -558,7 +558,12 @@ def import_invoices_task(self, batch_id: int, storage_key: str, echeance_str: st
 
                 data["echeance"] = echeance
 
-                # Mapping site
+                # Mapping site — un contrat sans site connu (ou hors périmètre
+                # Aktivco/grid_fee) N'EST PLUS ignoré : la facture est quand
+                # même importée (site_id laissé vide) pour que le nombre de
+                # factures en base corresponde toujours au fichier source,
+                # quel qu'il soit. Le rattachement/périmètre Aktivco reste
+                # appliqué en aval (affichage, certification), pas ici.
                 data["numero_compte_contrat"] = _to_contract_str(data.get("numero_compte_contrat"))
                 acc = data.get("numero_compte_contrat")
                 if acc:
@@ -567,7 +572,12 @@ def import_invoices_task(self, batch_id: int, storage_key: str, echeance_str: st
                         data["site_id"] = site_pk
                     else:
                         missing_contracts.add(acc)
-                        continue
+                        issues_buf.append(ImportIssue(
+                            batch=batch, row_number=excel_row,
+                            severity=ImportIssue.Severity.WARN, field="numero_compte_contrat",
+                            message=f"Site non résolu pour le contrat {acc!r} (absent de ContractSiteLink, ou site hors périmètre Aktivco/grid_fee) — facture importée sans site rattaché.",
+                            raw_data=raw_row,
+                        ))
 
                 # Champs requis
                 req_missing = [
@@ -663,8 +673,11 @@ def import_invoices_task(self, batch_id: int, storage_key: str, echeance_str: st
             "issues_logged":                len(issues_buf),
             "contract_months_upserted":     count_upserted,
             "contract_months_deleted":      count_deleted,
-            "invoices_missing_site_count":  len(missing_contracts),
-            "invoices_missing_site_sample": list(missing_contracts)[:20],
+            # Importées quand même (voir plus haut) — juste sans site rattaché,
+            # à corriger via un import ContractSiteLink si besoin de les
+            # rattacher plus tard (le compte de factures, lui, est déjà bon).
+            "invoices_without_site_count":  len(missing_contracts),
+            "invoices_without_site_sample": list(missing_contracts)[:20],
         }
         batch.task_status   = ImportBatch.TaskStatus.SUCCESS
         batch.task_progress = 100
