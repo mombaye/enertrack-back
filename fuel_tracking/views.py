@@ -559,7 +559,7 @@ class FuelConsommationDashboardView(APIView):
         }
 
     @staticmethod
-    def _top_sites(qs, limit=10):
+    def _top_sites(qs, limit=20):
         from django.db.models import Count, Sum
 
         rows = (
