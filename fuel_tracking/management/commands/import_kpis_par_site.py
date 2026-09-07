@@ -7,14 +7,20 @@ renseignées pour seulement 5 des 469 lignes, motif manifestement factice —
 voir import_base_ge.py). Ce fichier couvre ses 443 sites à 100% sur ces 2
 métriques (⊂ les 469 sites de Base GE.xlsx, vérifié 2026-08).
 
-Colonnes importées (A à O) : Site ID (A), Genset fuel conso — valeur
-mensuelle déjà calculée dans le fichier (K), Genset running time [hrs/yr]
-(L, ÷12 ici), Genset Production [kWh/y] (O, ÷12).
+Colonnes importées (A à O) : Site ID (A), Statut Facturation (C, Oui/Non),
+Batch opérationnel (D), Configuration (E, Indoor/Outdoor — jamais fournie
+par Base GE.xlsx, seule source de cette info), Zone (F), Load/load réelle
+utilisée en W (H), Genset fuel conso — valeur mensuelle déjà calculée dans
+le fichier (K), Genset running time [hrs/yr] (L, ÷12 ici), Genset
+Production [kWh/y] (O, ÷12).
 
 Ne touche JAMAIS aux champs sourcés de Base GE.xlsx (typologie/type de
 site/type de GE/PGE_KVA/rectifier/SPC/GE load %/Cph L/h) — écrit
-uniquement dans les colonnes _aout26 dédiées de FuelConsommationMonthly,
-priorité résolue en LECTURE dans FuelConsommationListView.serialize().
+uniquement dans les colonnes _aout26/_fichier dédiées de
+FuelConsommationMonthly, priorité résolue en LECTURE dans
+FuelConsommationListView.serialize(). configuration_fichier (Indoor/
+Outdoor) est distinct de site_type_fichier (On-Grid/Off-Grid, Base GE.xlsx) —
+ne pas confondre les deux malgré le nom "site_type" trompeur côté Base GE.
 
 Usage:
     docker compose exec web python manage.py import_kpis_par_site --file=data_imports/base_aout_26.xlsx --month=2026-08 --dry-run
@@ -34,6 +40,11 @@ HEADER_ROW = 6
 # Indices 0-based dans chaque tuple de ligne (colonnes A à O)
 COL_SITE_ID = 0
 COL_SITE_NAME = 1
+COL_STATUT_FACTURATION = 2  # "Oui" / "Non"
+COL_BATCH_OPERATIONNEL = 3
+COL_CONFIGURATION = 4  # "Indoor" / "Outdoor" — jamais fourni par Base GE.xlsx
+COL_ZONE = 5
+COL_LOAD_W = 7  # "Load (load reelle used)", en W
 COL_CONSO_MONTH = 10  # Genset fuel conso, déjà mensuel (L/mois)
 COL_RUNTIME_YR = 11  # Genset running time [hrs/yr]
 COL_GE_PROD_YR = 14  # Genset Production [kWh/y]
@@ -74,6 +85,19 @@ class Command(BaseCommand):
         def to_decimal(v):
             return Decimal(str(v)) if v is not None else None
 
+        def to_bool_oui_non(v):
+            if v is None:
+                return None
+            s = str(v).strip().lower()
+            if s in ("oui", "yes", "true", "1"):
+                return True
+            if s in ("non", "no", "false", "0"):
+                return False
+            return None
+
+        def to_str(v):
+            return str(v).strip() if v is not None and str(v).strip() else None
+
         rows = []
         errors = []
         for i, row in enumerate(ws.iter_rows(min_row=HEADER_ROW + 1, values_only=True)):
@@ -86,6 +110,7 @@ class Command(BaseCommand):
                 conso_month = to_decimal(row[COL_CONSO_MONTH])
                 runtime_yr = to_decimal(row[COL_RUNTIME_YR])
                 ge_prod_yr = to_decimal(row[COL_GE_PROD_YR])
+                load_w = to_decimal(row[COL_LOAD_W])
             except (InvalidOperation, ValueError, TypeError) as e:
                 errors.append({"row": excel_row, "site_id": site_id, "error": f"Valeur invalide : {e}"})
                 continue
@@ -100,12 +125,24 @@ class Command(BaseCommand):
                 errors.append({"row": excel_row, "site_id": site_id, "error": "Running time hors bornes plausibles (0-744h) — ignoré"})
                 runtime_h = None
 
+            configuration = to_str(row[COL_CONFIGURATION])
+            if configuration and configuration.lower() not in ("indoor", "outdoor"):
+                errors.append({"row": excel_row, "site_id": site_id, "error": f"Configuration inattendue (ni Indoor ni Outdoor) : {configuration!r} — ignorée"})
+                configuration = None
+            elif configuration:
+                configuration = configuration.capitalize()
+
             rows.append({
                 "site_id": site_id,
                 "site_name": str(row[COL_SITE_NAME]).strip() if row[COL_SITE_NAME] else None,
                 "conso_estimee_aout26_l": conso_month,
                 "ge_runtime_aout26_h": runtime_h,
                 "ge_prod_fichier_kwh": ge_prod_kwh,
+                "facturation_active_fichier": to_bool_oui_non(row[COL_STATUT_FACTURATION]),
+                "batch_operationnel_fichier": to_str(row[COL_BATCH_OPERATIONNEL]),
+                "configuration_fichier": configuration,
+                "zone_fichier": to_str(row[COL_ZONE]),
+                "load_fichier_w": load_w,
             })
 
         self.stdout.write(f"\n  Sites lus : {len(rows)}")
@@ -118,7 +155,9 @@ class Command(BaseCommand):
             for r in rows[:10]:
                 self.stdout.write(
                     f"    {r['site_id']} | conso_estimee={r['conso_estimee_aout26_l']} L/mois | "
-                    f"runtime={r['ge_runtime_aout26_h']} h | ge_prod={r['ge_prod_fichier_kwh']} kWh"
+                    f"runtime={r['ge_runtime_aout26_h']} h | ge_prod={r['ge_prod_fichier_kwh']} kWh | "
+                    f"facturation={r['facturation_active_fichier']} | configuration={r['configuration_fichier']} | "
+                    f"zone={r['zone_fichier']} | batch={r['batch_operationnel_fichier']} | load={r['load_fichier_w']} W"
                 )
             self.stdout.write(self.style.WARNING(f"\n  DRY RUN — aucune donnée écrite ({len(rows)} site(s) prêts).\n"))
             return
@@ -144,6 +183,11 @@ class Command(BaseCommand):
                 set_field("conso_estimee_aout26_l", r["conso_estimee_aout26_l"])
                 set_field("ge_runtime_aout26_h", r["ge_runtime_aout26_h"])
                 set_field("ge_prod_fichier_kwh", r["ge_prod_fichier_kwh"])
+                set_field("facturation_active_fichier", r["facturation_active_fichier"])
+                set_field("batch_operationnel_fichier", r["batch_operationnel_fichier"])
+                set_field("configuration_fichier", r["configuration_fichier"])
+                set_field("zone_fichier", r["zone_fichier"])
+                set_field("load_fichier_w", r["load_fichier_w"])
                 if update_fields:
                     fc.save(update_fields=update_fields)
                 if is_created:

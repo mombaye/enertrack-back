@@ -626,6 +626,7 @@ class FuelConsommationMonthly(models.Model):
     type_ge_fichier = models.CharField(max_length=160, null=True, blank=True, help_text="Type de GE — marque/modèle (Base GE.xlsx, colonne N).")
     batch_operationnel_fichier = models.CharField(max_length=64, null=True, blank=True)
     facturation_active_fichier = models.BooleanField(null=True, blank=True, help_text="Statut Facturation (Oui/Non) du fichier.")
+    configuration_fichier = models.CharField(max_length=32, null=True, blank=True, help_text="Indoor / Outdoor (Base août 26, feuille KPIs par site, colonne Configuration) — distinct de site_type_fichier (On-Grid/Off-Grid, vient de Base GE.xlsx).")
     load_fichier_w = models.DecimalField(max_digits=10, decimal_places=1, null=True, blank=True, help_text="Load (load reelle used), en W.")
     conso_fichier_l = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True, help_text="Genset fuel conso [L/Month] du fichier (Base GE.xlsx, colonne P) — total déclaratif mensuel, distinct de conso_estimee_fichier_l (calcul CPH interne au fichier).")
     ge_runtime_fichier_h = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, help_text="Durée de fonctionnement du GE en h, valeur du mois telle que fournie par le fichier (Base GE.xlsx, colonne X) — pas de ÷12, ce fichier donne déjà un total mensuel (contrairement à l'ancien fichier annuel).")
