@@ -247,6 +247,26 @@ class FuelConsommationListView(APIView):
         if country:
             qs = qs.filter(country=country)
 
+        # Filtre "source du Running Time" — mêmes 3 valeurs que le badge
+        # affiché dans la cellule (voir serialize() plus bas : ge_runtime_source
+        # = f"snowflake_{cph_runtime_source.lower()}"), + "none" pour les
+        # sites sans aucune source ce mois-ci (cph_runtime_h_total NULL).
+        # Comptés AVANT d'appliquer le filtre choisi (même principe que
+        # ge_counts plus bas) pour que le sélecteur affiche toujours les 4
+        # effectifs, filtre actif ou non.
+        RUNTIME_SOURCE_FILTERS = {
+            "tracker_5min": Q(cph_runtime_h_total__isnull=False, cph_runtime_source="TRACKER_5MIN"),
+            "dse_controller": Q(cph_runtime_h_total__isnull=False, cph_runtime_source="DSE_CONTROLLER"),
+            "dg_on_calculated": Q(cph_runtime_h_total__isnull=False, cph_runtime_source="DG_ON_CALCULATED"),
+            "none": Q(cph_runtime_h_total__isnull=True),
+        }
+        runtime_source_counts = qs.aggregate(**{
+            key: Count("id", filter=cond) for key, cond in RUNTIME_SOURCE_FILTERS.items()
+        })
+        runtime_source_param = (request.query_params.get("runtime_source") or "").strip().lower()
+        if runtime_source_param in RUNTIME_SOURCE_FILTERS:
+            qs = qs.filter(RUNTIME_SOURCE_FILTERS[runtime_source_param])
+
         # Répartition avec/sans GE calculée AVANT le filtre has_genset lui-même,
         # pour que le sélecteur du frontend puisse toujours afficher les 2
         # effectifs (ex: "Avec GE (373)" / "Sans GE (2949)"), qu'un filtre soit
@@ -299,6 +319,7 @@ class FuelConsommationListView(APIView):
             "total_conso_snowflake_l": float(agg["total_conso_snowflake_l"] or 0),
             "total_enoc_qte_ajoutee_l": float(agg["total_enoc_qte_ajoutee_l"] or 0),
             "total_enoc_nb_demandes": agg["total_enoc_nb_demandes"] or 0,
+            "runtime_source_counts": runtime_source_counts,
         }
 
         try:
