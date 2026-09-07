@@ -36,4 +36,9 @@ COPY . .
 # En arrière-plan (`&`) : des fichiers de 15-32 Mo (xlsb) à parser peuvent
 # prendre plus d'une minute — si gunicorn n'écoute qu'une fois les imports
 # terminés, le reverse-proxy renvoie 502 sur toutes les routes en attendant.
-CMD ["sh", "-c", "(python manage.py import_base_ge --file=data_imports/base_ge.xlsx --month=2026-08; python manage.py import_kpis_par_site --file=data_imports/base_aout_26.xlsx --month=2026-08; python manage.py import_gardien_conso --file=data_imports/synthese_conso_fuel_juillet_2026.xlsb --month=2026-07; python manage.py import_commande_fuel --file=data_imports/commande_fuel_aout_2026.xlsb --month=2026-08) & gunicorn enertrack_backend.wsgi:application --bind 0.0.0.0:8000"]
+# --max-requests(-jitter) : recycle chaque worker gunicorn après ~500-550
+# requêtes au lieu de le laisser tourner indéfiniment — même logique que
+# CELERY_WORKER_MAX_TASKS_PER_CHILD (settings.py), pour qu'une croissance
+# mémoire graduelle (pandas, connexions Snowflake) soit purgée régulièrement
+# plutôt que de s'accumuler pour toute la durée de vie du conteneur.
+CMD ["sh", "-c", "(python manage.py import_base_ge --file=data_imports/base_ge.xlsx --month=2026-08; python manage.py import_kpis_par_site --file=data_imports/base_aout_26.xlsx --month=2026-08; python manage.py import_gardien_conso --file=data_imports/synthese_conso_fuel_juillet_2026.xlsb --month=2026-07; python manage.py import_commande_fuel --file=data_imports/commande_fuel_aout_2026.xlsb --month=2026-08) & gunicorn enertrack_backend.wsgi:application --bind 0.0.0.0:8000 --max-requests 500 --max-requests-jitter 50"]

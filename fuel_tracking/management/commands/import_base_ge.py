@@ -85,7 +85,13 @@ class Command(BaseCommand):
         self.stdout.write(f"  Dry run      : {dry_run}")
 
         try:
-            wb = openpyxl.load_workbook(path, data_only=True)
+            # read_only : ce fichier n'est que lu (iter_rows/values_only),
+            # jamais réécrit — évite de charger tout le classeur en objets
+            # Python pleins (styles, formules, cellules fusionnées) alors
+            # que seules les valeurs brutes servent ici. Rejoué à chaque
+            # démarrage de conteneur (voir Dockerfile) : réduit le pic RAM
+            # de cet import récurrent en prod.
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
         except FileNotFoundError:
             self.stdout.write(self.style.ERROR(f"\n  Fichier introuvable : {path}\n"))
             return

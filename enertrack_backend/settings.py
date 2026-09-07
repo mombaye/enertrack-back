@@ -193,6 +193,15 @@ CELERY_RESULT_BACKEND = 'redis://redis:6379/0'
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
 
+# Recyclage des process worker — sans ça, un worker tourne indéfiniment et
+# toute croissance mémoire graduelle (pandas/openpyxl sur les gros fichiers,
+# connexions Snowflake, imports lourds type lightgbm/scikit-learn/shap
+# chargés une fois par process) s'accumule pour de bon au lieu d'être
+# purgée. Valeurs de départ prudentes — à ajuster selon la RAM réellement
+# observée en prod (docker stats), pas des chiffres mesurés ici.
+CELERY_WORKER_MAX_TASKS_PER_CHILD = 100
+CELERY_WORKER_MAX_MEMORY_PER_CHILD = 500_000  # Ko (≈500 Mo)
+
 # Planification (nécessite le service "beat" — voir docker-compose.yml) :
 # suivi-carburant Consommation, toutes les 5 min sur le mois en cours, pour
 # rattraper rapidement les nouvelles données Snowflake/ENOC. CPH (Running
