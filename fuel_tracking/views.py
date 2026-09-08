@@ -267,6 +267,22 @@ class FuelConsommationListView(APIView):
         if runtime_source_param in RUNTIME_SOURCE_FILTERS:
             qs = qs.filter(RUNTIME_SOURCE_FILTERS[runtime_source_param])
 
+        # Filtre "Configuration" (Indoor/Outdoor) — fichier ESCO SN
+        # Facturation par site (configuration_fichier). "none" = site absent
+        # de ce fichier ce mois-ci. Même principe de comptage AVANT filtre
+        # que runtime_source/ge_counts ci-dessus.
+        CONFIGURATION_FILTERS = {
+            "indoor": Q(configuration_fichier="Indoor"),
+            "outdoor": Q(configuration_fichier="Outdoor"),
+            "none": Q(configuration_fichier__isnull=True),
+        }
+        configuration_counts = qs.aggregate(**{
+            key: Count("id", filter=cond) for key, cond in CONFIGURATION_FILTERS.items()
+        })
+        configuration_param = (request.query_params.get("configuration") or "").strip().lower()
+        if configuration_param in CONFIGURATION_FILTERS:
+            qs = qs.filter(CONFIGURATION_FILTERS[configuration_param])
+
         # Répartition avec/sans GE calculée AVANT le filtre has_genset lui-même,
         # pour que le sélecteur du frontend puisse toujours afficher les 2
         # effectifs (ex: "Avec GE (373)" / "Sans GE (2949)"), qu'un filtre soit
@@ -320,6 +336,7 @@ class FuelConsommationListView(APIView):
             "total_enoc_qte_ajoutee_l": float(agg["total_enoc_qte_ajoutee_l"] or 0),
             "total_enoc_nb_demandes": agg["total_enoc_nb_demandes"] or 0,
             "runtime_source_counts": runtime_source_counts,
+            "configuration_counts": configuration_counts,
         }
 
         try:
