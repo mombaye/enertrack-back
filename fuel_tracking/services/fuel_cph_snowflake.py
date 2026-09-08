@@ -265,23 +265,42 @@ def _resolve_data_ids(cursor, db_schema: str, site_ids: list[str]) -> list[int]:
     return data_ids
 
 
-def _resolve_business_runtime(dse_h, dg_on_h, rectifier_h, is_hybrid_solar_ge) -> tuple[Decimal | None, str]:
+def _resolve_business_runtime(dse_h, dg_on_h, rectifier_h, is_hybrid_solar_ge, tracker_h=None) -> tuple[Decimal | None, str]:
     """
-    Priorité exacte de la spec (section 6) : DSE en premier quel que soit le
-    profil du site ; à défaut, DG-On calculé pour les sites NON hybrides
-    solaire+GE ; à défaut, runtime redresseur (5 min) pour les hybrides
-    solaire+GE sans DSE. `is_hybrid_solar_ge` vient de VW_INVOICE_DATA_REPORT
-    (DG='Yes' AND Solar='Yes') — absent (None) traité comme non-hybride (cas
-    très majoritaire observé, ~92% des sites avec GE ET solaire sont déjà
+    Priorité exacte de la spec (section 6), 4 paliers :
+      1. DSE (contrôleur), quel que soit le profil du site.
+      2. À défaut, DG-On calculé pour les sites NON hybrides solaire+GE.
+      3. À défaut, runtime redresseur (5 min) pour les hybrides solaire+GE
+         sans DSE.
+      4. À défaut, le compteur tracker 5 min lui-même (dg_runtime_interval_h)
+         — "conservé comme source identifiée et contrôlée" (spec) plutôt que
+         de déclarer NO_VALID_RUNTIME alors qu'une télémétrie directe existe.
+         Cette fonction n'est appelée QUE sur des jours où le tracker a déjà
+         détecté le GE actif (ge_intervals > 0, filtré en amont dans
+         daily_energy) donc `tracker_h` est quasi toujours disponible ici —
+         ce palier ne couvre que les cas DSE/DG-On/redresseur absents ou
+         invalides ce jour-là précisément, pas un vrai repli "aucune donnée".
+
+    `is_hybrid_solar_ge` vient de VW_INVOICE_DATA_REPORT (DG='Yes' AND
+    Solar='Yes') — absent (None) traité comme non-hybride (cas très
+    majoritaire observé, ~92% des sites avec GE ET solaire sont déjà
     hybrides quand le drapeau est connu, mais l'absence de ligne elle-même
     est le cas courant hors GE, donc pas un signal fiable de solaire).
+
+    DSE = 0 traité comme INVALIDE (pas un vrai "0h", palier suivant tenté) :
+    cette fonction n'est appelée que sur des jours où le GE tournait déjà
+    (confirmé par le tracker), donc un DSE à 0 un tel jour est un défaut de
+    remontée du contrôleur, jamais un 0h légitime — cohérent avec le repli
+    mensuel (fetch_monthly_runtime_fallback) qui utilise déjà `> 0`.
     """
-    if dse_h is not None and 0 <= dse_h <= 24:
+    if dse_h is not None and dse_h > 0 and dse_h <= 24:
         return dse_h, "DSE_CONTROLLER"
-    if not is_hybrid_solar_ge and dg_on_h is not None and 0 <= dg_on_h <= 24:
+    if not is_hybrid_solar_ge and dg_on_h is not None and dg_on_h > 0 and dg_on_h <= 24:
         return dg_on_h, "DG_ON_CALCULATED"
-    if is_hybrid_solar_ge and rectifier_h is not None:
+    if is_hybrid_solar_ge and rectifier_h is not None and rectifier_h > 0:
         return rectifier_h, "RECTIFIER_STATUS_5MIN"
+    if tracker_h is not None and tracker_h > 0:
+        return tracker_h, "TRACKER_5MIN"
     return None, "NO_VALID_RUNTIME"
 
 
@@ -301,11 +320,13 @@ def fetch_daily_tracker_energy(year: int, month: int, site_ids: list[str] | None
     dg_runtime_controller_h (DSE) reste la valeur utilisée pour la
     validation de l'intervalle (tolérance 0.15h, spec section 6) — jamais
     remplacée par le repli. dg_runtime_business_h/source est le runtime
-    "métier" à 3 sources (DSE > DG-On calculé > redresseur 5 min pour les
-    hybrides solaire+GE sans DSE), calculé jour par jour via
-    _resolve_business_runtime — c'est la colonne DG_RUNTIME_BUSINESS_H/
+    "métier" à 4 paliers (DSE > DG-On calculé [non-hybride] > redresseur 5
+    min [hybride solaire+GE] > compteur tracker lui-même), calculé jour par
+    jour via _resolve_business_runtime — c'est la colonne DG_RUNTIME_BUSINESS_H/
     DG_RUNTIME_BUSINESS_SOURCE du schéma de sortie documenté (spec section
-    2.2), distincte de la validation d'intervalle.
+    2.2), distincte de la validation d'intervalle. C'est CETTE valeur (pas
+    dg_runtime_interval_h) qui doit alimenter le Running Time agrégé/affiché
+    par fuel_cph_service.compute_monthly_cph_estimates.
 
     `site_ids`, si fourni, restreint le scan de GFMS_DATA_TRACKER_NC (coûteux
     à l'échelle du pays — voir avertissement de volume ci-dessous) à ces
@@ -449,14 +470,15 @@ def fetch_daily_tracker_energy(year: int, month: int, site_ids: list[str] | None
             dse_dec = Decimal(str(dse_h)) if dse_h is not None else None
             dg_on_dec = Decimal(str(dg_on_h)) if dg_on_h is not None else None
             rectifier_dec = Decimal(str(rectifier_h)).quantize(Decimal("0.01")) if rectifier_h is not None else None
-            business_h, business_source = _resolve_business_runtime(dse_dec, dg_on_dec, rectifier_dec, bool(is_hybrid_solar_ge))
+            tracker_dec = Decimal(str(dg_runtime_interval_h)) if dg_runtime_interval_h is not None else None
+            business_h, business_source = _resolve_business_runtime(dse_dec, dg_on_dec, rectifier_dec, bool(is_hybrid_solar_ge), tracker_h=tracker_dec)
 
             result.setdefault(site_id, {})[day] = {
                 "country": country,
                 "data_id": int(data_id) if data_id is not None else None,
                 "ge_intervals": int(ge_intervals or 0),
                 "valid_battery_intervals": int(valid_battery_intervals or 0),
-                "dg_runtime_interval_h": Decimal(str(dg_runtime_interval_h)) if dg_runtime_interval_h is not None else None,
+                "dg_runtime_interval_h": tracker_dec,
                 "dg_runtime_controller_h": dse_dec,
                 "dg_runtime_business_h": business_h,
                 "dg_runtime_business_source": business_source,

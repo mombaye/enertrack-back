@@ -258,6 +258,7 @@ class FuelConsommationListView(APIView):
             "tracker_5min": Q(cph_runtime_h_total__isnull=False, cph_runtime_source="TRACKER_5MIN"),
             "dse_controller": Q(cph_runtime_h_total__isnull=False, cph_runtime_source="DSE_CONTROLLER"),
             "dg_on_calculated": Q(cph_runtime_h_total__isnull=False, cph_runtime_source="DG_ON_CALCULATED"),
+            "rectifier_status_5min": Q(cph_runtime_h_total__isnull=False, cph_runtime_source="RECTIFIER_STATUS_5MIN"),
             "none": Q(cph_runtime_h_total__isnull=True),
         }
         runtime_source_counts = qs.aggregate(**{
@@ -459,6 +460,7 @@ class FuelConsommationListView(APIView):
                 "cph_status_breakdown": row.cph_status_breakdown,
                 "cph_runtime_h_total": float(row.cph_runtime_h_total) if row.cph_runtime_h_total is not None else None,
                 "cph_runtime_source": row.cph_runtime_source,
+                "cph_runtime_source_breakdown": row.cph_runtime_source_breakdown or None,
                 "cph_ge_type": row.cph_ge_type,
                 "cph_pge_kva": float(row.cph_pge_kva) if row.cph_pge_kva is not None else None,
                 "cph_power_factor": float(row.cph_power_factor) if row.cph_power_factor is not None else None,

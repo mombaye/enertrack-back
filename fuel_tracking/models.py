@@ -585,20 +585,25 @@ class FuelConsommationMonthly(models.Model):
     cph_nb_jours_calcules = models.IntegerField(null=True, blank=True, help_text="Nombre de jours du mois avec au moins un intervalle GE détecté (OK ou non).")
     cph_calculation_status = models.CharField(max_length=48, null=True, blank=True, help_text="Statut dominant du mois (OK, BATTERY_DATA_NOT_READY, MISSING_PARAMETER, ...).")
     cph_status_breakdown = models.JSONField(default=dict, blank=True, help_text='Répartition des statuts journaliers, ex. {"OK": 27, "BATTERY_DATA_NOT_READY": 2}.')
-    cph_runtime_h_total = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, help_text="Somme du runtime GE sur le mois — voir cph_runtime_source pour la source utilisée.")
+    cph_runtime_h_total = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, help_text="Somme du runtime GE sur le mois, résolue jour par jour selon la priorité DSE > DG-On > redresseur > tracker — voir cph_runtime_source pour la source dominante et cph_runtime_source_breakdown pour le détail par source.")
     cph_runtime_source = models.CharField(
         max_length=24, null=True, blank=True,
         help_text=(
-            "Origine de cph_runtime_h_total, priorité documentée dans la spec CPH "
-            "(DSE > DG-On calculé) : TRACKER_5MIN (compteur GFMS_DATA_TRACKER_NC, "
-            "seule source alimentant aussi le calcul des litres) ; DSE_CONTROLLER "
-            "(GENSET_REPORT.DG_RUNTIME_CONTROLLER, utilisé en secours quand le "
-            "compteur 5 min n'est jamais remonté par le site) ; DG_ON_CALCULATED "
-            "(GENSET_REPORT.DG_RUNTIME_CALCULATED, dernier recours). Les 2 sources "
-            "de secours donnent un Running Time mais PAS une estimation de litres "
-            "(qui nécessite l'énergie du compteur 5 min, pas juste sa durée)."
+            "Source AYANT FOURNI LE PLUS D'HEURES ce mois (pas la plus fréquente en "
+            "jours) parmi les 4 paliers résolus jour par jour par "
+            "fuel_cph_snowflake._resolve_business_runtime : DSE_CONTROLLER "
+            "(GENSET_REPORT.DG_RUNTIME_CONTROLLER, priorité 1, >0h exigé — un DSE à "
+            "0 sur un jour où le GE tournait déjà est traité comme un défaut de "
+            "remontée, pas un 0h légitime) ; DG_ON_CALCULATED "
+            "(GENSET_REPORT.DG_RUNTIME_CALCULATED, sites non-hybrides solaire+GE) ; "
+            "RECTIFIER_STATUS_5MIN (RECTIFIER_EFFICIENCY_STATUS, sites hybrides "
+            "solaire+GE sans DSE) ; TRACKER_5MIN (compteur GFMS_DATA_TRACKER_NC, "
+            "dernier palier — seule source alimentant aussi l'estimation de litres, "
+            "les 3 autres donnent un Running Time mais pas des litres). "
+            "Voir cph_runtime_source_breakdown pour la répartition complète."
         ),
     )
+    cph_runtime_source_breakdown = models.JSONField(default=dict, blank=True, help_text='Heures cumulées par source sur le mois, ex. {"DSE_CONTROLLER": 45.2, "TRACKER_5MIN": 3.1} — cph_runtime_source est la clé au plus grand nombre d\'heures ici.')
     cph_ge_type = models.CharField(max_length=160, null=True, blank=True, help_text="Marque + modèle du GE (Snowflake SITE_DG.VENDOR/GENSET_TYPE), auto-sourcé — voir fuel_cph_snowflake.fetch_site_ge_specs.")
 
     # Dernière valeur connue sur le mois — visibles sur la page Suivis

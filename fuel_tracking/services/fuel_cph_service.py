@@ -189,6 +189,7 @@ def compute_monthly_cph_estimates(year: int, month: int, site_ids: list[str] | N
         ok_consumptions: list[Decimal] = []
         ok_cphs: list[Decimal] = []
         runtime_total = Decimal("0")
+        runtime_source_hours: dict[str, Decimal] = {}
         last_pge_kva = last_power_factor = last_spc = None
         site_load_total = battery_dc_total = battery_ac_total = total_ge_total = Decimal("0")
         has_energy_detail = False
@@ -209,12 +210,21 @@ def compute_monthly_cph_estimates(year: int, month: int, site_ids: list[str] | N
             if computed.get("power_factor") is not None:
                 last_power_factor = computed["power_factor"]
 
-            # Le runtime GE (compteur tracker) est compté sur TOUS les jours
-            # détectés, OK ou non — il reflète le fonctionnement réel du GE
-            # (télémétrie), indépendamment de la disponibilité des paramètres
-            # nécessaires au calcul des litres.
-            if energies.get("dg_runtime_interval_h") is not None:
-                runtime_total += energies["dg_runtime_interval_h"]
+            # Runtime GE compté sur TOUS les jours détectés, OK ou non — il
+            # reflète le fonctionnement réel du GE, indépendamment de la
+            # disponibilité des paramètres nécessaires au calcul des litres.
+            # Utilise dg_runtime_business_h (priorité DSE > DG-On calculé >
+            # redresseur 5 min > compteur tracker, résolue par
+            # _resolve_business_runtime dans fuel_cph_snowflake.py), PAS le
+            # compteur tracker seul — corrige un défaut où DSE/DG-On/
+            # redresseur étaient bien interrogés dans Snowflake mais jamais
+            # utilisés ici, cph_runtime_source restant hardcodé à
+            # "TRACKER_5MIN" quel que soit le jour (audit 2026-09).
+            business_h = energies.get("dg_runtime_business_h")
+            business_source = energies.get("dg_runtime_business_source")
+            if business_h is not None and business_source not in (None, "NO_VALID_RUNTIME"):
+                runtime_total += business_h
+                runtime_source_hours[business_source] = runtime_source_hours.get(business_source, Decimal("0")) + business_h
 
             if status in ("OK", "OVER_CAPACITY") and computed["estimated_consumption_l"] is not None:
                 ok_consumptions.append(computed["estimated_consumption_l"])
@@ -249,6 +259,16 @@ def compute_monthly_cph_estimates(year: int, month: int, site_ids: list[str] | N
         else:
             dominant_status = None
 
+        # Source "dominante" du mois = celle qui a fourni le plus d'heures
+        # cumulées, pas la plus fréquente en nombre de jours — un site peut
+        # avoir 2 jours DSE (10h) et 20 jours tracker (2h chacun, 40h) :
+        # dominante = tracker par heures, ce qui reflète mieux "d'où vient le
+        # chiffre affiché" que de compter les jours.
+        if runtime_source_hours:
+            dominant_runtime_source = max(runtime_source_hours.items(), key=lambda kv: kv[1])[0]
+        else:
+            dominant_runtime_source = None
+
         monthly[site_id] = {
             "conso_estimee_cph_l": sum(ok_consumptions) if ok_consumptions else None,
             "cph_l_per_h_moy": (sum(ok_cphs) / len(ok_cphs)).quantize(Decimal("0.001")) if ok_cphs else None,
@@ -257,7 +277,11 @@ def compute_monthly_cph_estimates(year: int, month: int, site_ids: list[str] | N
             "cph_calculation_status": dominant_status,
             "cph_status_breakdown": dict(status_counts),
             "cph_runtime_h_total": runtime_total.quantize(Decimal("0.01")) if runtime_total > 0 else None,
-            "cph_runtime_source": "TRACKER_5MIN" if runtime_total > 0 else None,
+            "cph_runtime_source": dominant_runtime_source,
+            "cph_runtime_source_breakdown": (
+                {k: float(v.quantize(Decimal("0.01"))) for k, v in runtime_source_hours.items()}
+                if runtime_source_hours else None
+            ),
             "cph_ge_type": (ge_specs or {}).get("ge_type"),
             "cph_pge_kva": last_pge_kva,
             "cph_power_factor": last_power_factor,

@@ -35,7 +35,7 @@ DAILY_UPDATE_FIELDS = [
 MONTHLY_UPDATE_FIELDS = [
     "conso_estimee_cph_l", "cph_l_per_h_moy", "cph_nb_jours_ok",
     "cph_nb_jours_calcules", "cph_calculation_status", "cph_status_breakdown",
-    "cph_runtime_h_total", "cph_runtime_source", "cph_ge_type",
+    "cph_runtime_h_total", "cph_runtime_source", "cph_runtime_source_breakdown", "cph_ge_type",
     "cph_pge_kva", "cph_power_factor", "cph_spc_l_per_kwh",
     "cph_site_load_energy_kwh", "cph_battery_dc_energy_kwh",
     "cph_battery_ac_energy_kwh", "cph_total_ge_energy_kwh",
@@ -190,6 +190,7 @@ class Command(BaseCommand):
                     fc.cph_status_breakdown = agg["cph_status_breakdown"]
                     fc.cph_runtime_h_total = agg["cph_runtime_h_total"]
                     fc.cph_runtime_source = agg["cph_runtime_source"]
+                    fc.cph_runtime_source_breakdown = agg["cph_runtime_source_breakdown"] or {}
                     fc.cph_ge_type = agg["cph_ge_type"]
                     fc.cph_pge_kva = agg["cph_pge_kva"]
                     fc.cph_power_factor = agg["cph_power_factor"]
