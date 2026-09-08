@@ -476,6 +476,13 @@ class FuelConsommationListView(APIView):
                 "cph_battery_ac_energy_kwh": float(row.cph_battery_ac_energy_kwh) if row.cph_battery_ac_energy_kwh is not None else None,
                 "cph_total_ge_energy_kwh": float(row.cph_total_ge_energy_kwh) if row.cph_total_ge_energy_kwh is not None else None,
                 "commentaire": commentaire,
+                # Facturation (ESCO SN — Facturation par site, mensuel, voir
+                # import_facturation_par_site) — facturation_active_fichier =
+                # statut du mois en cours ; facturation_avec_ge_fichier =
+                # même statut croisé avec la présence GE, déjà calculé par Ops.
+                "facturation_active_fichier": row.facturation_active_fichier,
+                "facturation_avec_ge_fichier": row.facturation_avec_ge_fichier,
+                "configuration_fichier": row.configuration_fichier,
             }
 
         return Response({
