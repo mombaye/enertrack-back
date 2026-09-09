@@ -247,13 +247,14 @@ class FuelConsommationListView(APIView):
         if country:
             qs = qs.filter(country=country)
 
-        # Filtre "source du Running Time" — mêmes 3 valeurs que le badge
-        # affiché dans la cellule (voir serialize() plus bas : ge_runtime_source
-        # = f"snowflake_{cph_runtime_source.lower()}"), + "none" pour les
-        # sites sans aucune source ce mois-ci (cph_runtime_h_total NULL).
-        # Comptés AVANT d'appliquer le filtre choisi (même principe que
-        # ge_counts plus bas) pour que le sélecteur affiche toujours les 4
-        # effectifs, filtre actif ou non.
+        # Trois filtres combinables (has_genset, runtime_source, configuration)
+        # — chaque badge affiché au frontend doit compter "si je choisis
+        # cette option, sachant les AUTRES filtres déjà actifs", jamais le
+        # total brut du mois. Sans ça (bug corrigé 2026-09) : "Sans
+        # configuration (85)" restait le compte pays entier même avec "Avec
+        # GE" déjà sélectionné, alors que cliquer dessus combine les deux et
+        # ne retombe que sur 2 sites — écart trompeur, même défaut sur
+        # "Sans source" (3115 affiché vs 201 une fois "Avec GE" actif).
         RUNTIME_SOURCE_FILTERS = {
             "tracker_5min": Q(cph_runtime_h_total__isnull=False, cph_runtime_source="TRACKER_5MIN"),
             "dse_controller": Q(cph_runtime_h_total__isnull=False, cph_runtime_source="DSE_CONTROLLER"),
@@ -261,61 +262,64 @@ class FuelConsommationListView(APIView):
             "rectifier_status_5min": Q(cph_runtime_h_total__isnull=False, cph_runtime_source="RECTIFIER_STATUS_5MIN"),
             "none": Q(cph_runtime_h_total__isnull=True),
         }
-        runtime_source_counts = qs.aggregate(**{
-            key: Count("id", filter=cond) for key, cond in RUNTIME_SOURCE_FILTERS.items()
-        })
         runtime_source_param = (request.query_params.get("runtime_source") or "").strip().lower()
-        if runtime_source_param in RUNTIME_SOURCE_FILTERS:
-            qs = qs.filter(RUNTIME_SOURCE_FILTERS[runtime_source_param])
 
-        # Filtre "Configuration" (Indoor/Outdoor) — fichier ESCO SN
-        # Facturation par site (configuration_fichier). "none" = site absent
-        # de ce fichier ce mois-ci. Même principe de comptage AVANT filtre
-        # que runtime_source/ge_counts ci-dessus.
         CONFIGURATION_FILTERS = {
             "indoor": Q(configuration_fichier="Indoor"),
             "outdoor": Q(configuration_fichier="Outdoor"),
             "none": Q(configuration_fichier__isnull=True),
         }
-        configuration_counts = qs.aggregate(**{
-            key: Count("id", filter=cond) for key, cond in CONFIGURATION_FILTERS.items()
-        })
         configuration_param = (request.query_params.get("configuration") or "").strip().lower()
-        if configuration_param in CONFIGURATION_FILTERS:
-            qs = qs.filter(CONFIGURATION_FILTERS[configuration_param])
 
-        # Répartition avec/sans GE calculée AVANT le filtre has_genset lui-même,
-        # pour que le sélecteur du frontend puisse toujours afficher les 2
-        # effectifs (ex: "Avec GE (373)" / "Sans GE (2949)"), qu'un filtre soit
-        # actif ou non. "Avec GE" utilise effective_ge_q (Snowflake/ENOC OU
-        # Typo simple du fichier Base GE.xlsx mentionne GE — voir
-        # _effective_ge_q/_file_ge_site_ids). "Avec GE mais aucune donnée" =
-        # avec GE ET Conso estimée ET Conso mesurée vue (Snowflake OU
-        # gardiennage, voir conso_mesuree_source de serialize()) sont TOUTES
-        # LES DEUX manquantes — demande explicite (2026-08 : "cela doit
-        # prendre parmi les GE ceux qui n'ont pas de données de Conso
-        # estimée (L) / Conso mesurée vue (L)"). Running Time n'entre plus
-        # dans ce critère. Running Time/Conso estimée viennent
-        # EXCLUSIVEMENT du pipeline CPH Snowflake — plus de repli sur Base
-        # août 26 validée, qui n'est plus utilisée par ce tableau.
+        # "Avec GE" utilise effective_ge_q (Snowflake/ENOC OU Typo simple du
+        # fichier Base GE.xlsx mentionne GE — voir _effective_ge_q/
+        # _file_ge_site_ids). "Avec GE mais aucune donnée" = avec GE ET Conso
+        # estimée ET Conso mesurée vue (Snowflake OU gardiennage, voir
+        # conso_mesuree_source de serialize()) sont TOUTES LES DEUX
+        # manquantes — demande explicite (2026-08 : "cela doit prendre parmi
+        # les GE ceux qui n'ont pas de données de Conso estimée (L) / Conso
+        # mesurée vue (L)"). Running Time n'entre plus dans ce critère.
+        # Running Time/Conso estimée viennent EXCLUSIVEMENT du pipeline CPH
+        # Snowflake — plus de repli sur Base août 26 validée, qui n'est plus
+        # utilisée par ce tableau.
         effective_ge_q = _effective_ge_q(file_ge_site_ids)
         incomplete_q = effective_ge_q & (
             Q(conso_estimee_cph_l__isnull=True) & Q(conso_snowflake_l__isnull=True) & Q(conso_gardien_l__isnull=True)
         )
-        ge_counts = qs.aggregate(
+        has_genset_param = (request.query_params.get("has_genset") or "").strip().lower()
+
+        def _apply_combinable_filters(base_qs, *, skip):
+            """Applique has_genset/runtime_source/configuration sauf `skip` — sert à calculer
+            le compte d'une option de filtre compte tenu des AUTRES filtres déjà actifs."""
+            out = base_qs
+            if skip != "has_genset":
+                if has_genset_param in ("true", "1"):
+                    out = out.filter(effective_ge_q)
+                elif has_genset_param in ("false", "0"):
+                    out = out.filter(~effective_ge_q)
+                elif has_genset_param == "incomplete":
+                    out = out.filter(incomplete_q)
+            if skip != "runtime_source" and runtime_source_param in RUNTIME_SOURCE_FILTERS:
+                out = out.filter(RUNTIME_SOURCE_FILTERS[runtime_source_param])
+            if skip != "configuration" and configuration_param in CONFIGURATION_FILTERS:
+                out = out.filter(CONFIGURATION_FILTERS[configuration_param])
+            return out
+
+        runtime_source_counts = _apply_combinable_filters(qs, skip="runtime_source").aggregate(**{
+            key: Count("id", filter=cond) for key, cond in RUNTIME_SOURCE_FILTERS.items()
+        })
+        configuration_counts = _apply_combinable_filters(qs, skip="configuration").aggregate(**{
+            key: Count("id", filter=cond) for key, cond in CONFIGURATION_FILTERS.items()
+        })
+        ge_counts = _apply_combinable_filters(qs, skip="has_genset").aggregate(
             sites_avec_ge=Count("id", filter=effective_ge_q),
             sites_sans_ge=Count("id", filter=~effective_ge_q),
             sites_ge_enoc_only=Count("id", filter=Q(has_genset_enoc=True, has_genset_snowflake=False)),
             sites_avec_ge_incomplet=Count("id", filter=incomplete_q),
         )
 
-        has_genset_param = (request.query_params.get("has_genset") or "").strip().lower()
-        if has_genset_param in ("true", "1"):
-            qs = qs.filter(effective_ge_q)
-        elif has_genset_param in ("false", "0"):
-            qs = qs.filter(~effective_ge_q)
-        elif has_genset_param == "incomplete":
-            qs = qs.filter(incomplete_q)
+        # Filtre effectif de la liste retournée : les 3 filtres combinés.
+        qs = _apply_combinable_filters(qs, skip=None)
 
         agg = qs.aggregate(
             total_sites=Count("id"),
