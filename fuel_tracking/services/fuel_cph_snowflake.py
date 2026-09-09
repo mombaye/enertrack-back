@@ -141,9 +141,17 @@ def fetch_monthly_runtime_fallback(year: int, month: int, site_ids: list[str] | 
     Running Time exploitable mais PAS une estimation de litres : l'énergie
     (charge site + batterie) n'est intégrable qu'à partir du compteur 5 min,
     qu'on n'a justement pas pour ces sites.
+
+    site_ids=None (par défaut, synchro production standard) scanne tout le
+    périmètre Sénégal — même convention que fetch_daily_tracker_energy.
+    Corrige un bug où ce repli ne s'exécutait JAMAIS en production (l'appelant
+    ne le déclenchait que si site_ids était fourni, et cette fonction
+    renvoyait {} sans site_ids explicite : les deux gardes se combinaient pour
+    rendre le repli mort en dehors d'un test --sites explicite, découvert
+    2026-09 en constatant que cph_runtime_source_breakdown restait vide pour
+    des sites déjà en DG_ON_CALCULATED — valeur en fait jamais recalculée
+    depuis un ancien run --sites).
     """
-    if not site_ids:
-        return {}
     d_start = date(year, month, 1)
     d_end_excl = date(year + (1 if month == 12 else 0), 1 if month == 12 else month + 1, 1)
 
@@ -152,9 +160,14 @@ def fetch_monthly_runtime_fallback(year: int, month: int, site_ids: list[str] | 
         cursor = conn.cursor()
         db_schema = f"{FUEL_DATABASE}.{FUEL_SCHEMA}"
         genset_schema = f"{GENSET_DATABASE}.{GENSET_SCHEMA}"
-        data_ids = _resolve_data_ids(cursor, db_schema, site_ids)
-        if not data_ids:
-            return {}
+
+        data_id_filter_sql = ""
+        params = {"country": COUNTRY_SCOPE, "d_start": d_start, "d_end_excl": d_end_excl}
+        if site_ids:
+            data_ids = _resolve_data_ids(cursor, db_schema, site_ids)
+            if not data_ids:
+                return {}
+            data_id_filter_sql = f"AND g.DATA_ID IN ({','.join(str(d) for d in data_ids)})"
 
         cursor.execute(f"""
             WITH site_dim AS (
@@ -174,9 +187,9 @@ def fetch_monthly_runtime_fallback(year: int, month: int, site_ids: list[str] | 
             FROM {genset_schema}.GENSET_REPORT g
             JOIN site_dim s ON s.DATA_ID = g.DATA_ID
             WHERE g.REPORT_DATE >= %(d_start)s AND g.REPORT_DATE < %(d_end_excl)s
-              AND g.DATA_ID IN ({','.join(str(d) for d in data_ids)})
+              {data_id_filter_sql}
             GROUP BY s.SITE_ID
-        """, {"country": COUNTRY_SCOPE, "d_start": d_start, "d_end_excl": d_end_excl})
+        """, params)
 
         result: dict[str, dict] = {}
         for site_id, sum_dse, sum_calc in cursor.fetchall():

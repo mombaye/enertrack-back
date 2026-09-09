@@ -298,40 +298,58 @@ def compute_monthly_cph_estimates(year: int, month: int, site_ids: list[str] | N
     # 2026-08 sur des sites qui ont pourtant d'autres télémétries). Donne un
     # Running Time exploitable mais PAS une estimation de litres : l'énergie
     # (charge site + batterie) n'est intégrable qu'à partir du compteur 5 min.
-    if site_ids:
-        missing_or_no_runtime = [
-            sid for sid in site_ids
-            if sid not in monthly or monthly[sid]["cph_runtime_h_total"] is None
-        ]
-        if missing_or_no_runtime:
-            fallback_by_site = fetch_monthly_runtime_fallback(year, month, site_ids=missing_or_no_runtime)
-            # ge_specs déjà connus pour les sites présents dans `raw` — pour les
-            # autres (jamais vus dans la télémétrie 5 min), un seul appel groupé
-            # plutôt qu'un par site.
-            extra_specs = fetch_site_ge_specs([sid for sid in fallback_by_site if sid not in ge_specs_by_site])
-            for site_id, fb in fallback_by_site.items():
-                ge_specs = ge_specs_by_site.get(site_id) or extra_specs.get(site_id)
-                if site_id in monthly:
-                    monthly[site_id]["cph_runtime_h_total"] = fb["runtime_h"]
-                    monthly[site_id]["cph_runtime_source"] = fb["source"]
-                else:
-                    monthly[site_id] = {
-                        "conso_estimee_cph_l": None,
-                        "cph_l_per_h_moy": None,
-                        "cph_nb_jours_ok": 0,
-                        "cph_nb_jours_calcules": 0,
-                        "cph_calculation_status": "MISSING_LOAD_POWER",
-                        "cph_status_breakdown": {},
-                        "cph_runtime_h_total": fb["runtime_h"],
-                        "cph_runtime_source": fb["source"],
-                        "cph_ge_type": (ge_specs or {}).get("ge_type"),
-                        "cph_pge_kva": (ge_specs or {}).get("pge_kva"),
-                        "cph_power_factor": None,
-                        "cph_spc_l_per_kwh": None,
-                        "cph_site_load_energy_kwh": None,
-                        "cph_battery_dc_energy_kwh": None,
-                        "cph_battery_ac_energy_kwh": None,
-                        "cph_total_ge_energy_kwh": None,
-                    }
+    #
+    # site_ids est optionnel (None = tout le périmètre Sénégal, cas de la
+    # synchro production normale) — fetch_monthly_runtime_fallback scanne
+    # alors tout le pays (même convention que fetch_daily_tracker_energy),
+    # et le filtre "manque un runtime" s'applique en Python sur le résultat
+    # plutôt qu'en restreignant la requête Snowflake en amont : corrige un
+    # bug où l'ancien `if site_ids:` était systématiquement faux en
+    # production (site_ids=None) et ce bloc entier ne s'exécutait JAMAIS pour
+    # la synchro standard, seulement lors d'un test explicite avec --sites
+    # (découvert 2026-09 en constatant que cph_runtime_source_breakdown
+    # restait vide pour des sites déjà en DG_ON_CALCULATED — valeur en fait
+    # jamais recalculée depuis un ancien run --sites, simplement conservée en
+    # base d'une synchro à l'autre).
+    fallback_by_site = fetch_monthly_runtime_fallback(year, month, site_ids=site_ids)
+    fallback_by_site = {
+        sid: fb for sid, fb in fallback_by_site.items()
+        if sid not in monthly or monthly[sid]["cph_runtime_h_total"] is None
+    }
+    if fallback_by_site:
+        # ge_specs déjà connus pour les sites présents dans `raw` — pour les
+        # autres (jamais vus dans la télémétrie 5 min), un seul appel groupé
+        # plutôt qu'un par site.
+        extra_specs = fetch_site_ge_specs([sid for sid in fallback_by_site if sid not in ge_specs_by_site])
+        for site_id, fb in fallback_by_site.items():
+            ge_specs = ge_specs_by_site.get(site_id) or extra_specs.get(site_id)
+            if site_id in monthly:
+                monthly[site_id]["cph_runtime_h_total"] = fb["runtime_h"]
+                monthly[site_id]["cph_runtime_source"] = fb["source"]
+                monthly[site_id]["cph_runtime_source_breakdown"] = (
+                    {fb["source"]: float(fb["runtime_h"])} if fb["runtime_h"] else None
+                )
+            else:
+                monthly[site_id] = {
+                    "conso_estimee_cph_l": None,
+                    "cph_l_per_h_moy": None,
+                    "cph_nb_jours_ok": 0,
+                    "cph_nb_jours_calcules": 0,
+                    "cph_calculation_status": "MISSING_LOAD_POWER",
+                    "cph_status_breakdown": {},
+                    "cph_runtime_h_total": fb["runtime_h"],
+                    "cph_runtime_source": fb["source"],
+                    "cph_runtime_source_breakdown": (
+                        {fb["source"]: float(fb["runtime_h"])} if fb["runtime_h"] else None
+                    ),
+                    "cph_ge_type": (ge_specs or {}).get("ge_type"),
+                    "cph_pge_kva": (ge_specs or {}).get("pge_kva"),
+                    "cph_power_factor": None,
+                    "cph_spc_l_per_kwh": None,
+                    "cph_site_load_energy_kwh": None,
+                    "cph_battery_dc_energy_kwh": None,
+                    "cph_battery_ac_energy_kwh": None,
+                    "cph_total_ge_energy_kwh": None,
+                }
 
     return {"daily": daily_rows, "monthly": monthly}
