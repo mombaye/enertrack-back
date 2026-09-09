@@ -131,9 +131,11 @@ class FuelConsommationListView(APIView):
 
     def get(self, request):
         from django.db.models import Count, Max, Q, Sum
+        from django.db.models.functions import Coalesce
 
         from django.utils import timezone
 
+        from billing.models import SonatelInvoice
         from fuel_tracking.models import (
             FuelCphGeDaily,
             FuelCphGeParameter,
@@ -329,6 +331,29 @@ class FuelConsommationListView(APIView):
             total_enoc_qte_ajoutee_l=Sum("enoc_qte_ajoutee_l"),
             total_enoc_nb_demandes=Sum("enoc_nb_demandes"),
         )
+
+        # Statut de paiement des factures Sonatel (module billing) pour les
+        # sites actuellement affichés ici (même scope que les autres KPIs :
+        # respecte has_genset/runtime_source/configuration/recherche déjà
+        # appliqués à qs) et le mois consulté — même convention de date que
+        # le tableau de bord Facturation (BillingTrackingPage) :
+        # date_comptable_facture, ou à défaut date_fin_période, pour situer
+        # une facture dans un mois. Remplace le KPI "Demandes ENOC" (demande
+        # explicite 2026-09 : la question opérationnelle qui compte ici n'est
+        # pas le nombre de demandes ENOC mais l'état de facturation du site).
+        year_str, month_str = month.split("-")
+        invoice_summary = SonatelInvoice.objects.filter(
+            site__site_id__in=qs.values_list("site_id", flat=True)
+        ).annotate(
+            ref_date=Coalesce("date_comptable_facture", "date_fin_periode")
+        ).filter(
+            ref_date__year=int(year_str), ref_date__month=int(month_str)
+        ).aggregate(
+            total=Count("id"),
+            paid=Count("id", filter=Q(payment_status=SonatelInvoice.PaymentStatus.PAID)),
+            unpaid=Count("id", filter=Q(payment_status=SonatelInvoice.PaymentStatus.UNPAID)),
+        )
+
         kpis = {
             "total_sites": agg["total_sites"],
             "sites_avec_ge": ge_counts["sites_avec_ge"],
@@ -342,6 +367,9 @@ class FuelConsommationListView(APIView):
             "total_enoc_nb_demandes": agg["total_enoc_nb_demandes"] or 0,
             "runtime_source_counts": runtime_source_counts,
             "configuration_counts": configuration_counts,
+            "factures_payees": invoice_summary["paid"] or 0,
+            "factures_impayees": invoice_summary["unpaid"] or 0,
+            "factures_total": invoice_summary["total"] or 0,
         }
 
         try:
