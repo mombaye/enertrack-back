@@ -249,30 +249,6 @@ class FuelConsommationListView(APIView):
         if country:
             qs = qs.filter(country=country)
 
-        # Trois filtres combinables (has_genset, runtime_source, configuration)
-        # — chaque badge affiché au frontend doit compter "si je choisis
-        # cette option, sachant les AUTRES filtres déjà actifs", jamais le
-        # total brut du mois. Sans ça (bug corrigé 2026-09) : "Sans
-        # configuration (85)" restait le compte pays entier même avec "Avec
-        # GE" déjà sélectionné, alors que cliquer dessus combine les deux et
-        # ne retombe que sur 2 sites — écart trompeur, même défaut sur
-        # "Sans source" (3115 affiché vs 201 une fois "Avec GE" actif).
-        RUNTIME_SOURCE_FILTERS = {
-            "tracker_5min": Q(cph_runtime_h_total__isnull=False, cph_runtime_source="TRACKER_5MIN"),
-            "dse_controller": Q(cph_runtime_h_total__isnull=False, cph_runtime_source="DSE_CONTROLLER"),
-            "dg_on_calculated": Q(cph_runtime_h_total__isnull=False, cph_runtime_source="DG_ON_CALCULATED"),
-            "rectifier_status_5min": Q(cph_runtime_h_total__isnull=False, cph_runtime_source="RECTIFIER_STATUS_5MIN"),
-            "none": Q(cph_runtime_h_total__isnull=True),
-        }
-        runtime_source_param = (request.query_params.get("runtime_source") or "").strip().lower()
-
-        CONFIGURATION_FILTERS = {
-            "indoor": Q(configuration_fichier="Indoor"),
-            "outdoor": Q(configuration_fichier="Outdoor"),
-            "none": Q(configuration_fichier__isnull=True),
-        }
-        configuration_param = (request.query_params.get("configuration") or "").strip().lower()
-
         # "Avec GE" utilise effective_ge_q (Snowflake/ENOC OU Typo simple du
         # fichier Base GE.xlsx mentionne GE — voir _effective_ge_q/
         # _file_ge_site_ids). "Avec GE mais aucune donnée" = avec GE ET Conso
@@ -290,9 +266,56 @@ class FuelConsommationListView(APIView):
         )
         has_genset_param = (request.query_params.get("has_genset") or "").strip().lower()
 
+        # Quatre filtres combinables (has_genset, runtime_source, configuration,
+        # runtime_availability) — chaque badge affiché au frontend doit
+        # compter "si je choisis cette option, sachant les AUTRES filtres
+        # déjà actifs", jamais le total brut du mois. Sans ça (bug corrigé
+        # 2026-09) : "Sans configuration (85)" restait le compte pays entier
+        # même avec "Avec GE" déjà sélectionné, alors que cliquer dessus
+        # combine les deux et ne retombe que sur 2 sites — écart trompeur,
+        # même défaut sur "Sans source" (3115 affiché vs 201 une fois "Avec
+        # GE" actif). "Sans source" excluait aussi les sites sans GE du
+        # dénominateur qu'il aurait dû compter à part (spec 2026-09, point 4 :
+        # "le compteur Sans source ne doit pas inclure les sites sans GE") —
+        # corrigé ci-dessous en l'intersectant avec effective_ge_q, ET
+        # complété par runtime_availability qui sépare explicitement les 4
+        # catégories demandées.
+        RUNTIME_SOURCE_FILTERS = {
+            "tracker_5min": Q(cph_runtime_h_total__isnull=False, cph_runtime_source="TRACKER_5MIN"),
+            "dse_controller": Q(cph_runtime_h_total__isnull=False, cph_runtime_source="DSE_CONTROLLER"),
+            "dg_on_calculated": Q(cph_runtime_h_total__isnull=False, cph_runtime_source="DG_ON_CALCULATED"),
+            "rectifier_status_5min": Q(cph_runtime_h_total__isnull=False, cph_runtime_source="RECTIFIER_STATUS_5MIN"),
+            "none": Q(cph_runtime_h_total__isnull=True) & effective_ge_q,
+        }
+        runtime_source_param = (request.query_params.get("runtime_source") or "").strip().lower()
+
+        # Partition à 4 catégories, mutuellement exclusives et exhaustives
+        # sur l'ensemble des sites (spec 2026-09, point 4) :
+        #   1. sans_ge                 : GE non applicable (runtime hors sujet)
+        #   2. avec_ge_avec_runtime    : GE + runtime résolu + CPH calculé
+        #   3. avec_ge_sans_runtime    : GE mais aucun runtime résolu ce mois
+        #   4. avec_runtime_sans_cph   : GE + runtime résolu MAIS litres non
+        #      calculés (MISSING_PARAMETER/BATTERY_DATA_NOT_READY/etc. — le
+        #      Running Time est connu, le CPH ne l'est pas)
+        RUNTIME_AVAILABILITY_FILTERS = {
+            "sans_ge": ~effective_ge_q,
+            "avec_ge_avec_runtime": effective_ge_q & Q(cph_runtime_h_total__isnull=False) & Q(conso_estimee_cph_l__isnull=False),
+            "avec_ge_sans_runtime": effective_ge_q & Q(cph_runtime_h_total__isnull=True),
+            "avec_runtime_sans_cph": effective_ge_q & Q(cph_runtime_h_total__isnull=False) & Q(conso_estimee_cph_l__isnull=True),
+        }
+        runtime_availability_param = (request.query_params.get("runtime_availability") or "").strip().lower()
+
+        CONFIGURATION_FILTERS = {
+            "indoor": Q(configuration_fichier="Indoor"),
+            "outdoor": Q(configuration_fichier="Outdoor"),
+            "none": Q(configuration_fichier__isnull=True),
+        }
+        configuration_param = (request.query_params.get("configuration") or "").strip().lower()
+
         def _apply_combinable_filters(base_qs, *, skip):
-            """Applique has_genset/runtime_source/configuration sauf `skip` — sert à calculer
-            le compte d'une option de filtre compte tenu des AUTRES filtres déjà actifs."""
+            """Applique has_genset/runtime_source/runtime_availability/configuration
+            sauf `skip` — sert à calculer le compte d'une option de filtre compte
+            tenu des AUTRES filtres déjà actifs."""
             out = base_qs
             if skip != "has_genset":
                 if has_genset_param in ("true", "1"):
@@ -303,12 +326,17 @@ class FuelConsommationListView(APIView):
                     out = out.filter(incomplete_q)
             if skip != "runtime_source" and runtime_source_param in RUNTIME_SOURCE_FILTERS:
                 out = out.filter(RUNTIME_SOURCE_FILTERS[runtime_source_param])
+            if skip != "runtime_availability" and runtime_availability_param in RUNTIME_AVAILABILITY_FILTERS:
+                out = out.filter(RUNTIME_AVAILABILITY_FILTERS[runtime_availability_param])
             if skip != "configuration" and configuration_param in CONFIGURATION_FILTERS:
                 out = out.filter(CONFIGURATION_FILTERS[configuration_param])
             return out
 
         runtime_source_counts = _apply_combinable_filters(qs, skip="runtime_source").aggregate(**{
             key: Count("id", filter=cond) for key, cond in RUNTIME_SOURCE_FILTERS.items()
+        })
+        runtime_availability_counts = _apply_combinable_filters(qs, skip="runtime_availability").aggregate(**{
+            key: Count("id", filter=cond) for key, cond in RUNTIME_AVAILABILITY_FILTERS.items()
         })
         configuration_counts = _apply_combinable_filters(qs, skip="configuration").aggregate(**{
             key: Count("id", filter=cond) for key, cond in CONFIGURATION_FILTERS.items()
@@ -320,7 +348,7 @@ class FuelConsommationListView(APIView):
             sites_avec_ge_incomplet=Count("id", filter=incomplete_q),
         )
 
-        # Filtre effectif de la liste retournée : les 3 filtres combinés.
+        # Filtre effectif de la liste retournée : les 4 filtres combinés.
         qs = _apply_combinable_filters(qs, skip=None)
 
         agg = qs.aggregate(
@@ -366,6 +394,7 @@ class FuelConsommationListView(APIView):
             "total_enoc_qte_ajoutee_l": float(agg["total_enoc_qte_ajoutee_l"] or 0),
             "total_enoc_nb_demandes": agg["total_enoc_nb_demandes"] or 0,
             "runtime_source_counts": runtime_source_counts,
+            "runtime_availability_counts": runtime_availability_counts,
             "configuration_counts": configuration_counts,
             "factures_payees": invoice_summary["paid"] or 0,
             "factures_impayees": invoice_summary["unpaid"] or 0,

@@ -931,10 +931,12 @@ class FuelCphGeDaily(models.Model):
         OK = "OK", "OK"
         NO_VALID_RUNTIME = "NO_VALID_RUNTIME", "Aucun runtime métier valide"
         RUNTIME_NOT_VALIDATED = "RUNTIME_NOT_VALIDATED_FOR_INTERVAL_CPH", "Runtime non validé pour le CPH"
-        MISSING_LOAD_POWER = "MISSING_LOAD_POWER", "LOAD_POWER indisponible"
+        MISSING_LOAD_POWER = "MISSING_LOAD_POWER", "LOAD_POWER/LOAD_REPORT indisponible"
         BATTERY_DATA_NOT_READY = "BATTERY_DATA_NOT_READY", "Données batterie insuffisantes"
         MISSING_PARAMETER = "MISSING_PARAMETER", "Paramètres GE manquants"
         OVER_CAPACITY = "OVER_CAPACITY", "Charge GE > capacité déclarée"
+        DSE_ZERO_SOURCE_CONFLICT = "DSE_ZERO_SOURCE_CONFLICT", "DSE=0 en conflit avec une autre source positive"
+        NOT_APPLICABLE_NO_GE = "NOT_APPLICABLE_NO_GE", "Site sans GE — non applicable"
 
     country = models.CharField(max_length=64, null=True, blank=True, db_index=True)
     site_id = models.CharField(max_length=64, db_index=True)
@@ -950,10 +952,20 @@ class FuelCphGeDaily(models.Model):
     dg_runtime_interval_status = models.CharField(max_length=24, null=True, blank=True, help_text="VALID si dg_runtime_interval_h > 0 (énergie intégrable ce jour), NO_INTERVALS sinon.")
     dg_runtime_controller_h = models.DecimalField(max_digits=10, decimal_places=3, null=True, blank=True, help_text="DSE (GENSET_REPORT.DG_RUNTIME_CONTROLLER) — sert UNIQUEMENT à valider dg_runtime_interval_h, jamais au runtime affiché.")
 
-    # Runtime "métier" à 3 sources (DSE > DG-On calculé > redresseur 5 min) —
-    # colonne d'AFFICHAGE, distincte de dg_runtime_controller_h ci-dessus.
+    # Runtime "métier" à 8 règles (DSE > tracker > DG-On calculé [non-hybride]
+    # / redresseur [hybride], DSE=0 distingué confirmé/conflit) — colonnes
+    # d'AFFICHAGE, distinctes de dg_runtime_controller_h ci-dessus.
     dg_runtime_business_h = models.DecimalField(max_digits=10, decimal_places=3, null=True, blank=True)
-    dg_runtime_business_source = models.CharField(max_length=24, null=True, blank=True, help_text="DSE_CONTROLLER, DG_ON_CALCULATED, RECTIFIER_STATUS_5MIN ou NO_VALID_RUNTIME.")
+    dg_runtime_business_source = models.CharField(max_length=24, null=True, blank=True, help_text="Source PHYSIQUE ayant fourni dg_runtime_business_h : DSE_CONTROLLER, TRACKER_5MIN, DG_ON_CALCULATED ou RECTIFIER_STATUS_5MIN. None si dg_runtime_business_status ne désigne aucune source gagnante (DSE_ZERO_CONFIRMED/DSE_ZERO_SOURCE_CONFLICT/NO_VALID_RUNTIME/NOT_APPLICABLE_NO_GE).")
+    dg_runtime_business_status = models.CharField(max_length=32, null=True, blank=True, help_text="Un des 8 codes de règle (spec 2026-09) : NOT_APPLICABLE_NO_GE, DSE_CONTROLLER, DSE_ZERO_CONFIRMED, DSE_ZERO_SOURCE_CONFLICT, TRACKER_5MIN, DG_ON_CALCULATED, RECTIFIER_STATUS_5MIN, NO_VALID_RUNTIME.")
+    dg_runtime_business_rejection_reason = models.TextField(null=True, blank=True, help_text="Explication en clair pour DSE_ZERO_SOURCE_CONFLICT et NO_VALID_RUNTIME — None pour les autres statuts (rien à expliquer).")
+
+    # Charge journalière moyenne (GENSET_REPORT + LOAD_REPORT, LOAD_AVG/1000)
+    # — utilisée UNIQUEMENT les jours sans intervalle tracker actif (Path B,
+    # voir fuel_cph_service.compute_daily_status) comme énergie de repli
+    # load_kw × dg_runtime_business_h. None les jours où le tracker a une
+    # intégration 5 min propre (site_load_energy_kwh déjà renseigné).
+    load_kw = models.DecimalField(max_digits=10, decimal_places=3, null=True, blank=True)
 
     # Énergies (kWh), intégrées uniquement pendant les intervalles GE actifs
     site_load_energy_kwh = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
@@ -971,6 +983,7 @@ class FuelCphGeDaily(models.Model):
     cph_estimated_lph = models.DecimalField(max_digits=10, decimal_places=4, null=True, blank=True)
     estimated_consumption_l = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
     ge_load_percent = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True, help_text="100 × average_ge_power_kw / (PGE_KVA × power_factor). Informatif, ne divise pas le CPH.")
+    conso_estimee_source = models.CharField(max_length=32, null=True, blank=True, help_text="Méthode d'intégration énergie ayant produit estimated_consumption_l : CPH_TRACKER_5MIN (intégration 5 min) ou CPH_GENSET_DAILY_AVG (load_kw × runtime_h, jours sans intervalle tracker). None si aucun litre calculé ce jour.")
 
     calculation_status = models.CharField(max_length=48, choices=Status.choices, db_index=True)
 

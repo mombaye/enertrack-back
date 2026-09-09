@@ -128,78 +128,13 @@ def fetch_site_ge_specs(site_ids: list[str]) -> dict[str, dict]:
         conn.close()
 
 
-def fetch_monthly_runtime_fallback(year: int, month: int, site_ids: list[str] | None = None) -> dict[str, dict]:
-    """
-    site_id -> {"runtime_h": Decimal, "source": "DSE_CONTROLLER"|"DG_ON_CALCULATED"}
-    — repli quand GFMS_DATA_TRACKER_NC.DG_TOTAL_RUNNING_TIME_MINUTES n'est
-    jamais remonté pour un site (vérifié 2026-08 : arrive pour des sites qui
-    ont pourtant de la télémétrie 5 min par ailleurs — LOAD_POWER etc. — mais
-    dont le compteur GE spécifiquement n'est jamais peuplé).
-
-    Utilise GENSET_REPORT (agrégat journalier), priorité DSE > DG-On calculé
-    (même ordre que la règle métier documentée dans la spec CPH). Donne un
-    Running Time exploitable mais PAS une estimation de litres : l'énergie
-    (charge site + batterie) n'est intégrable qu'à partir du compteur 5 min,
-    qu'on n'a justement pas pour ces sites.
-
-    site_ids=None (par défaut, synchro production standard) scanne tout le
-    périmètre Sénégal — même convention que fetch_daily_tracker_energy.
-    Corrige un bug où ce repli ne s'exécutait JAMAIS en production (l'appelant
-    ne le déclenchait que si site_ids était fourni, et cette fonction
-    renvoyait {} sans site_ids explicite : les deux gardes se combinaient pour
-    rendre le repli mort en dehors d'un test --sites explicite, découvert
-    2026-09 en constatant que cph_runtime_source_breakdown restait vide pour
-    des sites déjà en DG_ON_CALCULATED — valeur en fait jamais recalculée
-    depuis un ancien run --sites).
-    """
-    d_start = date(year, month, 1)
-    d_end_excl = date(year + (1 if month == 12 else 0), 1 if month == 12 else month + 1, 1)
-
-    conn = _connect()
-    try:
-        cursor = conn.cursor()
-        db_schema = f"{FUEL_DATABASE}.{FUEL_SCHEMA}"
-        genset_schema = f"{GENSET_DATABASE}.{GENSET_SCHEMA}"
-
-        data_id_filter_sql = ""
-        params = {"country": COUNTRY_SCOPE, "d_start": d_start, "d_end_excl": d_end_excl}
-        if site_ids:
-            data_ids = _resolve_data_ids(cursor, db_schema, site_ids)
-            if not data_ids:
-                return {}
-            data_id_filter_sql = f"AND g.DATA_ID IN ({','.join(str(d) for d in data_ids)})"
-
-        cursor.execute(f"""
-            WITH site_dim AS (
-                SELECT DATA_ID, SITE_ID
-                FROM (
-                    SELECT DATA_ID, SITE_ID,
-                           ROW_NUMBER() OVER (PARTITION BY DATA_ID ORDER BY SITE_ID) AS rn
-                    FROM {db_schema}.SITE_FILTERED
-                    WHERE COUNTRY = %(country)s
-                )
-                WHERE rn = 1
-            )
-            SELECT
-                s.SITE_ID,
-                SUM(g.DG_RUNTIME_CONTROLLER) AS sum_dse,
-                SUM(g.DG_RUNTIME_CALCULATED) AS sum_calc
-            FROM {genset_schema}.GENSET_REPORT g
-            JOIN site_dim s ON s.DATA_ID = g.DATA_ID
-            WHERE g.REPORT_DATE >= %(d_start)s AND g.REPORT_DATE < %(d_end_excl)s
-              {data_id_filter_sql}
-            GROUP BY s.SITE_ID
-        """, params)
-
-        result: dict[str, dict] = {}
-        for site_id, sum_dse, sum_calc in cursor.fetchall():
-            if sum_dse is not None and sum_dse > 0:
-                result[site_id] = {"runtime_h": Decimal(str(sum_dse)).quantize(Decimal("0.01")), "source": "DSE_CONTROLLER"}
-            elif sum_calc is not None and sum_calc > 0:
-                result[site_id] = {"runtime_h": Decimal(str(sum_calc)).quantize(Decimal("0.01")), "source": "DG_ON_CALCULATED"}
-        return result
-    finally:
-        conn.close()
+# fetch_monthly_runtime_fallback (repli SUM(GENSET_REPORT) sur tout le mois,
+# priorité DSE > DG-On uniquement, sans redresseur/tracker ni bornage 0-24h)
+# a été RETIRÉ 2026-09 : la nouvelle union de jours de fetch_daily_tracker_energy
+# (daily_energy ∪ genset_daily ∪ rectifier_daily, voir day_universe ci-dessous)
+# couvre nativement, jour par jour et via les 8 règles de _resolve_business_runtime,
+# exactement les cas que ce repli grossier tentait de rattraper après coup —
+# le garder aurait fait cohabiter 2 moteurs de priorité pouvant diverger.
 
 
 def fetch_site_rectifier_efficiency(year: int, month: int, site_ids: list[str]) -> dict[str, Decimal]:
@@ -278,43 +213,89 @@ def _resolve_data_ids(cursor, db_schema: str, site_ids: list[str]) -> list[int]:
     return data_ids
 
 
-def _resolve_business_runtime(dse_h, dg_on_h, rectifier_h, is_hybrid_solar_ge, tracker_h=None) -> tuple[Decimal | None, str]:
+# Codes possibles de dg_runtime_business_source / dg_runtime_business_status
+# (retour de _resolve_business_runtime) — spec "règles" 2026-09, remplace
+# l'ancienne priorité DSE > DG-On > Redresseur > Tracker (audit 2026-09 :
+# le tracker doit passer AVANT DG-On/Redresseur quand le DSE est absent, pas
+# après ; DSE=0 doit être distingué d'un DSE réellement absent).
+RUNTIME_DSE_CONTROLLER = "DSE_CONTROLLER"
+RUNTIME_DSE_ZERO_CONFIRMED = "DSE_ZERO_CONFIRMED"
+RUNTIME_DSE_ZERO_CONFLICT = "DSE_ZERO_SOURCE_CONFLICT"
+RUNTIME_TRACKER_5MIN = "TRACKER_5MIN"
+RUNTIME_DG_ON_CALCULATED = "DG_ON_CALCULATED"
+RUNTIME_RECTIFIER_5MIN = "RECTIFIER_STATUS_5MIN"
+RUNTIME_NO_VALID = "NO_VALID_RUNTIME"
+
+# Sources "physiques" reconnues — sous-ensemble des statuts ci-dessus pour
+# lesquels dg_runtime_business_source doit être renseigné (les 4 autres
+# statuts — ZERO_CONFIRMED/CONFLICT/NO_VALID, + NOT_APPLICABLE_NO_GE
+# appliqué en aval par sync_fuel_cph selon has_genset Postgres — ne
+# désignent aucune source physique, seulement dg_runtime_business_status).
+_PHYSICAL_SOURCES = {RUNTIME_DSE_CONTROLLER, RUNTIME_TRACKER_5MIN, RUNTIME_DG_ON_CALCULATED, RUNTIME_RECTIFIER_5MIN}
+
+
+def _resolve_business_runtime(dse_h, dg_on_h, rectifier_h, is_hybrid_solar_ge, tracker_h=None) -> tuple[Decimal | None, str | None, str, str | None]:
     """
-    Priorité exacte de la spec (section 6), 4 paliers :
-      1. DSE (contrôleur), quel que soit le profil du site.
-      2. À défaut, DG-On calculé pour les sites NON hybrides solaire+GE.
-      3. À défaut, runtime redresseur (5 min) pour les hybrides solaire+GE
-         sans DSE.
-      4. À défaut, le compteur tracker 5 min lui-même (dg_runtime_interval_h)
-         — "conservé comme source identifiée et contrôlée" (spec) plutôt que
-         de déclarer NO_VALID_RUNTIME alors qu'une télémétrie directe existe.
-         Cette fonction n'est appelée QUE sur des jours où le tracker a déjà
-         détecté le GE actif (ge_intervals > 0, filtré en amont dans
-         daily_energy) donc `tracker_h` est quasi toujours disponible ici —
-         ce palier ne couvre que les cas DSE/DG-On/redresseur absents ou
-         invalides ce jour-là précisément, pas un vrai repli "aucune donnée".
+    Retourne (runtime_h, runtime_source, runtime_status, rejection_reason).
+
+    runtime_status porte TOUJOURS l'un des 8 codes de règle ci-dessous ;
+    runtime_source ne porte qu'un sous-ensemble (DSE_CONTROLLER/TRACKER_5MIN/
+    DG_ON_CALCULATED/RECTIFIER_STATUS_5MIN) — None pour les 4 autres statuts,
+    qui ne désignent aucune source physique gagnante.
+
+    Règles exactes (remplace l'ancienne priorité DSE > DG-On > Redresseur >
+    Tracker, corrigée suite à l'audit 2026-09 : "la télémétrie 5 min tracker
+    est repassée à zéro dans l'API alors que Snowflake en contient encore
+    pour septembre" — le tracker doit primer sur DG-On/Redresseur quand le
+    DSE est absent, pas l'inverse) :
+      1. Sans GE                                    -> NOT_APPLICABLE_NO_GE
+         (appliqué en aval, cette fonction ne reçoit que des sites avec GE —
+         voir sync_fuel_cph.py, has_genset vient de Postgres, pas Snowflake)
+      2. DSE > 0                                    -> DSE_CONTROLLER
+      3. DSE = 0, aucune autre source strictement positive
+                                                     -> DSE_ZERO_CONFIRMED
+         (0h métier réel, PAS un rejet : la valeur DSE=0 est prise au mot
+         puisque rien d'autre ne la contredit)
+      4. DSE = 0, tracker/DG-On/redresseur strictement positif ce jour
+                                                     -> DSE_ZERO_SOURCE_CONFLICT
+         (conflit de sources signalé tel quel — AUCUN repli automatique sur
+         l'autre source, contrairement à l'ancien comportement qui traitait
+         silencieusement DSE=0 comme invalide et retombait sur le palier
+         suivant)
+      5. DSE absent, tracker 5 min valide            -> TRACKER_5MIN
+      6. DSE absent, tracker absent, site NON hybride solaire+GE,
+         DG-On calculé valide                        -> DG_ON_CALCULATED
+      7. DSE absent, tracker absent, site hybride solaire+GE,
+         redresseur valide                           -> RECTIFIER_STATUS_5MIN
+      8. Sinon                                       -> NO_VALID_RUNTIME
 
     `is_hybrid_solar_ge` vient de VW_INVOICE_DATA_REPORT (DG='Yes' AND
     Solar='Yes') — absent (None) traité comme non-hybride (cas très
     majoritaire observé, ~92% des sites avec GE ET solaire sont déjà
     hybrides quand le drapeau est connu, mais l'absence de ligne elle-même
     est le cas courant hors GE, donc pas un signal fiable de solaire).
-
-    DSE = 0 traité comme INVALIDE (pas un vrai "0h", palier suivant tenté) :
-    cette fonction n'est appelée que sur des jours où le GE tournait déjà
-    (confirmé par le tracker), donc un DSE à 0 un tel jour est un défaut de
-    remontée du contrôleur, jamais un 0h légitime — cohérent avec le repli
-    mensuel (fetch_monthly_runtime_fallback) qui utilise déjà `> 0`.
     """
-    if dse_h is not None and dse_h > 0 and dse_h <= 24:
-        return dse_h, "DSE_CONTROLLER"
-    if not is_hybrid_solar_ge and dg_on_h is not None and dg_on_h > 0 and dg_on_h <= 24:
-        return dg_on_h, "DG_ON_CALCULATED"
-    if is_hybrid_solar_ge and rectifier_h is not None and rectifier_h > 0:
-        return rectifier_h, "RECTIFIER_STATUS_5MIN"
+    other_positive = any(v is not None and v > 0 for v in (tracker_h, dg_on_h, rectifier_h))
+
+    if dse_h is not None:
+        if dse_h > 0:
+            return dse_h, RUNTIME_DSE_CONTROLLER, RUNTIME_DSE_CONTROLLER, None
+        if other_positive:
+            candidats = ", ".join(
+                f"{label}={v}" for label, v in (("tracker", tracker_h), ("DG-On", dg_on_h), ("redresseur", rectifier_h))
+                if v is not None and v > 0
+            )
+            return None, None, RUNTIME_DSE_ZERO_CONFLICT, f"DSE=0 alors que {candidats} positif ce jour — conflit de sources, aucun repli automatique appliqué."
+        return Decimal("0"), None, RUNTIME_DSE_ZERO_CONFIRMED, None
+
+    # DSE absent : tracker > DG-On (non-hybride) > redresseur (hybride).
     if tracker_h is not None and tracker_h > 0:
-        return tracker_h, "TRACKER_5MIN"
-    return None, "NO_VALID_RUNTIME"
+        return tracker_h, RUNTIME_TRACKER_5MIN, RUNTIME_TRACKER_5MIN, None
+    if not is_hybrid_solar_ge and dg_on_h is not None and dg_on_h > 0:
+        return dg_on_h, RUNTIME_DG_ON_CALCULATED, RUNTIME_DG_ON_CALCULATED, None
+    if is_hybrid_solar_ge and rectifier_h is not None and rectifier_h > 0:
+        return rectifier_h, RUNTIME_RECTIFIER_5MIN, RUNTIME_RECTIFIER_5MIN, None
+    return None, None, RUNTIME_NO_VALID, "Aucune source de runtime disponible ce jour (ni DSE, ni tracker, ni DG-On, ni redresseur)."
 
 
 def fetch_daily_tracker_energy(year: int, month: int, site_ids: list[str] | None = None) -> dict[str, dict[date, dict]]:
@@ -323,23 +304,36 @@ def fetch_daily_tracker_energy(year: int, month: int, site_ids: list[str] | None
         country, data_id,
         ge_intervals, valid_battery_intervals,
         dg_runtime_interval_h, dg_runtime_controller_h,
-        dg_runtime_business_h, dg_runtime_business_source,
-        site_load_energy_kwh, battery_dc_energy_kwh,
-    }}} — uniquement les (site, date) avec au moins un intervalle GE détecté
-    ce jour-là (contrairement à fetch_monthly_consumption, pas une ligne par
-    site pour chaque jour du mois : un site sans marche GE ce jour n'a
-    simplement pas d'entrée).
+        dg_runtime_business_h, dg_runtime_business_source, dg_runtime_business_status,
+        dg_runtime_business_rejection_reason,
+        site_load_energy_kwh, battery_dc_energy_kwh, load_kw,
+    }}}.
+
+    Univers des jours retournés (corrige un bug 2026-09 : une journée DSE/
+    DG-On sans intervalle tracker actif ce jour-là était auparavant absente
+    du résultat — d'où "35 cas DG-On ont un runtime mais aucun ne calcule de
+    CPH, l'API retourne MISSING_LOAD_POWER" alors que la charge existe bien
+    dans LOAD_REPORT pour ces jours) : UNION de
+      - jours où le tracker 5 min a détecté une activité GE (daily_energy) ;
+      - jours où GENSET_REPORT a une ligne (DSE et/ou DG-On, même si les deux
+        sont NULL — la borne 0-24h peut aussi les avoir nullifiés) ;
+      - jours où RECTIFIER_EFFICIENCY_STATUS a une ligne.
+    Un jour "GENSET_REPORT sans tracker actif" n'a PAS de site_load_energy_kwh
+    tracker (intégration 5 min impossible sans intervalle) mais reçoit
+    load_kw (LOAD_REPORT, jointure obligatoire LOAD_REPORT.ID = GENSET_REPORT.
+    DATA_ID AND LOAD_REPORT.DATE = GENSET_REPORT.REPORT_DATE, LOAD_AVG/1000)
+    — fuel_cph_service.compute_daily_status l'utilise comme énergie de repli
+    (load_kw × runtime_h) quand le tracker n'a rien ce jour-là.
 
     dg_runtime_controller_h (DSE) reste la valeur utilisée pour la
-    validation de l'intervalle (tolérance 0.15h, spec section 6) — jamais
-    remplacée par le repli. dg_runtime_business_h/source est le runtime
-    "métier" à 4 paliers (DSE > DG-On calculé [non-hybride] > redresseur 5
-    min [hybride solaire+GE] > compteur tracker lui-même), calculé jour par
-    jour via _resolve_business_runtime — c'est la colonne DG_RUNTIME_BUSINESS_H/
-    DG_RUNTIME_BUSINESS_SOURCE du schéma de sortie documenté (spec section
-    2.2), distincte de la validation d'intervalle. C'est CETTE valeur (pas
-    dg_runtime_interval_h) qui doit alimenter le Running Time agrégé/affiché
-    par fuel_cph_service.compute_monthly_cph_estimates.
+    validation de l'intervalle tracker (tolérance 0.15h) — jamais remplacée
+    par le repli, et seulement quand un intervalle tracker existe (voir
+    compute_daily_status : aucune validation d'intervalle n'est possible ni
+    nécessaire les jours sans tracker). dg_runtime_business_h/source/status/
+    rejection_reason est le runtime "métier" résolu par _resolve_business_runtime
+    (8 règles — DSE > tracker > DG-On [non-hybride]/redresseur [hybride],
+    DSE=0 distingué en confirmé/conflit) — c'est CETTE valeur (pas
+    dg_runtime_interval_h) qui alimente le Running Time agrégé/affiché.
 
     `site_ids`, si fourni, restreint le scan de GFMS_DATA_TRACKER_NC (coûteux
     à l'échelle du pays — voir avertissement de volume ci-dessous) à ces
@@ -362,6 +356,7 @@ def fetch_daily_tracker_energy(year: int, month: int, site_ids: list[str] | None
         genset_schema = f"{GENSET_DATABASE}.{GENSET_SCHEMA}"
 
         data_id_filter_sql = ""
+        data_id_filter_sql_g = ""
         site_id_filter_sql = ""
         if site_ids:
             data_ids = _resolve_data_ids(cursor, db_schema, site_ids)
@@ -371,6 +366,7 @@ def fetch_daily_tracker_energy(year: int, month: int, site_ids: list[str] | None
             # entrée utilisateur) — interpolation directe sûre, même principe
             # que les noms de table/schéma qualifiés ailleurs dans ce module.
             data_id_filter_sql = f"AND t.ID IN ({','.join(str(d) for d in data_ids)})"
+            data_id_filter_sql_g = f"AND g.DATA_ID IN ({','.join(str(d) for d in data_ids)})"
             site_placeholders = ",".join(f"%(rsid{j})s" for j in range(len(site_ids)))
             site_id_filter_sql = f"AND SITE_ID IN ({site_placeholders})"
 
@@ -454,37 +450,76 @@ def fetch_daily_tracker_energy(year: int, month: int, site_ids: list[str] | None
                 FROM {genset_schema}.VW_INVOICE_DATA_REPORT
                 WHERE "Country" = %(country)s AND "Date" >= %(d_start)s AND "Date" < %(d_end_excl)s
                   {site_id_filter_sql}
+            ),
+            genset_daily AS (
+                -- DSE + DG-On (GENSET_REPORT) + charge du jour (LOAD_REPORT,
+                -- jointure obligatoire ID=DATA_ID/DATE=REPORT_DATE — spec
+                -- 2026-09 "corriger la jointure suivante dans le pipeline").
+                -- Une ligne par (data_id, day) dès que GENSET_REPORT en a une,
+                -- même si DSE et DG-On sont tous deux NULL/nullifiés : c'est
+                -- justement l'univers de jours qui manquait à daily_energy
+                -- (tracker-only) pour que les jours DSE/DG-On sans intervalle
+                -- tracker actif ce jour-là ne soient plus silencieusement
+                -- absents du résultat.
+                SELECT
+                    g.DATA_ID AS data_id,
+                    g.REPORT_DATE AS day,
+                    -- Bornage 0-24h à la source : DG_RUNTIME_CONTROLLER/CALCULATED
+                    -- contiennent parfois des valeurs aberrantes (constaté 2026-08 :
+                    -- jusqu'à 1 192 095 h pour UNE journée — clairement un compteur
+                    -- cumulatif mal réinitialisé, pas un runtime journalier réel).
+                    -- Nullifié ici plutôt que filtré en Python pour qu'aucune valeur
+                    -- corrompue ne soit jamais stockée, même rejetée.
+                    CASE WHEN g.DG_RUNTIME_CONTROLLER BETWEEN 0 AND 24 THEN g.DG_RUNTIME_CONTROLLER END AS dse_h,
+                    CASE WHEN g.DG_RUNTIME_CALCULATED BETWEEN 0 AND 24 THEN g.DG_RUNTIME_CALCULATED END AS dg_on_h,
+                    l.LOAD_AVG / 1000.0 AS load_kw
+                FROM {genset_schema}.GENSET_REPORT g
+                LEFT JOIN {genset_schema}.LOAD_REPORT l
+                    ON l.ID = g.DATA_ID AND l.DATE = g.REPORT_DATE
+                WHERE g.REPORT_DATE >= %(d_start)s AND g.REPORT_DATE < %(d_end_excl)s
+                  {data_id_filter_sql_g}
+            ),
+            day_universe AS (
+                -- Union des 3 sources de journées possibles (spec 2026-09,
+                -- point 1/2/3) — un site/jour peut n'apparaître QUE dans
+                -- genset_daily (DSE/DG-On sans tracker actif) ou QUE dans
+                -- rectifier_daily (redresseur seul), pas seulement dans
+                -- daily_energy comme avant.
+                SELECT data_id, day FROM daily_energy
+                UNION
+                SELECT data_id, day FROM genset_daily
+                UNION
+                SELECT sd.DATA_ID AS data_id, r.day AS day
+                FROM rectifier_daily r
+                JOIN site_dim sd ON sd.SITE_ID = r.SITE_ID
             )
             SELECT
-                s.SITE_ID, s.COUNTRY, d.data_id, d.day, d.ge_intervals, d.valid_battery_intervals,
+                s.SITE_ID, s.COUNTRY, u.data_id, u.day,
+                d.ge_intervals, d.valid_battery_intervals,
                 d.dg_runtime_interval_h, d.site_load_energy_kwh, d.battery_dc_energy_kwh,
-                -- Bornage 0-24h à la source : DG_RUNTIME_CONTROLLER/CALCULATED
-                -- contiennent parfois des valeurs aberrantes (constaté 2026-08 :
-                -- jusqu'à 1 192 095 h pour UNE journée — clairement un compteur
-                -- cumulatif mal réinitialisé, pas un runtime journalier réel).
-                -- Nullifié ici plutôt que filtré en Python pour qu'aucune valeur
-                -- corrompue ne soit jamais stockée, même rejetée.
-                CASE WHEN g.DG_RUNTIME_CONTROLLER BETWEEN 0 AND 24 THEN g.DG_RUNTIME_CONTROLLER END AS DG_RUNTIME_CONTROLLER,
-                CASE WHEN g.DG_RUNTIME_CALCULATED BETWEEN 0 AND 24 THEN g.DG_RUNTIME_CALCULATED END AS DG_RUNTIME_CALCULATED,
+                gd.dse_h AS DG_RUNTIME_CONTROLLER, gd.dg_on_h AS DG_RUNTIME_CALCULATED, gd.load_kw,
                 r.runtime_h AS rectifier_runtime_h, h.is_hybrid_solar_ge
-            FROM daily_energy d
-            JOIN site_dim s ON s.DATA_ID = d.data_id
-            LEFT JOIN {genset_schema}.GENSET_REPORT g
-                ON g.DATA_ID = d.data_id AND g.REPORT_DATE = d.day
-            LEFT JOIN rectifier_daily r ON r.SITE_ID = s.SITE_ID AND r.day = d.day
-            LEFT JOIN hybrid_daily h ON h.SITE_ID = s.SITE_ID AND h.day = d.day
+            FROM day_universe u
+            JOIN site_dim s ON s.DATA_ID = u.data_id
+            LEFT JOIN daily_energy d ON d.data_id = u.data_id AND d.day = u.day
+            LEFT JOIN genset_daily gd ON gd.data_id = u.data_id AND gd.day = u.day
+            LEFT JOIN rectifier_daily r ON r.SITE_ID = s.SITE_ID AND r.day = u.day
+            LEFT JOIN hybrid_daily h ON h.SITE_ID = s.SITE_ID AND h.day = u.day
         """, params)
 
         result: dict[str, dict[date, dict]] = {}
         for (site_id, country, data_id, day, ge_intervals, valid_battery_intervals,
              dg_runtime_interval_h, site_load_energy_kwh, battery_dc_energy_kwh,
-             dse_h, dg_on_h, rectifier_h, is_hybrid_solar_ge) in cursor.fetchall():
+             dse_h, dg_on_h, load_kw, rectifier_h, is_hybrid_solar_ge) in cursor.fetchall():
 
             dse_dec = Decimal(str(dse_h)) if dse_h is not None else None
             dg_on_dec = Decimal(str(dg_on_h)) if dg_on_h is not None else None
             rectifier_dec = Decimal(str(rectifier_h)).quantize(Decimal("0.01")) if rectifier_h is not None else None
             tracker_dec = Decimal(str(dg_runtime_interval_h)) if dg_runtime_interval_h is not None else None
-            business_h, business_source = _resolve_business_runtime(dse_dec, dg_on_dec, rectifier_dec, bool(is_hybrid_solar_ge), tracker_h=tracker_dec)
+            load_kw_dec = Decimal(str(load_kw)).quantize(Decimal("0.001")) if load_kw is not None else None
+            business_h, business_source, business_status, rejection_reason = _resolve_business_runtime(
+                dse_dec, dg_on_dec, rectifier_dec, bool(is_hybrid_solar_ge), tracker_h=tracker_dec
+            )
 
             result.setdefault(site_id, {})[day] = {
                 "country": country,
@@ -495,8 +530,11 @@ def fetch_daily_tracker_energy(year: int, month: int, site_ids: list[str] | None
                 "dg_runtime_controller_h": dse_dec,
                 "dg_runtime_business_h": business_h,
                 "dg_runtime_business_source": business_source,
+                "dg_runtime_business_status": business_status,
+                "dg_runtime_business_rejection_reason": rejection_reason,
                 "site_load_energy_kwh": Decimal(str(site_load_energy_kwh)) if site_load_energy_kwh is not None else None,
                 "battery_dc_energy_kwh": Decimal(str(battery_dc_energy_kwh)) if battery_dc_energy_kwh is not None else None,
+                "load_kw": load_kw_dec,
             }
         return result
     finally:

@@ -25,10 +25,11 @@ DAILY_UPDATE_FIELDS = [
     "ge_intervals", "valid_battery_intervals",
     "dg_runtime_interval_h", "dg_runtime_interval_status", "dg_runtime_controller_h",
     "dg_runtime_business_h", "dg_runtime_business_source",
+    "dg_runtime_business_status", "dg_runtime_business_rejection_reason", "load_kw",
     "site_load_energy_kwh", "battery_dc_energy_kwh", "battery_charge_ac_energy_kwh",
     "total_ge_energy_kwh", "average_ge_power_kw",
     "pge_kva", "power_factor", "spc_l_per_kwh",
-    "cph_estimated_lph", "estimated_consumption_l", "ge_load_percent",
+    "cph_estimated_lph", "estimated_consumption_l", "ge_load_percent", "conso_estimee_source",
     "calculation_status", "synced_at",
 ]
 
@@ -103,8 +104,17 @@ class Command(BaseCommand):
             self.stdout.write(f"\n── {month_year} ──")
 
             self.stdout.write("  Requête Snowflake (GFMS_DATA_TRACKER_NC / GENSET_REPORT) + paramètres GE...")
+            # has_genset vient de Postgres (déjà résolu par sync_fuel_consommation,
+            # Snowflake+ENOC+fichier — pas recalculé ici) : un site sans GE est
+            # reclassé NOT_APPLICABLE_NO_GE plutôt que NO_VALID_RUNTIME (spec
+            # 2026-09, règle 1). Chargé pour tout le mois AVANT l'appel Snowflake
+            # (indépendant du site_ids éventuel, filtré ensuite en Python).
+            has_genset_qs = FuelConsommationMonthly.objects.filter(month_year=month_year)
+            if site_ids:
+                has_genset_qs = has_genset_qs.filter(site_id__in=site_ids)
+            site_has_genset = dict(has_genset_qs.values_list("site_id", "has_genset"))
             try:
-                result = compute_monthly_cph_estimates(year, mo, site_ids=site_ids)
+                result = compute_monthly_cph_estimates(year, mo, site_ids=site_ids, site_has_genset=site_has_genset)
             except Exception as e:
                 self.stdout.write(self.style.ERROR(f"  Erreur pour {month_year} : {e}"))
                 last_error = str(e)
@@ -144,6 +154,9 @@ class Command(BaseCommand):
                     dg_runtime_controller_h=row["dg_runtime_controller_h"],
                     dg_runtime_business_h=row.get("dg_runtime_business_h"),
                     dg_runtime_business_source=row.get("dg_runtime_business_source"),
+                    dg_runtime_business_status=row.get("dg_runtime_business_status"),
+                    dg_runtime_business_rejection_reason=row.get("dg_runtime_business_rejection_reason"),
+                    load_kw=row.get("load_kw"),
                     site_load_energy_kwh=row["site_load_energy_kwh"],
                     battery_dc_energy_kwh=row["battery_dc_energy_kwh"],
                     battery_charge_ac_energy_kwh=row["battery_charge_ac_energy_kwh"],
@@ -155,6 +168,7 @@ class Command(BaseCommand):
                     cph_estimated_lph=row["cph_estimated_lph"],
                     estimated_consumption_l=row["estimated_consumption_l"],
                     ge_load_percent=row["ge_load_percent"],
+                    conso_estimee_source=row.get("conso_estimee_source"),
                     calculation_status=row["calculation_status"],
                     synced_at=timezone.now(),
                 )

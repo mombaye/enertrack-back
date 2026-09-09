@@ -3,27 +3,51 @@
 Agrégation Python du calcul CPH — applique les paramètres GE (Postgres,
 FuelCphGeParameter) aux énergies journalières brutes renvoyées par
 fuel_cph_snowflake.fetch_daily_tracker_energy, détermine le statut de chaque
-jour (spec section 8), calcule les litres estimés (jours OK/OVER_CAPACITY
-uniquement — "sans litre inventé"), puis agrège par site sur le mois.
+jour, calcule les litres estimés (jours OK/OVER_CAPACITY uniquement — "sans
+litre inventé"), puis agrège par site sur le mois.
+
+Deux chemins d'intégration énergie, selon l'ancrage du jour (spec 2026-09,
+point 3 : "les 35 cas DG-On ont un runtime mais MISSING_LOAD_POWER alors que
+la charge existe" — corrigé en distinguant ces 2 chemins plutôt qu'un seul
+qui supposait toujours un intervalle tracker) :
+  - Path A (tracker actif ce jour, ge_intervals > 0) : intégration fine 5 min
+    (site_load_energy_kwh/battery_dc_energy_kwh déjà sommés côté Snowflake),
+    validée contre le DSE (tolérance 0.15h) quand le DSE est disponible.
+  - Path B (DSE/DG-On/redresseur présents mais AUCUN intervalle tracker ce
+    jour) : énergie de repli = load_kw (LOAD_REPORT) × runtime_h métier
+    résolu — pas de comparaison possible avec un compteur tracker absent,
+    donc pas de garde BATTERY_DATA_NOT_READY/RUNTIME_NOT_VALIDATED sur ce
+    chemin (rien à valider), battery_dc_energy_kwh traité comme 0 (aucune
+    télémétrie batterie sans tracker).
 
 Ordre des gardes de qualité (une seule cause retenue par jour, la première
 qui s'applique) :
-  1. MISSING_LOAD_POWER  — aucun intervalle GE détecté ce jour, ou énergie
-     de charge site indisponible.
-  2. MISSING_PARAMETER   — aucune fiche FuelCphGeParameter active à cette
+  1. DSE_ZERO_SOURCE_CONFLICT — DSE=0 alors qu'une autre source (tracker/
+     DG-On/redresseur) est positive ce jour : conflit signalé tel quel,
+     AUCUN repli automatique (spec 2026-09, point 5).
+  2. NO_VALID_RUNTIME — aucune source de runtime métier valide DU TOUT (ni
+     DSE, ni tracker, ni DG-On calculé, ni redresseur 5 min).
+  3. DSE=0 confirmé (aucune autre source positive) — 0h métier réel, renvoyé
+     directement en OK/0 L : mathématiquement forcé par un runtime nul, pas
+     un litre inventé.
+  4. MISSING_LOAD_POWER — Path A : énergie de charge tracker indisponible.
+     Path B : runtime résolu mais load_kw (LOAD_REPORT) absent — la source
+     déjà résolue est CONSERVÉE (dg_runtime_business_source inchangé), seul
+     le statut du jour devient MISSING_LOAD_POWER (spec 2026-09, point 3).
+  5. MISSING_PARAMETER — aucune fiche FuelCphGeParameter active à cette
      date pour ce site (impossible de convertir l'énergie en litres).
-  3. BATTERY_DATA_NOT_READY — moins de 95% des intervalles GE avec une
-     mesure batterie valide.
-  4. NO_VALID_RUNTIME — aucune source de runtime métier valide DU TOUT
-     (ni DSE, ni DG-On calculé, ni redresseur 5 min).
-     RUNTIME_NOT_VALIDATED_FOR_INTERVAL_CPH — un runtime métier existe mais
-     le compteur tracker n'est pas comparable : soit le DSE spécifiquement
-     est absent (spec section 6 : "conserver la règle métier de runtime
-     mais publier RUNTIME_NOT_VALIDATED... tant qu'un contrôle équivalent de
-     l'intervalle n'est pas livré"), soit le DSE existe mais s'écarte de
-     plus de 0.15h du runtime déduit du compteur tracker.
-  5. OK (ou OVER_CAPACITY, informatif — charge GE calculée > 100% de la
+  6. BATTERY_DATA_NOT_READY — Path A uniquement : moins de 95% des
+     intervalles GE avec une mesure batterie valide.
+  7. RUNTIME_NOT_VALIDATED_FOR_INTERVAL_CPH — Path A uniquement : le DSE est
+     absent (rien pour valider le compteur tracker) ou s'écarte de plus de
+     0.15h du runtime déduit de ce compteur.
+  8. OK (ou OVER_CAPACITY, informatif — charge GE calculée > 100% de la
      capacité déclarée, litres quand même produits).
+
+NOT_APPLICABLE_NO_GE (site sans GE confirmé par Postgres has_genset — pas un
+signal Snowflake) est appliqué en aval par compute_monthly_cph_estimates
+quand `site_has_genset` est fourni, pas par cette fonction : elle ne reçoit
+jamais l'information has_genset.
 """
 from collections import Counter
 from datetime import date
@@ -31,8 +55,10 @@ from decimal import Decimal, ROUND_HALF_UP
 
 from fuel_tracking.models import FuelCphGeParameter
 from fuel_tracking.services.fuel_cph_snowflake import (
+    RUNTIME_DSE_ZERO_CONFIRMED,
+    RUNTIME_DSE_ZERO_CONFLICT,
+    RUNTIME_NO_VALID,
     fetch_daily_tracker_energy,
-    fetch_monthly_runtime_fallback,
     fetch_site_ge_specs,
     fetch_site_rectifier_efficiency,
 )
@@ -40,6 +66,7 @@ from fuel_tracking.services.fuel_cph_snowflake import (
 BATTERY_COVERAGE_MIN = Decimal("0.95")
 RUNTIME_TOLERANCE_H = Decimal("0.15")
 DEFAULT_POWER_FACTOR = Decimal("0.8")  # cos φ standard — informatif uniquement (n'affecte pas les litres), voir compute_daily_status.
+NOT_APPLICABLE_NO_GE = "NOT_APPLICABLE_NO_GE"
 
 _EMPTY_RESULT = {
     "battery_charge_ac_energy_kwh": None,
@@ -51,6 +78,7 @@ _EMPTY_RESULT = {
     "pge_kva": None,
     "power_factor": None,
     "spc_l_per_kwh": None,
+    "conso_estimee_source": None,
 }
 
 
@@ -78,7 +106,9 @@ def compute_daily_status(
     rectifier_efficiency_fallback: Decimal | None = None,
 ) -> tuple[str, dict]:
     """
-    Applique les gardes de qualité et le calcul CPH pour un (site, date).
+    Applique les gardes de qualité et le calcul CPH pour un (site, date) —
+    voir le docstring du module pour l'ordre des 8 gardes et les 2 chemins
+    d'intégration énergie (Path A tracker actif / Path B GENSET_REPORT seul).
 
     `ge_specs` (optionnel, {"pge_kva":..., "ge_type":...}) vient de Snowflake
     SITE_DG (fetch_site_ge_specs) — utilisé pour PGE_KVA si `params.pge_kva`
@@ -98,21 +128,52 @@ def compute_daily_status(
     ge_intervals = energies.get("ge_intervals") or 0
     dg_runtime_interval_h = energies.get("dg_runtime_interval_h")
     dg_runtime_controller_h = energies.get("dg_runtime_controller_h")
-    dg_runtime_business_h = energies.get("dg_runtime_business_h")
-    site_load_energy_kwh = energies.get("site_load_energy_kwh")
+    load_kw = energies.get("load_kw")
+    runtime_h = energies.get("dg_runtime_business_h")
+    runtime_status = energies.get("dg_runtime_business_status")
     battery_dc_energy_kwh = energies.get("battery_dc_energy_kwh")
     valid_battery_intervals = energies.get("valid_battery_intervals") or 0
 
-    if ge_intervals == 0 or site_load_energy_kwh is None or not dg_runtime_interval_h:
-        return "MISSING_LOAD_POWER", dict(_EMPTY_RESULT)
+    # 1-2 : conflit de sources ou aucun runtime résolu — rien à calculer, la
+    # source/le motif de rejet sont déjà tracés en amont (dg_runtime_business_*).
+    if runtime_status in (RUNTIME_DSE_ZERO_CONFLICT, RUNTIME_NO_VALID):
+        return runtime_status, dict(_EMPTY_RESULT)
+
+    # 3 : DSE=0 confirmé (aucune autre source positive) — 0h métier réel,
+    # 0 L mathématiquement forcé, sans avoir besoin de params/SPC : pas un
+    # litre inventé, c'est l'absence totale d'activité qui l'impose.
+    if runtime_status == RUNTIME_DSE_ZERO_CONFIRMED:
+        return "OK", dict(_EMPTY_RESULT, cph_estimated_lph=Decimal("0"), estimated_consumption_l=Decimal("0"))
+
+    tracker_active = ge_intervals > 0 and bool(dg_runtime_interval_h)
+
+    if tracker_active:
+        # Path A — intégration 5 min déjà sommée côté Snowflake.
+        site_load_energy_kwh = energies.get("site_load_energy_kwh")
+        if site_load_energy_kwh is None:
+            return "MISSING_LOAD_POWER", dict(_EMPTY_RESULT)
+        conso_estimee_source = "CPH_TRACKER_5MIN"
+    else:
+        # Path B — DSE/DG-On/redresseur présents mais aucun intervalle
+        # tracker ce jour : énergie de repli = load_kw (LOAD_REPORT) ×
+        # runtime_h métier résolu (spec 2026-09, point 3).
+        if runtime_h is None or runtime_h <= 0:
+            return (runtime_status or "NO_VALID_RUNTIME"), dict(_EMPTY_RESULT)
+        if load_kw is None:
+            # La source déjà résolue (dg_runtime_business_source) est
+            # CONSERVÉE — seul le statut du jour devient MISSING_LOAD_POWER.
+            return "MISSING_LOAD_POWER", dict(_EMPTY_RESULT)
+        site_load_energy_kwh = load_kw * runtime_h
+        dg_runtime_interval_h = runtime_h  # dénominateur d'intégration ; aucune validation DSE possible sans compteur tracker.
+        conso_estimee_source = "CPH_GENSET_DAILY_AVG"
 
     if params is None:
         return "MISSING_PARAMETER", dict(_EMPTY_RESULT)
 
     # PGE_KVA/POWER_FACTOR résolus dès ici (fichier > Snowflake > défaut) pour
     # être tracés dans TOUTES les issues à partir de ce point, y compris les
-    # jours rejetés — traçabilité complète (spec section 2.2), même si ces 2
-    # champs ne conditionnent jamais le calcul des litres lui-même.
+    # jours rejetés, même si ces 2 champs ne conditionnent jamais le calcul
+    # des litres lui-même.
     pge_kva = params.pge_kva if params.pge_kva is not None else (ge_specs or {}).get("pge_kva")
     power_factor = params.power_factor if params.power_factor is not None else DEFAULT_POWER_FACTOR
     traced = dict(_EMPTY_RESULT, pge_kva=pge_kva, power_factor=power_factor, spc_l_per_kwh=params.spc_l_per_kwh)
@@ -121,18 +182,15 @@ def compute_daily_status(
     if rectifier_efficiency_ratio is None or params.spc_l_per_kwh is None:
         return "MISSING_PARAMETER", traced
 
-    if Decimal(valid_battery_intervals) / Decimal(ge_intervals) < BATTERY_COVERAGE_MIN:
-        return "BATTERY_DATA_NOT_READY", traced
-
-    # DSE absent : le runtime métier (DG-On/redresseur) peut exister sans
-    # pouvoir valider le compteur tracker faute de DSE — spec section 6.
-    if dg_runtime_controller_h is None:
-        if dg_runtime_business_h is None:
-            return "NO_VALID_RUNTIME", traced
-        return "RUNTIME_NOT_VALIDATED_FOR_INTERVAL_CPH", traced
-
-    if abs(dg_runtime_interval_h - dg_runtime_controller_h) > RUNTIME_TOLERANCE_H:
-        return "RUNTIME_NOT_VALIDATED_FOR_INTERVAL_CPH", traced
+    if tracker_active:
+        # Gardes propres au chemin tracker — sans objet en Path B (pas de
+        # compteur tracker à comparer/valider).
+        if Decimal(valid_battery_intervals) / Decimal(ge_intervals) < BATTERY_COVERAGE_MIN:
+            return "BATTERY_DATA_NOT_READY", traced
+        if dg_runtime_controller_h is None:
+            return "RUNTIME_NOT_VALIDATED_FOR_INTERVAL_CPH", traced
+        if abs(dg_runtime_interval_h - dg_runtime_controller_h) > RUNTIME_TOLERANCE_H:
+            return "RUNTIME_NOT_VALIDATED_FOR_INTERVAL_CPH", traced
 
     battery_ac = (battery_dc_energy_kwh or Decimal("0")) / rectifier_efficiency_ratio
     total_ge = site_load_energy_kwh + battery_ac
@@ -158,10 +216,14 @@ def compute_daily_status(
         "pge_kva": pge_kva,
         "power_factor": power_factor,
         "spc_l_per_kwh": params.spc_l_per_kwh,
+        "conso_estimee_source": conso_estimee_source,
     }
 
 
-def compute_monthly_cph_estimates(year: int, month: int, site_ids: list[str] | None = None) -> dict:
+def compute_monthly_cph_estimates(
+    year: int, month: int, site_ids: list[str] | None = None,
+    site_has_genset: dict[str, bool] | None = None,
+) -> dict:
     """
     Retourne {
       "daily": [{"site_id", "date", <énergies brutes>, "calculation_status", <résultats calculés>}, ...],
@@ -172,6 +234,17 @@ def compute_monthly_cph_estimates(year: int, month: int, site_ids: list[str] | N
     "daily" reproduit une ligne par (site, date) avec au moins un intervalle
     GE — destiné à FuelCphGeDaily. "monthly" est l'agrégat destiné aux
     colonnes CPH de FuelConsommationMonthly.
+
+    `site_has_genset` (optionnel, {site_id: bool}) — vient de Postgres
+    (FuelConsommationMonthly.has_genset, PAS de Snowflake : "sans GE" est un
+    statut métier déjà résolu ailleurs dans l'app, pas recalculé ici). Un
+    site avec has_genset=False voit TOUS ses jours et son agrégat mensuel
+    forcés à NOT_APPLICABLE_NO_GE (spec 2026-09, règle 1 : "runtime non
+    applicable" plutôt qu'un statut de rejet type NO_VALID_RUNTIME, qui
+    laisserait croire à un problème de télémétrie sur un site qui n'a
+    simplement pas de GE). Omis (None) par défaut : aucun site n'est
+    reclassé (comportement historique, utile aux tests qui n'ont pas besoin
+    de charger Postgres).
     """
     raw = fetch_daily_tracker_energy(year, month, site_ids=site_ids)
     params_by_site = _load_active_parameters(list(raw.keys()))
@@ -213,16 +286,17 @@ def compute_monthly_cph_estimates(year: int, month: int, site_ids: list[str] | N
             # Runtime GE compté sur TOUS les jours détectés, OK ou non — il
             # reflète le fonctionnement réel du GE, indépendamment de la
             # disponibilité des paramètres nécessaires au calcul des litres.
-            # Utilise dg_runtime_business_h (priorité DSE > DG-On calculé >
-            # redresseur 5 min > compteur tracker, résolue par
-            # _resolve_business_runtime dans fuel_cph_snowflake.py), PAS le
-            # compteur tracker seul — corrige un défaut où DSE/DG-On/
-            # redresseur étaient bien interrogés dans Snowflake mais jamais
-            # utilisés ici, cph_runtime_source restant hardcodé à
-            # "TRACKER_5MIN" quel que soit le jour (audit 2026-09).
+            # Utilise dg_runtime_business_h/source résolu par
+            # _resolve_business_runtime (fuel_cph_snowflake.py, 8 règles :
+            # DSE > tracker > DG-On [non-hybride]/redresseur [hybride], DSE=0
+            # distingué en confirmé/conflit) — PAS le compteur tracker seul.
+            # business_source n'est renseigné QUE pour les 4 sources
+            # physiques (DSE_CONTROLLER/TRACKER_5MIN/DG_ON_CALCULATED/
+            # RECTIFIER_STATUS_5MIN) ; None pour ZERO_CONFIRMED/CONFLICT/
+            # NO_VALID (rien à additionner, 0h ou runtime non résolu).
             business_h = energies.get("dg_runtime_business_h")
             business_source = energies.get("dg_runtime_business_source")
-            if business_h is not None and business_source not in (None, "NO_VALID_RUNTIME"):
+            if business_source is not None and business_h is not None:
                 runtime_total += business_h
                 runtime_source_hours[business_source] = runtime_source_hours.get(business_source, Decimal("0")) + business_h
 
@@ -292,64 +366,32 @@ def compute_monthly_cph_estimates(year: int, month: int, site_ids: list[str] | N
             "cph_total_ge_energy_kwh": total_ge_total.quantize(Decimal("0.001")) if has_energy_detail else None,
         }
 
-    # Repli Running Time (GENSET_REPORT, priorité DSE > DG-On calculé) — pour
-    # les sites du périmètre demandé qui n'ont AUCUNE donnée tracker 5 min ce
-    # mois-ci (compteur DG_TOTAL_RUNNING_TIME_MINUTES jamais remonté, vérifié
-    # 2026-08 sur des sites qui ont pourtant d'autres télémétries). Donne un
-    # Running Time exploitable mais PAS une estimation de litres : l'énergie
-    # (charge site + batterie) n'est intégrable qu'à partir du compteur 5 min.
-    #
-    # site_ids est optionnel (None = tout le périmètre Sénégal, cas de la
-    # synchro production normale) — fetch_monthly_runtime_fallback scanne
-    # alors tout le pays (même convention que fetch_daily_tracker_energy),
-    # et le filtre "manque un runtime" s'applique en Python sur le résultat
-    # plutôt qu'en restreignant la requête Snowflake en amont : corrige un
-    # bug où l'ancien `if site_ids:` était systématiquement faux en
-    # production (site_ids=None) et ce bloc entier ne s'exécutait JAMAIS pour
-    # la synchro standard, seulement lors d'un test explicite avec --sites
-    # (découvert 2026-09 en constatant que cph_runtime_source_breakdown
-    # restait vide pour des sites déjà en DG_ON_CALCULATED — valeur en fait
-    # jamais recalculée depuis un ancien run --sites, simplement conservée en
-    # base d'une synchro à l'autre).
-    fallback_by_site = fetch_monthly_runtime_fallback(year, month, site_ids=site_ids)
-    fallback_by_site = {
-        sid: fb for sid, fb in fallback_by_site.items()
-        if sid not in monthly or monthly[sid]["cph_runtime_h_total"] is None
-    }
-    if fallback_by_site:
-        # ge_specs déjà connus pour les sites présents dans `raw` — pour les
-        # autres (jamais vus dans la télémétrie 5 min), un seul appel groupé
-        # plutôt qu'un par site.
-        extra_specs = fetch_site_ge_specs([sid for sid in fallback_by_site if sid not in ge_specs_by_site])
-        for site_id, fb in fallback_by_site.items():
-            ge_specs = ge_specs_by_site.get(site_id) or extra_specs.get(site_id)
-            if site_id in monthly:
-                monthly[site_id]["cph_runtime_h_total"] = fb["runtime_h"]
-                monthly[site_id]["cph_runtime_source"] = fb["source"]
-                monthly[site_id]["cph_runtime_source_breakdown"] = (
-                    {fb["source"]: float(fb["runtime_h"])} if fb["runtime_h"] else None
-                )
-            else:
-                monthly[site_id] = {
-                    "conso_estimee_cph_l": None,
-                    "cph_l_per_h_moy": None,
-                    "cph_nb_jours_ok": 0,
-                    "cph_nb_jours_calcules": 0,
-                    "cph_calculation_status": "MISSING_LOAD_POWER",
-                    "cph_status_breakdown": {},
-                    "cph_runtime_h_total": fb["runtime_h"],
-                    "cph_runtime_source": fb["source"],
-                    "cph_runtime_source_breakdown": (
-                        {fb["source"]: float(fb["runtime_h"])} if fb["runtime_h"] else None
-                    ),
-                    "cph_ge_type": (ge_specs or {}).get("ge_type"),
-                    "cph_pge_kva": (ge_specs or {}).get("pge_kva"),
-                    "cph_power_factor": None,
-                    "cph_spc_l_per_kwh": None,
-                    "cph_site_load_energy_kwh": None,
-                    "cph_battery_dc_energy_kwh": None,
-                    "cph_battery_ac_energy_kwh": None,
-                    "cph_total_ge_energy_kwh": None,
-                }
+    # Sites sans GE (Postgres, pas Snowflake) : reclassés NOT_APPLICABLE_NO_GE
+    # plutôt que de laisser un statut de rejet (NO_VALID_RUNTIME, etc.) qui
+    # laisserait croire à un problème de télémétrie sur un site qui n'a
+    # simplement pas de groupe électrogène. N'affecte que les sites déjà
+    # présents dans `monthly`/`daily_rows` (ceux que Snowflake a renvoyés) —
+    # un site sans GE ET sans aucune télémétrie n'a de toute façon aucune
+    # ligne à reclasser ici.
+    if site_has_genset:
+        no_ge_sites = {sid for sid in monthly if site_has_genset.get(sid) is False}
+        for row in daily_rows:
+            if row["site_id"] in no_ge_sites:
+                row["dg_runtime_business_source"] = None
+                row["dg_runtime_business_status"] = NOT_APPLICABLE_NO_GE
+                row["dg_runtime_business_rejection_reason"] = None
+                row["calculation_status"] = NOT_APPLICABLE_NO_GE
+                for key in _EMPTY_RESULT:
+                    row[key] = None
+        for sid in no_ge_sites:
+            monthly[sid] = {
+                **monthly[sid],
+                "conso_estimee_cph_l": None,
+                "cph_l_per_h_moy": None,
+                "cph_calculation_status": NOT_APPLICABLE_NO_GE,
+                "cph_runtime_h_total": None,
+                "cph_runtime_source": None,
+                "cph_runtime_source_breakdown": None,
+            }
 
     return {"daily": daily_rows, "monthly": monthly}
