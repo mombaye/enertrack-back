@@ -24,4 +24,11 @@ echo "PostgreSQL prêt."
 echo "Application des migrations..."
 python manage.py migrate --no-input
 
-exec "$@"
+echo "Collecte des fichiers statiques..."
+python manage.py collectstatic --no-input
+
+echo "Démarrage de Gunicorn..."
+exec gunicorn enertrack_backend.wsgi:application \
+    --bind 0.0.0.0:8000 \
+    --workers 3 \
+    --timeout 120

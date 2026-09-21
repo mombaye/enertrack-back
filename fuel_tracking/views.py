@@ -312,10 +312,21 @@ class FuelConsommationListView(APIView):
         }
         configuration_param = (request.query_params.get("configuration") or "").strip().lower()
 
+        # Filtre rapprochement stock — cliquable depuis les badges KPI
+        RAPPROCHEMENT_STATUT_FILTERS = {
+            "ok": Q(rapprochement_statut="OK"),
+            "a_justifier": Q(rapprochement_statut="A_JUSTIFIER"),
+            "a_investiguer": Q(rapprochement_statut="A_INVESTIGUER"),
+            "donnees_incompletes": Q(rapprochement_statut="DONNEES_INCOMPLETES"),
+            "cph_non_calcule": Q(rapprochement_statut="CPH_NON_CALCULE"),
+            "livraisons_a_controler": Q(livraisons_source="LIVRAISONS_ENOC_A_CONTROLER"),
+        }
+        rapprochement_statut_param = (request.query_params.get("rapprochement_statut") or "").strip().lower()
+
         def _apply_combinable_filters(base_qs, *, skip):
-            """Applique has_genset/runtime_source/runtime_availability/configuration
-            sauf `skip` — sert à calculer le compte d'une option de filtre compte
-            tenu des AUTRES filtres déjà actifs."""
+            """Applique has_genset/runtime_source/runtime_availability/configuration/
+            rapprochement_statut sauf `skip` — sert à calculer le compte d'une
+            option de filtre compte tenu des AUTRES filtres déjà actifs."""
             out = base_qs
             if skip != "has_genset":
                 if has_genset_param in ("true", "1"):
@@ -330,6 +341,8 @@ class FuelConsommationListView(APIView):
                 out = out.filter(RUNTIME_AVAILABILITY_FILTERS[runtime_availability_param])
             if skip != "configuration" and configuration_param in CONFIGURATION_FILTERS:
                 out = out.filter(CONFIGURATION_FILTERS[configuration_param])
+            if skip != "rapprochement_statut" and rapprochement_statut_param in RAPPROCHEMENT_STATUT_FILTERS:
+                out = out.filter(RAPPROCHEMENT_STATUT_FILTERS[rapprochement_statut_param])
             return out
 
         runtime_source_counts = _apply_combinable_filters(qs, skip="runtime_source").aggregate(**{
@@ -340,6 +353,9 @@ class FuelConsommationListView(APIView):
         })
         configuration_counts = _apply_combinable_filters(qs, skip="configuration").aggregate(**{
             key: Count("id", filter=cond) for key, cond in CONFIGURATION_FILTERS.items()
+        })
+        rapprochement_counts = _apply_combinable_filters(qs, skip="rapprochement_statut").aggregate(**{
+            key: Count("id", filter=cond) for key, cond in RAPPROCHEMENT_STATUT_FILTERS.items()
         })
         ge_counts = _apply_combinable_filters(qs, skip="has_genset").aggregate(
             sites_avec_ge=Count("id", filter=effective_ge_q),
@@ -401,6 +417,7 @@ class FuelConsommationListView(APIView):
             "runtime_source_counts": runtime_source_counts,
             "runtime_availability_counts": runtime_availability_counts,
             "configuration_counts": configuration_counts,
+            "rapprochement_counts": rapprochement_counts,
             "factures_payees": invoice_summary["paid"] or 0,
             "factures_impayees": invoice_summary["unpaid"] or 0,
             "factures_total": invoice_summary["total"] or 0,
@@ -568,6 +585,23 @@ class FuelConsommationListView(APIView):
                 "facturation_active_fichier": row.facturation_active_fichier,
                 "facturation_avec_ge_fichier": row.facturation_avec_ge_fichier,
                 "configuration_fichier": row.configuration_fichier,
+                # Disponibilité runtime CPH (spec B)
+                "cph_runtime_availability_pct": float(row.cph_runtime_availability_pct) if row.cph_runtime_availability_pct is not None else None,
+                "cph_runtime_source_availability": row.cph_runtime_source_availability or None,
+                # Rapprochement stock mensuel (spec C)
+                "rapprochement_stock_initial_l": float(row.rapprochement_stock_initial_l) if row.rapprochement_stock_initial_l is not None else None,
+                "rapprochement_livraisons_l": float(row.rapprochement_livraisons_l) if row.rapprochement_livraisons_l is not None else None,
+                "rapprochement_rajouts_l": float(row.rapprochement_rajouts_l) if row.rapprochement_rajouts_l is not None else None,
+                "rapprochement_retraits_l": float(row.rapprochement_retraits_l) if row.rapprochement_retraits_l is not None else None,
+                "rapprochement_vols_l": float(row.rapprochement_vols_l) if row.rapprochement_vols_l is not None else None,
+                "rapprochement_vidanges_l": float(row.rapprochement_vidanges_l) if row.rapprochement_vidanges_l is not None else None,
+                "rapprochement_stock_final_l": float(row.rapprochement_stock_final_l) if row.rapprochement_stock_final_l is not None else None,
+                "rapprochement_conso_stock_l": float(row.rapprochement_conso_stock_l) if row.rapprochement_conso_stock_l is not None else None,
+                "rapprochement_ecart_l": float(row.rapprochement_ecart_l) if row.rapprochement_ecart_l is not None else None,
+                "rapprochement_ecart_pct": float(row.rapprochement_ecart_pct) if row.rapprochement_ecart_pct is not None else None,
+                "rapprochement_statut": row.rapprochement_statut,
+                "rapprochement_motif": row.rapprochement_motif,
+                "livraisons_source": row.livraisons_source,
             }
 
         return Response({
@@ -587,6 +621,150 @@ class FuelConsommationListView(APIView):
             "cph_parameters": cph_parameters,
             "ge_detection": ge_detection,
         })
+
+
+class FuelConsommationExportControleView(APIView):
+    """
+    GET /api/fuel-tracking/consommation/export/controle/?month=YYYY-MM&...
+
+    Export CSV complet du suivi consommation (toutes colonnes dont rapprochement)
+    pour le mois demandé, avec les mêmes filtres que FuelConsommationListView.
+    Destiné au contrôle interne / audit fuel.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        import csv
+        from django.http import HttpResponse
+        from django.db.models import Q
+        from fuel_tracking.models import FuelConsommationMonthly
+
+        month = (request.query_params.get("month") or "").strip()
+        if not month:
+            from fuel_tracking.models import FuelConsommationMonthly as FCM
+            latest = FCM.objects.order_by("-month_year").values_list("month_year", flat=True).first()
+            month = latest or ""
+
+        file_ge_site_ids = _file_ge_site_ids()
+        _effective_ge_q = Q(has_genset=True) | Q(site_id__in=file_ge_site_ids)
+
+        qs = FuelConsommationMonthly.objects.filter(month_year=month).filter(_effective_ge_q)
+
+        search = (request.query_params.get("search") or "").strip()
+        if search:
+            qs = qs.filter(Q(site_id__icontains=search) | Q(site_name__icontains=search))
+        country = (request.query_params.get("country") or "").strip()
+        if country:
+            qs = qs.filter(country__iexact=country)
+        rapprochement_statut = (request.query_params.get("rapprochement_statut") or "").strip().lower()
+        RAPPROCHEMENT_STATUT_FILTERS = {
+            "ok": Q(rapprochement_statut="OK"),
+            "a_justifier": Q(rapprochement_statut="A_JUSTIFIER"),
+            "a_investiguer": Q(rapprochement_statut="A_INVESTIGUER"),
+            "donnees_incompletes": Q(rapprochement_statut="DONNEES_INCOMPLETES"),
+            "cph_non_calcule": Q(rapprochement_statut="CPH_NON_CALCULE"),
+            "livraisons_a_controler": Q(livraisons_source="LIVRAISONS_ENOC_A_CONTROLER"),
+        }
+        if rapprochement_statut in RAPPROCHEMENT_STATUT_FILTERS:
+            qs = qs.filter(RAPPROCHEMENT_STATUT_FILTERS[rapprochement_statut])
+
+        qs = qs.order_by("site_id")
+
+        response = HttpResponse(content_type="text/csv; charset=utf-8-sig")
+        response["Content-Disposition"] = f'attachment; filename="fuel_controle_{month}.csv"'
+
+        writer = csv.writer(response, delimiter=";")
+        writer.writerow([
+            "site_id", "site_name", "country", "typology", "has_genset",
+            "conso_snowflake_l", "nb_jours_data", "sensor_status", "quality_status",
+            "ge_prod_kwh", "conso_specifique_moy_l_kwh",
+            "cph_runtime_availability_pct", "cph_runtime_source",
+            "conso_estimee_cph_l", "cph_calculation_status",
+            "enoc_qte_ajoutee_l", "enoc_qte_demandee_l", "enoc_qte_validee_l", "enoc_nb_demandes",
+            "livraisons_source",
+            "rapprochement_stock_initial_l", "rapprochement_livraisons_l",
+            "rapprochement_rajouts_l", "rapprochement_retraits_l",
+            "rapprochement_vols_l", "rapprochement_vidanges_l",
+            "rapprochement_stock_final_l", "rapprochement_conso_stock_l",
+            "rapprochement_ecart_l", "rapprochement_ecart_pct",
+            "rapprochement_statut", "rapprochement_motif",
+        ])
+        for row in qs.iterator(chunk_size=500):
+            writer.writerow([
+                row.site_id, row.site_name, row.country, row.typology,
+                "Oui" if row.has_genset else "Non",
+                row.conso_snowflake_l, row.nb_jours_data, row.sensor_status, row.quality_status,
+                row.ge_prod_kwh, row.conso_specifique_moy_l_kwh,
+                row.cph_runtime_availability_pct, row.cph_runtime_source,
+                row.conso_estimee_cph_l, row.cph_calculation_status,
+                row.enoc_qte_ajoutee_l, row.enoc_qte_demandee_l, row.enoc_qte_validee_l, row.enoc_nb_demandes,
+                row.livraisons_source,
+                row.rapprochement_stock_initial_l, row.rapprochement_livraisons_l,
+                row.rapprochement_rajouts_l, row.rapprochement_retraits_l,
+                row.rapprochement_vols_l, row.rapprochement_vidanges_l,
+                row.rapprochement_stock_final_l, row.rapprochement_conso_stock_l,
+                row.rapprochement_ecart_l, row.rapprochement_ecart_pct,
+                row.rapprochement_statut, row.rapprochement_motif,
+            ])
+        return response
+
+
+class FuelConsommationExportAnomaliesView(APIView):
+    """
+    GET /api/fuel-tracking/consommation/export/anomalies/?month=YYYY-MM
+
+    Export CSV restreint aux anomalies fuel : rapprochement_statut IN
+    (A_JUSTIFIER, A_INVESTIGUER) ou livraisons_source=LIVRAISONS_ENOC_A_CONTROLER.
+    Destiné au fuel manager pour le suivi des écarts.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        import csv
+        from django.http import HttpResponse
+        from django.db.models import Q
+        from fuel_tracking.models import FuelConsommationMonthly
+
+        month = (request.query_params.get("month") or "").strip()
+        if not month:
+            latest = FuelConsommationMonthly.objects.order_by("-month_year").values_list("month_year", flat=True).first()
+            month = latest or ""
+
+        file_ge_site_ids = _file_ge_site_ids()
+        _effective_ge_q = Q(has_genset=True) | Q(site_id__in=file_ge_site_ids)
+
+        anomalie_q = (
+            Q(rapprochement_statut__in=["A_JUSTIFIER", "A_INVESTIGUER"])
+            | Q(livraisons_source="LIVRAISONS_ENOC_A_CONTROLER")
+        )
+        qs = (
+            FuelConsommationMonthly.objects
+            .filter(month_year=month)
+            .filter(_effective_ge_q)
+            .filter(anomalie_q)
+            .order_by("rapprochement_statut", "site_id")
+        )
+
+        response = HttpResponse(content_type="text/csv; charset=utf-8-sig")
+        response["Content-Disposition"] = f'attachment; filename="fuel_anomalies_{month}.csv"'
+
+        writer = csv.writer(response, delimiter=";")
+        writer.writerow([
+            "site_id", "site_name", "country",
+            "conso_snowflake_l", "conso_estimee_cph_l",
+            "enoc_qte_ajoutee_l", "livraisons_source",
+            "rapprochement_conso_stock_l", "rapprochement_ecart_l", "rapprochement_ecart_pct",
+            "rapprochement_statut", "rapprochement_motif",
+        ])
+        for row in qs.iterator(chunk_size=500):
+            writer.writerow([
+                row.site_id, row.site_name, row.country,
+                row.conso_snowflake_l, row.conso_estimee_cph_l,
+                row.enoc_qte_ajoutee_l, row.livraisons_source,
+                row.rapprochement_conso_stock_l, row.rapprochement_ecart_l, row.rapprochement_ecart_pct,
+                row.rapprochement_statut, row.rapprochement_motif,
+            ])
+        return response
 
 
 class FuelConsommationDashboardView(APIView):

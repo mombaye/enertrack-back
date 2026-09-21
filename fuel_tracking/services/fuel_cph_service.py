@@ -49,6 +49,7 @@ signal Snowflake) est appliqué en aval par compute_monthly_cph_estimates
 quand `site_has_genset` est fourni, pas par cette fonction : elle ne reçoit
 jamais l'information has_genset.
 """
+import calendar
 from collections import Counter
 from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
@@ -204,6 +205,11 @@ def compute_daily_status(
             Decimal("0.01"), rounding=ROUND_HALF_UP
         )
 
+    # > 105 % : charge irréaliste — rejet (spec B 2026-09 : P_GE_kW ≤ 1.05 × KVA × PF).
+    # Entre 100 % et 105 % : OVER_CAPACITY informatif, litres quand même produits.
+    if ge_load_pct is not None and ge_load_pct > Decimal("105"):
+        return "OVER_CAPACITY", {**traced, "ge_load_percent": ge_load_pct}
+
     status = "OVER_CAPACITY" if (ge_load_pct is not None and ge_load_pct > 100) else "OK"
 
     return status, {
@@ -253,6 +259,7 @@ def compute_monthly_cph_estimates(
 
     daily_rows: list[dict] = []
     monthly: dict[str, dict] = {}
+    days_in_month = calendar.monthrange(year, month)[1]
 
     for site_id, days in raw.items():
         entries = params_by_site.get(site_id, [])
@@ -263,6 +270,7 @@ def compute_monthly_cph_estimates(
         ok_cphs: list[Decimal] = []
         runtime_total = Decimal("0")
         runtime_source_hours: dict[str, Decimal] = {}
+        runtime_source_days: dict[str, int] = {}
         last_pge_kva = last_power_factor = last_spc = None
         site_load_total = battery_dc_total = battery_ac_total = total_ge_total = Decimal("0")
         has_energy_detail = False
@@ -299,6 +307,7 @@ def compute_monthly_cph_estimates(
             if business_source is not None and business_h is not None:
                 runtime_total += business_h
                 runtime_source_hours[business_source] = runtime_source_hours.get(business_source, Decimal("0")) + business_h
+                runtime_source_days[business_source] = runtime_source_days.get(business_source, 0) + 1
 
             if status in ("OK", "OVER_CAPACITY") and computed["estimated_consumption_l"] is not None:
                 ok_consumptions.append(computed["estimated_consumption_l"])
@@ -364,6 +373,15 @@ def compute_monthly_cph_estimates(
             "cph_battery_dc_energy_kwh": battery_dc_total.quantize(Decimal("0.001")) if has_energy_detail else None,
             "cph_battery_ac_energy_kwh": battery_ac_total.quantize(Decimal("0.001")) if has_energy_detail else None,
             "cph_total_ge_energy_kwh": total_ge_total.quantize(Decimal("0.001")) if has_energy_detail else None,
+            # Disponibilité : % jours du mois avec runtime GE résolu (spec B)
+            "cph_runtime_availability_pct": (
+                Decimal(str(round(nb_jours_calcules / days_in_month * 100, 2))).quantize(Decimal("0.01"))
+                if days_in_month > 0 else None
+            ),
+            "cph_runtime_source_availability": (
+                {src: round(d / days_in_month * 100, 2) for src, d in runtime_source_days.items()}
+                if runtime_source_days else None
+            ),
         }
 
     # Sites sans GE (Postgres, pas Snowflake) : reclassés NOT_APPLICABLE_NO_GE

@@ -40,6 +40,7 @@ MONTHLY_UPDATE_FIELDS = [
     "cph_pge_kva", "cph_power_factor", "cph_spc_l_per_kwh",
     "cph_site_load_energy_kwh", "cph_battery_dc_energy_kwh",
     "cph_battery_ac_energy_kwh", "cph_total_ge_energy_kwh",
+    "cph_runtime_availability_pct", "cph_runtime_source_availability",
 ]
 
 
@@ -213,6 +214,8 @@ class Command(BaseCommand):
                     fc.cph_battery_dc_energy_kwh = agg["cph_battery_dc_energy_kwh"]
                     fc.cph_battery_ac_energy_kwh = agg["cph_battery_ac_energy_kwh"]
                     fc.cph_total_ge_energy_kwh = agg["cph_total_ge_energy_kwh"]
+                    fc.cph_runtime_availability_pct = agg.get("cph_runtime_availability_pct")
+                    fc.cph_runtime_source_availability = agg.get("cph_runtime_source_availability")
                     to_update.append(fc)
 
                 if to_update:

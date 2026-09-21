@@ -684,6 +684,73 @@ class FuelConsommationMonthly(models.Model):
     gardien_date_releve_finale = models.CharField(max_length=32, null=True, blank=True, help_text="Date de Relevé Finale telle que fournie par le fichier (texte brut, formats mixtes) — vide si la période n'était pas encore clôturée à l'export du fichier.")
     gardien_source = models.CharField(max_length=200, null=True, blank=True, help_text="Nom/onglet du fichier de gardiennage d'origine, traçabilité.")
 
+    # Disponibilité runtime CPH — % jours du mois avec runtime GE valide (toutes
+    # sources), base de la règle "disponibilité ≥ 50 %" (spec B 2026-09).
+    cph_runtime_availability_pct = models.DecimalField(
+        max_digits=5, decimal_places=2, null=True, blank=True,
+        help_text="% jours du mois avec runtime GE valide (toutes sources confondues) — règle disponibilité ≥ 50 %."
+    )
+    cph_runtime_source_availability = models.JSONField(
+        default=None, null=True, blank=True,
+        help_text='% jours du mois avec runtime valide par source, ex. {"DSE_CONTROLLER": 87.5, "TRACKER_5MIN": 12.5}.'
+    )
+
+    # Rapprochement stock mensuel (spec C) —
+    # conso_stock = stock_initial + livraisons + rajouts − retraits − vols − vidanges − stock_final
+    # Statuts : OK / A_JUSTIFIER / A_INVESTIGUER / DONNEES_INCOMPLETES / CPH_NON_CALCULE
+    rapprochement_stock_initial_l = models.DecimalField(
+        max_digits=18, decimal_places=3, null=True, blank=True,
+        help_text="Stock initial du mois (FuelStockSnapshot.stock_snowflake_l ou fichier gardien)."
+    )
+    rapprochement_livraisons_l = models.DecimalField(
+        max_digits=18, decimal_places=3, null=True, blank=True,
+        help_text="Livraisons du mois (enoc_qte_ajoutee_l ; flagué LIVRAISONS_ENOC_A_CONTROLER si = 0 L)."
+    )
+    rapprochement_rajouts_l = models.DecimalField(
+        max_digits=18, decimal_places=3, null=True, blank=True,
+        help_text="Rajouts manuels du mois (fichier observation)."
+    )
+    rapprochement_retraits_l = models.DecimalField(
+        max_digits=18, decimal_places=3, null=True, blank=True,
+        help_text="Retraits autorisés du mois (fichier observation)."
+    )
+    rapprochement_vols_l = models.DecimalField(
+        max_digits=18, decimal_places=3, null=True, blank=True,
+        help_text="Vols déclarés du mois (fichier observation)."
+    )
+    rapprochement_vidanges_l = models.DecimalField(
+        max_digits=18, decimal_places=3, null=True, blank=True,
+        help_text="Vidanges du mois (fichier observation)."
+    )
+    rapprochement_stock_final_l = models.DecimalField(
+        max_digits=18, decimal_places=3, null=True, blank=True,
+        help_text="Stock final du mois (FuelStockSnapshot.stock_snowflake_l ou fichier gardien)."
+    )
+    rapprochement_conso_stock_l = models.DecimalField(
+        max_digits=18, decimal_places=3, null=True, blank=True,
+        help_text="Conso balance stock : initial + livraisons + rajouts − retraits − vols − vidanges − final."
+    )
+    rapprochement_ecart_l = models.DecimalField(
+        max_digits=18, decimal_places=3, null=True, blank=True,
+        help_text="Écart conso mesurée/estimée vs conso stock (L)."
+    )
+    rapprochement_ecart_pct = models.DecimalField(
+        max_digits=7, decimal_places=2, null=True, blank=True,
+        help_text="Écart en % de la conso de référence."
+    )
+    rapprochement_statut = models.CharField(
+        max_length=24, null=True, blank=True,
+        help_text="Statut rapprochement : OK / A_JUSTIFIER / A_INVESTIGUER / DONNEES_INCOMPLETES / CPH_NON_CALCULE."
+    )
+    rapprochement_motif = models.TextField(
+        null=True, blank=True,
+        help_text="Motif lisible du statut rapprochement."
+    )
+    livraisons_source = models.CharField(
+        max_length=48, null=True, blank=True,
+        help_text="Source livraisons : ENOC_REEL ou LIVRAISONS_ENOC_A_CONTROLER (données à contrôler)."
+    )
+
     synced_at = models.DateTimeField(default=timezone.now)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -704,6 +771,35 @@ class FuelConsommationMonthly(models.Model):
 
     def __str__(self):
         return f"{self.month_year} · {self.site_id} · conso={self.conso_snowflake_l}"
+
+
+class FuelRapprochementThreshold(models.Model):
+    """
+    Seuils de déclenchement des statuts de rapprochement stock (spec C).
+    Configurables via l'Admin Django sans redéploiement.
+    Le jeu 'default' est le jeu actif ; s'il n'existe pas, les valeurs
+    codées dans fuel_rapprochement_service.py (10 % / 20 %) s'appliquent.
+    """
+    label = models.CharField(
+        max_length=64, default="default", unique=True,
+        help_text="Identifiant du jeu de seuils ('default' = jeu actif)."
+    )
+    seuil_ok_pct = models.DecimalField(
+        max_digits=5, decimal_places=2, default=10,
+        help_text="Écart absolu ≤ ce seuil → statut OK."
+    )
+    seuil_a_justifier_pct = models.DecimalField(
+        max_digits=5, decimal_places=2, default=20,
+        help_text="seuil_ok_pct < écart absolu ≤ ce seuil → A_JUSTIFIER ; au-delà → A_INVESTIGUER."
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Seuil de rapprochement carburant"
+        verbose_name_plural = "Seuils de rapprochement carburant"
+
+    def __str__(self):
+        return f"Seuils rapprochement [{self.label}] OK≤{self.seuil_ok_pct}% AJ≤{self.seuil_a_justifier_pct}%"
 
 
 class FuelConsommationSyncRun(models.Model):

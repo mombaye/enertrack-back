@@ -23,6 +23,7 @@ from django.utils import timezone
 from fuel_tracking.models import FuelConsommationMonthly, FuelConsommationSyncRun, FuelEnocMovement
 from fuel_tracking.services.enoc_mongo_service import fetch_estimated_consumption, fetch_genset_reference
 from fuel_tracking.services.fuel_consommation_snowflake import fetch_monthly_consumption
+from fuel_tracking.services.fuel_rapprochement_service import run_rapprochement_for_month
 
 
 def parse_month(value: str) -> tuple[int, int]:
@@ -249,6 +250,14 @@ class Command(BaseCommand):
             self.stdout.write(self.style.SUCCESS(f"  {created} créée(s), {updated} mise(s) à jour."))
             total_created += created
             total_updated += updated
+
+            # Rapprochement stock — calculé immédiatement après la sync conso
+            # (ENOC et stock snapshot doivent être à jour au préalable).
+            try:
+                nb_rapproch = run_rapprochement_for_month(year, mo)
+                self.stdout.write(f"  Rapprochement stock : {nb_rapproch} ligne(s) mise(s) à jour.")
+            except Exception as e:
+                self.stdout.write(self.style.WARNING(f"  Rapprochement stock non calculé ({e}) — sera relancé au prochain cycle."))
 
         if not dry_run:
             self.stdout.write(self.style.SUCCESS(f"\n  Terminé — {total_created} créée(s), {total_updated} mise(s) à jour au total.\n"))
