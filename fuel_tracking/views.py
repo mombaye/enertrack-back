@@ -354,6 +354,10 @@ class FuelConsommationListView(APIView):
         agg = qs.aggregate(
             total_sites=Count("id"),
             sites_avec_conso=Count("id", filter=Q(conso_snowflake_l__isnull=False)),
+            # Sites ayant au moins un relevé brut dans VW_FUEL_REPORT (raw_point_count > 0)
+            # — correspond à la définition de couverture utilisée par Power BI, sans
+            # le filtre DROP_DETECTED=TRUE que sites_avec_conso exige.
+            sites_avec_donnees_brutes=Count("id", filter=Q(raw_point_count__gt=0)),
             sites_avec_estimation=Count("id", filter=Q(conso_estimee_snowflake_l__isnull=False) | Q(conso_estimee_enoc_l__isnull=False)),
             total_conso_snowflake_l=Sum("conso_snowflake_l"),
             total_enoc_qte_ajoutee_l=Sum("enoc_qte_ajoutee_l"),
@@ -389,6 +393,7 @@ class FuelConsommationListView(APIView):
             "sites_ge_enoc_only": ge_counts["sites_ge_enoc_only"],
             "sites_avec_ge_incomplet": ge_counts["sites_avec_ge_incomplet"],
             "sites_avec_conso": agg["sites_avec_conso"],
+            "sites_avec_donnees_brutes": agg["sites_avec_donnees_brutes"],
             "sites_avec_estimation": agg["sites_avec_estimation"],
             "total_conso_snowflake_l": float(agg["total_conso_snowflake_l"] or 0),
             "total_enoc_qte_ajoutee_l": float(agg["total_enoc_qte_ajoutee_l"] or 0),
