@@ -27,6 +27,18 @@ RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY . .
 
+# ── Entrypoint : attend PostgreSQL, applique migrate, puis exec la commande ──
+# exec "$@" transmet la `command:` de docker-compose (ou le CMD ci-dessous
+# si aucune command: n'est définie). Les migrations sont ainsi toujours
+# appliquées avant tout démarrage de service, sans étape manuelle.
+COPY docker/backend/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+EXPOSE 8000
+
+ENTRYPOINT ["/entrypoint.sh"]
+
+# CMD par défaut (écrasé par `command:` dans docker-compose pour web/celery/celery-beat)
 # Imports fichiers Suivi Carburant — rejoue les mêmes commandes qu'en local
 # à chaque démarrage du conteneur (idempotent : update_or_create/get_or_create,
 # sans risque à être relancé), pour que la prod ait les mêmes données que le
