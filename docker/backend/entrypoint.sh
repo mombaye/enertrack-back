@@ -24,7 +24,4 @@ echo "PostgreSQL prêt."
 echo "Application des migrations..."
 python manage.py migrate --no-input
 
-echo "Collecte des fichiers statiques..."
-python manage.py collectstatic --no-input
-
 exec "$@"
