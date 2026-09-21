@@ -266,6 +266,8 @@ class Command(BaseCommand):
         try:
             conn_dev2 = connect("DB_GFMS_ANALYTICS_DEV")
             cur2 = conn_dev2.cursor()
+
+            # Répartition par QUALITY_STATUS
             cur2.execute(
                 "SELECT QUALITY_STATUS, "
                 "COUNT(*) AS total, "
@@ -286,6 +288,33 @@ class Command(BaseCommand):
             total_pass = sum(r[4] for r in rows)
             self.stdout.write(("  → " + (OK(f"{total_pass} lignes passent le filtre — données disponibles")
                                if total_pass > 0 else ERR("0 lignes passent le filtre — CAUSE RACINE des NULL"))))
+
+            # ── Couverture sites : comparaison avec / sans filtre ──────────────
+            self.stdout.write(f"\n  Comparaison couverture SITES distincts {month_str} :")
+            cur2.execute(
+                "SELECT "
+                "  COUNT(DISTINCT DATA_ID) AS sites_total_vue, "
+                "  COUNT(DISTINCT CASE WHEN QUALITY_STATUS = 'OK' THEN DATA_ID END) AS sites_quality_ok, "
+                "  COUNT(DISTINCT CASE WHEN QUALITY_STATUS = 'OK' AND VALID_POINT_COUNT >= 2 THEN DATA_ID END) AS sites_vpc_ok, "
+                "  COUNT(DISTINCT CASE WHEN DROP_DETECTED = TRUE THEN DATA_ID END) AS sites_any_drop, "
+                "  COUNT(DISTINCT CASE WHEN QUALITY_STATUS = 'OK' AND VALID_POINT_COUNT >= 2 AND DROP_DETECTED = TRUE THEN DATA_ID END) AS sites_pass_filter "
+                "FROM DB_GFMS_ANALYTICS_DEV.GOLD.VW_FUEL_REPORT "
+                "WHERE COUNTRY = 'Senegal' AND DATE >= %(s)s AND DATE <= %(e)s",
+                {"s": d_start, "e": d_end},
+            )
+            row = cur2.fetchone()
+            if row:
+                sites_total, sites_qok, sites_vpc, sites_drop, sites_pass = row
+                self.stdout.write(f"  Tous les sites avec au moins 1 ligne        : {sites_total}")
+                self.stdout.write(f"  Sites avec QUALITY_STATUS='OK'             : {sites_qok}")
+                self.stdout.write(f"  Sites avec QS='OK' + VPC>=2                : {sites_vpc}")
+                self.stdout.write(f"  Sites avec DROP_DETECTED=TRUE (qqconque)   : {sites_drop}")
+                self.stdout.write(OK(f"  Sites passant le TRIPLE filtre (enertrack) : {sites_pass}") if sites_pass else ERR(f"  Sites passant le TRIPLE filtre (enertrack) : 0"))
+                self.stdout.write(W(
+                    f"\n  ⚠ Écart Power BI probable : Power BI compte probablement {sites_total} ou {sites_qok} sites,\n"
+                    f"    enertrack n'en compte que {sites_pass} (filtre DROP_DETECTED=TRUE en plus)."
+                ))
+
             conn_dev2.close()
         except Exception as e:
             self.stdout.write(ERR(f"  Vérification filtre qualité échouée : {e}"))
