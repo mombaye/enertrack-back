@@ -233,29 +233,62 @@ class Command(BaseCommand):
             self.stdout.write(ERR(f"  Connexion DB_GFMS_ANALYTICS_PROD échouée : {e}"))
 
         # ── 4. Résumé PostgreSQL local ────────────────────────────────────────
-        self.stdout.write("\n── 4. FuelConsommationSyncRun (PostgreSQL) — 5 dernières runs ──")
+        self.stdout.write("\n── 4. FuelConsommationSyncRun (PostgreSQL) — 10 dernières runs ──")
         try:
             from fuel_tracking.models import FuelConsommationSyncRun
-            runs = FuelConsommationSyncRun.objects.order_by("-created_at")[:5]
+            runs = FuelConsommationSyncRun.objects.order_by("-started_at")[:10]
             for r in runs:
                 self.stdout.write(
-                    f"  {r.created_at:%Y-%m-%d %H:%M} | {r.month_from}→{r.month_to} | "
+                    f"  {r.started_at:%Y-%m-%d %H:%M} | {r.month_from}→{r.month_to} | "
                     f"{r.status} | sites={r.sites_fetched} | err={r.error_message or '-'}"
                 )
+            if not runs:
+                self.stdout.write(W("  Aucune run enregistrée — la sync n'a jamais tourné."))
         except Exception as e:
             self.stdout.write(W(f"  Lecture FuelConsommationSyncRun échouée : {e}"))
 
-        self.stdout.write("\n── 5. FuelCphSyncRun (PostgreSQL) — 5 dernières runs ──")
+        self.stdout.write("\n── 5. FuelCphSyncRun (PostgreSQL) — 10 dernières runs ──")
         try:
             from fuel_tracking.models import FuelCphSyncRun
-            runs = FuelCphSyncRun.objects.order_by("-created_at")[:5]
+            runs = FuelCphSyncRun.objects.order_by("-started_at")[:10]
             for r in runs:
                 self.stdout.write(
-                    f"  {r.created_at:%Y-%m-%d %H:%M} | {r.month_from}→{r.month_to} | "
-                    f"{r.status} | sites={r.sites_synced} | err={r.error_message or '-'}"
+                    f"  {r.started_at:%Y-%m-%d %H:%M} | {r.month_from}→{r.month_to} | "
+                    f"{r.status} | sites={r.sites_fetched} | err={r.error_message or '-'}"
                 )
+            if not runs:
+                self.stdout.write(W("  Aucune run enregistrée — la sync CPH n'a jamais tourné."))
         except Exception as e:
             self.stdout.write(W(f"  Lecture FuelCphSyncRun échouée : {e}"))
+
+        # ── 4b. Couverture filtre qualité VW_FUEL_REPORT ──────────────────────
+        self.stdout.write(f"\n── 4b. VW_FUEL_REPORT — répartition filtre qualité {month_str} ──")
+        try:
+            conn_dev2 = connect("DB_GFMS_ANALYTICS_DEV")
+            cur2 = conn_dev2.cursor()
+            cur2.execute(
+                "SELECT QUALITY_STATUS, "
+                "COUNT(*) AS total, "
+                "SUM(CASE WHEN VALID_POINT_COUNT >= 2 THEN 1 ELSE 0 END) AS vpc_ok, "
+                "SUM(CASE WHEN DROP_DETECTED = TRUE THEN 1 ELSE 0 END) AS drop_ok, "
+                "SUM(CASE WHEN QUALITY_STATUS = 'OK' AND VALID_POINT_COUNT >= 2 AND DROP_DETECTED = TRUE THEN 1 ELSE 0 END) AS pass_filter "
+                "FROM DB_GFMS_ANALYTICS_DEV.GOLD.VW_FUEL_REPORT "
+                "WHERE COUNTRY = 'Senegal' AND DATE >= %(s)s AND DATE <= %(e)s "
+                "GROUP BY QUALITY_STATUS ORDER BY total DESC",
+                {"s": d_start, "e": d_end},
+            )
+            rows = cur2.fetchall()
+            self.stdout.write("  QUALITY_STATUS | total | vpc>=2 | drop=T | PASS_FILTER")
+            for row in rows:
+                status, total, vpc, drop, passed = row
+                flag = OK if passed > 0 else W
+                self.stdout.write(flag(f"  {status} | {total} | {vpc} | {drop} | {passed}"))
+            total_pass = sum(r[4] for r in rows)
+            self.stdout.write(("  → " + (OK(f"{total_pass} lignes passent le filtre — données disponibles")
+                               if total_pass > 0 else ERR("0 lignes passent le filtre — CAUSE RACINE des NULL"))))
+            conn_dev2.close()
+        except Exception as e:
+            self.stdout.write(ERR(f"  Vérification filtre qualité échouée : {e}"))
 
         self.stdout.write("\n── 6. FuelConsommationMonthly 2026-08 — état PostgreSQL ──")
         try:
