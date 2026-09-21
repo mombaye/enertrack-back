@@ -59,17 +59,13 @@ services:
     build:
       context: .
       dockerfile: docker/backend/Dockerfile
-    # Au démarrage : imports fichiers Suivi Carburant (mêmes commandes que le
-    # CMD du Dockerfile — ce `command:` du compose l'écrase entièrement,
-    # d'où ces colonnes toujours vides jusqu'ici malgré le CMD à jour dans
-    # l'image : Docker Compose priorise toujours son propre `command:` sur
-    # le CMD de l'image, donc le CMD du Dockerfile n'était jamais atteint),
-    # puis resync Snowflake/ENOC/CPH sur M-1 et M (les tâches Celery font
-    # pareil en continu toutes les 5 min, mais au premier démarrage il faut
-    # peupler immédiatement le mois précédent — sinon les données n'arrivent
-    # qu'à la première exécution planifiée, ~5 min après le lancement),
-    # puis recalcule FinancialEvaluation sur les 3 derniers mois. Tout ce
-    # bloc tourne en ARRIÈRE-PLAN (`&` avant runserver).
+    # Au démarrage : imports fichiers Suivi Carburant (mois explicites —
+    # ces fichiers ne changent pas de nom automatiquement, un nouveau fichier
+    # mensuel doit être ajouté ici ET commité dans data_imports/), puis
+    # sync_recent_months calcule dynamiquement M-1 et M courant (ENOC +
+    # Snowflake conso + CPH + réévaluation financière) — sans mois hardcodés,
+    # donc toujours correct quel que soit le mois de démarrage. Tout ce bloc
+    # tourne en ARRIÈRE-PLAN (`&`) pour que runserver écoute immédiatement.
     command: >-
       sh -c "
       (
@@ -78,11 +74,7 @@ services:
         python manage.py import_gardien_conso --file=data_imports/synthese_conso_fuel_juillet_2026.xlsb --month=2026-07;
         python manage.py import_commande_fuel --file=data_imports/commande_fuel_aout_2026.xlsb --month=2026-08;
         python manage.py import_facturation_par_site --file=data_imports/esco_facturation_sept26.xlsx --month=2026-09;
-        python manage.py sync_enoc_fuel_movements --month=2026-08;
-        python manage.py sync_enoc_fuel_movements --month=2026-09;
-        python manage.py sync_fuel_consommation --from-month=2026-08 --to-month=2026-09;
-        python manage.py sync_fuel_cph --from-month=2026-08 --to-month=2026-09;
-        python manage.py recompute_financial_evaluations --months=3
+        python manage.py sync_recent_months --months=2
       ) &
       python manage.py runserver 0.0.0.0:8000
       "
@@ -103,7 +95,9 @@ services:
     build:
       context: .
       dockerfile: docker/backend/Dockerfile
-    command: celery -A enertrack_backend worker --loglevel=info --concurrency=4
+    # --autoreload (watchfiles) : recharge le worker automatiquement quand
+    # le code Python change — pas besoin de restart manuel après un git pull.
+    command: celery -A enertrack_backend worker --loglevel=info --concurrency=4 --autoreload
     volumes:
       - .:/code
     env_file:

@@ -6,6 +6,7 @@ gunicorn
 python-decouple
 celery
 redis
+watchfiles
 django-cors-headers
 pandas
 openpyxl
