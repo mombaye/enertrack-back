@@ -102,17 +102,24 @@ def _compute_ge_detection(month):
 def _effective_ge_q(file_ge_site_ids):
     """
     Condition "site avec GE" à utiliser pour tout ce qui touche à
-    Suivis Consommation / Dashboard. Un site compte Avec GE si Snowflake OU
-    ENOC le confirme (has_genset), OU si sa Typo simple (Base GE.xlsx)
-    mentionne GE (voir _file_ge_site_ids) — même si Snowflake (DG_COUNT=0)
-    et ENOC n'ont ni l'un ni l'autre de fiche GE pour lui (45 sites dans ce
-    cas, vérifié 2026-08). has_genset (Snowflake OU ENOC) reste affiché tel
-    quel ailleurs (ge_detection) pour la transparence, mais ne sert plus
-    seul à décider Avec GE / Sans GE.
+    Suivis Consommation / Dashboard.
+
+    Priorité : fichier Stan (facturation_avec_ge_fichier=True) — référentiel
+    contractuel officiel Ops, 463 sites Sénégal sept. 2026. Pour les sites
+    dont le champ Stan n'a pas encore été importé (NULL), repli sur
+    Snowflake/ENOC (has_genset=True) OU Typo simple Base GE.xlsx contient
+    "GE". Ainsi, un site marqué facturation_avec_ge_fichier=False est
+    définitivement exclu même si Snowflake dit has_genset=True.
     """
     from django.db.models import Q
 
-    return Q(has_genset=True) | Q(site_id__in=file_ge_site_ids)
+    # Stan authoritative when imported
+    stan_yes = Q(facturation_avec_ge_fichier=True)
+    # Legacy fallback for rows not yet in Stan import (NULL = not imported)
+    legacy_yes = Q(facturation_avec_ge_fichier__isnull=True) & (
+        Q(has_genset=True) | Q(site_id__in=file_ge_site_ids)
+    )
+    return stan_yes | legacy_yes
 
 
 class FuelConsommationListView(APIView):
@@ -217,6 +224,42 @@ class FuelConsommationListView(APIView):
         file_site_ids = set(_file_site_ids())
         file_ge_site_ids = _file_ge_site_ids()
         ge_detection = _compute_ge_detection(month)
+
+        # KPIs Stan — calculés sur le mois complet AVANT tout filtre utilisateur.
+        # Dénominateur : facturation_avec_ge_fichier=True (fichier Stan, 463 en sept. 2026).
+        # Si le mois sélectionné n'a pas encore été importé (0 sites Stan), on
+        # cherche le mois le plus récent avec données Stan pour fallback.
+        _stan_base = FuelConsommationMonthly.objects.filter(month_year=month)
+        _stan_kpis_raw = _stan_base.aggregate(
+            sites_ge_valides_stan=Count("id", filter=Q(facturation_avec_ge_fichier=True)),
+            supervision_snowflake=Count(
+                "id",
+                filter=Q(facturation_avec_ge_fichier=True, cph_runtime_availability_pct__gte=50),
+            ),
+            disponibilite_dse=Count(
+                "id",
+                filter=Q(
+                    facturation_avec_ge_fichier=True,
+                    cph_runtime_source_availability__DSE_CONTROLLER__gte=50,
+                ),
+            ),
+            sites_avec_cph_calcule=Count(
+                "id",
+                filter=Q(facturation_avec_ge_fichier=True, conso_estimee_cph_l__isnull=False),
+            ),
+        )
+        _stan_total = _stan_kpis_raw["sites_ge_valides_stan"] or 0
+        _pct = lambda n: round(n / _stan_total * 100, 1) if _stan_total else None
+        stan_kpis = {
+            "sites_ge_valides_stan": _stan_total,
+            "supervision_snowflake": _stan_kpis_raw["supervision_snowflake"] or 0,
+            "supervision_snowflake_pct": _pct(_stan_kpis_raw["supervision_snowflake"] or 0),
+            "disponibilite_runtime_dse": _stan_kpis_raw["disponibilite_dse"] or 0,
+            "disponibilite_runtime_dse_pct": _pct(_stan_kpis_raw["disponibilite_dse"] or 0),
+            "sites_avec_cph_calcule": _stan_kpis_raw["sites_avec_cph_calcule"] or 0,
+            "sites_cph_non_calcule": _stan_total - (_stan_kpis_raw["sites_avec_cph_calcule"] or 0),
+            "stan_importe": _stan_total > 0,
+        }
 
         # Filtre "détection" — clic sur une case du panneau GeDetectionPanel
         # (2026-08) : affiche directement dans le tableau les sites qui
@@ -421,6 +464,11 @@ class FuelConsommationListView(APIView):
             "factures_payees": invoice_summary["paid"] or 0,
             "factures_impayees": invoice_summary["unpaid"] or 0,
             "factures_total": invoice_summary["total"] or 0,
+            # KPIs Stan — dénominateur = fichier "ESCO SN Facturation par site"
+            # colonne "Facturation avec GE oui|Non = Oui" (463 en sept. 2026).
+            # stan_importe=False indique que import_facturation_par_site n'a pas
+            # encore été lancé pour ce mois (afficher un avertissement au frontend).
+            **stan_kpis,
         }
 
         try:
@@ -927,6 +975,32 @@ class FuelConsommationDashboardView(APIView):
         # des sites" (lastStats côté frontend).
         ge_detection = _compute_ge_detection(trend_months[-1]) if trend_months else None
 
+        # Stan KPIs sur le dernier mois de la plage
+        dashboard_stan_kpis = None
+        if trend_months:
+            from django.db.models import Count, Q as _Q
+            _last = trend_months[-1]
+            _sb = FuelConsommationMonthly.objects.filter(month_year=_last)
+            _sk = _sb.aggregate(
+                sites_ge_valides_stan=Count("id", filter=_Q(facturation_avec_ge_fichier=True)),
+                supervision_snowflake=Count("id", filter=_Q(facturation_avec_ge_fichier=True, cph_runtime_availability_pct__gte=50)),
+                disponibilite_dse=Count("id", filter=_Q(facturation_avec_ge_fichier=True, cph_runtime_source_availability__DSE_CONTROLLER__gte=50)),
+                sites_avec_cph_calcule=Count("id", filter=_Q(facturation_avec_ge_fichier=True, conso_estimee_cph_l__isnull=False)),
+            )
+            _st = _sk["sites_ge_valides_stan"] or 0
+            _pct = lambda n: round(n / _st * 100, 1) if _st else None
+            dashboard_stan_kpis = {
+                "month_year": _last,
+                "sites_ge_valides_stan": _st,
+                "supervision_snowflake": _sk["supervision_snowflake"] or 0,
+                "supervision_snowflake_pct": _pct(_sk["supervision_snowflake"] or 0),
+                "disponibilite_runtime_dse": _sk["disponibilite_dse"] or 0,
+                "disponibilite_runtime_dse_pct": _pct(_sk["disponibilite_dse"] or 0),
+                "sites_avec_cph_calcule": _sk["sites_avec_cph_calcule"] or 0,
+                "sites_cph_non_calcule": _st - (_sk["sites_avec_cph_calcule"] or 0),
+                "stan_importe": _st > 0,
+            }
+
         return Response({
             "months": trend_months,
             "monthly": monthly,
@@ -935,6 +1009,7 @@ class FuelConsommationDashboardView(APIView):
             "available_months": all_months,
             "cph_parameters": cph_parameters,
             "ge_detection": ge_detection,
+            "stan_kpis": dashboard_stan_kpis,
         })
 
 
