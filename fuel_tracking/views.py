@@ -694,9 +694,9 @@ class FuelConsommationExportControleView(APIView):
             month = latest or ""
 
         file_ge_site_ids = _file_ge_site_ids()
-        _effective_ge_q = Q(has_genset=True) | Q(site_id__in=file_ge_site_ids)
+        effective_ge_q = _effective_ge_q(file_ge_site_ids)
 
-        qs = FuelConsommationMonthly.objects.filter(month_year=month).filter(_effective_ge_q)
+        qs = FuelConsommationMonthly.objects.filter(month_year=month).filter(effective_ge_q)
 
         search = (request.query_params.get("search") or "").strip()
         if search:
@@ -724,6 +724,7 @@ class FuelConsommationExportControleView(APIView):
         writer = csv.writer(response, delimiter=";")
         writer.writerow([
             "site_id", "site_name", "country", "typology", "has_genset",
+            "facturation_avec_ge_fichier", "facturation_active_fichier", "configuration_fichier",
             "conso_snowflake_l", "nb_jours_data", "sensor_status", "quality_status",
             "ge_prod_kwh", "conso_specifique_moy_l_kwh",
             "cph_runtime_availability_pct", "cph_runtime_source",
@@ -741,6 +742,9 @@ class FuelConsommationExportControleView(APIView):
             writer.writerow([
                 row.site_id, row.site_name, row.country, row.typology,
                 "Oui" if row.has_genset else "Non",
+                "Oui" if row.facturation_avec_ge_fichier else ("Non" if row.facturation_avec_ge_fichier is False else ""),
+                "Oui" if row.facturation_active_fichier else ("Non" if row.facturation_active_fichier is False else ""),
+                row.configuration_fichier or "",
                 row.conso_snowflake_l, row.nb_jours_data, row.sensor_status, row.quality_status,
                 row.ge_prod_kwh, row.conso_specifique_moy_l_kwh,
                 row.cph_runtime_availability_pct, row.cph_runtime_source,
@@ -779,7 +783,7 @@ class FuelConsommationExportAnomaliesView(APIView):
             month = latest or ""
 
         file_ge_site_ids = _file_ge_site_ids()
-        _effective_ge_q = Q(has_genset=True) | Q(site_id__in=file_ge_site_ids)
+        effective_ge_q = _effective_ge_q(file_ge_site_ids)
 
         anomalie_q = (
             Q(rapprochement_statut__in=["A_JUSTIFIER", "A_INVESTIGUER"])
@@ -788,7 +792,7 @@ class FuelConsommationExportAnomaliesView(APIView):
         qs = (
             FuelConsommationMonthly.objects
             .filter(month_year=month)
-            .filter(_effective_ge_q)
+            .filter(effective_ge_q)
             .filter(anomalie_q)
             .order_by("rapprochement_statut", "site_id")
         )
