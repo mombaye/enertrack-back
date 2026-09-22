@@ -10,4 +10,9 @@ data_imports/*
 !data_imports/synthese_conso_fuel_juillet_2026.xlsb
 !data_imports/commande_fuel_aout_2026.xlsb
 !data_imports/esco_facturation_sept26.xlsx
+# Fichiers Stan mensuels — déposés sur le serveur dans data_imports/stan/,
+# non commités (trop lourds + données opérationnelles confidentielles).
+!data_imports/stan/
+data_imports/stan/*.xlsx
+data_imports/stan/*.xlsb
 celerybeat-schedule

@@ -38,6 +38,8 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    volumes:
+      - ./data_imports:/code/data_imports
     depends_on:
       db:
         condition: service_healthy
@@ -53,6 +55,8 @@ services:
       sh -c "celery -A enertrack_backend worker --loglevel=info"
     env_file:
       - .env
+    volumes:
+      - ./data_imports:/code/data_imports
     depends_on:
       db:
         condition: service_healthy

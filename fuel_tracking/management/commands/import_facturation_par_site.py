@@ -20,15 +20,24 @@ Ne touche PAS à typology_fichier/typo_simple_fichier/site_type_fichier/
 type_ge_fichier (Base GE.xlsx) ni conso_estimee_aout26_l/ge_runtime_aout26_h
 (Base août 26) — uniquement les 3 champs ci-dessus.
 
-Usage:
-    docker compose exec web python manage.py import_facturation_par_site --file=data_imports/esco_facturation_sept26.xlsx --month=2026-09 --dry-run
-    docker compose exec web python manage.py import_facturation_par_site --file=data_imports/esco_facturation_sept26.xlsx --month=2026-09
+Usage (--file optionnel — auto-détection dans data_imports/stan/) :
+    # Copier le fichier Stan sur le serveur :
+    #   cp "ESCO SN _ base oct 26 validé-GE.xlsx" /srv/enertrack-back/data_imports/stan/
+    # Lancer l'import (sans --file = prend le .xlsx le plus récent du dossier) :
+    docker compose exec web python manage.py import_facturation_par_site --month=2026-10 --dry-run
+    docker compose exec web python manage.py import_facturation_par_site --month=2026-10
+    # Ou chemin explicite :
+    docker compose exec web python manage.py import_facturation_par_site --file=data_imports/stan/esco_oct26.xlsx --month=2026-10
 """
 import openpyxl
-from django.core.management.base import BaseCommand
+from pathlib import Path
+from django.conf import settings
+from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 
 from fuel_tracking.models import FuelConsommationMonthly
+
+STAN_DIR = Path(settings.BASE_DIR) / "data_imports" / "stan"
 
 SHEET_NAME = "Facturation par site"
 HEADER_ROW = 7
@@ -47,12 +56,41 @@ class Command(BaseCommand):
     help = 'Importe "ESCO SN _ base <mois> validé-GE.xlsx" (Facturation par site) — Statut Facturation/Facturation avec GE/Configuration.'
 
     def add_arguments(self, parser):
-        parser.add_argument("--file", required=True)
+        parser.add_argument(
+            "--file",
+            required=False,
+            default=None,
+            help="Chemin vers le fichier Stan. Si absent, prend le .xlsx le plus récent dans data_imports/stan/.",
+        )
         parser.add_argument("--month", required=True, help="YYYY-MM")
         parser.add_argument("--dry-run", action="store_true")
 
+    def _resolve_file(self, file_arg: str | None) -> Path:
+        if file_arg:
+            p = Path(file_arg)
+            if not p.is_absolute():
+                p = Path(settings.BASE_DIR) / p
+            return p
+        # Auto-détection : dernier .xlsx dans data_imports/stan/
+        if not STAN_DIR.exists():
+            raise CommandError(
+                f"Dossier Stan introuvable : {STAN_DIR}\n"
+                "Créez data_imports/stan/ et déposez-y le fichier ESCO SN."
+            )
+        candidates = sorted(STAN_DIR.glob("*.xlsx"), key=lambda f: f.stat().st_mtime, reverse=True)
+        if not candidates:
+            raise CommandError(
+                f"Aucun fichier .xlsx dans {STAN_DIR}.\n"
+                "Copiez le fichier ESCO SN _ base <mois> validé-GE.xlsx dans ce dossier."
+            )
+        chosen = candidates[0]
+        self.stdout.write(f"  Auto-détection : {chosen.name}")
+        if len(candidates) > 1:
+            self.stdout.write(f"  (autres fichiers ignorés : {', '.join(f.name for f in candidates[1:])})")
+        return chosen
+
     def handle(self, *args, **options):
-        path = options["file"]
+        path = self._resolve_file(options["file"])
         month_str = options["month"]
         dry_run = options["dry_run"]
         year, month = (int(x) for x in month_str.split("-"))
