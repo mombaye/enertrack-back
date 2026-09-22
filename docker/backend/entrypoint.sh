@@ -27,6 +27,9 @@ python manage.py migrate --no-input
 echo "Collecte des fichiers statiques..."
 python manage.py collectstatic --no-input
 
+echo "Import auto fichier Stan (data_imports/stan/)..."
+python manage.py auto_import_stan
+
 echo "Démarrage de Gunicorn..."
 exec gunicorn enertrack_backend.wsgi:application \
     --bind 0.0.0.0:8000 \
