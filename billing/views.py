@@ -736,6 +736,133 @@ class ImportBatchViewSet(viewsets.GenericViewSet, mixins.ListModelMixin):
         )
 
 
+    @action(methods=["post"], detail=False, url_path="import-payment-status")
+    def import_payment_status(self, request, *args, **kwargs):
+        """
+        Import simple du statut de paiement par numéro de facture.
+
+        Body (multipart/form-data) :
+          - file : fichier Excel (.xlsx/.xls) ou CSV
+                  Colonnes : "Numero de facture" (obligatoire), "Statut Paiement" (optionnel)
+
+        Mapping Statut Paiement → payment_status :
+          PAID / payé / payée / oui / yes → PAID
+          OUT_OF_SCOPE / hors scope / annulé / n/a → OUT_OF_SCOPE
+          (vide ou absent) → UNPAID (défaut)
+
+        Retour synchrone : { updated, not_found, total_rows, col_facture, col_statut, rows }
+        """
+        import io
+        import csv
+        import openpyxl
+        from django.utils import timezone
+        from .models import SonatelInvoice
+
+        f = request.FILES.get("file")
+        if not f:
+            return Response({"detail": "Aucun fichier fourni"}, status=400)
+
+        content = f.read()
+        filename = f.name.lower()
+
+        rows_data: list[dict] = []
+        try:
+            if filename.endswith(".csv"):
+                reader = csv.DictReader(io.StringIO(content.decode("utf-8-sig")))
+                for row in reader:
+                    rows_data.append(dict(row))
+            else:
+                wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+                ws = wb.active
+                headers: list[str] = []
+                for i, row in enumerate(ws.iter_rows(values_only=True)):
+                    if i == 0:
+                        headers = [str(c).strip() if c is not None else "" for c in row]
+                    else:
+                        if all(c is None for c in row):
+                            continue
+                        rows_data.append(dict(zip(headers, row)))
+                wb.close()
+        except Exception as exc:
+            return Response({"detail": f"Erreur lecture fichier : {exc}"}, status=400)
+
+        if not rows_data:
+            return Response({"detail": "Fichier vide ou non lisible"}, status=400)
+
+        headers_found = list(rows_data[0].keys())
+
+        def _find_col(candidates: list[str], available: list[str]) -> str | None:
+            for c in candidates:
+                for h in available:
+                    if h.strip().lower() == c.lower():
+                        return h
+            return None
+
+        col_facture = _find_col(
+            ["Numero de facture", "Numéro de facture", "numero_facture", "num_facture", "facture"],
+            headers_found,
+        )
+        col_statut = _find_col(
+            ["Statut Paiement", "Statut paiement", "statut_paiement", "payment_status", "statut"],
+            headers_found,
+        )
+
+        if not col_facture:
+            return Response(
+                {
+                    "detail": "Colonne 'Numero de facture' introuvable dans le fichier.",
+                    "columns_found": headers_found,
+                },
+                status=400,
+            )
+
+        def _parse_status(raw) -> str:
+            if raw is None or str(raw).strip() == "":
+                return "UNPAID"
+            s = str(raw).strip().upper()
+            if s in ("PAID", "PAYÉ", "PAYE", "PAYÉE", "PAYEE", "OUI", "YES"):
+                return "PAID"
+            if s in ("OUT_OF_SCOPE", "HORS SCOPE", "ANNULÉ", "ANNULE", "ANNULÉE", "ANNULEE", "N/A", "NA"):
+                return "OUT_OF_SCOPE"
+            return "UNPAID"
+
+        updated = 0
+        not_found = 0
+        result_rows: list[dict] = []
+        now = timezone.now()
+
+        for r in rows_data:
+            num_facture = r.get(col_facture)
+            if num_facture is None or str(num_facture).strip() == "":
+                continue
+            num_facture = str(num_facture).strip()
+            raw_statut = r.get(col_statut) if col_statut else None
+            payment_status = _parse_status(raw_statut)
+
+            count = SonatelInvoice.objects.filter(numero_facture=num_facture).update(
+                payment_status=payment_status,
+                payment_status_updated_at=now,
+            )
+
+            if count > 0:
+                updated += count
+                result_rows.append({"numero_facture": num_facture, "payment_status": payment_status, "action": "updated"})
+            else:
+                not_found += 1
+                result_rows.append({"numero_facture": num_facture, "payment_status": payment_status, "action": "not_found"})
+
+        return Response(
+            {
+                "updated": updated,
+                "not_found": not_found,
+                "total_rows": len(result_rows),
+                "col_facture": col_facture,
+                "col_statut": col_statut,
+                "default_when_missing": "UNPAID",
+                "rows": result_rows[:200],
+            }
+        )
+
     @action(methods=["get"], detail=True, url_path="task-status")
     def task_status(self, request, pk=None):
         """
