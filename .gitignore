@@ -15,4 +15,8 @@ data_imports/*
 !data_imports/stan/
 data_imports/stan/*.xlsx
 data_imports/stan/*.xlsb
+# Liste des sites GRID — dossier dev avec un CSV de test commité.
+# En prod le vrai fichier est à /mnt/ESCO/… (GRID_SITES_LIST_DIR dans .env).
+!data_imports/grid_sites/
+!data_imports/grid_sites/Listes_Sites_GRID_sample.csv
 celerybeat-schedule

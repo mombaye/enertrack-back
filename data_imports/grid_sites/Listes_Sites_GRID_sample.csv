@@ -1,0 +1,11 @@
+Site ID,Nom Site,Région,Département,Commune,Longitude,Latitude,Typologie,Statut GRID,Puissance kVA,Numéro Contrat,Date Mise en Service,Opérateur ESCO,Commentaire
+SEN001,Dakar Nord,Dakar,Dakar,Plateau,−17.4439,14.6928,Urban Macro,Actif,50,CTR-2021-001,2021-03-15,CAMUSAT,
+SEN002,Rufisque Est,Dakar,Rufisque,Rufisque,−17.2720,14.7153,Urban Macro,Actif,30,CTR-2021-002,2021-04-01,CAMUSAT,
+SEN003,Thiès Centre,Thiès,Thiès,Thiès,−16.9245,14.7886,Urban Macro,Actif,50,CTR-2020-015,2020-11-10,CAMUSAT,
+SEN004,Mbour,Thiès,Mbour,Mbour,−16.9659,14.3680,Urban Macro,Actif,30,CTR-2020-018,2020-12-05,CAMUSAT,
+SEN005,Saint-Louis,Saint-Louis,Saint-Louis,Saint-Louis,−16.5017,16.0244,Urban Macro,Actif,50,CTR-2021-009,2021-06-20,CAMUSAT,
+SEN006,Kaolack,Kaolack,Kaolack,Kaolack,−16.0726,14.1652,Urban Macro,Actif,30,CTR-2022-003,2022-01-15,CAMUSAT,
+SEN007,Ziguinchor,Ziguinchor,Ziguinchor,Ziguinchor,−16.2719,12.5681,Urban Macro,Actif,30,CTR-2022-007,2022-03-10,CAMUSAT,
+SEN008,Tambacounda,Tambacounda,Tambacounda,Tambacounda,−13.6773,13.7707,Urban Macro,Actif,30,CTR-2022-011,2022-05-18,CAMUSAT,
+SEN009,Kolda,Kolda,Kolda,Kolda,−14.9441,12.8986,Urban Macro,Actif,30,CTR-2023-002,2023-02-01,CAMUSAT,
+SEN010,Sédhiou,Sédhiou,Sédhiou,Sédhiou,−15.5570,12.7080,Rural Macro,Actif,20,CTR-2023-005,2023-04-12,CAMUSAT,Nouveau site
