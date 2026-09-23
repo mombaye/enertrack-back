@@ -234,6 +234,13 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'financial.sync_financial_conso_auto',
         'schedule': crontab(minute='*/30'),
     },
+    # Vérifie toutes les 15 min si un nouveau fichier Stan a été déposé dans
+    # data_imports/stan/ et l'importe automatiquement. Idempotent : pas de
+    # ré-import si le fichier n'a pas changé et tous les mois sont couverts.
+    'stan-auto-import-15min': {
+        'task': 'fuel_tracking.auto_import_stan_periodic',
+        'schedule': crontab(minute='*/15'),
+    },
 }
 
 # Cache Redis (DB 1, distincte du broker Celery en DB 0) — utilisé notamment pour

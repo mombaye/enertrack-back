@@ -92,3 +92,18 @@ def sync_fuel_stock_current(self):
         call_command("sync_fuel_stock")
     except Exception:
         logger.exception("[fuel_tracking] Échec sync_fuel_stock planifiée")
+
+
+@shared_task(bind=True, name="fuel_tracking.auto_import_stan_periodic")
+def auto_import_stan_periodic(self):
+    """Détecte un nouveau fichier Stan dans data_imports/stan/ et l'importe.
+
+    La commande est idempotente : même fichier + mois déjà couverts → skip immédiat.
+    Nouveau fichier → import de tous les mois ; même fichier + mois manquants → backfill.
+    """
+    from django.core.management import call_command
+
+    try:
+        call_command("auto_import_stan")
+    except Exception:
+        logger.exception("[fuel_tracking] Échec auto_import_stan planifiée")
