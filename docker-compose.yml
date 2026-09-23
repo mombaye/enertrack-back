@@ -38,8 +38,14 @@ services:
       - "8000:8000"
     env_file:
       - .env
+    environment:
+      # Monte le répertoire ESCO dans le container et y pointe la variable.
+      # Prérequis local : le partage réseau doit être monté sur la machine hôte
+      # (Mac) au même chemin /mnt/ESCO/... pour que le volume bind fonctionne.
+      GRID_SITES_LIST_DIR: "/mnt/ESCO/Energie Desk/GRID/Listes Sites"
     volumes:
       - ./data_imports:/code/data_imports
+      - "/mnt/ESCO/Energie Desk/GRID/Listes Sites:/mnt/ESCO/Energie Desk/GRID/Listes Sites:ro"
     depends_on:
       db:
         condition: service_healthy
