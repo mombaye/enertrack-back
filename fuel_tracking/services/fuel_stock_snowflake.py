@@ -50,14 +50,16 @@ def _connect():
     return snowflake.connector.connect(**kwargs)
 
 
-def fetch_stock_snapshot() -> dict[str, dict]:
+def fetch_stock_snapshot(as_of_date: date | None = None) -> dict[str, dict]:
     """
-    Retourne {site_id: {site_name, country, typology, site_type, dg_count,
-    power_supply, has_genset, stock_snowflake_l, capacity_snowflake_l,
-    stock_snowflake_date, quality_status}} — une entrée pour CHAQUE site du
-    périmètre (Sénégal), même sans relevé récent.
+    Retourne {site_id: {...}} — une entrée pour CHAQUE site du périmètre
+    (Sénégal), même sans relevé récent.
+
+    as_of_date : date de référence pour la fenêtre glissante (défaut = aujourd'hui).
+                 Passer la fin d'un mois pour obtenir un snapshot mensuel archivé.
     """
-    d_start = date.today() - timedelta(days=WINDOW_DAYS)
+    ref_date = as_of_date or date.today()
+    d_start = ref_date - timedelta(days=WINDOW_DAYS)
 
     conn = _connect()
     try:
@@ -81,7 +83,7 @@ def fetch_stock_snapshot() -> dict[str, dict]:
                     SITE_ID, DATE, LAST_VALID_LEVEL, CAPACITY_L, QUALITY_STATUS,
                     ROW_NUMBER() OVER (PARTITION BY SITE_ID ORDER BY DATE DESC) AS rn
                 FROM {report_schema}.VW_FUEL_REPORT
-                WHERE COUNTRY = %(country)s AND DATE >= %(d_start)s
+                WHERE COUNTRY = %(country)s AND DATE >= %(d_start)s AND DATE <= %(d_end)s
                   AND LAST_VALID_LEVEL IS NOT NULL AND CAPACITY_L IS NOT NULL AND CAPACITY_L > 0
             )
             SELECT
@@ -89,7 +91,7 @@ def fetch_stock_snapshot() -> dict[str, dict]:
                 l.DATE, l.LAST_VALID_LEVEL, l.CAPACITY_L, l.QUALITY_STATUS
             FROM site_dim s
             LEFT JOIN latest l ON l.SITE_ID = s.SITE_ID AND l.rn = 1
-        """, {"country": COUNTRY_SCOPE, "d_start": d_start})
+        """, {"country": COUNTRY_SCOPE, "d_start": d_start, "d_end": ref_date})
 
         result: dict[str, dict] = {}
         for (site_id, site_name, country, typology, site_type, dg_count, power_supply,

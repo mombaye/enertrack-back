@@ -15,6 +15,7 @@ Usage:
     python manage.py sync_fuel_consommation --from-month 2026-01 --to-month 2026-07
     python manage.py sync_fuel_consommation --month 2026-07 --dry-run
 """
+from django.core.management import call_command
 from django.core.management.base import BaseCommand
 from django.db import transaction
 from django.db.models import Count, Sum
@@ -250,6 +251,15 @@ class Command(BaseCommand):
             self.stdout.write(self.style.SUCCESS(f"  {created} créée(s), {updated} mise(s) à jour."))
             total_created += created
             total_updated += updated
+
+            # Sync snapshot mensuel pour le rapprochement (stock fin de mois M et M-1).
+            try:
+                call_command("sync_fuel_stock", month=f"{year}-{mo:02d}")
+                self.stdout.write(f"  Stock mensuel {year}-{mo:02d} synchronisé.")
+            except Exception as e:
+                self.stdout.write(self.style.WARNING(
+                    f"  Sync stock mensuel échoué ({e}) — rapprochement utilisera snapshot courant."
+                ))
 
             # Rapprochement stock — calculé immédiatement après la sync conso
             # (ENOC et stock snapshot doivent être à jour au préalable).

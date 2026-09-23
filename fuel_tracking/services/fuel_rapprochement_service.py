@@ -113,10 +113,10 @@ def run_rapprochement_for_month(year: int, month: int, site_ids: list[str] | Non
     (ou seulement `site_ids`) et met à jour FuelConsommationMonthly en place.
     Retourne le nombre de lignes mises à jour.
 
-    Stock de référence = FuelStockSnapshot.stock_snowflake_l (snapshot courant).
-    En l'absence d'un modèle mensuel de snapshot, le même snapshot sert pour
-    stock_initial et stock_final — c'est une approximation documentée dans
-    rapprochement_motif lorsque stock_initial_l == stock_final_l.
+    Priorité des snapshots :
+      - stock_initial : snapshot mensuel fin-de-mois M-1 (snapshot_year=prev_year, snapshot_month=prev_month)
+      - stock_final   : snapshot mensuel fin-de-mois M (snapshot_year=year, snapshot_month=month)
+      - Fallback      : snapshot courant (snapshot_year IS NULL) si le mensuel est absent.
     """
     from fuel_tracking.models import (
         FuelConsommationMonthly,
@@ -132,21 +132,46 @@ def run_rapprochement_for_month(year: int, month: int, site_ids: list[str] | Non
         seuil_ok = _DEFAULT_SEUIL_OK_PCT
         seuil_aj = _DEFAULT_SEUIL_AJ_PCT
 
+    prev_year = year if month > 1 else year - 1
+    prev_month = month - 1 if month > 1 else 12
+
     month_year = f"{year:04d}-{month:02d}"
     qs = FuelConsommationMonthly.objects.filter(month_year=month_year)
     if site_ids:
         qs = qs.filter(site_id__in=site_ids)
 
     site_id_list = list(qs.values_list("site_id", flat=True))
-    stock_by_site = {
+
+    monthly_initial = {
         s.site_id: s
-        for s in FuelStockSnapshot.objects.filter(site_id__in=site_id_list)
+        for s in FuelStockSnapshot.objects.filter(
+            site_id__in=site_id_list,
+            snapshot_year=prev_year,
+            snapshot_month=prev_month,
+        )
+    }
+    monthly_final = {
+        s.site_id: s
+        for s in FuelStockSnapshot.objects.filter(
+            site_id__in=site_id_list,
+            snapshot_year=year,
+            snapshot_month=month,
+        )
+    }
+    current_by_site = {
+        s.site_id: s
+        for s in FuelStockSnapshot.objects.filter(
+            site_id__in=site_id_list,
+            snapshot_year__isnull=True,
+        )
     }
 
     to_update = []
     for row in qs.select_related().iterator(chunk_size=500):
-        snap = stock_by_site.get(row.site_id)
-        stock_l = snap.stock_snowflake_l if (snap and snap.stock_snowflake_l is not None) else None
+        initial_snap = monthly_initial.get(row.site_id) or current_by_site.get(row.site_id)
+        final_snap = monthly_final.get(row.site_id) or current_by_site.get(row.site_id)
+        stock_initial_l = initial_snap.stock_snowflake_l if (initial_snap and initial_snap.stock_snowflake_l is not None) else None
+        stock_final_l = final_snap.stock_snowflake_l if (final_snap and final_snap.stock_snowflake_l is not None) else None
 
         livraisons = Decimal(str(row.enoc_qte_ajoutee_l or 0))
         conso_ref = (
@@ -158,8 +183,8 @@ def run_rapprochement_for_month(year: int, month: int, site_ids: list[str] | Non
             conso_ref = Decimal(str(conso_ref))
 
         result = compute_rapprochement(
-            stock_initial_l=stock_l,
-            stock_final_l=stock_l,
+            stock_initial_l=stock_initial_l,
+            stock_final_l=stock_final_l,
             livraisons_l=livraisons,
             conso_reference_l=conso_ref,
             seuil_ok_pct=seuil_ok,

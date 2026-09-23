@@ -1,18 +1,22 @@
 # fuel_tracking/management/commands/sync_fuel_stock.py
 """
-Synchronise le Stock carburant ACTUEL par site (FuelStockSnapshot) — jointure
+Synchronise le Stock carburant par site (FuelStockSnapshot) — jointure
 Snowflake (VW_FUEL_REPORT, dernier relevé physiquement valide par site sur
 30 jours) + ENOC (fuel_level_readings, dernier relevé). Voir
 fuel_tracking/models.py::FuelStockSnapshot pour le détail des sources.
 
-Contrairement à sync_fuel_consommation (mensuel, --month/--from-month/--to-month),
-le stock n'a pas de notion de mois : chaque exécution remplace entièrement
-l'état courant (upsert par site_id).
+Mode courant (défaut) : remplace l'état courant (snapshot_year=NULL) par site.
+Mode mensuel (--month YYYY-MM) : archive un snapshot fin-de-mois (snapshot_year/month)
+  utilisé par le rapprochement comme stock_initial (M-1) et stock_final (M).
 
 Usage:
     python manage.py sync_fuel_stock
+    python manage.py sync_fuel_stock --month 2026-08
     python manage.py sync_fuel_stock --dry-run
 """
+import calendar
+from datetime import date
+
 from django.core.management.base import BaseCommand
 from django.db import transaction
 from django.utils import timezone
@@ -26,14 +30,30 @@ class Command(BaseCommand):
     help = "Synchronise le Stock carburant actuel (Snowflake + ENOC)"
 
     def add_arguments(self, parser):
+        parser.add_argument("--month", type=str, default=None, help="YYYY-MM — archive un snapshot fin-de-mois.")
         parser.add_argument("--dry-run", action="store_true")
 
     def handle(self, *args, **options):
         dry_run = options["dry_run"]
+        month_str = options.get("month")
+
+        # Mode mensuel : snapshot archivé au dernier jour du mois demandé.
+        snapshot_year: int | None = None
+        snapshot_month: int | None = None
+        as_of_date: date | None = None
+        if month_str:
+            y, m = int(month_str[:4]), int(month_str[5:7])
+            last_day = calendar.monthrange(y, m)[1]
+            as_of_date = date(y, m, last_day)
+            snapshot_year, snapshot_month = y, m
 
         self.stdout.write("\n" + "═" * 80)
         self.stdout.write("  SYNC STOCK CARBURANT (Snowflake + ENOC) → EnerTrack")
         self.stdout.write("═" * 80)
+        if snapshot_year:
+            self.stdout.write(f"  Mode       : mensuel ({month_str}, as_of={as_of_date})")
+        else:
+            self.stdout.write("  Mode       : courant")
         self.stdout.write(f"  Dry run : {dry_run}\n")
 
         sync_run = None
@@ -51,7 +71,7 @@ class Command(BaseCommand):
                 genset_ref_enoc = {}
 
             self.stdout.write("  Requête Snowflake (VW_FUEL_REPORT, dernier relevé/site sur 30j)...")
-            snowflake_data = fetch_stock_snapshot()
+            snowflake_data = fetch_stock_snapshot(as_of_date=as_of_date)
             nb_avec_stock = sum(1 for v in snowflake_data.values() if v["stock_snowflake_l"] is not None)
             self.stdout.write(f"  {len(snowflake_data)} site(s) Snowflake, {nb_avec_stock} avec un relevé de stock.")
 
@@ -90,6 +110,8 @@ class Command(BaseCommand):
 
                 objects.append(FuelStockSnapshot(
                     site_id=site_id,
+                    snapshot_year=snapshot_year,
+                    snapshot_month=snapshot_month,
                     site_name=sf.get("site_name"),
                     country=sf.get("country"),
                     typology=sf.get("typology"),
@@ -119,7 +141,23 @@ class Command(BaseCommand):
                 self.stdout.write(self.style.WARNING(f"\n  DRY RUN — {len(objects)} ligne(s), rien écrit.\n"))
                 return
 
-            existing_keys = set(FuelStockSnapshot.objects.values_list("site_id", flat=True))
+            if snapshot_year:
+                # Mode mensuel : unique par (site_id, snapshot_year, snapshot_month)
+                existing_keys = set(
+                    FuelStockSnapshot.objects.filter(
+                        snapshot_year=snapshot_year, snapshot_month=snapshot_month,
+                    ).values_list("site_id", flat=True)
+                )
+                bulk_unique_fields = ["site_id", "snapshot_year", "snapshot_month"]
+            else:
+                # Mode courant : unique par site_id (snapshot_year IS NULL)
+                existing_keys = set(
+                    FuelStockSnapshot.objects.filter(
+                        snapshot_year__isnull=True,
+                    ).values_list("site_id", flat=True)
+                )
+                bulk_unique_fields = ["site_id"]
+
             created = sum(1 for o in objects if o.site_id not in existing_keys)
             updated = len(objects) - created
 
@@ -128,7 +166,7 @@ class Command(BaseCommand):
                     objects,
                     batch_size=1000,
                     update_conflicts=True,
-                    unique_fields=["site_id"],
+                    unique_fields=bulk_unique_fields,
                     update_fields=[
                         "site_name", "country", "typology", "site_type", "dg_count", "power_supply",
                         "has_genset_snowflake", "has_genset_enoc", "nb_ge_enoc", "has_genset",
@@ -138,12 +176,16 @@ class Command(BaseCommand):
                     ],
                 )
 
-            # Sites disparus du périmètre (plus GE ni côté Snowflake ni ENOC) —
-            # supprimés pour ne pas laisser un stock obsolète affiché.
-            stale = FuelStockSnapshot.objects.exclude(site_id__in=all_site_ids)
-            nb_stale = stale.count()
-            if nb_stale:
-                stale.delete()
+            # Mode courant seulement : supprimer les sites hors périmètre.
+            # Ne jamais supprimer les snapshots mensuels historiques.
+            nb_stale = 0
+            if not snapshot_year:
+                stale = FuelStockSnapshot.objects.filter(
+                    snapshot_year__isnull=True,
+                ).exclude(site_id__in=all_site_ids)
+                nb_stale = stale.count()
+                if nb_stale:
+                    stale.delete()
 
             self.stdout.write(self.style.SUCCESS(f"\n  Terminé — {created} créée(s), {updated} mise(s) à jour"
                                                    f"{f', {nb_stale} supprimée(s) (hors périmètre)' if nb_stale else ''}.\n"))

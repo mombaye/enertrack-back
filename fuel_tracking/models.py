@@ -1,4 +1,5 @@
 from django.db import models
+from django.db.models import Q
 from django.utils import timezone
 
 
@@ -853,9 +854,15 @@ class FuelStockSnapshot(models.Model):
         (level_liters=0 + level_cm=None écarté comme valeur par défaut).
     """
 
-    site_id = models.CharField(max_length=64, unique=True, db_index=True)
+    site_id = models.CharField(max_length=64, db_index=True)
     site_name = models.CharField(max_length=255, null=True, blank=True)
     country = models.CharField(max_length=64, null=True, blank=True, db_index=True)
+
+    # NULL = snapshot courant (remplacé à chaque sync) ; valeur = snapshot mensuel archivé.
+    snapshot_year = models.IntegerField(null=True, blank=True, db_index=True,
+        help_text="NULL = snapshot courant ; valeur = snapshot mensuel (année).")
+    snapshot_month = models.IntegerField(null=True, blank=True,
+        help_text="NULL = snapshot courant ; valeur = snapshot mensuel (mois 1-12).")
 
     typology = models.CharField(max_length=64, null=True, blank=True)
     site_type = models.CharField(max_length=64, null=True, blank=True)
@@ -885,6 +892,18 @@ class FuelStockSnapshot(models.Model):
         verbose_name = "Stock carburant (automatisé)"
         verbose_name_plural = "Stocks carburant (automatisés)"
         ordering = ["site_id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["site_id"],
+                condition=Q(snapshot_year__isnull=True),
+                name="fuel_stock_snapshot_current_uniq",
+            ),
+            models.UniqueConstraint(
+                fields=["site_id", "snapshot_year", "snapshot_month"],
+                condition=Q(snapshot_year__isnull=False),
+                name="fuel_stock_snapshot_monthly_uniq",
+            ),
+        ]
         indexes = [
             models.Index(fields=["has_genset"]),
         ]
@@ -1082,6 +1101,20 @@ class FuelCphGeDaily(models.Model):
     conso_estimee_source = models.CharField(max_length=32, null=True, blank=True, help_text="Méthode d'intégration énergie ayant produit estimated_consumption_l : CPH_TRACKER_5MIN (intégration 5 min) ou CPH_GENSET_DAILY_AVG (load_kw × runtime_h, jours sans intervalle tracker). None si aucun litre calculé ce jour.")
 
     calculation_status = models.CharField(max_length=48, choices=Status.choices, db_index=True)
+
+    # Données brutes DSE — GENSET_REPORT (Snowflake, lecture seule)
+    controller_fuel_level_start = models.DecimalField(
+        max_digits=12, decimal_places=3, null=True, blank=True,
+        help_text="GENSET_REPORT.FUEL_LEVEL_START — niveau cuve début journée (brut DSE).",
+    )
+    controller_fuel_level_end = models.DecimalField(
+        max_digits=12, decimal_places=3, null=True, blank=True,
+        help_text="GENSET_REPORT.FUEL_LEVEL_END — niveau cuve fin journée (brut DSE).",
+    )
+    controller_fuel_consumed = models.DecimalField(
+        max_digits=12, decimal_places=3, null=True, blank=True,
+        help_text="GENSET_REPORT.FUEL_CONSUMED — consommation fuel journée (brut DSE).",
+    )
 
     synced_at = models.DateTimeField(default=timezone.now)
 

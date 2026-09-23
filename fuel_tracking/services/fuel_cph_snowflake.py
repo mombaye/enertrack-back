@@ -472,7 +472,15 @@ def fetch_daily_tracker_energy(year: int, month: int, site_ids: list[str] | None
                     -- corrompue ne soit jamais stockée, même rejetée.
                     CASE WHEN g.DG_RUNTIME_CONTROLLER BETWEEN 0 AND 24 THEN g.DG_RUNTIME_CONTROLLER END AS dse_h,
                     CASE WHEN g.DG_RUNTIME_CALCULATED BETWEEN 0 AND 24 THEN g.DG_RUNTIME_CALCULATED END AS dg_on_h,
-                    l.LOAD_AVG / 1000.0 AS load_kw
+                    l.LOAD_AVG / 1000.0 AS load_kw,
+                    -- Colonnes fuel DSE (FUEL_LEVEL_START/END/CONSUMED) — présentes
+                    -- dans GENSET_REPORT mais jusqu'ici non récupérées. Stockées
+                    -- telles quelles (brut DSE) dans controller_fuel_* pour audit et
+                    -- croisement avec VW_FUEL_REPORT. Valeurs négatives = corrompues,
+                    -- nullifiées à la source.
+                    CASE WHEN g.FUEL_LEVEL_START >= 0 THEN CAST(g.FUEL_LEVEL_START AS DECIMAL(12,3)) END AS fuel_level_start,
+                    CASE WHEN g.FUEL_LEVEL_END >= 0 THEN CAST(g.FUEL_LEVEL_END AS DECIMAL(12,3)) END AS fuel_level_end,
+                    CASE WHEN g.FUEL_CONSUMED >= 0 THEN CAST(g.FUEL_CONSUMED AS DECIMAL(12,3)) END AS fuel_consumed
                 FROM {genset_schema}.GENSET_REPORT g
                 LEFT JOIN {genset_schema}.LOAD_REPORT l
                     ON l.ID = g.DATA_ID AND l.DATE = g.REPORT_DATE
@@ -498,7 +506,8 @@ def fetch_daily_tracker_energy(year: int, month: int, site_ids: list[str] | None
                 d.ge_intervals, d.valid_battery_intervals,
                 d.dg_runtime_interval_h, d.site_load_energy_kwh, d.battery_dc_energy_kwh,
                 gd.dse_h AS DG_RUNTIME_CONTROLLER, gd.dg_on_h AS DG_RUNTIME_CALCULATED, gd.load_kw,
-                r.runtime_h AS rectifier_runtime_h, h.is_hybrid_solar_ge
+                r.runtime_h AS rectifier_runtime_h, h.is_hybrid_solar_ge,
+                gd.fuel_level_start, gd.fuel_level_end, gd.fuel_consumed
             FROM day_universe u
             JOIN site_dim s ON s.DATA_ID = u.data_id
             LEFT JOIN daily_energy d ON d.data_id = u.data_id AND d.day = u.day
@@ -510,7 +519,8 @@ def fetch_daily_tracker_energy(year: int, month: int, site_ids: list[str] | None
         result: dict[str, dict[date, dict]] = {}
         for (site_id, country, data_id, day, ge_intervals, valid_battery_intervals,
              dg_runtime_interval_h, site_load_energy_kwh, battery_dc_energy_kwh,
-             dse_h, dg_on_h, load_kw, rectifier_h, is_hybrid_solar_ge) in cursor.fetchall():
+             dse_h, dg_on_h, load_kw, rectifier_h, is_hybrid_solar_ge,
+             fuel_level_start, fuel_level_end, fuel_consumed) in cursor.fetchall():
 
             dse_dec = Decimal(str(dse_h)) if dse_h is not None else None
             dg_on_dec = Decimal(str(dg_on_h)) if dg_on_h is not None else None
@@ -535,6 +545,9 @@ def fetch_daily_tracker_energy(year: int, month: int, site_ids: list[str] | None
                 "site_load_energy_kwh": Decimal(str(site_load_energy_kwh)) if site_load_energy_kwh is not None else None,
                 "battery_dc_energy_kwh": Decimal(str(battery_dc_energy_kwh)) if battery_dc_energy_kwh is not None else None,
                 "load_kw": load_kw_dec,
+                "controller_fuel_level_start": Decimal(str(fuel_level_start)) if fuel_level_start is not None else None,
+                "controller_fuel_level_end": Decimal(str(fuel_level_end)) if fuel_level_end is not None else None,
+                "controller_fuel_consumed": Decimal(str(fuel_consumed)) if fuel_consumed is not None else None,
             }
         return result
     finally:

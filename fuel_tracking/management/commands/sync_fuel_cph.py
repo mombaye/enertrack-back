@@ -30,7 +30,9 @@ DAILY_UPDATE_FIELDS = [
     "total_ge_energy_kwh", "average_ge_power_kw",
     "pge_kva", "power_factor", "spc_l_per_kwh",
     "cph_estimated_lph", "estimated_consumption_l", "ge_load_percent", "conso_estimee_source",
-    "calculation_status", "synced_at",
+    "calculation_status",
+    "controller_fuel_level_start", "controller_fuel_level_end", "controller_fuel_consumed",
+    "synced_at",
 ]
 
 MONTHLY_UPDATE_FIELDS = [
@@ -171,6 +173,9 @@ class Command(BaseCommand):
                     ge_load_percent=row["ge_load_percent"],
                     conso_estimee_source=row.get("conso_estimee_source"),
                     calculation_status=row["calculation_status"],
+                    controller_fuel_level_start=row.get("controller_fuel_level_start"),
+                    controller_fuel_level_end=row.get("controller_fuel_level_end"),
+                    controller_fuel_consumed=row.get("controller_fuel_consumed"),
                     synced_at=timezone.now(),
                 )
                 for row in daily_rows
