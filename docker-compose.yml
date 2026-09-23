@@ -39,13 +39,18 @@ services:
     env_file:
       - .env
     environment:
-      # Monte le répertoire ESCO dans le container et y pointe la variable.
-      # Prérequis local : le partage réseau doit être monté sur la machine hôte
-      # (Mac) au même chemin /mnt/ESCO/... pour que le volume bind fonctionne.
-      GRID_SITES_LIST_DIR: "/mnt/ESCO/Energie Desk/GRID/Listes Sites"
+      # Chemin DANS le container où la liste des sites GRID est accessible.
+      # Le volume ci-dessous mappe ESCO_HOST_PATH (défini dans .env) vers ce chemin.
+      # Valeur par défaut : dossier de dev avec CSV de test.
+      GRID_SITES_LIST_DIR: "/code/data_imports/grid_sites"
     volumes:
       - ./data_imports:/code/data_imports
-      - "/mnt/ESCO/Energie Desk/GRID/Listes Sites:/mnt/ESCO/Energie Desk/GRID/Listes Sites:ro"
+      # Monte le répertoire ESCO local vers /code/data_imports/grid_sites dans le container.
+      # Sur Mac : ajouter ESCO_HOST_PATH dans .env, ex :
+      #   ESCO_HOST_PATH=/Users/macbookair/esco_grid_sites
+      # Puis partager ce chemin dans Docker Desktop → Settings → Resources → File Sharing.
+      # Sans ESCO_HOST_PATH : fallback sur data_imports/grid_sites/ (CSV de test).
+      - "${ESCO_HOST_PATH:-./data_imports/grid_sites}:/code/data_imports/grid_sites:ro"
     depends_on:
       db:
         condition: service_healthy
