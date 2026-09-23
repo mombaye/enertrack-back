@@ -108,12 +108,11 @@ def _apply_scope_to_invoice_qs(qs, scope: str):
     if scope == "UNDEFINED":
         return qs.filter(Q(payment_status__isnull=True) | Q(payment_status=""))
 
-    # règle métier : Payée = Certifiée
+    # Certifiée = validée via le workflow certification de la plateforme (status=VALIDATED).
+    # Distinct de Payée (payment_status=PAID) : les deux champs sont indépendants —
+    # une facture peut être payée sans avoir été certifiée et vice versa.
     if scope == "CERTIFIED":
-        return qs.filter(
-            Q(payment_status=SonatelInvoice.PaymentStatus.PAID)
-            | Q(status=SonatelInvoice.Status.VALIDATED)
-        )
+        return qs.filter(status=SonatelInvoice.Status.VALIDATED)
 
     if scope == "CONTESTED":
         # "Contestée" = résultat de certification "À analyser" (NEEDS_REVIEW),
@@ -153,12 +152,9 @@ def _apply_scope_to_monthly_qs(qs, scope: str):
     if scope == "UNDEFINED":
         return qs.filter(Q(source__payment_status__isnull=True) | Q(source__payment_status=""))
 
-    # règle métier : Payée = Certifiée
+    # Certifiée = status=VALIDATED sur la facture source (indépendant du paiement).
     if scope == "CERTIFIED":
-        return qs.filter(
-            Q(source__payment_status=SonatelInvoice.PaymentStatus.PAID)
-            | Q(source__status=SonatelInvoice.Status.VALIDATED)
-        )
+        return qs.filter(source__status=SonatelInvoice.Status.VALIDATED)
 
     if scope == "CONTESTED":
         # Même règle que _apply_scope_to_invoice_qs, adaptée à MonthlySynthesis
@@ -1040,12 +1036,10 @@ class SonatelBillingStatsAPIView(APIView):
 
         # ------------------------------------------------------------------
         # Certification billing (globale sur la période, non filtrée par scope)
-        # règle : Payée = Certifiée
+        # Certifiée = status=VALIDATED (workflow certification plateforme).
+        # Distinct de Payée (payment_status=PAID) : champs indépendants.
         # ------------------------------------------------------------------
-        certified_filter = (
-            Q(payment_status=SonatelInvoice.PaymentStatus.PAID)
-            | Q(status=SonatelInvoice.Status.VALIDATED)
-        )
+        certified_filter = Q(status=SonatelInvoice.Status.VALIDATED)
         # "Contestée" = résultat de certification "À analyser" (NEEDS_REVIEW),
         # voir la même remarque Exists() que dans _apply_scope_to_invoice_qs.
         contested_filter = (
