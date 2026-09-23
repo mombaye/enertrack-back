@@ -473,14 +473,11 @@ def fetch_daily_tracker_energy(year: int, month: int, site_ids: list[str] | None
                     CASE WHEN g.DG_RUNTIME_CONTROLLER BETWEEN 0 AND 24 THEN g.DG_RUNTIME_CONTROLLER END AS dse_h,
                     CASE WHEN g.DG_RUNTIME_CALCULATED BETWEEN 0 AND 24 THEN g.DG_RUNTIME_CALCULATED END AS dg_on_h,
                     l.LOAD_AVG / 1000.0 AS load_kw,
-                    -- Colonnes fuel DSE (FUEL_LEVEL_START/END/CONSUMED) — présentes
-                    -- dans GENSET_REPORT mais jusqu'ici non récupérées. Stockées
-                    -- telles quelles (brut DSE) dans controller_fuel_* pour audit et
-                    -- croisement avec VW_FUEL_REPORT. Valeurs négatives = corrompues,
-                    -- nullifiées à la source.
-                    CASE WHEN g.FUEL_LEVEL_START >= 0 THEN CAST(g.FUEL_LEVEL_START AS DECIMAL(12,3)) END AS fuel_level_start,
-                    CASE WHEN g.FUEL_LEVEL_END >= 0 THEN CAST(g.FUEL_LEVEL_END AS DECIMAL(12,3)) END AS fuel_level_end,
-                    CASE WHEN g.FUEL_CONSUMED >= 0 THEN CAST(g.FUEL_CONSUMED AS DECIMAL(12,3)) END AS fuel_consumed
+                    -- FUEL_LEVEL_START/END/CONSUMED : non disponibles dans GENSET_REPORT
+                    -- en production (2026-09). Mis à NULL jusqu'à disponibilité côté Snowflake.
+                    NULL AS fuel_level_start,
+                    NULL AS fuel_level_end,
+                    NULL AS fuel_consumed
                 FROM {genset_schema}.GENSET_REPORT g
                 LEFT JOIN {genset_schema}.LOAD_REPORT l
                     ON l.ID = g.DATA_ID AND l.DATE = g.REPORT_DATE

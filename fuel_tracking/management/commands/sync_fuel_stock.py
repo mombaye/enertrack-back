@@ -144,54 +144,28 @@ class Command(BaseCommand):
                 self.stdout.write(self.style.WARNING(f"\n  DRY RUN — {len(objects)} ligne(s), rien écrit.\n"))
                 return
 
-            if snapshot_year:
-                # Mode mensuel : unique par (site_id, snapshot_year, snapshot_month)
-                existing_keys = set(
-                    FuelStockSnapshot.objects.filter(
-                        snapshot_year=snapshot_year, snapshot_month=snapshot_month,
-                    ).values_list("site_id", flat=True)
-                )
-                bulk_unique_fields = ["site_id", "snapshot_year", "snapshot_month"]
-            else:
-                # Mode courant : unique par site_id (snapshot_year IS NULL)
-                existing_keys = set(
-                    FuelStockSnapshot.objects.filter(
-                        snapshot_year__isnull=True,
-                    ).values_list("site_id", flat=True)
-                )
-                bulk_unique_fields = ["site_id"]
-
-            created = sum(1 for o in objects if o.site_id not in existing_keys)
-            updated = len(objects) - created
-
+            # Stratégie delete+create dans une transaction atomique :
+            # bulk_create(update_conflicts) requiert une contrainte simple sur les
+            # unique_fields, incompatible avec les contraintes partielles (WHERE clause)
+            # utilisées ici. Le delete+create dans une transaction est équivalent et
+            # fonctionne sans dépendance sur les noms de contraintes PostgreSQL.
             with transaction.atomic():
-                FuelStockSnapshot.objects.bulk_create(
-                    objects,
-                    batch_size=1000,
-                    update_conflicts=True,
-                    unique_fields=bulk_unique_fields,
-                    update_fields=[
-                        "site_name", "country", "typology", "site_type", "dg_count", "power_supply",
-                        "has_genset_snowflake", "has_genset_enoc", "nb_ge_enoc", "has_genset",
-                        "stock_snowflake_l", "capacity_snowflake_l", "stock_snowflake_pct",
-                        "stock_snowflake_date", "quality_status",
-                        "stock_enoc_l", "stock_enoc_date", "synced_at",
-                    ],
-                )
+                if snapshot_year:
+                    deleted, _ = FuelStockSnapshot.objects.filter(
+                        snapshot_year=snapshot_year, snapshot_month=snapshot_month,
+                    ).delete()
+                else:
+                    deleted, _ = FuelStockSnapshot.objects.filter(
+                        snapshot_year__isnull=True,
+                    ).delete()
 
-            # Mode courant seulement : supprimer les sites hors périmètre.
-            # Ne jamais supprimer les snapshots mensuels historiques.
+                FuelStockSnapshot.objects.bulk_create(objects, batch_size=1000)
+
+            created = len(objects)
+            updated = deleted
             nb_stale = 0
-            if not snapshot_year:
-                stale = FuelStockSnapshot.objects.filter(
-                    snapshot_year__isnull=True,
-                ).exclude(site_id__in=all_site_ids)
-                nb_stale = stale.count()
-                if nb_stale:
-                    stale.delete()
 
-            self.stdout.write(self.style.SUCCESS(f"\n  Terminé — {created} créée(s), {updated} mise(s) à jour"
-                                                   f"{f', {nb_stale} supprimée(s) (hors périmètre)' if nb_stale else ''}.\n"))
+            self.stdout.write(self.style.SUCCESS(f"\n  Terminé — {created} créée(s) ({updated} remplacée(s)).\n"))
 
             sync_run.sites_fetched = len(all_site_ids)
             sync_run.status = FuelStockSyncRun.Status.SUCCESS if all_site_ids else FuelStockSyncRun.Status.FAILED
