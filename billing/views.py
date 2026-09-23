@@ -2402,3 +2402,84 @@ class FNPSitesAPIView(APIView):
             },
             "rows": result_rows,
         })
+
+
+class GridSiteListAPIView(APIView):
+    """
+    GET /billing/grid-site-list/
+
+    Lit le fichier le plus récent (xlsx/xls/csv) dans le répertoire
+    settings.GRID_SITES_LIST_DIR et retourne son contenu sous forme de tableau.
+
+    Réponse :
+    {
+      "filename": "Listes Sites 2026-09.xlsx",
+      "total": 412,
+      "columns": ["Site ID", "Nom", ...],
+      "rows": [ ["SEN001", "Dakar Nord", ...], ... ]
+    }
+
+    Erreurs possibles :
+      404 — répertoire introuvable ou aucun fichier supporté dedans
+      500 — erreur de lecture du fichier
+    """
+    permission_classes = [IsAuthenticated]
+    _ROW_LIMIT = 10_000
+
+    def get(self, request):
+        import os
+        import math
+        from django.conf import settings
+
+        dir_path = getattr(settings, "GRID_SITES_LIST_DIR", "")
+        if not dir_path or not os.path.isdir(dir_path):
+            return Response(
+                {"detail": f"Répertoire introuvable : {dir_path!r}"},
+                status=404,
+            )
+
+        # Cherche le fichier supporté le plus récent (xlsx > xls > csv)
+        candidates = []
+        for name in os.listdir(dir_path):
+            lower = name.lower()
+            if lower.endswith((".xlsx", ".xls", ".csv")):
+                full = os.path.join(dir_path, name)
+                if os.path.isfile(full):
+                    candidates.append((os.path.getmtime(full), name, full))
+
+        if not candidates:
+            return Response(
+                {"detail": "Aucun fichier xlsx/xls/csv trouvé dans le répertoire."},
+                status=404,
+            )
+
+        candidates.sort(reverse=True)
+        _, filename, filepath = candidates[0]
+
+        try:
+            lower = filename.lower()
+            if lower.endswith(".csv"):
+                df = pd.read_csv(filepath, dtype=str, nrows=self._ROW_LIMIT)
+            else:
+                df = pd.read_excel(filepath, dtype=str, nrows=self._ROW_LIMIT)
+        except Exception as exc:
+            return Response(
+                {"detail": f"Erreur de lecture du fichier : {exc}"},
+                status=500,
+            )
+
+        # Normalise : NaN → None, garde les colonnes telles quelles
+        columns = list(df.columns)
+        rows = []
+        for record in df.itertuples(index=False, name=None):
+            rows.append([
+                None if (isinstance(v, float) and math.isnan(v)) else v
+                for v in record
+            ])
+
+        return Response({
+            "filename": filename,
+            "total": len(rows),
+            "columns": columns,
+            "rows": rows,
+        })

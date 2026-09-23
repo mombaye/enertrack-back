@@ -287,6 +287,13 @@ SNOWFLAKE_DATABASE  = os.environ.get("SNOWFLAKE_DATABASE", "DB_GFMS_ANALYTICS_PR
 SNOWFLAKE_SCHEMA    = os.environ.get("SNOWFLAKE_SCHEMA", "GOLD")
 
 ENOC_BASE_URL = os.getenv("ENOC_BASE_URL", "").rstrip("/")
+
+# Répertoire monté sur le serveur contenant la liste des sites GRID/ESCO.
+# Surcharger via l'env var GRID_SITES_LIST_DIR si le chemin diffère.
+GRID_SITES_LIST_DIR = os.environ.get(
+    "GRID_SITES_LIST_DIR",
+    "/mnt/ESCO/Energie Desk/GRID/Listes Sites",
+)
 ENOC_INTEGRATION_CLIENT_ID = os.getenv("ENOC_INTEGRATION_CLIENT_ID", "enertrack")
 ENOC_INTEGRATION_SHARED_SECRET = os.getenv("ENOC_INTEGRATION_SHARED_SECRET", "")
 
