@@ -1,3 +1,5 @@
+__pycache__/
+*.py[cod]
 ml/models/*.pkl
 .env
 .secrets/
