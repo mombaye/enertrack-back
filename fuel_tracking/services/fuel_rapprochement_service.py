@@ -27,6 +27,8 @@ ENOC_REEL = "ENOC_REEL"
 
 _DEFAULT_SEUIL_OK_PCT = Decimal("10.00")
 _DEFAULT_SEUIL_AJ_PCT = Decimal("20.00")
+_DEFAULT_SEUIL_OK_L = Decimal("100.00")
+_DEFAULT_SEUIL_AJ_L = Decimal("200.00")
 
 
 def compute_rapprochement(
@@ -41,6 +43,8 @@ def compute_rapprochement(
     conso_reference_l: Decimal | None,
     seuil_ok_pct: Decimal = _DEFAULT_SEUIL_OK_PCT,
     seuil_aj_pct: Decimal = _DEFAULT_SEUIL_AJ_PCT,
+    seuil_ok_l: Decimal = _DEFAULT_SEUIL_OK_L,
+    seuil_aj_l: Decimal = _DEFAULT_SEUIL_AJ_L,
 ) -> dict:
     """
     Retourne :
@@ -83,22 +87,39 @@ def compute_rapprochement(
     else:
         ecart_pct = None
 
+    abs_l = abs(ecart_l)
     abs_pct = abs(ecart_pct) if ecart_pct is not None else None
 
-    if abs_pct is None:
-        statut = "DONNEES_INCOMPLETES"
-        motif = "Conso de référence = 0 L — écart en % non calculable."
-    elif abs_pct <= seuil_ok_pct:
+    # Seuils effectifs = max(plancher absolu L, % de la conso de référence)
+    ref = conso_reference_l if conso_reference_l > Decimal("0") else Decimal("0")
+    effective_ok = max(seuil_ok_l, ref * seuil_ok_pct / Decimal("100"))
+    effective_aj = max(seuil_aj_l, ref * seuil_aj_pct / Decimal("100"))
+
+    if abs_l <= effective_ok:
         statut = "OK"
-        motif = f"Écart {float(ecart_pct):+.1f}% ≤ seuil OK ({float(seuil_ok_pct):.0f}%)."
-    elif abs_pct <= seuil_aj_pct:
+        if abs_pct is not None:
+            motif = (f"Écart {float(ecart_pct):+.1f}% ({float(ecart_l):+.0f} L) "
+                     f"≤ seuil OK (max {float(seuil_ok_l):.0f} L, {float(seuil_ok_pct):.0f}%).")
+        else:
+            motif = (f"Écart {float(ecart_l):+.0f} L ≤ seuil OK absolu ({float(seuil_ok_l):.0f} L) "
+                     f"— conso de référence = 0 L (% non calculable).")
+    elif abs_l <= effective_aj:
         statut = "A_JUSTIFIER"
-        motif = (f"Écart {float(ecart_pct):+.1f}% entre le seuil OK ({float(seuil_ok_pct):.0f}%) "
-                 f"et le seuil A_JUSTIFIER ({float(seuil_aj_pct):.0f}%) — justification requise.")
+        if abs_pct is not None:
+            motif = (f"Écart {float(ecart_pct):+.1f}% ({float(ecart_l):+.0f} L) entre seuil OK "
+                     f"(max {float(seuil_ok_l):.0f} L, {float(seuil_ok_pct):.0f}%) "
+                     f"et seuil A_JUSTIFIER (max {float(seuil_aj_l):.0f} L, {float(seuil_aj_pct):.0f}%) — justification requise.")
+        else:
+            motif = (f"Écart {float(ecart_l):+.0f} L dépasse le seuil OK absolu ({float(seuil_ok_l):.0f} L) "
+                     f"mais ≤ seuil A_JUSTIFIER ({float(seuil_aj_l):.0f} L) — justification requise.")
     else:
         statut = "A_INVESTIGUER"
-        motif = (f"Écart {float(ecart_pct):+.1f}% dépasse le seuil d'investigation "
-                 f"({float(seuil_aj_pct):.0f}%) — analyse approfondie requise.")
+        if abs_pct is not None:
+            motif = (f"Écart {float(ecart_pct):+.1f}% ({float(ecart_l):+.0f} L) dépasse le seuil d'investigation "
+                     f"(max {float(seuil_aj_l):.0f} L, {float(seuil_aj_pct):.0f}%) — analyse approfondie requise.")
+        else:
+            motif = (f"Écart {float(ecart_l):+.0f} L dépasse le seuil d'investigation absolu ({float(seuil_aj_l):.0f} L) "
+                     f"— analyse approfondie requise.")
 
     if livraisons_source == LIVRAISONS_ENOC_A_CONTROLER:
         motif += " Livraisons ENOC à 0 L — données à contrôler avant de conclure."
@@ -128,9 +149,13 @@ def run_rapprochement_for_month(year: int, month: int, site_ids: list[str] | Non
         thr = FuelRapprochementThreshold.objects.get(label="default")
         seuil_ok = thr.seuil_ok_pct
         seuil_aj = thr.seuil_a_justifier_pct
+        seuil_ok_l = thr.seuil_ok_l
+        seuil_aj_l = thr.seuil_aj_l
     except FuelRapprochementThreshold.DoesNotExist:
         seuil_ok = _DEFAULT_SEUIL_OK_PCT
         seuil_aj = _DEFAULT_SEUIL_AJ_PCT
+        seuil_ok_l = _DEFAULT_SEUIL_OK_L
+        seuil_aj_l = _DEFAULT_SEUIL_AJ_L
 
     prev_year = year if month > 1 else year - 1
     prev_month = month - 1 if month > 1 else 12
@@ -189,6 +214,8 @@ def run_rapprochement_for_month(year: int, month: int, site_ids: list[str] | Non
             conso_reference_l=conso_ref,
             seuil_ok_pct=seuil_ok,
             seuil_aj_pct=seuil_aj,
+            seuil_ok_l=seuil_ok_l,
+            seuil_aj_l=seuil_aj_l,
         )
 
         row.rapprochement_stock_initial_l = result["stock_initial_l"]

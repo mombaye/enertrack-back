@@ -787,11 +787,19 @@ class FuelRapprochementThreshold(models.Model):
     )
     seuil_ok_pct = models.DecimalField(
         max_digits=5, decimal_places=2, default=10,
-        help_text="Écart absolu ≤ ce seuil → statut OK."
+        help_text="Écart ≤ max(seuil_ok_l, seuil_ok_pct% × conso_ref) → statut OK."
     )
     seuil_a_justifier_pct = models.DecimalField(
         max_digits=5, decimal_places=2, default=20,
-        help_text="seuil_ok_pct < écart absolu ≤ ce seuil → A_JUSTIFIER ; au-delà → A_INVESTIGUER."
+        help_text="Écart ≤ max(seuil_aj_l, seuil_a_justifier_pct% × conso_ref) → A_JUSTIFIER ; au-delà → A_INVESTIGUER."
+    )
+    seuil_ok_l = models.DecimalField(
+        max_digits=10, decimal_places=2, default=100,
+        help_text="Plancher absolu (L) pour le seuil OK : max(ce seuil, seuil_ok_pct% × conso_ref)."
+    )
+    seuil_aj_l = models.DecimalField(
+        max_digits=10, decimal_places=2, default=200,
+        help_text="Plancher absolu (L) pour le seuil A_JUSTIFIER : max(ce seuil, seuil_a_justifier_pct% × conso_ref)."
     )
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -800,7 +808,7 @@ class FuelRapprochementThreshold(models.Model):
         verbose_name_plural = "Seuils de rapprochement carburant"
 
     def __str__(self):
-        return f"Seuils rapprochement [{self.label}] OK≤{self.seuil_ok_pct}% AJ≤{self.seuil_a_justifier_pct}%"
+        return f"Seuils rapprochement [{self.label}] OK≤max({self.seuil_ok_l}L,{self.seuil_ok_pct}%) AJ≤max({self.seuil_aj_l}L,{self.seuil_a_justifier_pct}%)"
 
 
 class FuelConsommationSyncRun(models.Model):
