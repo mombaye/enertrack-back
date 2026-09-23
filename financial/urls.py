@@ -24,9 +24,11 @@ urlpatterns = [
     path("suivi-conso/", views.SuiviConsoView.as_view(), name="suivi-conso"),
 
     # ── Dashboard Marge Grid ──────────────────────────────────────────────────
+    path("marge-dashboard/export/", views.MargeDashboardExportView.as_view(), name="marge-dashboard-export"),
+    path("marge-dashboard/import/", views.MargeDashboardImportView.as_view(), name="marge-dashboard-import"),
     path("marge-dashboard/", views.MargeDashboardDataView.as_view(), name="marge-dashboard"),
 
-   
+
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────

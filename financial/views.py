@@ -2761,3 +2761,247 @@ class MargeDashboardDataView(APIView):
         data["meta"]["reelle_year"] = year
         data["meta"]["reelle_month"] = month
         return Response(data)
+
+
+class MargeDashboardExportView(APIView):
+    """Génère un fichier Excel contenant tous les BOMarginSnapshot.
+    Colonnes éditables (fond bleu) : Catégorie BO, Owner, Commentaires.
+    Le fichier peut être modifié puis réimporté via /marge-dashboard/import/.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        import io
+        import openpyxl
+        from openpyxl.styles import PatternFill, Font, Alignment
+        from openpyxl.utils import get_column_letter
+        from django.http import HttpResponse
+        from bo_analysis.models import BOMarginSnapshot, CategorieBO, ActionOwner
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Analyse Marge"
+
+        HEADERS = [
+            "Site ID", "Nom Site", "Zone",
+            "Mois A", "Mois B",
+            "Redevance A (XOF)", "Redevance B (XOF)",
+            "Conso kWh A", "Conso kWh B",
+            "Conso XOF A", "Conso XOF B",
+            "Marge Est. A (XOF)", "Marge Est. B (XOF)", "Statut Marge",
+            "Catégorie BO", "Catégorie BO (autre)", "Commentaire BO",
+            "Check Done",
+            "Owner", "Owner (autre)", "Commentaire",
+        ]
+        EDITABLE = {15, 16, 17, 18, 19, 20, 21}
+
+        fill_dark = PatternFill("solid", fgColor="0F235A")
+        fill_edit = PatternFill("solid", fgColor="DBEAFE")
+        font_white = Font(bold=True, color="FFFFFF", size=10)
+        font_blue = Font(bold=True, color="1A56C4", size=10)
+        align_c = Alignment(horizontal="center", vertical="center")
+
+        for ci, h in enumerate(HEADERS, 1):
+            cell = ws.cell(row=1, column=ci, value=h)
+            cell.fill = fill_edit if ci in EDITABLE else fill_dark
+            cell.font = font_blue if ci in EDITABLE else font_white
+            cell.alignment = align_c
+
+        ws.freeze_panes = "A2"
+        ws.row_dimensions[1].height = 18
+
+        cat_labels = dict(CategorieBO.choices)
+        owner_labels = dict(ActionOwner.choices)
+
+        for snap in BOMarginSnapshot.objects.order_by("site_id_raw"):
+            ws.append([
+                snap.site_id_raw,
+                snap.site_name_raw,
+                snap.zone,
+                snap.month_a_label,
+                snap.month_b_label,
+                float(snap.redevance_grid_a) if snap.redevance_grid_a is not None else None,
+                float(snap.redevance_grid_b) if snap.redevance_grid_b is not None else None,
+                float(snap.estimation_conso_kwh_a) if snap.estimation_conso_kwh_a is not None else None,
+                float(snap.estimation_conso_kwh_b) if snap.estimation_conso_kwh_b is not None else None,
+                float(snap.estimation_conso_xof_a) if snap.estimation_conso_xof_a is not None else None,
+                float(snap.estimation_conso_xof_b) if snap.estimation_conso_xof_b is not None else None,
+                float(snap.redevance_vs_estimation_a) if snap.redevance_vs_estimation_a is not None else None,
+                float(snap.redevance_vs_estimation_b) if snap.redevance_vs_estimation_b is not None else None,
+                snap.statut_marge,
+                cat_labels.get(snap.categorie_bo, snap.categorie_bo),
+                snap.categorie_bo_autre,
+                snap.commentaire_bo,
+                "Oui" if snap.check_done else "Non",
+                owner_labels.get(snap.action_owner, snap.action_owner),
+                snap.action_owner_autre,
+                snap.commentaire,
+            ])
+
+        col_widths = [14, 26, 12, 10, 10, 18, 18, 13, 13, 14, 14, 18, 18, 12,
+                      30, 22, 34, 10, 14, 22, 34]
+        for ci, w in enumerate(col_widths, 1):
+            ws.column_dimensions[get_column_letter(ci)].width = w
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+
+        resp = HttpResponse(
+            buf.getvalue(),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        resp["Content-Disposition"] = 'attachment; filename="analyse-marge-export.xlsx"'
+        return resp
+
+
+class MargeDashboardImportView(APIView):
+    """Met à jour les colonnes BO des BOMarginSnapshot depuis un fichier Excel.
+    Seules les colonnes éditables sont mises à jour (Catégorie BO, Owner, Commentaires).
+    La correspondance se fait par la colonne 'Site ID'.
+    Retourne {"updated": N, "skipped": M, "errors": [...]}.
+    """
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser]
+
+    def post(self, request):
+        import io as _io
+        import unicodedata
+        import openpyxl
+        from bo_analysis.models import BOMarginSnapshot, CategorieBO, ActionOwner
+
+        uploaded = request.FILES.get("file")
+        if not uploaded:
+            return Response({"detail": "Champ 'file' manquant."}, status=400)
+        name = uploaded.name.lower()
+        if not (name.endswith(".xlsx") or name.endswith(".xls")):
+            return Response({"detail": "Format non supporté : attendu .xlsx ou .xls"}, status=400)
+
+        try:
+            wb = openpyxl.load_workbook(_io.BytesIO(uploaded.read()), read_only=True, data_only=True)
+        except Exception as exc:
+            return Response({"detail": f"Erreur lecture fichier : {exc}"}, status=400)
+
+        ws = wb.active
+        rows_iter = ws.iter_rows(values_only=True)
+
+        header = None
+        for row in rows_iter:
+            if any(c is not None and str(c).strip() for c in row):
+                header = [str(c).strip() if c is not None else "" for c in row]
+                break
+
+        if not header:
+            return Response({"detail": "Fichier vide ou en-tête introuvable."}, status=400)
+
+        def _norm(s: str) -> str:
+            s = str(s or "").lower().strip()
+            s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
+            return s.replace(" ", "").replace("(", "").replace(")", "")
+
+        col_map = {_norm(h): i for i, h in enumerate(header)}
+
+        def ci_of(name: str):
+            return col_map.get(_norm(name))
+
+        if ci_of("Site ID") is None:
+            return Response({"detail": "Colonne 'Site ID' introuvable dans l'en-tête."}, status=400)
+
+        def _build_lookup(choices_cls):
+            return {_norm(label): value for value, label in choices_cls.choices}
+
+        cat_lookup = _build_lookup(CategorieBO)
+        owner_lookup = _build_lookup(ActionOwner)
+
+        def _match(raw, lookup, autre_key):
+            if raw is None or str(raw).strip() == "":
+                return "", ""
+            v = lookup.get(_norm(raw))
+            return (v, "") if v else (autre_key, str(raw).strip())
+
+        snap_index = {s.site_id_raw: s for s in BOMarginSnapshot.objects.all()}
+        to_update, errors, updated, skipped = [], [], 0, 0
+
+        for row_num, row in enumerate(rows_iter, start=2):
+            idx_id = ci_of("Site ID")
+            site_id_val = row[idx_id] if idx_id is not None and idx_id < len(row) else None
+            if not site_id_val or str(site_id_val).strip() == "":
+                continue
+
+            site_id = str(site_id_val).strip()
+            snap = snap_index.get(site_id)
+            if not snap:
+                errors.append(f"Ligne {row_num} : Site ID '{site_id}' introuvable.")
+                skipped += 1
+                continue
+
+            def _get(col_name):
+                idx = ci_of(col_name)
+                return row[idx] if idx is not None and idx < len(row) else None
+
+            changed = False
+
+            raw_cat = _get("Catégorie BO")
+            if raw_cat is not None:
+                v, a = _match(raw_cat, cat_lookup, CategorieBO.AUTRE)
+                if v != snap.categorie_bo or a != snap.categorie_bo_autre:
+                    snap.categorie_bo, snap.categorie_bo_autre = v, a
+                    changed = True
+
+            raw_cat_autre = _get("Catégorie BO (autre)")
+            if raw_cat_autre is not None:
+                v = str(raw_cat_autre).strip() if raw_cat_autre else ""
+                if v != snap.categorie_bo_autre:
+                    snap.categorie_bo_autre = v
+                    changed = True
+
+            raw_cbo = _get("Commentaire BO")
+            if raw_cbo is not None:
+                v = str(raw_cbo).strip() if raw_cbo else ""
+                if v != snap.commentaire_bo:
+                    snap.commentaire_bo = v
+                    changed = True
+
+            raw_owner = _get("Owner")
+            if raw_owner is not None:
+                v, a = _match(raw_owner, owner_lookup, ActionOwner.AUTRE)
+                if v != snap.action_owner or a != snap.action_owner_autre:
+                    snap.action_owner, snap.action_owner_autre = v, a
+                    changed = True
+
+            raw_owner_autre = _get("Owner (autre)")
+            if raw_owner_autre is not None:
+                v = str(raw_owner_autre).strip() if raw_owner_autre else ""
+                if v != snap.action_owner_autre:
+                    snap.action_owner_autre = v
+                    changed = True
+
+            raw_check = _get("Check Done")
+            if raw_check is not None:
+                v = str(raw_check).strip().lower() in ("oui", "yes", "true", "1", "done")
+                if v != snap.check_done:
+                    snap.check_done = v
+                    changed = True
+
+            raw_comment = _get("Commentaire")
+            if raw_comment is not None:
+                v = str(raw_comment).strip() if raw_comment else ""
+                if v != snap.commentaire:
+                    snap.commentaire = v
+                    changed = True
+
+            if changed:
+                to_update.append(snap)
+                updated += 1
+            else:
+                skipped += 1
+
+        if to_update:
+            BOMarginSnapshot.objects.bulk_update(
+                to_update,
+                ["categorie_bo", "categorie_bo_autre", "commentaire_bo",
+                 "action_owner", "action_owner_autre", "check_done", "commentaire"],
+                batch_size=200,
+            )
+
+        return Response({"updated": updated, "skipped": skipped, "errors": errors[:50]})
