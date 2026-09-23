@@ -78,7 +78,29 @@ class Command(BaseCommand):
         except Exception as e:
             self.stdout.write(self.style.WARNING(f"  CPH : {e}"))
 
-        # 4. Réévaluation financière sur la même fenêtre
+        # 4. Snapshot stock mensuel fin-de-mois (stock_initial M-1 / stock_final M)
+        self.stdout.write("  ── Snapshots stock mensuels ──")
+        for m in months:
+            try:
+                call_command("sync_fuel_stock", month=m)
+            except Exception as e:
+                self.stdout.write(self.style.WARNING(f"  Stock snapshot {m} : {e}"))
+
+        # 5. Stock courant (état présent, sans argument mois)
+        self.stdout.write("  ── Stock courant ──")
+        try:
+            call_command("sync_fuel_stock")
+        except Exception as e:
+            self.stdout.write(self.style.WARNING(f"  Stock courant : {e}"))
+
+        # 6. Rapprochement stock
+        self.stdout.write("  ── Rapprochement stock ──")
+        try:
+            call_command("run_fuel_rapprochement", from_month=from_month, to_month=to_month)
+        except Exception as e:
+            self.stdout.write(self.style.WARNING(f"  Rapprochement : {e}"))
+
+        # 7. Réévaluation financière sur la même fenêtre
         if not options["skip_financial"]:
             self.stdout.write("  ── Réévaluation financière ──")
             try:

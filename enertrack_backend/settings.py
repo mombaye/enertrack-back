@@ -226,6 +226,10 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'fuel_tracking.sync_fuel_cph_current_month',
         'schedule': crontab(minute='*/30'),
     },
+    'fuel-rapprochement-sync-30min': {
+        'task': 'fuel_tracking.sync_fuel_rapprochement_current_month',
+        'schedule': crontab(minute='*/30'),
+    },
     'fuel-stock-sync-5min': {
         'task': 'fuel_tracking.sync_fuel_stock_current',
         'schedule': crontab(minute='*/5'),

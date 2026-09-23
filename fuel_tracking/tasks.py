@@ -94,6 +94,20 @@ def sync_fuel_stock_current(self):
         logger.exception("[fuel_tracking] Échec sync_fuel_stock planifiée")
 
 
+@shared_task(bind=True, name="fuel_tracking.sync_fuel_rapprochement_current_month")
+def sync_fuel_rapprochement_current_month(self):
+    from django.core.management import call_command
+
+    current = timezone.now().strftime("%Y-%m")
+    prev = _prev_month(current)
+    try:
+        call_command("run_fuel_rapprochement", from_month=prev, to_month=current)
+    except Exception:
+        logger.exception(
+            "[fuel_tracking] Échec run_fuel_rapprochement planifiée (%s → %s)", prev, current
+        )
+
+
 @shared_task(bind=True, name="fuel_tracking.auto_import_stan_periodic")
 def auto_import_stan_periodic(self):
     """Détecte un nouveau fichier Stan dans data_imports/stan/ et l'importe.

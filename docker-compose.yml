@@ -59,8 +59,7 @@ services:
       context: .
       dockerfile: docker/backend/Dockerfile
     restart: unless-stopped
-    command: >
-      sh -c "celery -A enertrack_backend worker --loglevel=info"
+    command: celery -A enertrack_backend worker --loglevel=info --concurrency=4
     env_file:
       - .env
     volumes:
@@ -70,6 +69,24 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      web:
+        condition: service_started
+
+  celery-beat:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    restart: unless-stopped
+    command: celery -A enertrack_backend beat --loglevel=info --schedule=/tmp/celerybeat-schedule
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      web:
+        condition: service_started
 
 volumes:
   postgres_data:
