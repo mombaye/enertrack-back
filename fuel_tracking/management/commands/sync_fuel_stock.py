@@ -47,6 +47,8 @@ class Command(BaseCommand):
             as_of_date = date(y, m, last_day)
             snapshot_year, snapshot_month = y, m
 
+        from fuel_tracking.services.fuel_stock_snowflake import FUEL_DATABASE, FUEL_SCHEMA, FUEL_REPORT_DATABASE
+
         self.stdout.write("\n" + "═" * 80)
         self.stdout.write("  SYNC STOCK CARBURANT (Snowflake + ENOC) → EnerTrack")
         self.stdout.write("═" * 80)
@@ -54,7 +56,8 @@ class Command(BaseCommand):
             self.stdout.write(f"  Mode       : mensuel ({month_str}, as_of={as_of_date})")
         else:
             self.stdout.write("  Mode       : courant")
-        self.stdout.write(f"  Dry run : {dry_run}\n")
+        self.stdout.write(f"  Dry run : {dry_run}")
+        self.stdout.write(f"  Snowflake  : {FUEL_REPORT_DATABASE}.{FUEL_SCHEMA} (VW_FUEL_REPORT)\n")
 
         sync_run = None
         if not dry_run:

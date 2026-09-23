@@ -83,6 +83,8 @@ class Command(BaseCommand):
             self.stdout.write(self.style.ERROR("Préciser --month YYYY-MM, ou --from-month/--to-month YYYY-MM."))
             return
 
+        from fuel_tracking.services.fuel_cph_snowflake import FUEL_DATABASE, FUEL_SCHEMA, GENSET_DATABASE
+
         self.stdout.write("\n" + "═" * 80)
         self.stdout.write("  SYNC CPH (télémétrie GFMS_DATA_TRACKER_NC) → EnerTrack")
         self.stdout.write("═" * 80)
@@ -90,6 +92,7 @@ class Command(BaseCommand):
         self.stdout.write(f"  To month   : {to_month}")
         self.stdout.write(f"  Sites      : {', '.join(site_ids) if site_ids else 'tout le périmètre Sénégal'}")
         self.stdout.write(f"  Dry run    : {dry_run}")
+        self.stdout.write(f"  Snowflake  : {FUEL_DATABASE}.{FUEL_SCHEMA} (tracker) + {GENSET_DATABASE}.{FUEL_SCHEMA} (GENSET_REPORT)")
         self.stdout.write("═" * 80 + "\n")
 
         sync_run = None

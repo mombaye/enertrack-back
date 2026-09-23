@@ -62,12 +62,15 @@ class Command(BaseCommand):
             self.stdout.write(self.style.ERROR("Préciser --month YYYY-MM, ou --from-month/--to-month YYYY-MM."))
             return
 
+        from fuel_tracking.services.fuel_consommation_snowflake import FUEL_DATABASE, FUEL_SCHEMA, FUEL_REPORT_DATABASE
+
         self.stdout.write("\n" + "═" * 80)
         self.stdout.write("  SYNC CONSOMMATION CARBURANT (Snowflake + ENOC) → EnerTrack")
         self.stdout.write("═" * 80)
         self.stdout.write(f"  From month : {from_month}")
         self.stdout.write(f"  To month   : {to_month}")
         self.stdout.write(f"  Dry run    : {dry_run}")
+        self.stdout.write(f"  Snowflake  : {FUEL_DATABASE}.{FUEL_SCHEMA} + {FUEL_REPORT_DATABASE}.{FUEL_SCHEMA} (VW_FUEL_REPORT)")
         self.stdout.write("═" * 80 + "\n")
 
         sync_run = None
