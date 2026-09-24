@@ -42,6 +42,8 @@ services:
       GRID_SITES_LIST_DIR: "/code/data_imports/grid_sites"
     volumes:
       - ./data_imports:/code/data_imports
+      # Volume partagé web↔celery pour les fichiers uploadés (imports billing, etc.)
+      - media_data:/code/media
       # Monte le répertoire ESCO dans le container (lecture seule).
       # En dev (Mac/Linux sans partage) : utilise automatiquement data_imports/grid_sites/
       #   → git pull + docker compose up suffit, aucune config nécessaire.
@@ -64,6 +66,8 @@ services:
       - .env
     volumes:
       - ./data_imports:/code/data_imports
+      # Même volume partagé que web pour lire les fichiers uploadés
+      - media_data:/code/media
     depends_on:
       db:
         condition: service_healthy
@@ -90,3 +94,4 @@ services:
 
 volumes:
   postgres_data:
+  media_data:

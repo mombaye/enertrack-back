@@ -161,6 +161,11 @@ USE_TZ = True
 STATIC_URL = 'static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 
+# Répertoire des fichiers uploadés (partagé entre le container web et le worker Celery
+# via le volume Docker "media_data" monté sur /code/media dans les deux services).
+MEDIA_URL = '/media/'
+MEDIA_ROOT = BASE_DIR / 'media'
+
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
