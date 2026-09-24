@@ -1,7 +1,4 @@
-# billing/serializers.py — PATCH payment_status
-#
-# Seul SonatelInvoiceSerializer est modifié :
-#   + payment_status et payment_status_updated_at exposés en read_only_fields
+# billing/serializers.py
 
 from rest_framework import serializers
 from .models import (
@@ -10,9 +7,16 @@ from .models import (
 )
 
 
+class SiteLiteSerializer(serializers.Serializer):
+    id      = serializers.IntegerField(read_only=True)
+    site_id = serializers.CharField(read_only=True)
+    name    = serializers.CharField(read_only=True, allow_null=True)
+
+
 class SonatelInvoiceSerializer(serializers.ModelSerializer):
-    site_code = serializers.CharField(source="site.site_id", read_only=True)
-    site_name = serializers.CharField(source="site.name", read_only=True)
+    # Retourne le site comme objet imbriqué {id, site_id, name}
+    # plutôt que comme entier PK (comportement DRF par défaut).
+    site = SiteLiteSerializer(read_only=True)
 
     class Meta:
         model = SonatelInvoice
@@ -21,8 +25,7 @@ class SonatelInvoiceSerializer(serializers.ModelSerializer):
             "id", "batch", "created_at", "updated_at",
             "last_seen_at", "last_seen_batch",
             "status_updated_at", "status_last_batch",
-            # ✅ payment_status en lecture seule (mis à jour via import Excel)
-             "payment_status", "payment_status_updated_at",
+            "payment_status", "payment_status_updated_at",
         )
 
 
