@@ -753,7 +753,8 @@ class ImportBatchViewSet(viewsets.GenericViewSet, mixins.ListModelMixin):
 
         Mapping Statut Paiement → payment_status :
           PAID / payé / payée / oui / yes → PAID
-          OUT_OF_SCOPE / hors scope / annulé / n/a → OUT_OF_SCOPE
+          CANCELLED / annulé / annulée → CANCELLED
+          OUT_OF_SCOPE / hors scope / n/a → OUT_OF_SCOPE
           (vide ou absent) → UNPAID (défaut)
 
         Retour synchrone : { updated, not_found, total_rows, col_facture, col_statut, rows }
@@ -828,7 +829,9 @@ class ImportBatchViewSet(viewsets.GenericViewSet, mixins.ListModelMixin):
             s = str(raw).strip().upper()
             if s in ("PAID", "PAYÉ", "PAYE", "PAYÉE", "PAYEE", "OUI", "YES"):
                 return "PAID"
-            if s in ("OUT_OF_SCOPE", "HORS SCOPE", "ANNULÉ", "ANNULE", "ANNULÉE", "ANNULEE", "N/A", "NA"):
+            if s in ("CANCELLED", "ANNULÉ", "ANNULE", "ANNULÉE", "ANNULEE"):
+                return "CANCELLED"
+            if s in ("OUT_OF_SCOPE", "HORS SCOPE", "N/A", "NA"):
                 return "OUT_OF_SCOPE"
             return "UNPAID"
 
