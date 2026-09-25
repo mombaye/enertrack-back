@@ -532,9 +532,9 @@ class EstimationCompareView(APIView):
             return Response({"detail": "Aucun batch EnerTrack pour cette période."}, status=404)
 
         et_results = {
-            r.site_id: r
+            r.site.site_id: r
             for r in EstimationResult.objects.filter(batch=batch).select_related("site")
-            if r.site_id
+            if r.site and r.site.site_id
         }
 
         # External results
