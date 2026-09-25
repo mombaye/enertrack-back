@@ -3128,7 +3128,8 @@ class MargeDashboardImportView(APIView):
         site_id_idx   = ci_first("Site ID")
         site_name_idx = ci_first("Site Name", "Nom du site", "Site_Name", "NOM DU SITE")
         zone_idx      = ci_first("Zone")
-        typo_idx      = ci_first("New Typo", "Typo", "Typolog", "Typologie", "Typologie réelle")
+        typo_idx      = ci_first("New Typo", "Typo", "Typolog", "Typologie", "Typologie réelle",
+                                 "Typologie facturée")
         statut_idx    = ci_first("Statut Marge", "Statut_Marge")
         action_idx    = ci_first("GRID_Action plan", "GRID Action plan", "Action plan")
         if action_idx is None:
