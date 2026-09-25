@@ -2856,10 +2856,16 @@ class MargeDashboardExportView(APIView):
 
 
 class MargeDashboardImportView(APIView):
-    """Met à jour les colonnes BO des BOMarginSnapshot depuis un fichier Excel.
-    Seules les colonnes éditables sont mises à jour (Catégorie BO, Owner, Commentaires).
-    La correspondance se fait par la colonne 'Site ID'.
-    Retourne {"updated": N, "skipped": M, "errors": [...]}.
+    """
+    Importe un fichier Excel Analyse Marge.
+
+    - Format source (Analyse_Marge.xlsx) : détecté par la présence de colonnes
+      'Redevance grid' dans l'en-tête. Remplace tous les BOMarginSnapshot.
+      Retourne {"imported": N, "skipped": M, "sheet": "...", "month_a": "...",
+                "month_b": "...", "errors": [...]}.
+    - Format BO (export depuis ce dashboard) : met à jour les colonnes
+      Catégorie BO, Owner, Commentaire uniquement.
+      Retourne {"updated": N, "skipped": M, "errors": [...]}.
     """
     permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser]
@@ -2868,50 +2874,41 @@ class MargeDashboardImportView(APIView):
         import io as _io
         import unicodedata
         import openpyxl
+        from django.db import transaction
         from bo_analysis.models import BOMarginSnapshot, CategorieBO, ActionOwner
+        from core.models import Site as CoreSite
 
         uploaded = request.FILES.get("file")
         if not uploaded:
             return Response({"detail": "Champ 'file' manquant."}, status=400)
-        name = uploaded.name.lower()
-        if not (name.endswith(".xlsx") or name.endswith(".xls")):
+        fname = uploaded.name.lower()
+        if not (fname.endswith(".xlsx") or fname.endswith(".xls")):
             return Response({"detail": "Format non supporté : attendu .xlsx ou .xls"}, status=400)
 
+        file_bytes = uploaded.read()
         try:
-            wb = openpyxl.load_workbook(_io.BytesIO(uploaded.read()), read_only=True, data_only=True)
+            wb = openpyxl.load_workbook(_io.BytesIO(file_bytes), data_only=True)
         except Exception as exc:
             return Response({"detail": f"Erreur lecture fichier : {exc}"}, status=400)
 
-        ws = wb.active
-        rows_iter = ws.iter_rows(values_only=True)
-
-        header = None
-        for row in rows_iter:
-            if any(c is not None and str(c).strip() for c in row):
-                header = [str(c).strip() if c is not None else "" for c in row]
-                break
-
-        if not header:
-            return Response({"detail": "Fichier vide ou en-tête introuvable."}, status=400)
-
-        def _norm(s: str) -> str:
-            s = str(s or "").lower().strip()
+        def _norm(s):
+            s = str(s or "").strip()
             s = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
-            return s.replace(" ", "").replace("(", "").replace(")", "")
+            return (s.lower()
+                    .replace(" ", "").replace("(", "").replace(")", "")
+                    .replace("\n", "").replace("\r", "").replace("_", ""))
 
-        col_map = {_norm(h): i for i, h in enumerate(header)}
-
-        def ci_of(name: str):
-            return col_map.get(_norm(name))
-
-        if ci_of("Site ID") is None:
-            return Response({"detail": "Colonne 'Site ID' introuvable dans l'en-tête."}, status=400)
+        def _dec(v):
+            from decimal import Decimal, InvalidOperation
+            if v is None or str(v).strip() == "":
+                return None
+            try:
+                return Decimal(str(v).replace(",", ".").strip())
+            except InvalidOperation:
+                return None
 
         def _build_lookup(choices_cls):
             return {_norm(label): value for value, label in choices_cls.choices}
-
-        cat_lookup = _build_lookup(CategorieBO)
-        owner_lookup = _build_lookup(ActionOwner)
 
         def _match(raw, lookup, autre_key):
             if raw is None or str(raw).strip() == "":
@@ -2919,6 +2916,49 @@ class MargeDashboardImportView(APIView):
             v = lookup.get(_norm(raw))
             return (v, "") if v else (autre_key, str(raw).strip())
 
+        # ── Detect format: scan all sheets for source-format header ──────────
+        # Source format: header row containing both "Site ID" and "Redevance grid"
+        source_candidates = []  # [(sheet_name, header_list, data_rows_list)]
+        for sname in wb.sheetnames:
+            ws = wb[sname]
+            all_rows = list(ws.iter_rows(values_only=True))
+            for row_idx, row in enumerate(all_rows[:20]):
+                cells = [str(c).strip() if c is not None else "" for c in row]
+                norms = [_norm(c) for c in cells]
+                if "siteid" in norms and any("redevancegrid" in n for n in norms):
+                    source_candidates.append((sname, cells, all_rows[row_idx + 1:]))
+                    break
+
+        if source_candidates:
+            # Use last sheet (most recent period in the file)
+            sheet_name, header, data_rows = source_candidates[-1]
+            return self._import_source_format(
+                sheet_name, header, data_rows, uploaded.name,
+                _norm, _dec, _match, _build_lookup,
+                BOMarginSnapshot, CategorieBO, ActionOwner, CoreSite,
+            )
+
+        # ── BO-only update format ────────────────────────────────────────────
+        ws = wb.active
+        rows_iter = ws.iter_rows(values_only=True)
+        header = None
+        for row in rows_iter:
+            if any(c is not None and str(c).strip() for c in row):
+                header = [str(c).strip() if c is not None else "" for c in row]
+                break
+        if not header:
+            return Response({"detail": "Fichier vide ou en-tête introuvable."}, status=400)
+
+        col_map = {_norm(h): i for i, h in enumerate(header)}
+
+        def ci_of(name):
+            return col_map.get(_norm(name))
+
+        if ci_of("Site ID") is None:
+            return Response({"detail": "Colonne 'Site ID' introuvable dans l'en-tête."}, status=400)
+
+        cat_lookup = _build_lookup(CategorieBO)
+        owner_lookup = _build_lookup(ActionOwner)
         snap_index = {s.site_id_raw: s for s in BOMarginSnapshot.objects.all()}
         to_update, errors, updated, skipped = [], [], 0, 0
 
@@ -2927,7 +2967,6 @@ class MargeDashboardImportView(APIView):
             site_id_val = row[idx_id] if idx_id is not None and idx_id < len(row) else None
             if not site_id_val or str(site_id_val).strip() == "":
                 continue
-
             site_id = str(site_id_val).strip()
             snap = snap_index.get(site_id)
             if not snap:
@@ -2935,9 +2974,9 @@ class MargeDashboardImportView(APIView):
                 skipped += 1
                 continue
 
-            def _get(col_name):
+            def _get(col_name, _row=row):
                 idx = ci_of(col_name)
-                return row[idx] if idx is not None and idx < len(row) else None
+                return _row[idx] if idx is not None and idx < len(_row) else None
 
             changed = False
 
@@ -3003,5 +3042,201 @@ class MargeDashboardImportView(APIView):
                  "action_owner", "action_owner_autre", "check_done", "commentaire"],
                 batch_size=200,
             )
+        return Response({"updated": updated, "skipped": skipped, "errors": errors[:50],
+                         "imported": 0})
 
-        return Response({"updated": updated, "skipped": skipped, "errors": errors[:50]})
+    # ── Source-format import ─────────────────────────────────────────────────
+    def _import_source_format(
+        self, sheet_name, header, data_rows, filename,
+        _norm, _dec, _match, _build_lookup,
+        BOMarginSnapshot, CategorieBO, ActionOwner, CoreSite,
+    ):
+        from django.db import transaction
+
+        # Build column map: normalized_name → index
+        col_map = {_norm(h): i for i, h in enumerate(header)}
+
+        def ci(name):
+            return col_map.get(_norm(name))
+
+        # Find all columns whose normalized name *contains* keyword, sorted by index
+        def find_all(kw):
+            n = _norm(kw)
+            return sorted(
+                [(i, h) for i, h in enumerate(header) if n in _norm(h)],
+                key=lambda x: x[0],
+            )
+
+        MONTHS_FR = {
+            "janvier": "Janvier", "fevrier": "Février", "mars": "Mars",
+            "avril": "Avril", "mai": "Mai", "juin": "Juin",
+            "juillet": "Juillet", "aout": "Août", "septembre": "Septembre",
+            "octobre": "Octobre", "novembre": "Novembre", "decembre": "Décembre",
+        }
+
+        def extract_month(col_name):
+            n = _norm(col_name)
+            for mn, ml in MONTHS_FR.items():
+                if mn in n:
+                    return ml
+            return ""
+
+        def ci_first(*names):
+            for name in names:
+                idx = ci(name)
+                if idx is not None:
+                    return idx
+            return None
+
+        # Locate period columns (month A = first occurrence, month B = second)
+        redev_cols   = find_all("redevancegrid")    # 2 cols: month A, month B
+        est_all      = find_all("estimationgrid")
+        est_kwh_cols = [(i, h) for i, h in est_all if "kwh" in _norm(h)]
+        est_xof_cols = [(i, h) for i, h in est_all if "xof" in _norm(h) and "kwh" not in _norm(h)]
+        redev_vs     = find_all("redevancevsestimation") or find_all("redevancevs")
+        puissance    = find_all("puissance")
+
+        # Month labels from redevance column names
+        month_a_label = extract_month(redev_cols[0][1]) if len(redev_cols) > 0 else "A"
+        month_b_label = extract_month(redev_cols[1][1]) if len(redev_cols) > 1 else "B"
+
+        def _idx(pairs, pos):
+            return pairs[pos][0] if len(pairs) > pos else None
+
+        redev_a_idx = _idx(redev_cols, 0)
+        redev_b_idx = _idx(redev_cols, 1)
+        kwh_a_idx   = _idx(est_kwh_cols, 0)
+        kwh_b_idx   = _idx(est_kwh_cols, 1)
+        xof_a_idx   = _idx(est_xof_cols, 0)
+        xof_b_idx   = _idx(est_xof_cols, 1)
+        rvs_a_idx   = _idx(redev_vs, 0)
+        rvs_b_idx   = _idx(redev_vs, 1)
+        puis_a_idx  = _idx(puissance, 0)
+        puis_b_idx  = _idx(puissance, 1)
+
+        # Direct-name columns (single occurrence) — ci_first avoids false 0 via `or`
+        site_id_idx   = ci_first("Site ID")
+        site_name_idx = ci_first("Site Name", "Nom du site", "Site_Name", "NOM DU SITE")
+        zone_idx      = ci_first("Zone")
+        typo_idx      = ci_first("New Typo", "Typo", "Typolog", "Typologie")
+        statut_idx    = ci_first("Statut Marge", "Statut_Marge")
+        action_idx    = ci_first("GRID_Action plan", "GRID Action plan", "Action plan")
+        cat_ops_idx   = ci_first("Categorie", "Catégorie")  # ops category
+        cbo_idx       = ci_first("Commentaire BO")
+        cat_bo_idx    = ci_first("Categorie BO", "Catégorie BO")
+        check_idx     = ci_first("CHECK", "Check Done", "Check")
+        owner_idx     = ci_first("Action Owner", "Owner")
+        comment_idx   = ci_first("Commentaire")
+
+        # cat_ops comes before cbo in the file; if both match same norm key,
+        # prefer the one with lower index
+        if cat_ops_idx is not None and cat_bo_idx is not None and cat_ops_idx == cat_bo_idx:
+            cat_ops_idx = None  # can't distinguish, skip ops category
+
+        # ── Build site lookup ────────────────────────────────────────────────
+        site_map = {s.site_id: s for s in CoreSite.objects.only("id", "site_id").all()}
+
+        cat_lookup   = _build_lookup(CategorieBO)
+        owner_lookup = _build_lookup(ActionOwner)
+
+        def _cell(row, idx):
+            if idx is None or idx >= len(row):
+                return None
+            return row[idx]
+
+        def _str(v):
+            return str(v).strip() if v is not None else ""
+
+        # ── Process rows ─────────────────────────────────────────────────────
+        snaps, errors, skipped = [], [], 0
+
+        for row_num, raw_row in enumerate(data_rows, start=2):
+            row = [str(c).strip() if c is not None else "" for c in raw_row]
+
+            site_id_raw = _str(_cell(row, site_id_idx))
+            if not site_id_raw:
+                skipped += 1
+                continue
+            # Skip summary rows (all-caps short labels like "TOTAL", numeric-only)
+            if site_id_raw.upper() in ("TOTAL", "SOUS-TOTAL", "SOUS TOTAL", "TOTAL GÉNÉRAL"):
+                skipped += 1
+                continue
+
+            site_name_raw = _str(_cell(row, site_name_idx))
+            zone          = _str(_cell(row, zone_idx))
+            typo          = _str(_cell(row, typo_idx))
+            statut_marge  = _str(_cell(row, statut_idx)).upper() or "RAS"
+
+            redevance_a   = _dec(_cell(row, redev_a_idx))
+            redevance_b   = _dec(_cell(row, redev_b_idx))
+            kwh_a         = _dec(_cell(row, kwh_a_idx))
+            kwh_b         = _dec(_cell(row, kwh_b_idx))
+            xof_a         = _dec(_cell(row, xof_a_idx))
+            xof_b         = _dec(_cell(row, xof_b_idx))
+            rvs_a         = _dec(_cell(row, rvs_a_idx))
+            rvs_b         = _dec(_cell(row, rvs_b_idx))
+            puis_a        = _dec(_cell(row, puis_a_idx))
+            puis_b        = _dec(_cell(row, puis_b_idx))
+
+            grid_action   = _str(_cell(row, action_idx))
+            cat_ops       = _str(_cell(row, cat_ops_idx))
+            cbo           = _str(_cell(row, cbo_idx))
+
+            raw_cat_bo    = _cell(row, cat_bo_idx)
+            cat_bo, cat_bo_autre = _match(raw_cat_bo, cat_lookup, CategorieBO.AUTRE)
+
+            raw_check     = _str(_cell(row, check_idx))
+            check_done    = raw_check.lower() in ("oui", "yes", "true", "1", "done", "x")
+
+            raw_owner     = _cell(row, owner_idx)
+            act_owner, act_owner_autre = _match(raw_owner, owner_lookup, ActionOwner.AUTRE)
+
+            comment       = _str(_cell(row, comment_idx))
+
+            snap = BOMarginSnapshot(
+                site=site_map.get(site_id_raw),
+                site_id_raw=site_id_raw,
+                site_name_raw=site_name_raw,
+                zone=zone,
+                typologie_reelle=typo,
+                month_a_label=month_a_label,
+                month_b_label=month_b_label,
+                puissance_facturee_a=puis_a,
+                puissance_facturee_b=puis_b,
+                redevance_grid_a=redevance_a,
+                redevance_grid_b=redevance_b,
+                estimation_conso_kwh_a=kwh_a,
+                estimation_conso_kwh_b=kwh_b,
+                estimation_conso_xof_a=xof_a,
+                estimation_conso_xof_b=xof_b,
+                redevance_vs_estimation_a=rvs_a,
+                redevance_vs_estimation_b=rvs_b,
+                statut_marge=statut_marge,
+                grid_action_plan_ops=grid_action,
+                categorie_ops=cat_ops,
+                commentaire_bo=cbo,
+                categorie_bo=cat_bo,
+                categorie_bo_autre=cat_bo_autre,
+                check_done=check_done,
+                action_owner=act_owner,
+                action_owner_autre=act_owner_autre,
+                commentaire=comment,
+                source_filename=filename,
+                row_number=row_num,
+            )
+            snaps.append(snap)
+
+        # ── Atomic replace ───────────────────────────────────────────────────
+        with transaction.atomic():
+            BOMarginSnapshot.objects.all().delete()
+            BOMarginSnapshot.objects.bulk_create(snaps, batch_size=500)
+
+        return Response({
+            "imported": len(snaps),
+            "skipped": skipped,
+            "updated": 0,
+            "sheet": sheet_name,
+            "month_a": month_a_label,
+            "month_b": month_b_label,
+            "errors": errors[:50],
+        })
