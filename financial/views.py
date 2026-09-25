@@ -3053,8 +3053,12 @@ class MargeDashboardImportView(APIView):
     ):
         from django.db import transaction
 
-        # Build column map: normalized_name → index
-        col_map = {_norm(h): i for i, h in enumerate(header)}
+        # Build column map: normalized_name → index. Keep the FIRST occurrence:
+        # duplicated headers (e.g. "Catégorie") exist in both the GRID and the
+        # FUEL sections, and this dashboard is about the GRID section (left).
+        col_map: dict[str, int] = {}
+        for i, h in enumerate(header):
+            col_map.setdefault(_norm(h), i)
 
         def ci(name):
             return col_map.get(_norm(name))
@@ -3090,7 +3094,13 @@ class MargeDashboardImportView(APIView):
 
         # Locate period columns (month A = first occurrence, month B = second)
         redev_cols   = find_all("redevancegrid")    # 2 cols: month A, month B
-        est_all      = find_all("estimationgrid")
+        # Headers read "Estimation consommation Grid <Mois> (Kwh|xof)"; the
+        # "<Mois> Vs <Mois>" variation columns are excluded.
+        est_all = [
+            (i, h) for i, h in enumerate(header)
+            if "estimation" in _norm(h) and "grid" in _norm(h)
+            and "redevance" not in _norm(h) and "vs" not in _norm(h)
+        ]
         est_kwh_cols = [(i, h) for i, h in est_all if "kwh" in _norm(h)]
         est_xof_cols = [(i, h) for i, h in est_all if "xof" in _norm(h) and "kwh" not in _norm(h)]
         redev_vs     = find_all("redevancevsestimation") or find_all("redevancevs")
@@ -3118,13 +3128,25 @@ class MargeDashboardImportView(APIView):
         site_id_idx   = ci_first("Site ID")
         site_name_idx = ci_first("Site Name", "Nom du site", "Site_Name", "NOM DU SITE")
         zone_idx      = ci_first("Zone")
-        typo_idx      = ci_first("New Typo", "Typo", "Typolog", "Typologie")
+        typo_idx      = ci_first("New Typo", "Typo", "Typolog", "Typologie", "Typologie réelle")
         statut_idx    = ci_first("Statut Marge", "Statut_Marge")
         action_idx    = ci_first("GRID_Action plan", "GRID Action plan", "Action plan")
+        if action_idx is None:
+            # e.g. " GRID_Action plan  (ops)_"
+            action_idx = next((i for i, _ in find_all("gridactionplan")), None)
         cat_ops_idx   = ci_first("Categorie", "Catégorie")  # ops category
         cbo_idx       = ci_first("Commentaire BO")
         cat_bo_idx    = ci_first("Categorie BO", "Catégorie BO")
         check_idx     = ci_first("CHECK", "Check Done", "Check")
+        # Some sheets reuse "Check" for numeric control columns: only accept it as
+        # the done-flag if it actually holds a textual done marker.
+        _DONE = ("oui", "yes", "true", "1", "done", "x")
+        if check_idx is not None and not any(
+            len(r) > check_idx and isinstance(r[check_idx], str)
+            and r[check_idx].strip().lower() in _DONE
+            for r in data_rows
+        ):
+            check_idx = None
         owner_idx     = ci_first("Action Owner", "Owner")
         comment_idx   = ci_first("Commentaire")
 
@@ -3132,6 +3154,30 @@ class MargeDashboardImportView(APIView):
         # prefer the one with lower index
         if cat_ops_idx is not None and cat_bo_idx is not None and cat_ops_idx == cat_bo_idx:
             cat_ops_idx = None  # can't distinguish, skip ops category
+
+        # Annotations absent from this file are carried over from the previous
+        # snapshot of the same site instead of being wiped by the replace below.
+        carry_fields: list[str] = []
+        if typo_idx is None:
+            carry_fields.append("typologie_reelle")
+        if action_idx is None:
+            carry_fields.append("grid_action_plan_ops")
+        if cat_ops_idx is None:
+            carry_fields.append("categorie_ops")
+        if cbo_idx is None:
+            carry_fields.append("commentaire_bo")
+        if cat_bo_idx is None:
+            carry_fields += ["categorie_bo", "categorie_bo_autre"]
+        if check_idx is None:
+            carry_fields.append("check_done")
+        if owner_idx is None:
+            carry_fields += ["action_owner", "action_owner_autre"]
+        if comment_idx is None:
+            carry_fields.append("commentaire")
+        previous = (
+            {r["site_id_raw"]: r for r in BOMarginSnapshot.objects.values("site_id_raw", *carry_fields)}
+            if carry_fields else {}
+        )
 
         # ── Build site lookup ────────────────────────────────────────────────
         site_map = {s.site_id: s for s in CoreSite.objects.only("id", "site_id").all()}
@@ -3224,6 +3270,10 @@ class MargeDashboardImportView(APIView):
                 source_filename=filename,
                 row_number=row_num,
             )
+            prev = previous.get(site_id_raw)
+            if prev:
+                for field in carry_fields:
+                    setattr(snap, field, prev[field])
             snaps.append(snap)
 
         # ── Atomic replace ───────────────────────────────────────────────────
