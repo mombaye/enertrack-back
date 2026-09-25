@@ -51,6 +51,17 @@ def _save_progress(batch, pct, message="", meta=None):
 # Valeurs observées dans le fichier Excel de base billing 2025
 
 CERT_STATUS_MAP: dict[str, str] = {
+    # Valeurs courtes (format court / saisie directe)
+    "validee":   SonatelInvoice.Status.VALIDATED,
+    "valide":    SonatelInvoice.Status.VALIDATED,
+    "validated": SonatelInvoice.Status.VALIDATED,
+    "contestee": SonatelInvoice.Status.CONTESTED,
+    "conteste":  SonatelInvoice.Status.CONTESTED,
+    "contested": SonatelInvoice.Status.CONTESTED,
+    "creee":     SonatelInvoice.Status.CREATED,
+    "cree":      SonatelInvoice.Status.CREATED,
+    "created":   SonatelInvoice.Status.CREATED,
+
     # Certifiés → VALIDATED
     "sites certifies - ok paiement":             SonatelInvoice.Status.VALIDATED,
     "sites d2 - certifies":                      SonatelInvoice.Status.VALIDATED,
@@ -276,18 +287,25 @@ def import_status_update_task(
 
             # ── Résolution statut certification ───────────────────────────────
             cert_status = None
+            _cert_col_payment_fallback = None  # payment value found in cert column
             if has_cert_col:
-                cert_status = _parse_cert_status(row.get(cert_col))
-                if cert_status is None and not _is_blank(row.get(cert_col)):
-                    # Valeur inconnue → log + fallback default_status
-                    issues_buf.append(ImportIssue(
-                        batch=batch, row_number=excel_row,
-                        severity=ImportIssue.Severity.WARN,
-                        field="statut",
-                        message=f"Valeur 'Statut' non reconnue: {row.get(cert_col)!r}. Fallback: {default_status}",
-                        raw_data=raw_row,
-                    ))
-                    cert_status = default_status
+                raw_cert_val = row.get(cert_col)
+                cert_status = _parse_cert_status(raw_cert_val)
+                if cert_status is None and not _is_blank(raw_cert_val):
+                    # Valeur non reconnue comme certification → tenter comme paiement
+                    # (ex : "Payée" dans une colonne "Statut")
+                    pay_from_cert = _parse_payment_status(raw_cert_val)
+                    if pay_from_cert is not None:
+                        _cert_col_payment_fallback = pay_from_cert
+                    else:
+                        issues_buf.append(ImportIssue(
+                            batch=batch, row_number=excel_row,
+                            severity=ImportIssue.Severity.WARN,
+                            field="statut",
+                            message=f"Valeur 'Statut' non reconnue: {raw_cert_val!r}. Fallback: {default_status}",
+                            raw_data=raw_row,
+                        ))
+                        cert_status = default_status
             else:
                 cert_status = default_status
 
@@ -303,6 +321,9 @@ def import_status_update_task(
                         message=f"Valeur 'Statut Paiement' non reconnue: {row.get(payment_col)!r}",
                         raw_data=raw_row,
                     ))
+            elif _cert_col_payment_fallback is not None:
+                # Valeur paiement trouvée dans la colonne "Statut" (pas de colonne dédiée)
+                payment_status = _cert_col_payment_fallback
 
             pk_to_updates[pk] = {
                 "cert":    cert_status,
