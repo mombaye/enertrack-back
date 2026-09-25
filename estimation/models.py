@@ -190,3 +190,34 @@ class EstimationResult(models.Model):
 
     def __str__(self):
         return f"{self.batch.label} | {self.site_id} → {self.source_utilisee} | {self.conso_estimee_kwh} kWh"
+
+
+class ExternalEstimationUpload(models.Model):
+    """
+    Résultats d'estimation importés depuis un fichier externe (BO/client).
+    Remplacés intégralement à chaque import pour la même (year, month).
+    """
+    year  = models.IntegerField("Année")
+    month = models.IntegerField("Mois")
+
+    site        = models.ForeignKey(Site, null=True, blank=True, on_delete=models.SET_NULL)
+    site_id_raw = models.CharField(max_length=50, db_index=True)
+    site_name_raw = models.CharField(max_length=255, blank=True)
+
+    conso_kwh = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    montant   = models.DecimalField(max_digits=16, decimal_places=3, null=True, blank=True)
+    source_raw = models.CharField(max_length=100, blank=True)
+
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
+    )
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("year", "month", "site")
+        ordering = ["year", "month", "site__site_id"]
+        verbose_name = "Estimation externe"
+        verbose_name_plural = "Estimations externes"
+
+    def __str__(self):
+        return f"Ext {self.year}-{self.month:02d} | {self.site_id_raw}"
