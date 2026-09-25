@@ -105,6 +105,9 @@ def _apply_scope_to_invoice_qs(qs, scope: str):
     if scope == "OUT_OF_SCOPE":
         return qs.filter(payment_status=SonatelInvoice.PaymentStatus.OUT_OF_SCOPE)
 
+    if scope == "CANCELLED":
+        return qs.filter(payment_status=SonatelInvoice.PaymentStatus.CANCELLED)
+
     if scope == "UNDEFINED":
         return qs.filter(Q(payment_status__isnull=True) | Q(payment_status=""))
 
@@ -148,6 +151,9 @@ def _apply_scope_to_monthly_qs(qs, scope: str):
 
     if scope == "OUT_OF_SCOPE":
         return qs.filter(source__payment_status=SonatelInvoice.PaymentStatus.OUT_OF_SCOPE)
+
+    if scope == "CANCELLED":
+        return qs.filter(source__payment_status=SonatelInvoice.PaymentStatus.CANCELLED)
 
     if scope == "UNDEFINED":
         return qs.filter(Q(source__payment_status__isnull=True) | Q(source__payment_status=""))

@@ -143,7 +143,8 @@ class SonatelInvoice(models.Model):
     class PaymentStatus(models.TextChoices):
         PAID         = "PAID",         "Payée"
         UNPAID       = "UNPAID",       "Impayée"
-        OUT_OF_SCOPE = "OUT_OF_SCOPE", "Hors scope / Annulée"
+        OUT_OF_SCOPE = "OUT_OF_SCOPE", "Hors scope"
+        CANCELLED    = "CANCELLED",    "Annulée"
 
 
 
