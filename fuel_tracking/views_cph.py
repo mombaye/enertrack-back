@@ -8,6 +8,7 @@ la plage exacte demandée (services/cph_engine.py).
   GET  /api/fuel-tracking/cph/export/controle/         export « Contrôle complet » (CSV, site × jour)
   GET  /api/fuel-tracking/cph/export/anomalies/        export « Anomalies Fuel » (statut ≠ OK)
   POST /api/fuel-tracking/cph/observations/import/     fichier d'observation standard
+  POST /api/fuel-tracking/cph/abaque/import/           abaque CPH PRP 50 Hz (admin, manager)
   GET  /api/fuel-tracking/cph/observations/imports/    historique des imports
   GET  /api/fuel-tracking/cph/referentiel/             courbes + mappages (état de validation)
   POST /api/fuel-tracking/cph/mappings/<id>/validate/  validation métier d'un mappage (admin, manager)
@@ -158,7 +159,10 @@ def _meta() -> dict:
 
     last_run = FuelDailyFactsSyncRun.objects.order_by("-started_at").first()
     curves = list(CphCurve.objects.all())
+    last_curve = max(curves, key=lambda c: c.imported_at, default=None)
     return {
+        "abaque_file": last_curve.abaque_file if last_curve else None,
+        "abaque_imported_at": last_curve.imported_at if last_curve else None,
         "rule_version": E.RULE_VERSION,
         "enoc_deliveries_connected": bool(getattr(settings, "FUEL_ENOC_DELIVERIES_CONNECTED", False)),
         "facts_last_date": FuelSiteDailyFacts.objects.aggregate(v=Max("date"))["v"],
@@ -331,6 +335,33 @@ class CphObservationImportView(APIView):
         return Response({"id": imp.id, "file_name": imp.file_name, "rule_version": imp.rule_version,
                          "rows_total": imp.rows_total, "rows_imported": imp.rows_imported,
                          "rows_rejected": imp.rows_rejected, "errors": imp.errors[:50]}, status=201)
+
+
+class CphAbaqueImportView(APIView):
+    permission_classes = [IsCphValidator]
+    parser_classes = [MultiPartParser]
+
+    def post(self, request):
+        from fuel_tracking.services.cph_abaque_import import apply_abaque, parse_abaque
+
+        f = request.FILES.get("file")
+        if not f:
+            return Response({"detail": "Aucun fichier fourni."}, status=400)
+        if not f.name.lower().endswith((".xlsx", ".xlsm")):
+            return Response({"detail": "Format attendu : ABAQUE_CPH_GE_PRP_50HZ.xlsx"}, status=400)
+        try:
+            parsed = parse_abaque(f)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=400)
+        reset = apply_abaque(parsed, f.name)
+        return Response({
+            "file_name": f.name,
+            "curves": len(parsed["curves"]),
+            "status_counts": parsed["status_counts"],
+            "mappings": len(parsed["mappings"]),
+            "warnings": parsed["warnings"],
+            "validations_reset": reset,
+        }, status=201)
 
 
 class CphObservationImportListView(APIView):

@@ -10,6 +10,7 @@ from fuel_tracking.views import (
     FuelStockListView,
 )
 from fuel_tracking.views_cph import (
+    CphAbaqueImportView,
     CphCurveApproveView,
     CphCurveRevokeView,
     CphExportAnomaliesView,
@@ -37,6 +38,7 @@ urlpatterns = [
     path("cph/observations/import/", CphObservationImportView.as_view(), name="fuel-cph-observations-import"),
     path("cph/observations/imports/", CphObservationImportListView.as_view(), name="fuel-cph-observations-imports"),
     path("cph/referentiel/", CphReferentielView.as_view(), name="fuel-cph-referentiel"),
+    path("cph/abaque/import/", CphAbaqueImportView.as_view(), name="fuel-cph-abaque-import"),
     path("cph/mappings/<int:pk>/validate/", CphMappingValidateView.as_view(), name="fuel-cph-mapping-validate"),
     path("cph/mappings/<int:pk>/unvalidate/", CphMappingUnvalidateView.as_view(), name="fuel-cph-mapping-unvalidate"),
     path("cph/curves/<str:curve_id>/approve/", CphCurveApproveView.as_view(), name="fuel-cph-curve-approve"),
