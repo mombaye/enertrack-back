@@ -360,3 +360,53 @@ class ObservationFileTests(SimpleTestCase):
 
         content = ("﻿" + ";".join(COLUMNS) + "\r\n").encode("utf-8")
         self.assertEqual(read_rows("modele.csv", content), [])
+
+
+class BlocageTests(SimpleTestCase):
+    """Premier point bloquant affiché à l'utilisateur (views_cph._blocage_code)."""
+
+    def facts(self, n=2):
+        return {d: fact(dse_runtime_h=10, tracker_ge_on_slots=10, p_dc_ge_tracker_kw=D("8"), eff_ge_tracker=D("0.8"))
+                for d in days(OCT1, n)}
+
+    def code(self, ctx, facts, observations=(), settings=None):
+        from fuel_tracking.views_cph import _blocage_code
+        return _blocage_code(period(ctx, facts, OCT1, OCT1 + timedelta(days=1), observations, settings))
+
+    def obs(self):
+        return E.Observation(start=OCT1, end=OCT1 + timedelta(days=1), opening_fuel_l=D("500"), closing_fuel_l=D("300"),
+                             fuel_deliveries_l=D("0"), fuel_transfer_in_l=D("0"), fuel_transfer_out_l=D("0"),
+                             fuel_theft_l=D("0"), fuel_drain_l=D("0"), observation_status="VALIDÉ")
+
+    def test_curve_reasons_are_classified(self):
+        cases = {
+            "mappage « SDMO - K22 » non validé (CANDIDAT_UNIQUE_A_VALIDER) — Valider plaque": "MAPPAGE_NON_VALIDE",
+            "courbe CPH-0048 au statut HISTORIQUE_A_VALIDER non activée par le métier": "COURBE_NON_ACTIVEE",
+            "site multi-GE (DG_COUNT = 2) : affectation d'une courbe par GE non disponible": "MULTI_GE",
+            "type de GE absent de l'inventaire Base GE": "GE_INCONNU",
+            "libellé GE « X » absent du mappage de l'abaque": "GE_HORS_ABAQUE",
+            "libellé « X » présent pour plusieurs kVA (22, 33) et kVA du site inconnu : mappage ambigu": "MAPPAGE_AMBIGU",
+            "courbe CPH-0145 sans cos φ : plafond 105 % × kVA × cos φ non vérifiable": "COURBE_SANS_COS_PHI",
+        }
+        for reason, expected in cases.items():
+            self.assertEqual(self.code(outdoor(curve=None, curve_reason=reason), self.facts()), expected, reason)
+
+    def test_runtime_then_observation_then_enoc(self):
+        connected = E.EngineSettings(enoc_deliveries_connected=True)
+        self.assertEqual(self.code(outdoor(), {}), "RUNTIME_ABSENT")
+        self.assertEqual(self.code(outdoor(), self.facts(1)), "OBSERVATION_ABSENTE")
+        self.assertEqual(self.code(outdoor(), self.facts(1), [self.obs()], connected), "CPH_PARTIEL")
+        self.assertEqual(self.code(outdoor(), self.facts()), "OBSERVATION_ABSENTE")
+        self.assertEqual(self.code(outdoor(), self.facts(), [self.obs()]), "LIVRAISONS_ENOC")
+        self.assertIsNone(self.code(outdoor(), self.facts(), [self.obs()], connected))
+
+    def test_site_with_verdict_has_no_blocage_even_if_period_cph_is_partial(self):
+        from fuel_tracking.views_cph import _blocage_code
+        obs = self.obs()  # relevé du 1er au 2, période du 1er au 3 dont le 3 sans données
+        r = period(outdoor(), self.facts(), OCT1, OCT1 + timedelta(days=2), [obs], E.EngineSettings(enoc_deliveries_connected=True))
+        self.assertEqual(r["cph_status"], E.CPH_PARTIEL)
+        self.assertIn(r["rapprochement_statut"], (E.R_OK, E.R_A_JUSTIFIER, E.R_A_INVESTIGUER))
+        self.assertIsNone(_blocage_code(r))
+
+    def test_data_issue_comes_first(self):
+        self.assertEqual(self.code(outdoor(data_issue="plusieurs DATA_ID", curve=None, curve_reason="x"), self.facts()), "DONNEES_SITE")

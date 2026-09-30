@@ -81,8 +81,83 @@ def _reconciliation_dict(r: dict | None):
     }
 
 
+# Premier point bloquant d'un site, en langage métier (présentation seulement :
+# aucune valeur n'est recalculée). Ordre = chaîne de calcul : rattachement des
+# données → courbe → runtime → puissance/CPH → observation stock → ENOC.
+# Un site qui a un verdict (OK / À justifier / À investiguer) n'a pas de blocage.
+BLOCAGE_LABELS = {
+    "DONNEES_SITE": ("cph", "Rattachement des données Snowflake à vérifier"),
+    "MULTI_GE": ("cph", "Site multi-GE : une courbe par GE non gérée"),
+    "GE_INCONNU": ("cph", "Type de GE absent de la Base GE"),
+    "GE_HORS_ABAQUE": ("cph", "Type de GE absent de l'abaque"),
+    "MAPPAGE_AMBIGU": ("cph", "Mappage ambigu (plusieurs kVA)"),
+    "MAPPAGE_NON_VALIDE": ("cph", "Plaque signalétique non validée"),
+    "COURBE_NON_ACTIVEE": ("cph", "Courbe non activée par le métier"),
+    "COURBE_SANS_COS_PHI": ("cph", "Courbe sans cos φ"),
+    "RUNTIME_ABSENT": ("cph", "Aucune heure de marche GE fiable"),
+    "PUISSANCE_ABSENTE": ("cph", "Puissance GE non disponible"),
+    "HORS_COURBE": ("cph", "Charge GE hors du domaine de la courbe"),
+    "CPH_PARTIEL": ("cph", "CPH incomplet sur la période du relevé"),
+    "OBSERVATION_ABSENTE": ("rapprochement", "Aucun relevé de stock sur la période"),
+    "OBSERVATION_INCOMPLETE": ("rapprochement", "Relevé de stock incomplet ou non validé"),
+    "LIVRAISONS_ENOC": ("rapprochement", "Livraisons ENOC à contrôler"),
+}
+
+_CURVE_REASON_CODES = (
+    ("site multi-ge", "MULTI_GE"),
+    ("type de ge absent", "GE_INCONNU"),
+    ("absent du mappage", "GE_HORS_ABAQUE"),
+    ("mappage ambigu", "MAPPAGE_AMBIGU"),
+    ("non validé", "MAPPAGE_NON_VALIDE"),
+    ("non activée", "COURBE_NON_ACTIVEE"),
+    ("sans cos", "COURBE_SANS_COS_PHI"),
+)
+
+_DAY_STATUS_CODES = {
+    E.DAY_RUNTIME_ABSENT: "RUNTIME_ABSENT",
+    E.DAY_PUISSANCE_ABSENTE: "PUISSANCE_ABSENTE",
+    E.DAY_PUISSANCE_HORS_PLAFOND: "HORS_COURBE",
+    E.DAY_CPH_HORS_DOMAINE: "HORS_COURBE",
+}
+
+
+def _blocage_code(r: dict) -> str | None:
+    if r["data_issue"]:
+        return "DONNEES_SITE"
+    if r["curve"] is None:
+        reason = (r["curve_reason"] or "").lower()
+        return next((code for key, code in _CURVE_REASON_CODES if key in reason), "MAPPAGE_NON_VALIDE")
+    if r["runtime_days"] == 0:
+        return "RUNTIME_ABSENT"
+    if r["cph_status"] == E.CPH_NON_CALCULE_PERIODE:
+        blocking = {k: v for k, v in r["day_status_counts"].items() if k in _DAY_STATUS_CODES}
+        return _DAY_STATUS_CODES[max(blocking, key=blocking.get)] if blocking else "RUNTIME_ABSENT"
+    # Un CPH partiel sur la période ne bloque que s'il manque sur la fenêtre du
+    # relevé : c'est le rapprochement qui le dit (statut CPH_NON_CALCULE).
+    rec = r["rapprochement"]
+    if rec is None:
+        return "OBSERVATION_ABSENTE"
+    if rec["statut"] == E.R_DONNEES_INCOMPLETES:
+        if rec.get("livraisons_statut") == E.LIVRAISONS_ENOC_A_CONTROLER:
+            return "LIVRAISONS_ENOC"
+        return "OBSERVATION_INCOMPLETE"
+    if rec["statut"] == E.R_CPH_NON_CALCULE:
+        return "CPH_PARTIEL"
+    return None
+
+
+def _blocage(r: dict) -> dict | None:
+    code = _blocage_code(r)
+    if code is None:
+        return None
+    etape, label = BLOCAGE_LABELS[code]
+    detail = r["curve_reason"] if r["curve"] is None and not r["data_issue"] else (r["data_issue"] or (r["motifs"][0] if r["motifs"] else None))
+    return {"code": code, "etape": etape, "label": label, "detail": detail}
+
+
 def _site_summary(r: dict) -> dict:
     return {
+        "blocage": _blocage(r),
         "site_id": r["site_id"], "site_name": r["site_name"], "country": r["country"], "zone": r["zone"],
         "kind": r["kind"], "kind_source": r["kind_source"], "grid_supply": r["grid_supply"], "off_grid": r["off_grid"],
         "dg_count": r["dg_count"], "ge_label": r["ge_label"], "data_issue": r["data_issue"],
@@ -134,6 +209,9 @@ def _apply_table_filters(rows: list[dict], params) -> list[dict]:
     cst = (params.get("cph_status") or "").strip()
     if cst:
         rows = [r for r in rows if r["cph_status"] == cst]
+    bl = (params.get("blocage") or "").strip()
+    if bl:
+        rows = [r for r in rows if _blocage_code(r) == bl]
     return rows
 
 
@@ -150,7 +228,18 @@ def _synthesis(rows: list[dict]) -> dict:
         "a_investiguer": count(lambda r: r["rapprochement_statut"] == E.R_A_INVESTIGUER),
         "donnees_incompletes": count(lambda r: r["rapprochement_statut"] == E.R_DONNEES_INCOMPLETES),
         "rapprochement_cph_non_calcule": count(lambda r: r["rapprochement_statut"] == E.R_CPH_NON_CALCULE),
+        "blocages": _blocages_summary(rows),
     }
+
+
+def _blocages_summary(rows: list[dict]) -> list[dict]:
+    counts: dict[str, int] = {}
+    for r in rows:
+        code = _blocage_code(r)
+        if code:
+            counts[code] = counts.get(code, 0) + 1
+    return [{"code": c, "etape": BLOCAGE_LABELS[c][0], "label": BLOCAGE_LABELS[c][1], "sites": n}
+            for c, n in sorted(counts.items(), key=lambda kv: -kv[1])]
 
 
 def _meta(request=None) -> dict:
