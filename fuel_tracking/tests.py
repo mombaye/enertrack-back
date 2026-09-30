@@ -1,256 +1,318 @@
-"""
-Tests de la priorité de source Running Time CPH (spec 2026-09) — couvrent :
-  - les 8 règles de _resolve_business_runtime (fuel_cph_snowflake.py) ;
-  - compute_daily_status (fuel_cph_service.py) sur les 2 chemins
-    d'intégration énergie (Path A tracker actif / Path B GENSET_REPORT seul)
-    et les statuts spéciaux (DSE=0 confirmé/conflit) ;
-  - la reclassification NOT_APPLICABLE_NO_GE (compute_monthly_cph_estimates)
-    pour un site sans GE (Postgres has_genset=False).
-
-Aucun de ces tests ne touche Snowflake ni Postgres : fetch_daily_tracker_energy/
-_load_active_parameters/fetch_site_ge_specs/fetch_site_rectifier_efficiency
-sont mockés là où nécessaire, FuelCphGeParameter est instancié SANS .save().
-"""
-from datetime import date
-from decimal import Decimal
-from unittest.mock import patch
+from datetime import date, timedelta
+from decimal import Decimal as D
+from types import SimpleNamespace
 
 from django.test import SimpleTestCase
 
-from fuel_tracking.models import FuelCphGeParameter
-from fuel_tracking.services.fuel_cph_service import compute_daily_status, compute_monthly_cph_estimates
-from fuel_tracking.services.fuel_cph_snowflake import (
-    RUNTIME_DG_ON_CALCULATED,
-    RUNTIME_DSE_CONTROLLER,
-    RUNTIME_DSE_ZERO_CONFIRMED,
-    RUNTIME_DSE_ZERO_CONFLICT,
-    RUNTIME_NO_VALID,
-    RUNTIME_RECTIFIER_5MIN,
-    RUNTIME_TRACKER_5MIN,
-    _resolve_business_runtime,
-)
+from fuel_tracking.services import cph_engine as E
+from fuel_tracking.services.cph_service import resolve_curve
+
+# Caterpillar DE22E3 (CPH-0014, VALIDÉ_CONSTRUCTEUR) : 20 kVA / 16 kW, a=3.2 b=0 c=2.1
+DE22E3 = E.Curve(curve_id="CPH-0014", label="Caterpillar DE22E3", status="VALIDÉ_CONSTRUCTEUR",
+                 prp_kva=D("20"), prp_kw=D("16"), power_factor=D("0.8"), a=D("3.2"), b=D("0"), c=D("2.1"))
+# Rehlko R50C5 (CPH-0123) : c < 0, CPH négatif à faible charge
+R50C5 = E.Curve(curve_id="CPH-0123", label="Rehlko R50C5", status="VALIDÉ_CONSTRUCTEUR",
+                prp_kva=D("45"), prp_kw=D("36"), power_factor=D("0.8"), a=D("-6.4"), b=D("20"), c=D("-2.6"))
+
+OCT1 = date(2026, 10, 1)
 
 
-class ResolveBusinessRuntimeTests(SimpleTestCase):
-    """Les 8 règles exactes de la spec 2026-09 (remplace DSE > DG-On > Redresseur > Tracker)."""
-
-    def test_dse_positive_wins_regardless_of_other_sources(self):
-        runtime_h, source, status, reason = _resolve_business_runtime(
-            dse_h=Decimal("5"), dg_on_h=Decimal("2"), rectifier_h=Decimal("1"),
-            is_hybrid_solar_ge=False, tracker_h=Decimal("3"),
-        )
-        self.assertEqual(runtime_h, Decimal("5"))
-        self.assertEqual(source, RUNTIME_DSE_CONTROLLER)
-        self.assertEqual(status, RUNTIME_DSE_CONTROLLER)
-        self.assertIsNone(reason)
-
-    def test_dse_zero_confirmed_when_no_other_source_positive(self):
-        runtime_h, source, status, reason = _resolve_business_runtime(
-            dse_h=Decimal("0"), dg_on_h=None, rectifier_h=None, is_hybrid_solar_ge=False, tracker_h=None,
-        )
-        self.assertEqual(runtime_h, Decimal("0"))
-        self.assertIsNone(source)  # aucune source physique gagnante pour un 0h confirmé
-        self.assertEqual(status, RUNTIME_DSE_ZERO_CONFIRMED)
-        self.assertIsNone(reason)
-
-    def test_dse_zero_conflicts_with_positive_tracker(self):
-        runtime_h, source, status, reason = _resolve_business_runtime(
-            dse_h=Decimal("0"), dg_on_h=None, rectifier_h=None, is_hybrid_solar_ge=False, tracker_h=Decimal("2.5"),
-        )
-        self.assertIsNone(runtime_h)  # aucun repli automatique
-        self.assertIsNone(source)
-        self.assertEqual(status, RUNTIME_DSE_ZERO_CONFLICT)
-        self.assertIsNotNone(reason)
-
-    def test_dse_zero_conflicts_with_positive_dg_on(self):
-        _, _, status, _ = _resolve_business_runtime(
-            dse_h=Decimal("0"), dg_on_h=Decimal("4"), rectifier_h=None, is_hybrid_solar_ge=False, tracker_h=None,
-        )
-        self.assertEqual(status, RUNTIME_DSE_ZERO_CONFLICT)
-
-    def test_dse_absent_falls_back_to_tracker_before_dg_on(self):
-        """Corrige l'audit 2026-09 : le tracker doit primer sur DG-On/Redresseur quand le DSE est absent."""
-        runtime_h, source, status, reason = _resolve_business_runtime(
-            dse_h=None, dg_on_h=Decimal("6"), rectifier_h=Decimal("6"), is_hybrid_solar_ge=False, tracker_h=Decimal("2.5"),
-        )
-        self.assertEqual(runtime_h, Decimal("2.5"))
-        self.assertEqual(source, RUNTIME_TRACKER_5MIN)
-        self.assertEqual(status, RUNTIME_TRACKER_5MIN)
-        self.assertIsNone(reason)
-
-    def test_dse_and_tracker_absent_non_hybrid_uses_dg_on(self):
-        runtime_h, source, status, reason = _resolve_business_runtime(
-            dse_h=None, dg_on_h=Decimal("4"), rectifier_h=Decimal("6"), is_hybrid_solar_ge=False, tracker_h=None,
-        )
-        self.assertEqual(runtime_h, Decimal("4"))
-        self.assertEqual(source, RUNTIME_DG_ON_CALCULATED)
-        self.assertEqual(status, RUNTIME_DG_ON_CALCULATED)
-
-    def test_dse_and_tracker_absent_hybrid_uses_rectifier(self):
-        runtime_h, source, status, reason = _resolve_business_runtime(
-            dse_h=None, dg_on_h=Decimal("4"), rectifier_h=Decimal("6"), is_hybrid_solar_ge=True, tracker_h=None,
-        )
-        self.assertEqual(runtime_h, Decimal("6"))
-        self.assertEqual(source, RUNTIME_RECTIFIER_5MIN)
-        self.assertEqual(status, RUNTIME_RECTIFIER_5MIN)
-
-    def test_no_source_at_all(self):
-        runtime_h, source, status, reason = _resolve_business_runtime(
-            dse_h=None, dg_on_h=None, rectifier_h=None, is_hybrid_solar_ge=False, tracker_h=None,
-        )
-        self.assertIsNone(runtime_h)
-        self.assertIsNone(source)
-        self.assertEqual(status, RUNTIME_NO_VALID)
-        self.assertIsNotNone(reason)
+def outdoor(**kw):
+    base = dict(site_id="S1", kind="OUTDOOR", off_grid=True, dg_count=1, curve=DE22E3)
+    base.update(kw)
+    return E.SiteContext(**base)
 
 
-class ComputeDailyStatusTests(SimpleTestCase):
-    """Path A (tracker actif) vs Path B (GENSET_REPORT + LOAD_REPORT, sans intervalle tracker)."""
-
-    def _params(self, **overrides):
-        defaults = dict(spc_l_per_kwh=Decimal("0.3"), rectifier_efficiency_ratio=Decimal("0.9"), pge_kva=None, power_factor=None)
-        defaults.update(overrides)
-        return FuelCphGeParameter(**defaults)
-
-    def _energies(self, **overrides):
-        base = {
-            "ge_intervals": 0, "valid_battery_intervals": 0,
-            "dg_runtime_interval_h": None, "dg_runtime_controller_h": None,
-            "dg_runtime_business_h": None, "dg_runtime_business_source": None,
-            "dg_runtime_business_status": None, "dg_runtime_business_rejection_reason": None,
-            "site_load_energy_kwh": None, "battery_dc_energy_kwh": None, "load_kw": None,
-        }
-        base.update(overrides)
-        return base
-
-    def test_dse_zero_confirmed_is_ok_zero_litres_without_params(self):
-        energies = self._energies(dg_runtime_business_h=Decimal("0"), dg_runtime_business_status=RUNTIME_DSE_ZERO_CONFIRMED)
-        status, computed = compute_daily_status(energies, params=None)
-        self.assertEqual(status, "OK")
-        self.assertEqual(computed["estimated_consumption_l"], Decimal("0"))
-        self.assertEqual(computed["cph_estimated_lph"], Decimal("0"))
-
-    def test_dse_zero_conflict_short_circuits_without_computing_litres(self):
-        energies = self._energies(
-            ge_intervals=3, dg_runtime_interval_h=Decimal("2"), dg_runtime_controller_h=Decimal("0"),
-            dg_runtime_business_status=RUNTIME_DSE_ZERO_CONFLICT, valid_battery_intervals=3,
-            site_load_energy_kwh=Decimal("10"),
-        )
-        status, computed = compute_daily_status(energies, self._params())
-        self.assertEqual(status, RUNTIME_DSE_ZERO_CONFLICT)
-        self.assertIsNone(computed["estimated_consumption_l"])
-
-    def test_no_valid_runtime_short_circuits(self):
-        energies = self._energies(dg_runtime_business_status=RUNTIME_NO_VALID)
-        status, computed = compute_daily_status(energies, self._params())
-        self.assertEqual(status, RUNTIME_NO_VALID)
-        self.assertIsNone(computed["estimated_consumption_l"])
-
-    def test_path_a_tracker_active_ok(self):
-        energies = self._energies(
-            ge_intervals=5, valid_battery_intervals=5,
-            dg_runtime_interval_h=Decimal("3"), dg_runtime_controller_h=Decimal("3"),
-            dg_runtime_business_h=Decimal("3"), dg_runtime_business_source=RUNTIME_DSE_CONTROLLER,
-            dg_runtime_business_status=RUNTIME_DSE_CONTROLLER,
-            site_load_energy_kwh=Decimal("9"), battery_dc_energy_kwh=Decimal("0"),
-        )
-        status, computed = compute_daily_status(energies, self._params())
-        self.assertEqual(status, "OK")
-        self.assertEqual(computed["conso_estimee_source"], "CPH_TRACKER_5MIN")
-        self.assertEqual(computed["estimated_consumption_l"], Decimal("2.7000"))  # 9 kWh * 0.3 L/kWh
-
-    def test_path_a_missing_load_power_when_tracker_inactive_and_no_business_runtime(self):
-        energies = self._energies()  # ge_intervals=0, aucune source résolue
-        status, computed = compute_daily_status(energies, self._params())
-        self.assertEqual(status, RUNTIME_NO_VALID)  # dg_runtime_business_status=None -> traité comme NO_VALID_RUNTIME
-
-    def test_path_b_dg_on_without_tracker_uses_load_report(self):
-        """Corrige le point 3 de l'audit : DG-On avec runtime mais MISSING_LOAD_POWER alors
-        que la charge existe dans LOAD_REPORT — désormais utilisée via load_kw."""
-        energies = self._energies(
-            dg_runtime_business_h=Decimal("4"), dg_runtime_business_source=RUNTIME_DG_ON_CALCULATED,
-            dg_runtime_business_status=RUNTIME_DG_ON_CALCULATED, load_kw=Decimal("2.5"),
-        )
-        status, computed = compute_daily_status(energies, self._params())
-        self.assertEqual(status, "OK")
-        self.assertEqual(computed["conso_estimee_source"], "CPH_GENSET_DAILY_AVG")
-        self.assertEqual(computed["estimated_consumption_l"], Decimal("3.0000"))  # (2.5*4) kWh * 0.3 L/kWh
-
-    def test_path_b_rectifier_without_tracker_uses_load_report(self):
-        energies = self._energies(
-            dg_runtime_business_h=Decimal("2"), dg_runtime_business_source=RUNTIME_RECTIFIER_5MIN,
-            dg_runtime_business_status=RUNTIME_RECTIFIER_5MIN, load_kw=Decimal("5"),
-        )
-        status, computed = compute_daily_status(energies, self._params())
-        self.assertEqual(status, "OK")
-        self.assertEqual(computed["conso_estimee_source"], "CPH_GENSET_DAILY_AVG")
-
-    def test_charge_absente_conserves_source_but_status_becomes_missing_load_power(self):
-        """Spec 2026-09, point 3 : "si le runtime existe mais que load_kw est absent,
-        conserver la source et retourner MISSING_LOAD_POWER" — la source déjà résolue
-        (dg_runtime_business_source) n'est PAS effacée par compute_daily_status."""
-        energies = self._energies(
-            dg_runtime_business_h=Decimal("5"), dg_runtime_business_source=RUNTIME_DSE_CONTROLLER,
-            dg_runtime_business_status=RUNTIME_DSE_CONTROLLER, load_kw=None,
-        )
-        status, computed = compute_daily_status(energies, self._params())
-        self.assertEqual(status, "MISSING_LOAD_POWER")
-        self.assertEqual(energies["dg_runtime_business_source"], RUNTIME_DSE_CONTROLLER)
-
-    def test_missing_parameter_when_no_reference_sheet(self):
-        energies = self._energies(
-            dg_runtime_business_h=Decimal("4"), dg_runtime_business_source=RUNTIME_DG_ON_CALCULATED,
-            dg_runtime_business_status=RUNTIME_DG_ON_CALCULATED, load_kw=Decimal("2.5"),
-        )
-        status, computed = compute_daily_status(energies, params=None)
-        self.assertEqual(status, "MISSING_PARAMETER")
+def fact(**kw):
+    return dict(kw)
 
 
-class ComputeMonthlyEstimatesNoGeTests(SimpleTestCase):
-    """Site sans GE (Postgres has_genset=False) — reclassé NOT_APPLICABLE_NO_GE (spec 2026-09, règle 1)."""
+def days(start, n):
+    return [start + timedelta(days=i) for i in range(n)]
 
-    @patch("fuel_tracking.services.fuel_cph_service.fetch_site_rectifier_efficiency", return_value={})
-    @patch("fuel_tracking.services.fuel_cph_service.fetch_site_ge_specs", return_value={})
-    @patch("fuel_tracking.services.fuel_cph_service._load_active_parameters", return_value={})
-    @patch("fuel_tracking.services.fuel_cph_service.fetch_daily_tracker_energy")
-    def test_site_without_genset_marked_not_applicable(self, mock_fetch, *_mocks):
-        mock_fetch.return_value = {
-            "NOGE_0001": {
-                date(2026, 9, 1): {
-                    "country": "Senegal", "data_id": 1,
-                    "ge_intervals": 5, "valid_battery_intervals": 5,
-                    "dg_runtime_interval_h": Decimal("3"), "dg_runtime_controller_h": Decimal("3"),
-                    "dg_runtime_business_h": Decimal("3"), "dg_runtime_business_source": RUNTIME_DSE_CONTROLLER,
-                    "dg_runtime_business_status": RUNTIME_DSE_CONTROLLER, "dg_runtime_business_rejection_reason": None,
-                    "site_load_energy_kwh": Decimal("10"), "battery_dc_energy_kwh": Decimal("1"), "load_kw": None,
-                }
-            }
-        }
-        result = compute_monthly_cph_estimates(2026, 9, site_ids=["NOGE_0001"], site_has_genset={"NOGE_0001": False})
 
-        self.assertEqual(result["monthly"]["NOGE_0001"]["cph_calculation_status"], "NOT_APPLICABLE_NO_GE")
-        self.assertIsNone(result["monthly"]["NOGE_0001"]["cph_runtime_h_total"])
-        self.assertIsNone(result["monthly"]["NOGE_0001"]["cph_runtime_source"])
-        self.assertEqual(len(result["daily"]), 1)
-        self.assertEqual(result["daily"][0]["calculation_status"], "NOT_APPLICABLE_NO_GE")
+def period(ctx, facts, start, end, observations=(), settings=None):
+    return E.compute_site_period(ctx, facts, start, end, list(observations), settings or E.EngineSettings())
 
-    @patch("fuel_tracking.services.fuel_cph_service.fetch_site_rectifier_efficiency", return_value={})
-    @patch("fuel_tracking.services.fuel_cph_service.fetch_site_ge_specs", return_value={})
-    @patch("fuel_tracking.services.fuel_cph_service._load_active_parameters", return_value={})
-    @patch("fuel_tracking.services.fuel_cph_service.fetch_daily_tracker_energy")
-    def test_site_with_genset_untouched_by_override(self, mock_fetch, *_mocks):
-        mock_fetch.return_value = {
-            "GE_0001": {
-                date(2026, 9, 1): {
-                    "country": "Senegal", "data_id": 2,
-                    "ge_intervals": 5, "valid_battery_intervals": 5,
-                    "dg_runtime_interval_h": Decimal("3"), "dg_runtime_controller_h": Decimal("3"),
-                    "dg_runtime_business_h": Decimal("3"), "dg_runtime_business_source": RUNTIME_DSE_CONTROLLER,
-                    "dg_runtime_business_status": RUNTIME_DSE_CONTROLLER, "dg_runtime_business_rejection_reason": None,
-                    "site_load_energy_kwh": Decimal("10"), "battery_dc_energy_kwh": Decimal("1"), "load_kw": None,
-                }
-            }
-        }
-        result = compute_monthly_cph_estimates(2026, 9, site_ids=["GE_0001"], site_has_genset={"GE_0001": True})
-        self.assertNotEqual(result["monthly"]["GE_0001"]["cph_calculation_status"], "NOT_APPLICABLE_NO_GE")
-        self.assertEqual(result["monthly"]["GE_0001"]["cph_runtime_source"], RUNTIME_DSE_CONTROLLER)
+
+class RuntimeTests(SimpleTestCase):
+    def test_dse_zero_is_zero_not_missing(self):
+        facts = {d: fact(dse_runtime_h=0) for d in days(OCT1, 10)}
+        r = period(outdoor(), facts, OCT1, OCT1 + timedelta(days=9))
+        day = r["daily"][0]
+        self.assertEqual(day["runtime_h"], D("0"))
+        self.assertEqual(day["runtime_source"], E.RT_DSE)
+        self.assertEqual(day["status"], E.DAY_GE_ARRET)
+        self.assertEqual(day["conso_l"], D("0"))
+        self.assertIsNone(day["cph_l_h"])
+        self.assertEqual(r["runtime_total_h"], D("0"))
+
+    def test_dse_priority_over_other_sources(self):
+        facts = {d: fact(dse_runtime_h=5, dg_on_runtime_h=7, rectifier_slots=288, rectifier_active_slots=96,
+                         tracker_runtime_h=6, tracker_covered_min=1440) for d in days(OCT1, 4)}
+        r = period(outdoor(), facts, OCT1, OCT1 + timedelta(days=3))
+        self.assertTrue(all(d["runtime_source"] == E.RT_DSE and d["runtime_h"] == D("5") for d in r["daily"]))
+
+    def test_source_below_50pct_availability_is_not_used(self):
+        # DSE présent 1 jour sur 4 (25 %) → rejeté pour toute la période, même ce jour-là.
+        facts = {d: fact(tracker_runtime_h=3, tracker_covered_min=1440) for d in days(OCT1, 4)}
+        facts[OCT1]["dse_runtime_h"] = 8
+        r = period(outdoor(off_grid=False), facts, OCT1, OCT1 + timedelta(days=3))
+        self.assertFalse(r["sources"][E.RT_DSE]["exploitable"])
+        self.assertIn("25 %", r["sources"][E.RT_DSE]["rejection"])
+        self.assertEqual(r["daily"][0]["runtime_source"], E.RT_COMPTEUR)
+        self.assertEqual(r["daily"][0]["runtime_h"], D("3"))
+
+    def test_availability_counts_non_null_days_without_coalesce(self):
+        facts = {d: fact(dse_runtime_h=0) for d in days(OCT1, 2)}  # 2 jours sur 4 = 50 %
+        r = period(outdoor(), facts, OCT1, OCT1 + timedelta(days=3))
+        self.assertEqual(r["sources"][E.RT_DSE]["availability"], D("0.5"))
+        self.assertTrue(r["sources"][E.RT_DSE]["exploitable"])
+        self.assertEqual(r["daily"][2]["status"], E.DAY_RUNTIME_ABSENT)
+        self.assertIsNone(r["daily"][2]["runtime_h"])
+
+    def test_dse_out_of_bounds_rejected(self):
+        facts = {d: fact(dse_runtime_h=1192095) for d in days(OCT1, 2)}
+        r = period(outdoor(), facts, OCT1, OCT1 + timedelta(days=1))
+        self.assertIsNone(r["daily"][0]["runtime_h"])
+        self.assertEqual(r["cph_status"], E.CPH_NON_CALCULE_PERIODE)
+
+    def test_rectifier_only_for_off_grid(self):
+        facts = {d: fact(rectifier_slots=288, rectifier_active_slots=60) for d in days(OCT1, 2)}
+        on_grid = period(outdoor(off_grid=False), facts, OCT1, OCT1 + timedelta(days=1))
+        self.assertIsNone(on_grid["daily"][0]["runtime_h"])
+        self.assertIn("non off-grid", on_grid["sources"][E.RT_REDRESSEUR]["rejection"])
+        off_grid = period(outdoor(off_grid=True), facts, OCT1, OCT1 + timedelta(days=1))
+        self.assertEqual(off_grid["daily"][0]["runtime_h"], D("60") * E.SLOT_H)
+        self.assertEqual(off_grid["daily"][0]["runtime_source"], E.RT_REDRESSEUR)
+
+    def test_day_dg_on_rejected_when_zero_coalesced(self):
+        facts = {d: fact(dg_on_runtime_h=0, tracker_runtime_h=4, tracker_covered_min=1440) for d in days(OCT1, 3)}
+        r = period(outdoor(off_grid=False), facts, OCT1, OCT1 + timedelta(days=2))
+        self.assertFalse(r["sources"][E.RT_DAY_DG_ON]["exploitable"])
+        self.assertIn("coalescence", r["sources"][E.RT_DAY_DG_ON]["rejection"])
+        self.assertEqual(r["daily"][0]["runtime_source"], E.RT_COMPTEUR)
+
+    def test_tracker_requires_continuous_coverage(self):
+        facts = {d: fact(tracker_runtime_h=5, tracker_covered_min=600) for d in days(OCT1, 2)}
+        r = period(outdoor(off_grid=False), facts, OCT1, OCT1 + timedelta(days=1))
+        self.assertIsNone(r["daily"][0]["runtime_h"])
+
+    def test_no_source_gives_null_runtime_and_no_cph(self):
+        r = period(outdoor(), {}, OCT1, OCT1)
+        day = r["daily"][0]
+        self.assertIsNone(day["runtime_h"])
+        self.assertIsNone(day["cph_l_h"])
+        self.assertIsNone(day["conso_l"])
+        self.assertEqual(day["status"], E.DAY_RUNTIME_ABSENT)
+
+
+class PowerAndCphTests(SimpleTestCase):
+    def test_outdoor_dc_power_does_not_add_battery(self):
+        f = fact(dse_runtime_h=10, tracker_ge_on_slots=120, p_dc_ge_tracker_kw=D("8"), eff_ge_tracker=D("0.8"),
+                 )
+        r = period(outdoor(), {OCT1: f}, OCT1, OCT1)
+        day = r["daily"][0]
+        self.assertEqual(day["power_source"], E.PW_DC_REDRESSEUR)
+        self.assertEqual(day["p_ge_kw"], D("10"))  # 8 / 0.8, sans ajout batterie
+        x = D("10") / D("16")
+        self.assertEqual(day["cph_l_h"], D("3.2") * x * x + D("2.1"))
+        self.assertEqual(day["conso_l"], D("10") * day["cph_l_h"])
+        self.assertEqual(day["status"], E.DAY_CPH_CALCULE)
+
+    def test_outdoor_production_ge_first_when_dse_runtime(self):
+        f = fact(dse_runtime_h=4, dg_production_kwh=40, tracker_ge_on_slots=10, p_dc_ge_tracker_kw=5, eff_ge_tracker=D("0.9"))
+        day = period(outdoor(), {OCT1: f}, OCT1, OCT1)["daily"][0]
+        self.assertEqual(day["power_source"], E.PW_PRODUCTION)
+        self.assertEqual(day["p_ge_kw"], D("10"))
+
+    def test_efficiency_must_be_in_0_1(self):
+        f = fact(dse_runtime_h=4, tracker_ge_on_slots=10, p_dc_ge_tracker_kw=5, eff_ge_tracker=D("85"))
+        day = period(outdoor(), {OCT1: f}, OCT1, OCT1)["daily"][0]
+        self.assertIsNone(day["p_ge_kw"])
+        self.assertEqual(day["status"], E.DAY_PUISSANCE_ABSENTE)
+        self.assertIsNone(day["cph_l_h"])
+
+    def test_no_cph_without_validated_curve(self):
+        f = fact(dse_runtime_h=4, tracker_ge_on_slots=10, p_dc_ge_tracker_kw=5, eff_ge_tracker=D("0.9"))
+        ctx = outdoor(curve=None, curve_reason="mappage non validé")
+        day = period(ctx, {OCT1: f}, OCT1, OCT1)["daily"][0]
+        self.assertEqual(day["status"], E.DAY_COURBE_ABSENTE)
+        self.assertIsNone(day["cph_l_h"])
+        self.assertIsNone(day["conso_l"])
+        self.assertIn("mappage non validé", day["motifs"][0])
+
+    def test_power_above_105pct_refused(self):
+        f = fact(dse_runtime_h=4, tracker_ge_on_slots=10, p_dc_ge_tracker_kw=D("17"), eff_ge_tracker=D("1"))
+        day = period(outdoor(), {OCT1: f}, OCT1, OCT1)["daily"][0]  # 17 kW > 1.05 × 20 × 0.8 = 16.8
+        self.assertEqual(day["status"], E.DAY_PUISSANCE_HORS_PLAFOND)
+        self.assertIsNone(day["cph_l_h"])
+
+    def test_low_load_extrapolation_is_flagged(self):
+        f = fact(dse_runtime_h=4, tracker_ge_on_slots=10, p_dc_ge_tracker_kw=D("4"), eff_ge_tracker=D("1"))
+        day = period(outdoor(), {OCT1: f}, OCT1, OCT1)["daily"][0]
+        self.assertTrue(day["extrapolated"])
+        self.assertIn("estimation mathématique", day["motifs"][0])
+
+    def test_negative_cph_extrapolation_refused(self):
+        f = fact(dse_runtime_h=4, tracker_ge_on_slots=10, p_dc_ge_tracker_kw=D("3"), eff_ge_tracker=D("1"))
+        day = period(outdoor(curve=R50C5), {OCT1: f}, OCT1, OCT1)["daily"][0]  # x = 0.083 → CPH < 0
+        self.assertEqual(day["status"], E.DAY_CPH_HORS_DOMAINE)
+        self.assertIsNone(day["conso_l"])
+
+    def test_indoor_power_is_dc_during_ge_plus_ac_history(self):
+        ctx = E.SiteContext(site_id="S2", kind="INDOOR", off_grid=False, dg_count=1, curve=DE22E3)
+        facts = {}
+        # 6 jours de référence (réseau, GE absent) : AC 5 kW, DC 2.4 kW / 0.8 = 3 kW → aux 2 kW
+        for i, d in enumerate(days(OCT1 - timedelta(days=10), 6)):
+            facts[d] = fact(dse_runtime_h=0, ac_active_power_avg_w=D("5000") + i, p_dc_day_kw=D("2.4"), eff_day=D("0.8"))
+        facts[OCT1] = fact(dse_runtime_h=3, tracker_ge_on_slots=30, p_dc_ge_tracker_kw=D("4"), eff_ge_tracker=D("0.8"),
+                           ac_active_power_avg_w=D("9000"))
+        r = period(ctx, facts, OCT1, OCT1)
+        day = r["daily"][0]
+        self.assertEqual(day["power_source"], E.PW_INDOOR)
+        self.assertEqual(day["p_dc_input_kw"], D("5"))
+        aux = day["p_ac_aux_kw"]
+        self.assertEqual(aux.quantize(D("0.0001")), D("2.0025"))
+        self.assertEqual(day["p_ge_kw"], D("5") + aux)
+        self.assertEqual(len(r["ac_reference"]["reference_dates"]), 6)
+        self.assertIn("P_DC pendant GE", day["power_detail"])
+
+    def test_indoor_ac_instrument_never_used_as_ge_power(self):
+        ctx = E.SiteContext(site_id="S2", kind="INDOOR", off_grid=False, dg_count=1, curve=DE22E3)
+        facts = {OCT1: fact(dse_runtime_h=3, tracker_ge_on_slots=30, p_dc_ge_tracker_kw=D("4"), eff_ge_tracker=D("0.8"),
+                            ac_active_power_avg_w=D("9000"))}
+        day = period(ctx, facts, OCT1, OCT1)["daily"][0]
+        self.assertIsNone(day["p_ge_kw"])
+        self.assertIn("profil AC historique insuffisant", day["motifs"][0])
+
+    def test_unknown_site_kind(self):
+        f = fact(dse_runtime_h=4, tracker_ge_on_slots=10, p_dc_ge_tracker_kw=5, eff_ge_tracker=D("0.9"))
+        day = period(outdoor(kind=None), {OCT1: f}, OCT1, OCT1)["daily"][0]
+        self.assertIn("indoor/outdoor inconnu", day["motifs"][0])
+
+
+class PeriodTests(SimpleTestCase):
+    def facts(self):
+        # Runtime DSE = numéro du jour (1er → 1 h, 2 → 2 h…), puissance constante.
+        return {d: fact(dse_runtime_h=d.day, tracker_ge_on_slots=10, p_dc_ge_tracker_kw=D("8"), eff_ge_tracker=D("0.8"))
+                for d in days(OCT1, 25)}
+
+    def test_exact_dates_are_kept(self):
+        a = period(outdoor(), self.facts(), date(2026, 10, 1), date(2026, 10, 12))
+        b = period(outdoor(), self.facts(), date(2026, 10, 2), date(2026, 10, 20))
+        self.assertEqual(a["days"], 12)
+        self.assertEqual(b["days"], 19)
+        self.assertEqual(a["runtime_total_h"], D(sum(range(1, 13))))
+        self.assertEqual(b["runtime_total_h"], D(sum(range(2, 21))))
+        cph = a["daily"][0]["cph_l_h"]
+        self.assertEqual(a["conso_theorique_l"], D(sum(range(1, 13))) * cph)
+        self.assertEqual(b["conso_theorique_l"], D(sum(range(2, 21))) * cph)
+        self.assertEqual(a["daily"][0]["date"], date(2026, 10, 1))
+        self.assertEqual(b["daily"][-1]["date"], date(2026, 10, 20))
+
+    def test_partial_period_has_no_theoretical_total(self):
+        f = self.facts()
+        del f[date(2026, 10, 3)]
+        r = period(outdoor(), f, date(2026, 10, 1), date(2026, 10, 5))
+        self.assertEqual(r["cph_status"], E.CPH_PARTIEL)
+        self.assertIsNone(r["conso_theorique_l"])
+        self.assertIsNotNone(r["conso_partielle_l"])
+
+
+class ReconciliationTests(SimpleTestCase):
+    def obs(self, **kw):
+        base = dict(start=date(2026, 10, 1), end=date(2026, 10, 2), opening_fuel_l=D("500"), closing_fuel_l=D("300"),
+                    fuel_deliveries_l=D("0"), fuel_transfer_in_l=D("0"), fuel_transfer_out_l=D("0"),
+                    fuel_theft_l=D("0"), fuel_drain_l=D("0"), observation_status="VALIDÉ")
+        base.update(kw)
+        return E.Observation(**base)
+
+    def facts(self):
+        # 10 h × CPH(0.625) = 10 × 3.35 = 33.5 L par jour → 67 L sur 2 jours
+        return {d: fact(dse_runtime_h=10, tracker_ge_on_slots=10, p_dc_ge_tracker_kw=D("8"), eff_ge_tracker=D("0.8"))
+                for d in days(OCT1, 2)}
+
+    def test_enoc_not_connected_blocks_reconciliation(self):
+        r = period(outdoor(), self.facts(), OCT1, OCT1 + timedelta(days=1), [self.obs()])
+        rec = r["rapprochement"]
+        self.assertEqual(rec["statut"], E.R_DONNEES_INCOMPLETES)
+        self.assertEqual(rec["livraisons_statut"], E.LIVRAISONS_ENOC_A_CONTROLER)
+        self.assertIsNone(rec["ecart_l"])
+        self.assertTrue(any("LIVRAISONS_ENOC_A_CONTROLER" in m for m in rec["motifs"]))
+
+    def test_empty_cell_is_never_zero(self):
+        s = E.EngineSettings(enoc_deliveries_connected=True)
+        r = period(outdoor(), self.facts(), OCT1, OCT1 + timedelta(days=1), [self.obs(fuel_theft_l=None)], s)
+        self.assertEqual(r["rapprochement"]["statut"], E.R_DONNEES_INCOMPLETES)
+        self.assertIn("vols", r["rapprochement"]["motifs"][0])
+        self.assertIsNone(r["rapprochement"]["conso_stock_l"])
+
+    def test_thresholds(self):
+        s = E.EngineSettings(enoc_deliveries_connected=True)
+        conso_th = D("2") * D("10") * (D("3.2") * (D("10") / D("16")) ** 2 + D("2.1"))
+        cases = [(conso_th + D("90"), E.R_OK), (conso_th + D("150"), E.R_A_JUSTIFIER), (conso_th + D("250"), E.R_A_INVESTIGUER)]
+        for conso_stock, expected in cases:
+            o = self.obs(opening_fuel_l=conso_stock + D("300"), closing_fuel_l=D("300"))
+            rec = period(outdoor(), self.facts(), OCT1, OCT1 + timedelta(days=1), [o], s)["rapprochement"]
+            self.assertEqual(rec["statut"], expected, conso_stock)
+            self.assertEqual(rec["ecart_l"], conso_stock - conso_th)
+
+    def test_cph_non_calcule_when_theoretical_incomplete(self):
+        s = E.EngineSettings(enoc_deliveries_connected=True)
+        f = self.facts()
+        del f[OCT1]
+        rec = period(outdoor(), f, OCT1, OCT1 + timedelta(days=1), [self.obs()], s)["rapprochement"]
+        self.assertEqual(rec["statut"], E.R_CPH_NON_CALCULE)
+
+    def test_unvalidated_observation(self):
+        s = E.EngineSettings(enoc_deliveries_connected=True)
+        rec = period(outdoor(), self.facts(), OCT1, OCT1 + timedelta(days=1), [self.obs(observation_status="brouillon")], s)["rapprochement"]
+        self.assertEqual(rec["statut"], E.R_DONNEES_INCOMPLETES)
+
+    def test_no_observation(self):
+        r = period(outdoor(), self.facts(), OCT1, OCT1 + timedelta(days=1))
+        self.assertEqual(r["rapprochement_statut"], E.R_DONNEES_INCOMPLETES)
+        self.assertIsNone(r["rapprochement"])
+
+
+class CurveResolutionTests(SimpleTestCase):
+    def curve_model(self, status="VALIDÉ_CONSTRUCTEUR", approved=False):
+        return SimpleNamespace(curve_id="CPH-0014", manufacturer="Caterpillar", model="DE22E3", variant="",
+                               status=status, prp_kva=D("20"), prp_kw=D("16"), power_factor=D("0.8"),
+                               coef_a=D("3.2"), coef_b=D("0"), coef_c=D("2.1"), source="fiche",
+                               is_usable=(status == "VALIDÉ_CONSTRUCTEUR" or approved))
+
+    def test_unvalidated_mapping_gives_no_curve(self):
+        m = SimpleNamespace(validated_curve=None, abaque_status="CANDIDAT_UNIQUE_A_VALIDER", action_required="Valider plaque", inventory_kva=D("22"))
+        curve, reason = resolve_curve(1, "CATERPILLAR - DE22E3", D("22"), {"caterpillar - de22e3": [m]})
+        self.assertIsNone(curve)
+        self.assertIn("non validé", reason)
+
+    def test_historical_curve_needs_business_approval(self):
+        m = SimpleNamespace(validated_curve=self.curve_model("HISTORIQUE_A_VALIDER"), abaque_status="", action_required="", inventory_kva=D("20"))
+        curve, reason = resolve_curve(1, "X", None, {"x": [m]})
+        self.assertIsNone(curve)
+        m.validated_curve = self.curve_model("HISTORIQUE_A_VALIDER", approved=True)
+        curve, _ = resolve_curve(1, "X", None, {"x": [m]})
+        self.assertEqual(curve.curve_id, "CPH-0014")
+
+    def test_multi_ge_site(self):
+        curve, reason = resolve_curve(2, "X", None, {})
+        self.assertIsNone(curve)
+        self.assertIn("multi-GE", reason)
+
+    def test_same_label_several_kva_uses_site_kva(self):
+        m30 = SimpleNamespace(validated_curve=self.curve_model(), abaque_status="", action_required="", inventory_kva=D("30"))
+        m33 = SimpleNamespace(validated_curve=None, abaque_status="CANDIDAT_UNIQUE_A_VALIDER", action_required="", inventory_kva=D("33"))
+        mappings = {"olympian - gep30-1": [m30, m33]}
+        curve, _ = resolve_curve(1, "OLYMPIAN - GEP30-1", D("30"), mappings)
+        self.assertIsNotNone(curve)
+        curve, reason = resolve_curve(1, "OLYMPIAN - GEP30-1", None, mappings)
+        self.assertIsNone(curve)
+        self.assertIn("ambigu", reason)
+
+    def test_off_grid_parsing(self):
+        self.assertTrue(E.is_off_grid("Off-Grid"))
+        self.assertFalse(E.is_off_grid("On Grid"))
+        self.assertIsNone(E.is_off_grid(None))

@@ -1,7 +1,7 @@
 # fuel_tracking/management/commands/sync_recent_months.py
 """
 Synchronise les N derniers mois complets (défaut : 2 = M-1 et M courant)
-en enchaînant ENOC → Consommation Snowflake → CPH → Réévaluation financière.
+en enchaînant ENOC → Consommation Snowflake → faits journaliers CPH → Réévaluation financière.
 
 Appelé au démarrage du conteneur (docker-compose command / Dockerfile CMD)
 pour garantir que la base est à jour sans intervention manuelle — les mois
@@ -31,7 +31,7 @@ def _months_back(n: int) -> list[str]:
 
 
 class Command(BaseCommand):
-    help = "Synchronise les N derniers mois (ENOC + Snowflake conso + CPH) — mois calculés dynamiquement"
+    help = "Synchronise les N derniers mois (ENOC + Snowflake conso + faits journaliers CPH) — mois calculés dynamiquement"
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -71,12 +71,13 @@ class Command(BaseCommand):
         except Exception as e:
             self.stdout.write(self.style.WARNING(f"  Conso Snowflake : {e}"))
 
-        # 3. CPH Running Time (plage from → to)
-        self.stdout.write("  ── CPH Running Time ──")
+        # 3. Faits journaliers CPH (Snowflake, lecture seule) du 1er jour de la
+        # fenêtre à aujourd'hui — le calcul CPH se fait ensuite à la demande.
+        self.stdout.write("  ── Faits journaliers CPH ──")
         try:
-            call_command("sync_fuel_cph", from_month=from_month, to_month=to_month)
+            call_command("sync_fuel_daily_facts", start=date.fromisoformat(f"{from_month}-01"), end=date.today())
         except Exception as e:
-            self.stdout.write(self.style.WARNING(f"  CPH : {e}"))
+            self.stdout.write(self.style.WARNING(f"  Faits journaliers CPH : {e}"))
 
         # 4. Snapshot stock mensuel fin-de-mois (stock_initial M-1 / stock_final M)
         self.stdout.write("  ── Snapshots stock mensuels ──")
@@ -93,14 +94,7 @@ class Command(BaseCommand):
         except Exception as e:
             self.stdout.write(self.style.WARNING(f"  Stock courant : {e}"))
 
-        # 6. Rapprochement stock
-        self.stdout.write("  ── Rapprochement stock ──")
-        try:
-            call_command("run_fuel_rapprochement", from_month=from_month, to_month=to_month)
-        except Exception as e:
-            self.stdout.write(self.style.WARNING(f"  Rapprochement : {e}"))
-
-        # 7. Réévaluation financière sur la même fenêtre
+        # 6. Réévaluation financière sur la même fenêtre
         if not options["skip_financial"]:
             self.stdout.write("  ── Réévaluation financière ──")
             try:

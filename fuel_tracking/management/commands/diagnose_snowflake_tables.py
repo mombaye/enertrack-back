@@ -179,17 +179,6 @@ class Command(BaseCommand):
                     self.stdout.write(OK(f"  {table} → {n}") if n > 0
                                       else W(f"  {table} → 0"))
 
-            # VW_INVOICE_DATA_REPORT (pour classification hybride CPH)
-            n = try_count(cur,
-                "SELECT COUNT(*) FROM DB_GFMS_ANALYTICS_PROD.GOLD.VW_INVOICE_DATA_REPORT "
-                "WHERE \"Country\" = 'Senegal' AND \"Date\" >= %(s)s AND \"Date\" <= %(e)s",
-                {"s": d_start, "e": d_end})
-            if isinstance(n, str):
-                self.stdout.write(W(f"  VW_INVOICE_DATA_REPORT → {n}"))
-            else:
-                self.stdout.write(OK(f"  VW_INVOICE_DATA_REPORT → {n} lignes") if n > 0
-                                  else W(f"  VW_INVOICE_DATA_REPORT → 0 lignes (ou table absente)"))
-
             # GENSET_REPORT : colonnes clés nullable pour fuel tank
             self.stdout.write("\n  GENSET_REPORT — échantillon colonnes fuel/runtime (10 lignes Sénégal) :")
             try:
@@ -247,19 +236,19 @@ class Command(BaseCommand):
         except Exception as e:
             self.stdout.write(W(f"  Lecture FuelConsommationSyncRun échouée : {e}"))
 
-        self.stdout.write("\n── 5. FuelCphSyncRun (PostgreSQL) — 10 dernières runs ──")
+        self.stdout.write("\n── 5. FuelDailyFactsSyncRun (PostgreSQL) — 10 dernières runs ──")
         try:
-            from fuel_tracking.models import FuelCphSyncRun
-            runs = FuelCphSyncRun.objects.order_by("-started_at")[:10]
+            from fuel_tracking.models import FuelDailyFactsSyncRun
+            runs = FuelDailyFactsSyncRun.objects.order_by("-started_at")[:10]
             for r in runs:
                 self.stdout.write(
-                    f"  {r.started_at:%Y-%m-%d %H:%M} | {r.month_from}→{r.month_to} | "
-                    f"{r.status} | sites={r.sites_fetched} | err={r.error_message or '-'}"
+                    f"  {r.started_at:%Y-%m-%d %H:%M} | {r.date_from}→{r.date_to} | "
+                    f"{r.status} | lignes={r.rows_written} | err={r.error_message or '-'}"
                 )
             if not runs:
-                self.stdout.write(W("  Aucune run enregistrée — la sync CPH n'a jamais tourné."))
+                self.stdout.write(W("  Aucune run enregistrée — sync_fuel_daily_facts n'a jamais tourné."))
         except Exception as e:
-            self.stdout.write(W(f"  Lecture FuelCphSyncRun échouée : {e}"))
+            self.stdout.write(W(f"  Lecture FuelDailyFactsSyncRun échouée : {e}"))
 
         # ── 4b. Couverture filtre qualité VW_FUEL_REPORT ──────────────────────
         self.stdout.write(f"\n── 4b. VW_FUEL_REPORT — répartition filtre qualité {month_str} ──")
@@ -326,12 +315,10 @@ class Command(BaseCommand):
             agg = FuelConsommationMonthly.objects.filter(month_year="2026-08").aggregate(
                 total=Count("id"),
                 avec_conso=Count("id", filter=Q(conso_snowflake_l__isnull=False)),
-                avec_cph=Count("id", filter=Q(cph_runtime_h_total__isnull=False)),
             )
             self.stdout.write(
                 f"  Total lignes 2026-08 : {agg['total']} | "
-                f"conso_snowflake_l non-null : {agg['avec_conso']} | "
-                f"cph_runtime_h_total non-null : {agg['avec_cph']}"
+                f"conso_snowflake_l non-null : {agg['avec_conso']}"
             )
         except Exception as e:
             self.stdout.write(W(f"  Lecture FuelConsommationMonthly échouée : {e}"))

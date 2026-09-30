@@ -5,13 +5,12 @@ la synchronisation automatique du module Suivi Carburant — exécutées
 périodiquement pour rattraper rapidement les nouvelles données Snowflake/
 ENOC sans attendre une intervention manuelle. Chaque commande gère déjà sa
 propre traçabilité (FuelConsommationSyncRun / FuelEnocSyncRun /
-FuelCphSyncRun / FuelStockSyncRun) et n'écrase que les mois concernés
+FuelDailyFactsSyncRun / FuelStockSyncRun) et n'écrase que les mois concernés
 (upsert par site) ou l'état courant (Stock, pas de notion de mois).
 
-sync_fuel_cph et sync_fuel_stock ont longtemps été absentes d'ici (2026-08)
-— jamais planifiées, seulement lancées manuellement pendant les tests —
-d'où les colonnes Type de GE/Running Time/Énergie site vides et l'onglet
-Stock jamais alimenté en prod malgré Consommation/ENOC qui tournaient bien.
+Le calcul CPH lui-même n'est pas planifié : il est fait à la demande, sur
+la plage exacte choisie, à partir des faits journaliers synchronisés ici
+(voir services/cph_engine.py).
 
 Chaque tâche mensuelle couvre M ET M-1 (from_month=M-1, to_month=M) :
 les données Snowflake/ENOC du mois précédent peuvent encore arriver pendant
@@ -70,18 +69,16 @@ def sync_enoc_fuel_movements_current_month(self):
         )
 
 
-@shared_task(bind=True, name="fuel_tracking.sync_fuel_cph_current_month")
-def sync_fuel_cph_current_month(self):
+@shared_task(bind=True, name="fuel_tracking.sync_fuel_daily_facts_recent")
+def sync_fuel_daily_facts_recent(self):
+    """Faits journaliers CPH (Snowflake, lecture seule) sur J-3 → aujourd'hui : les
+    données GE/redresseur/AC_METER arrivent avec quelques jours de retard."""
     from django.core.management import call_command
 
-    current = timezone.now().strftime("%Y-%m")
-    prev = _prev_month(current)
     try:
-        call_command("sync_fuel_cph", from_month=prev, to_month=current)
+        call_command("sync_fuel_daily_facts", days=3)
     except Exception:
-        logger.exception(
-            "[fuel_tracking] Échec sync_fuel_cph planifiée (%s → %s)", prev, current
-        )
+        logger.exception("[fuel_tracking] Échec sync_fuel_daily_facts planifiée (J-3)")
 
 
 @shared_task(bind=True, name="fuel_tracking.sync_fuel_stock_current")
@@ -92,20 +89,6 @@ def sync_fuel_stock_current(self):
         call_command("sync_fuel_stock")
     except Exception:
         logger.exception("[fuel_tracking] Échec sync_fuel_stock planifiée")
-
-
-@shared_task(bind=True, name="fuel_tracking.sync_fuel_rapprochement_current_month")
-def sync_fuel_rapprochement_current_month(self):
-    from django.core.management import call_command
-
-    current = timezone.now().strftime("%Y-%m")
-    prev = _prev_month(current)
-    try:
-        call_command("run_fuel_rapprochement", from_month=prev, to_month=current)
-    except Exception:
-        logger.exception(
-            "[fuel_tracking] Échec run_fuel_rapprochement planifiée (%s → %s)", prev, current
-        )
 
 
 @shared_task(bind=True, name="fuel_tracking.auto_import_stan_periodic")

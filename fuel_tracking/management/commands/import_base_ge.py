@@ -13,12 +13,10 @@ Colonnes importées (B à AF) :
   = Cph L/h × Durée), Fuel Consumption (L) (AF, bilan de cuve — stock
   initial + ajouts − stock final).
 
-Rectifier efficiency et SPC (colonnes S/U) ne sont PLUS affichées comme
-colonnes du tableau (constantes uniques 0.8/0.27 sur les 469 lignes,
-vérifié 2026-08) mais restent importées dans FuelCphGeParameter, qui
-continue d'alimenter le pipeline CPH Snowflake (seule source pour
-Énergie site / Batterie DC / Batterie AC / Énergie GE, absentes de ce
-fichier).
+Rectifier efficiency et SPC (colonnes S/U, constantes 0.8/0.27) ne sont plus
+importées : le CPH vient exclusivement de l'abaque PRP 50 Hz (cph_engine.py).
+« Type de GE » (colonne N) sert au rattachement du site à sa courbe CPH via
+le mappage inventaire de l'abaque (CphInventoryMapping).
 
 "Mêmes sites exacts que le fichier" (demande explicite) : les 469 sites du
 fichier sont importés tels quels, y compris ceux sans ligne
@@ -29,14 +27,13 @@ Usage:
     docker compose exec web python manage.py import_base_ge --file=data_imports/base_ge.xlsx --month=2026-08 --dry-run
     docker compose exec web python manage.py import_base_ge --file=data_imports/base_ge.xlsx --month=2026-08
 """
-from datetime import date
 from decimal import Decimal, InvalidOperation
 
 import openpyxl
 from django.core.management.base import BaseCommand
 from django.db import transaction
 
-from fuel_tracking.models import FuelCphGeParameter, FuelConsommationMonthly
+from fuel_tracking.models import FuelConsommationMonthly
 
 SHEET_NAME = "Feuil32"
 HEADER_ROW = 4
@@ -58,7 +55,6 @@ COL_RUNTIME_H = 23
 COL_CONSO_ESTIMEE = 24  # Consommation de carburant en L (= Cph L/h × Durée)
 COL_CONSO_MESUREE = 31  # Fuel Consumption (L) — bilan de cuve
 
-PARAMETER_SOURCE_LABEL = "Base GE.xlsx — SPC/rendement uniformes (hypothèse validée), PGE_KVA réel"
 FICHIER_SOURCE_LABEL = "Base GE.xlsx"
 
 
@@ -174,28 +170,10 @@ class Command(BaseCommand):
             self.stdout.write(self.style.WARNING(f"\n  DRY RUN — aucune donnée écrite ({len(rows)} site(s) prêts).\n"))
             return
 
-        cph_created = cph_updated = 0
         fcm_created = fcm_updated = 0
-        valid_from = date(year, 1, 1)
 
         with transaction.atomic():
             for r in rows:
-                if r["spc_l_per_kwh"] is not None and r["rectifier_efficiency_ratio"] is not None:
-                    _, is_created = FuelCphGeParameter.objects.update_or_create(
-                        site_id=r["site_id"], valid_from=valid_from,
-                        defaults={
-                            "valid_to": None,
-                            "pge_kva": r["pge_kva"],
-                            "rectifier_efficiency_ratio": r["rectifier_efficiency_ratio"],
-                            "spc_l_per_kwh": r["spc_l_per_kwh"],
-                            "parameter_source": PARAMETER_SOURCE_LABEL,
-                        },
-                    )
-                    if is_created:
-                        cph_created += 1
-                    else:
-                        cph_updated += 1
-
                 fc, is_created = FuelConsommationMonthly.objects.get_or_create(
                     month_year=month_year, site_id=r["site_id"],
                     defaults={"year": year, "month": month, "site_name": r["site_name"]},
@@ -231,6 +209,5 @@ class Command(BaseCommand):
                     fcm_updated += 1
 
         self.stdout.write(self.style.SUCCESS(
-            f"\n  FuelCphGeParameter        : {cph_created} créée(s), {cph_updated} mise(s) à jour.\n"
-            f"  FuelConsommationMonthly ({month_year}) : {fcm_created} créée(s), {fcm_updated} mise(s) à jour.\n"
+            f"\n  FuelConsommationMonthly ({month_year}) : {fcm_created} créée(s), {fcm_updated} mise(s) à jour.\n"
         ))

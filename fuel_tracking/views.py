@@ -140,30 +140,14 @@ class FuelConsommationListView(APIView):
         from django.db.models import Count, Max, Q, Sum
         from django.db.models.functions import Coalesce
 
-        from django.utils import timezone
-
         from billing.models import SonatelInvoice
         from fuel_tracking.models import (
-            FuelCphGeDaily,
-            FuelCphGeParameter,
             FuelConsommationMonthly,
             FuelConsommationSyncRun,
             FuelEnocMovement,
             FuelEnocSyncRun,
+            FuelSiteDailyFacts,
         )
-
-        # Statut du fichier de référence CPH (FuelCphGeParameter) — pas une
-        # connectivité live comme Snowflake/ENOC, mais l'UI a besoin de savoir
-        # si le fichier a été chargé pour expliquer pourquoi conso_estimee_cph_l
-        # est vide partout (MISSING_PARAMETER) tant qu'il ne l'est pas.
-        today = timezone.now().date()
-        cph_params_qs = FuelCphGeParameter.objects.all()
-        cph_parameters = {
-            "sites_configures": cph_params_qs.filter(
-                valid_from__lte=today
-            ).exclude(valid_to__lt=today).values("site_id").distinct().count(),
-            "dernier_import": cph_params_qs.order_by("-updated_at").values_list("updated_at", flat=True).first(),
-        }
 
         available_months = list(
             FuelConsommationMonthly.objects.order_by("-month_year")
@@ -180,9 +164,9 @@ class FuelConsommationListView(APIView):
         # que la source Snowflake (GFMS_DATA_TRACKER_NC) n'a plus publié de
         # nouvelle ligne depuis des jours (coupure repérée le 2026-09 sur
         # août : dernière ligne le 20/08 alors que la synchro, elle, tourne
-        # bien tous les jours). CPH est la donnée Snowflake la plus fine
-        # (journalière) disponible ici, donc le signal le plus révélateur.
-        snowflake_last_data = FuelCphGeDaily.objects.aggregate(v=Max("date"))["v"]
+        # bien tous les jours). Les faits journaliers CPH sont la donnée
+        # Snowflake la plus fine disponible ici, donc le signal le plus révélateur.
+        snowflake_last_data = FuelSiteDailyFacts.objects.aggregate(v=Max("date"))["v"]
         enoc_last_data = FuelEnocMovement.objects.aggregate(v=Max("operation_date"))["v"]
 
         sources = {
@@ -205,7 +189,7 @@ class FuelConsommationListView(APIView):
         month = request.query_params.get("month")
         if not month:
             if not available_months:
-                return Response({"month_year": None, "data": [], "pagination": None, "available_months": [], "kpis": None, "sources": sources, "cph_parameters": cph_parameters, "ge_detection": None})
+                return Response({"month_year": None, "data": [], "pagination": None, "available_months": [], "kpis": None, "sources": sources, "ge_detection": None})
             month = available_months[0]
 
         # Suivis Consommation (2026-08) — périmètre à nouveau TOUT le réseau
@@ -230,34 +214,11 @@ class FuelConsommationListView(APIView):
         # Si le mois sélectionné n'a pas encore été importé (0 sites Stan), on
         # cherche le mois le plus récent avec données Stan pour fallback.
         _stan_base = FuelConsommationMonthly.objects.filter(month_year=month)
-        _stan_kpis_raw = _stan_base.aggregate(
-            sites_ge_valides_stan=Count("id", filter=Q(facturation_avec_ge_fichier=True)),
-            supervision_snowflake=Count(
-                "id",
-                filter=Q(facturation_avec_ge_fichier=True, cph_runtime_availability_pct__gte=50),
-            ),
-            disponibilite_dse=Count(
-                "id",
-                filter=Q(
-                    facturation_avec_ge_fichier=True,
-                    cph_runtime_source_availability__DSE_CONTROLLER__gte=50,
-                ),
-            ),
-            sites_avec_cph_calcule=Count(
-                "id",
-                filter=Q(facturation_avec_ge_fichier=True, conso_estimee_cph_l__isnull=False),
-            ),
-        )
-        _stan_total = _stan_kpis_raw["sites_ge_valides_stan"] or 0
-        _pct = lambda n: round(n / _stan_total * 100, 1) if _stan_total else None
+        _stan_total = _stan_base.filter(facturation_avec_ge_fichier=True).count()
+        # Supervision / disponibilité DSE / CPH calculés : voir l'onglet
+        # Contrôle CPH (calcul au grain site/jour sur la plage exacte).
         stan_kpis = {
             "sites_ge_valides_stan": _stan_total,
-            "supervision_snowflake": _stan_kpis_raw["supervision_snowflake"] or 0,
-            "supervision_snowflake_pct": _pct(_stan_kpis_raw["supervision_snowflake"] or 0),
-            "disponibilite_runtime_dse": _stan_kpis_raw["disponibilite_dse"] or 0,
-            "disponibilite_runtime_dse_pct": _pct(_stan_kpis_raw["disponibilite_dse"] or 0),
-            "sites_avec_cph_calcule": _stan_kpis_raw["sites_avec_cph_calcule"] or 0,
-            "sites_cph_non_calcule": _stan_total - (_stan_kpis_raw["sites_avec_cph_calcule"] or 0),
             "stan_importe": _stan_total > 0,
         }
 
@@ -300,54 +261,13 @@ class FuelConsommationListView(APIView):
         # manquantes — demande explicite (2026-08 : "cela doit prendre parmi
         # les GE ceux qui n'ont pas de données de Conso estimée (L) / Conso
         # mesurée vue (L)"). Running Time n'entre plus dans ce critère.
-        # Running Time/Conso estimée viennent EXCLUSIVEMENT du pipeline CPH
-        # Snowflake — plus de repli sur Base août 26 validée, qui n'est plus
-        # utilisée par ce tableau.
         effective_ge_q = _effective_ge_q(file_ge_site_ids)
-        incomplete_q = effective_ge_q & (
-            Q(conso_estimee_cph_l__isnull=True) & Q(conso_snowflake_l__isnull=True) & Q(conso_gardien_l__isnull=True)
-        )
+        incomplete_q = effective_ge_q & Q(conso_snowflake_l__isnull=True) & Q(conso_gardien_l__isnull=True)
         has_genset_param = (request.query_params.get("has_genset") or "").strip().lower()
 
-        # Quatre filtres combinables (has_genset, runtime_source, configuration,
-        # runtime_availability) — chaque badge affiché au frontend doit
-        # compter "si je choisis cette option, sachant les AUTRES filtres
-        # déjà actifs", jamais le total brut du mois. Sans ça (bug corrigé
-        # 2026-09) : "Sans configuration (85)" restait le compte pays entier
-        # même avec "Avec GE" déjà sélectionné, alors que cliquer dessus
-        # combine les deux et ne retombe que sur 2 sites — écart trompeur,
-        # même défaut sur "Sans source" (3115 affiché vs 201 une fois "Avec
-        # GE" actif). "Sans source" excluait aussi les sites sans GE du
-        # dénominateur qu'il aurait dû compter à part (spec 2026-09, point 4 :
-        # "le compteur Sans source ne doit pas inclure les sites sans GE") —
-        # corrigé ci-dessous en l'intersectant avec effective_ge_q, ET
-        # complété par runtime_availability qui sépare explicitement les 4
-        # catégories demandées.
-        RUNTIME_SOURCE_FILTERS = {
-            "tracker_5min": Q(cph_runtime_h_total__isnull=False, cph_runtime_source="TRACKER_5MIN"),
-            "dse_controller": Q(cph_runtime_h_total__isnull=False, cph_runtime_source="DSE_CONTROLLER"),
-            "dg_on_calculated": Q(cph_runtime_h_total__isnull=False, cph_runtime_source="DG_ON_CALCULATED"),
-            "rectifier_status_5min": Q(cph_runtime_h_total__isnull=False, cph_runtime_source="RECTIFIER_STATUS_5MIN"),
-            "none": Q(cph_runtime_h_total__isnull=True) & effective_ge_q,
-        }
-        runtime_source_param = (request.query_params.get("runtime_source") or "").strip().lower()
-
-        # Partition à 4 catégories, mutuellement exclusives et exhaustives
-        # sur l'ensemble des sites (spec 2026-09, point 4) :
-        #   1. sans_ge                 : GE non applicable (runtime hors sujet)
-        #   2. avec_ge_avec_runtime    : GE + runtime résolu + CPH calculé
-        #   3. avec_ge_sans_runtime    : GE mais aucun runtime résolu ce mois
-        #   4. avec_runtime_sans_cph   : GE + runtime résolu MAIS litres non
-        #      calculés (MISSING_PARAMETER/BATTERY_DATA_NOT_READY/etc. — le
-        #      Running Time est connu, le CPH ne l'est pas)
-        RUNTIME_AVAILABILITY_FILTERS = {
-            "sans_ge": ~effective_ge_q,
-            "avec_ge_avec_runtime": effective_ge_q & Q(cph_runtime_h_total__isnull=False) & Q(conso_estimee_cph_l__isnull=False),
-            "avec_ge_sans_runtime": effective_ge_q & Q(cph_runtime_h_total__isnull=True),
-            "avec_runtime_sans_cph": effective_ge_q & Q(cph_runtime_h_total__isnull=False) & Q(conso_estimee_cph_l__isnull=True),
-        }
-        runtime_availability_param = (request.query_params.get("runtime_availability") or "").strip().lower()
-
+        # Filtres combinables (has_genset, configuration) — chaque badge
+        # affiché au frontend compte « si je choisis cette option, sachant les
+        # AUTRES filtres déjà actifs », jamais le total brut du mois.
         CONFIGURATION_FILTERS = {
             "indoor": Q(configuration_fichier="Indoor"),
             "outdoor": Q(configuration_fichier="Outdoor"),
@@ -355,21 +275,9 @@ class FuelConsommationListView(APIView):
         }
         configuration_param = (request.query_params.get("configuration") or "").strip().lower()
 
-        # Filtre rapprochement stock — cliquable depuis les badges KPI
-        RAPPROCHEMENT_STATUT_FILTERS = {
-            "ok": Q(rapprochement_statut="OK"),
-            "a_justifier": Q(rapprochement_statut="A_JUSTIFIER"),
-            "a_investiguer": Q(rapprochement_statut="A_INVESTIGUER"),
-            "donnees_incompletes": Q(rapprochement_statut="DONNEES_INCOMPLETES"),
-            "cph_non_calcule": Q(rapprochement_statut="CPH_NON_CALCULE"),
-            "livraisons_a_controler": Q(livraisons_source="LIVRAISONS_ENOC_A_CONTROLER"),
-        }
-        rapprochement_statut_param = (request.query_params.get("rapprochement_statut") or "").strip().lower()
-
         def _apply_combinable_filters(base_qs, *, skip):
-            """Applique has_genset/runtime_source/runtime_availability/configuration/
-            rapprochement_statut sauf `skip` — sert à calculer le compte d'une
-            option de filtre compte tenu des AUTRES filtres déjà actifs."""
+            """Applique has_genset/configuration sauf `skip` — sert à calculer le
+            compte d'une option de filtre compte tenu des AUTRES filtres déjà actifs."""
             out = base_qs
             if skip != "has_genset":
                 if has_genset_param in ("true", "1"):
@@ -378,27 +286,12 @@ class FuelConsommationListView(APIView):
                     out = out.filter(~effective_ge_q)
                 elif has_genset_param == "incomplete":
                     out = out.filter(incomplete_q)
-            if skip != "runtime_source" and runtime_source_param in RUNTIME_SOURCE_FILTERS:
-                out = out.filter(RUNTIME_SOURCE_FILTERS[runtime_source_param])
-            if skip != "runtime_availability" and runtime_availability_param in RUNTIME_AVAILABILITY_FILTERS:
-                out = out.filter(RUNTIME_AVAILABILITY_FILTERS[runtime_availability_param])
             if skip != "configuration" and configuration_param in CONFIGURATION_FILTERS:
                 out = out.filter(CONFIGURATION_FILTERS[configuration_param])
-            if skip != "rapprochement_statut" and rapprochement_statut_param in RAPPROCHEMENT_STATUT_FILTERS:
-                out = out.filter(RAPPROCHEMENT_STATUT_FILTERS[rapprochement_statut_param])
             return out
 
-        runtime_source_counts = _apply_combinable_filters(qs, skip="runtime_source").aggregate(**{
-            key: Count("id", filter=cond) for key, cond in RUNTIME_SOURCE_FILTERS.items()
-        })
-        runtime_availability_counts = _apply_combinable_filters(qs, skip="runtime_availability").aggregate(**{
-            key: Count("id", filter=cond) for key, cond in RUNTIME_AVAILABILITY_FILTERS.items()
-        })
         configuration_counts = _apply_combinable_filters(qs, skip="configuration").aggregate(**{
             key: Count("id", filter=cond) for key, cond in CONFIGURATION_FILTERS.items()
-        })
-        rapprochement_counts = _apply_combinable_filters(qs, skip="rapprochement_statut").aggregate(**{
-            key: Count("id", filter=cond) for key, cond in RAPPROCHEMENT_STATUT_FILTERS.items()
         })
         ge_counts = _apply_combinable_filters(qs, skip="has_genset").aggregate(
             sites_avec_ge=Count("id", filter=effective_ge_q),
@@ -407,7 +300,7 @@ class FuelConsommationListView(APIView):
             sites_avec_ge_incomplet=Count("id", filter=incomplete_q),
         )
 
-        # Filtre effectif de la liste retournée : les 4 filtres combinés.
+        # Filtre effectif de la liste retournée : les filtres combinés.
         qs = _apply_combinable_filters(qs, skip=None)
 
         agg = qs.aggregate(
@@ -457,10 +350,7 @@ class FuelConsommationListView(APIView):
             "total_conso_snowflake_l": float(agg["total_conso_snowflake_l"] or 0),
             "total_enoc_qte_ajoutee_l": float(agg["total_enoc_qte_ajoutee_l"] or 0),
             "total_enoc_nb_demandes": agg["total_enoc_nb_demandes"] or 0,
-            "runtime_source_counts": runtime_source_counts,
-            "runtime_availability_counts": runtime_availability_counts,
             "configuration_counts": configuration_counts,
-            "rapprochement_counts": rapprochement_counts,
             "factures_payees": invoice_summary["paid"] or 0,
             "factures_impayees": invoice_summary["unpaid"] or 0,
             "factures_total": invoice_summary["total"] or 0,
@@ -486,21 +376,8 @@ class FuelConsommationListView(APIView):
         rows = qs[start:start + limit]
 
         def serialize(row):
-            # Suivis Consommation (2026-08) — demande explicite : "toute la
-            # base fixe est prise du fichier Base GE" (identité/typologie
-            # ci-dessous) ; "pour les autres [colonnes calculées], respecter
-            # les informations de Snowflake" — Running Time et Conso estimée
-            # viennent EXCLUSIVEMENT du pipeline CPH Snowflake (télémétrie
-            # GFMS_DATA_TRACKER_NC), plus de repli sur Base août 26 validée.
-            # Base GE.xlsx colonnes X/Y (Running Time/Conso estimée propres
-            # au fichier) restent ignorées ici : renseignées pour 5 des 469
-            # lignes seulement, motif manifestement factice (2,3,4,5,6h).
-            runtime_h = row.cph_runtime_h_total
-            runtime_source = f"snowflake_{(row.cph_runtime_source or '').lower()}" if runtime_h is not None else None
-
-            conso_estimee = row.conso_estimee_cph_l
-            estimee_source = "cph_snowflake" if conso_estimee is not None else None
-
+            # Running Time / Conso estimée / CPH / rapprochement : onglet
+            # Contrôle CPH (services/cph_engine.py, grain site/jour).
             # Conso mesurée vue : Snowflake (capteur automatisé, priorité 1)
             # > relevé de gardiennage (jauge physique relevée manuellement,
             # priorité 2) — pour les sites sans capteur Snowflake fiable
@@ -515,22 +392,11 @@ class FuelConsommationListView(APIView):
             else:
                 conso_mesuree, mesuree_source = None, None
 
-            ecart_l = None
-            ecart_pct = None
-            if conso_estimee is not None and conso_mesuree is not None:
-                ecart_l = float(conso_mesuree - conso_estimee)
-                if conso_mesuree:
-                    ecart_pct = round(ecart_l / float(conso_mesuree) * 100, 2)
-
             # Commentaire — explique en clair, pour les valeurs manquantes de
             # CETTE ligne, pourquoi (aucune des sources disponibles ne l'a
             # fournie), plutôt que de laisser deviner depuis une cellule
             # vide. Rien à dire quand tout est renseigné.
             comment_parts = []
-            if runtime_h is None:
-                comment_parts.append("Running Time : non déduit par le pipeline CPH Snowflake ce mois-ci (ni compteur télémétrie 5 min, ni contrôleur DSE, ni DG-On calculé).")
-            if conso_estimee is None:
-                comment_parts.append("Conso estimée : pipeline CPH Snowflake sans résultat ce mois-ci (voir cph_calculation_status).")
             if conso_mesuree is None:
                 comment_parts.append("Conso mesurée vue : aucune baisse de niveau de cuve fiable détectée par Snowflake (VW_FUEL_REPORT), et aucun relevé de gardiennage disponible pour ce site ce mois-ci.")
             commentaire = " ".join(comment_parts) or None
@@ -551,7 +417,7 @@ class FuelConsommationListView(APIView):
                 "typology": row.typology_fichier or row.typology,
                 "typologie_simple": row.typo_simple_fichier,
                 "site_type": row.site_type_fichier or row.site_type,
-                "type_ge": row.type_ge_fichier or row.cph_ge_type,
+                "type_ge": row.type_ge_fichier,
                 "dg_count": row.dg_count,
                 "power_supply": row.power_supply,
                 "has_genset": has_genset_effective,
@@ -580,51 +446,17 @@ class FuelConsommationListView(APIView):
                 "enoc_qte_ajoutee_l": float(row.enoc_qte_ajoutee_l),
                 "enoc_nb_demandes": row.enoc_nb_demandes,
                 "ecart_conso_vs_enoc_l": float(row.ecart_conso_vs_enoc_l) if row.ecart_conso_vs_enoc_l is not None else None,
-                # Estimation CPH (télémétrie GFMS_DATA_TRACKER_NC) — troisième
-                # source, indépendante des 2 ci-dessus, pour les GE sans
-                # capteur de cuve fiable. Voir sync_fuel_cph/FuelCphGeDaily.
-                "conso_estimee_cph_l": float(row.conso_estimee_cph_l) if row.conso_estimee_cph_l is not None else None,
-                "cph_l_per_h_moy": float(row.cph_l_per_h_moy) if row.cph_l_per_h_moy is not None else None,
-                "cph_nb_jours_ok": row.cph_nb_jours_ok,
-                "cph_nb_jours_calcules": row.cph_nb_jours_calcules,
-                "cph_calculation_status": row.cph_calculation_status,
-                "cph_status_breakdown": row.cph_status_breakdown,
-                "cph_runtime_h_total": float(row.cph_runtime_h_total) if row.cph_runtime_h_total is not None else None,
-                "cph_runtime_source": row.cph_runtime_source,
-                "cph_runtime_source_breakdown": row.cph_runtime_source_breakdown or None,
-                "cph_ge_type": row.cph_ge_type,
-                "cph_pge_kva": float(row.cph_pge_kva) if row.cph_pge_kva is not None else None,
-                "cph_power_factor": float(row.cph_power_factor) if row.cph_power_factor is not None else None,
-                "cph_spc_l_per_kwh": float(row.cph_spc_l_per_kwh) if row.cph_spc_l_per_kwh is not None else None,
-                # 4e source — fichier métier validé (Base GE.xlsx), jamais
-                # fusionnée avec conso_snowflake_l/conso_estimee_cph_l.
+                # Fichier métier validé (Base GE.xlsx), jamais fusionné avec
+                # conso_snowflake_l.
                 "conso_fichier_l": float(row.conso_fichier_l) if row.conso_fichier_l is not None else None,
                 "fichier_source": row.fichier_source,
-                # Colonnes Suivis Consommation affichées (2026-08) — sourcées
-                # de Base GE.xlsx pour tout ce que le fichier fournit ;
-                # Énergie site/Batterie DC/Batterie AC/Énergie GE viennent du
-                # pipeline CPH Snowflake (FuelCphGeDaily agrégé), seule source
-                # pour ces 4 métriques, absentes du fichier.
+                # Valeurs brutes Base GE.xlsx (audit uniquement).
                 "pge_kva_fichier": float(row.pge_kva_fichier) if row.pge_kva_fichier is not None else None,
                 "ge_load_pct_fichier": float(row.ge_load_pct_fichier) if row.ge_load_pct_fichier is not None else None,
                 "cph_lph_fichier": float(row.cph_lph_fichier) if row.cph_lph_fichier is not None else None,
-                # Valeurs résolues (priorité fichier(s) > Snowflake, voir
-                # commentaire en tête de serialize()) — jamais les colonnes
-                # brutes Base GE.xlsx X/Y (quasi vides, voir help_text du
-                # modèle).
-                "ge_runtime_fichier_h": float(runtime_h) if runtime_h is not None else None,
-                "ge_runtime_source": runtime_source,
-                "conso_estimee_fichier_l": float(conso_estimee) if conso_estimee is not None else None,
-                "conso_estimee_source": estimee_source,
                 "conso_mesuree_fichier_l": float(conso_mesuree) if conso_mesuree is not None else None,
                 "conso_mesuree_source": mesuree_source,
                 "gardien_statut": row.gardien_statut,
-                "ecart_fichier_l": ecart_l,
-                "ecart_fichier_pct": ecart_pct,
-                "cph_site_load_energy_kwh": float(row.cph_site_load_energy_kwh) if row.cph_site_load_energy_kwh is not None else None,
-                "cph_battery_dc_energy_kwh": float(row.cph_battery_dc_energy_kwh) if row.cph_battery_dc_energy_kwh is not None else None,
-                "cph_battery_ac_energy_kwh": float(row.cph_battery_ac_energy_kwh) if row.cph_battery_ac_energy_kwh is not None else None,
-                "cph_total_ge_energy_kwh": float(row.cph_total_ge_energy_kwh) if row.cph_total_ge_energy_kwh is not None else None,
                 "commentaire": commentaire,
                 # Facturation (ESCO SN — Facturation par site, mensuel, voir
                 # import_facturation_par_site) — facturation_active_fichier =
@@ -633,23 +465,6 @@ class FuelConsommationListView(APIView):
                 "facturation_active_fichier": row.facturation_active_fichier,
                 "facturation_avec_ge_fichier": row.facturation_avec_ge_fichier,
                 "configuration_fichier": row.configuration_fichier,
-                # Disponibilité runtime CPH (spec B)
-                "cph_runtime_availability_pct": float(row.cph_runtime_availability_pct) if row.cph_runtime_availability_pct is not None else None,
-                "cph_runtime_source_availability": row.cph_runtime_source_availability or None,
-                # Rapprochement stock mensuel (spec C)
-                "rapprochement_stock_initial_l": float(row.rapprochement_stock_initial_l) if row.rapprochement_stock_initial_l is not None else None,
-                "rapprochement_livraisons_l": float(row.rapprochement_livraisons_l) if row.rapprochement_livraisons_l is not None else None,
-                "rapprochement_rajouts_l": float(row.rapprochement_rajouts_l) if row.rapprochement_rajouts_l is not None else None,
-                "rapprochement_retraits_l": float(row.rapprochement_retraits_l) if row.rapprochement_retraits_l is not None else None,
-                "rapprochement_vols_l": float(row.rapprochement_vols_l) if row.rapprochement_vols_l is not None else None,
-                "rapprochement_vidanges_l": float(row.rapprochement_vidanges_l) if row.rapprochement_vidanges_l is not None else None,
-                "rapprochement_stock_final_l": float(row.rapprochement_stock_final_l) if row.rapprochement_stock_final_l is not None else None,
-                "rapprochement_conso_stock_l": float(row.rapprochement_conso_stock_l) if row.rapprochement_conso_stock_l is not None else None,
-                "rapprochement_ecart_l": float(row.rapprochement_ecart_l) if row.rapprochement_ecart_l is not None else None,
-                "rapprochement_ecart_pct": float(row.rapprochement_ecart_pct) if row.rapprochement_ecart_pct is not None else None,
-                "rapprochement_statut": row.rapprochement_statut,
-                "rapprochement_motif": row.rapprochement_motif,
-                "livraisons_source": row.livraisons_source,
             }
 
         return Response({
@@ -666,157 +481,8 @@ class FuelConsommationListView(APIView):
             "available_months": available_months,
             "sources": sources,
             "kpis": kpis,
-            "cph_parameters": cph_parameters,
             "ge_detection": ge_detection,
         })
-
-
-class FuelConsommationExportControleView(APIView):
-    """
-    GET /api/fuel-tracking/consommation/export/controle/?month=YYYY-MM&...
-
-    Export CSV complet du suivi consommation (toutes colonnes dont rapprochement)
-    pour le mois demandé, avec les mêmes filtres que FuelConsommationListView.
-    Destiné au contrôle interne / audit fuel.
-    """
-    permission_classes = [IsAuthenticated]
-
-    def get(self, request):
-        import csv
-        from django.http import HttpResponse
-        from django.db.models import Q
-        from fuel_tracking.models import FuelConsommationMonthly
-
-        month = (request.query_params.get("month") or "").strip()
-        if not month:
-            from fuel_tracking.models import FuelConsommationMonthly as FCM
-            latest = FCM.objects.order_by("-month_year").values_list("month_year", flat=True).first()
-            month = latest or ""
-
-        file_ge_site_ids = _file_ge_site_ids()
-        effective_ge_q = _effective_ge_q(file_ge_site_ids)
-
-        qs = FuelConsommationMonthly.objects.filter(month_year=month).filter(effective_ge_q)
-
-        search = (request.query_params.get("search") or "").strip()
-        if search:
-            qs = qs.filter(Q(site_id__icontains=search) | Q(site_name__icontains=search))
-        country = (request.query_params.get("country") or "").strip()
-        if country:
-            qs = qs.filter(country__iexact=country)
-        rapprochement_statut = (request.query_params.get("rapprochement_statut") or "").strip().lower()
-        RAPPROCHEMENT_STATUT_FILTERS = {
-            "ok": Q(rapprochement_statut="OK"),
-            "a_justifier": Q(rapprochement_statut="A_JUSTIFIER"),
-            "a_investiguer": Q(rapprochement_statut="A_INVESTIGUER"),
-            "donnees_incompletes": Q(rapprochement_statut="DONNEES_INCOMPLETES"),
-            "cph_non_calcule": Q(rapprochement_statut="CPH_NON_CALCULE"),
-            "livraisons_a_controler": Q(livraisons_source="LIVRAISONS_ENOC_A_CONTROLER"),
-        }
-        if rapprochement_statut in RAPPROCHEMENT_STATUT_FILTERS:
-            qs = qs.filter(RAPPROCHEMENT_STATUT_FILTERS[rapprochement_statut])
-
-        qs = qs.order_by("site_id")
-
-        response = HttpResponse(content_type="text/csv; charset=utf-8-sig")
-        response["Content-Disposition"] = f'attachment; filename="fuel_controle_{month}.csv"'
-
-        writer = csv.writer(response, delimiter=";")
-        writer.writerow([
-            "site_id", "site_name", "country", "typology", "has_genset",
-            "facturation_avec_ge_fichier", "facturation_active_fichier", "configuration_fichier",
-            "conso_snowflake_l", "nb_jours_data", "sensor_status", "quality_status",
-            "ge_prod_kwh", "conso_specifique_moy_l_kwh",
-            "cph_runtime_availability_pct", "cph_runtime_source",
-            "conso_estimee_cph_l", "cph_calculation_status",
-            "enoc_qte_ajoutee_l", "enoc_qte_demandee_l", "enoc_qte_validee_l", "enoc_nb_demandes",
-            "livraisons_source",
-            "rapprochement_stock_initial_l", "rapprochement_livraisons_l",
-            "rapprochement_rajouts_l", "rapprochement_retraits_l",
-            "rapprochement_vols_l", "rapprochement_vidanges_l",
-            "rapprochement_stock_final_l", "rapprochement_conso_stock_l",
-            "rapprochement_ecart_l", "rapprochement_ecart_pct",
-            "rapprochement_statut", "rapprochement_motif",
-        ])
-        for row in qs.iterator(chunk_size=500):
-            writer.writerow([
-                row.site_id, row.site_name, row.country, row.typology,
-                "Oui" if row.has_genset else "Non",
-                "Oui" if row.facturation_avec_ge_fichier else ("Non" if row.facturation_avec_ge_fichier is False else ""),
-                "Oui" if row.facturation_active_fichier else ("Non" if row.facturation_active_fichier is False else ""),
-                row.configuration_fichier or "",
-                row.conso_snowflake_l, row.nb_jours_data, row.sensor_status, row.quality_status,
-                row.ge_prod_kwh, row.conso_specifique_moy_l_kwh,
-                row.cph_runtime_availability_pct, row.cph_runtime_source,
-                row.conso_estimee_cph_l, row.cph_calculation_status,
-                row.enoc_qte_ajoutee_l, row.enoc_qte_demandee_l, row.enoc_qte_validee_l, row.enoc_nb_demandes,
-                row.livraisons_source,
-                row.rapprochement_stock_initial_l, row.rapprochement_livraisons_l,
-                row.rapprochement_rajouts_l, row.rapprochement_retraits_l,
-                row.rapprochement_vols_l, row.rapprochement_vidanges_l,
-                row.rapprochement_stock_final_l, row.rapprochement_conso_stock_l,
-                row.rapprochement_ecart_l, row.rapprochement_ecart_pct,
-                row.rapprochement_statut, row.rapprochement_motif,
-            ])
-        return response
-
-
-class FuelConsommationExportAnomaliesView(APIView):
-    """
-    GET /api/fuel-tracking/consommation/export/anomalies/?month=YYYY-MM
-
-    Export CSV restreint aux anomalies fuel : rapprochement_statut IN
-    (A_JUSTIFIER, A_INVESTIGUER) ou livraisons_source=LIVRAISONS_ENOC_A_CONTROLER.
-    Destiné au fuel manager pour le suivi des écarts.
-    """
-    permission_classes = [IsAuthenticated]
-
-    def get(self, request):
-        import csv
-        from django.http import HttpResponse
-        from django.db.models import Q
-        from fuel_tracking.models import FuelConsommationMonthly
-
-        month = (request.query_params.get("month") or "").strip()
-        if not month:
-            latest = FuelConsommationMonthly.objects.order_by("-month_year").values_list("month_year", flat=True).first()
-            month = latest or ""
-
-        file_ge_site_ids = _file_ge_site_ids()
-        effective_ge_q = _effective_ge_q(file_ge_site_ids)
-
-        anomalie_q = (
-            Q(rapprochement_statut__in=["A_JUSTIFIER", "A_INVESTIGUER"])
-            | Q(livraisons_source="LIVRAISONS_ENOC_A_CONTROLER")
-        )
-        qs = (
-            FuelConsommationMonthly.objects
-            .filter(month_year=month)
-            .filter(effective_ge_q)
-            .filter(anomalie_q)
-            .order_by("rapprochement_statut", "site_id")
-        )
-
-        response = HttpResponse(content_type="text/csv; charset=utf-8-sig")
-        response["Content-Disposition"] = f'attachment; filename="fuel_anomalies_{month}.csv"'
-
-        writer = csv.writer(response, delimiter=";")
-        writer.writerow([
-            "site_id", "site_name", "country",
-            "conso_snowflake_l", "conso_estimee_cph_l",
-            "enoc_qte_ajoutee_l", "livraisons_source",
-            "rapprochement_conso_stock_l", "rapprochement_ecart_l", "rapprochement_ecart_pct",
-            "rapprochement_statut", "rapprochement_motif",
-        ])
-        for row in qs.iterator(chunk_size=500):
-            writer.writerow([
-                row.site_id, row.site_name, row.country,
-                row.conso_snowflake_l, row.conso_estimee_cph_l,
-                row.enoc_qte_ajoutee_l, row.livraisons_source,
-                row.rapprochement_conso_stock_l, row.rapprochement_ecart_l, row.rapprochement_ecart_pct,
-                row.rapprochement_statut, row.rapprochement_motif,
-            ])
-        return response
 
 
 class FuelConsommationDashboardView(APIView):
@@ -827,10 +493,9 @@ class FuelConsommationDashboardView(APIView):
     (FuelConsommationListView) : _effective_ge_q (Snowflake/ENOC OU site du
     fichier Base GE.xlsx) — sinon les 2 onglets afficheraient des totaux
     décalés (demande explicite : "les données de la partie Dashboard
-    doivent être les mêmes que sur Suivis Consommations"). Le
-    total_conso_estimee_cph_l ci-dessous vient exclusivement du pipeline CPH
-    Snowflake, comme la colonne "Conso estimée" de la liste, pour que les 2
-    totaux concordent.
+    doivent être les mêmes que sur Suivis Consommations"). La consommation
+    estimée CPH n'est pas agrégée ici : elle se calcule sur une plage exacte
+    dans l'onglet Contrôle CPH.
 
     Portée de `months`/`monthly`/`top_sites` (priorité dans cet ordre,
     spec 2026-08) :
@@ -847,20 +512,9 @@ class FuelConsommationDashboardView(APIView):
     def _month_stats(qs, month_year, file_ge_site_ids):
         from django.db.models import Count, Q, Sum
 
-        # Conso estimée / Running Time viennent EXCLUSIVEMENT du pipeline CPH
-        # Snowflake (demande explicite 2026-08 : "pour les autres [colonnes
-        # calculées], respecter les informations de Snowflake") — même
-        # champs que FuelConsommationListView.serialize(), plus de repli sur
-        # Base août 26 validée, pour que le total ici corresponde
-        # exactement à la somme de la colonne "Conso estimée" de Suivis
-        # Consommation sur le même mois. nb_sites_incomplet utilise
-        # EXACTEMENT la même définition que le filtre "Avec GE mais aucune
-        # donnée" de FuelConsommationListView (incomplete_q) : Conso estimée
-        # ET Conso mesurée vue (Snowflake OU gardiennage) toutes les deux
-        # manquantes — Running Time n'entre plus dans ce critère.
-        incomplete_q = _effective_ge_q(file_ge_site_ids) & (
-            Q(conso_estimee_cph_l__isnull=True) & Q(conso_snowflake_l__isnull=True) & Q(conso_gardien_l__isnull=True)
-        )
+        # nb_sites_incomplet : même définition que le filtre « Avec GE mais
+        # aucune donnée » de FuelConsommationListView (incomplete_q).
+        incomplete_q = _effective_ge_q(file_ge_site_ids) & Q(conso_snowflake_l__isnull=True) & Q(conso_gardien_l__isnull=True)
 
         agg = qs.aggregate(
             nb_sites_ge=Count("id"),
@@ -875,8 +529,6 @@ class FuelConsommationDashboardView(APIView):
             # (cf. fuel_consommation_snowflake.py).
             specif_num=Sum("conso_snowflake_l", filter=Q(conso_snowflake_l__isnull=False, ge_prod_kwh__isnull=False)),
             specif_den=Sum("ge_prod_kwh", filter=Q(conso_snowflake_l__isnull=False, ge_prod_kwh__isnull=False)),
-            total_conso_estimee_cph_l=Sum("conso_estimee_cph_l"),
-            nb_sites_avec_cph=Count("id", filter=Q(conso_estimee_cph_l__isnull=False)),
             nb_sites_incomplet=Count("id", filter=incomplete_q),
         )
         specif_num = agg["specif_num"]
@@ -896,8 +548,6 @@ class FuelConsommationDashboardView(APIView):
             "total_enoc_nb_demandes": agg["total_enoc_nb_demandes"] or 0,
             "nb_sites_enoc_ajoutee": agg["nb_sites_enoc_ajoutee"],
             "conso_specifique_moy_l_kwh": conso_specifique,
-            "total_conso_estimee_cph_l": float(agg["total_conso_estimee_cph_l"] or 0),
-            "nb_sites_avec_cph": agg["nb_sites_avec_cph"],
             "nb_sites_incomplet": agg["nb_sites_incomplet"],
         }
 
@@ -925,9 +575,7 @@ class FuelConsommationDashboardView(APIView):
         ]
 
     def get(self, request):
-        from django.utils import timezone
-
-        from fuel_tracking.models import FuelCphGeParameter, FuelConsommationMonthly
+        from fuel_tracking.models import FuelConsommationMonthly
 
         # effective_ge_q (Snowflake/ENOC OU Typo simple du fichier Base
         # GE.xlsx mentionne GE, voir _effective_ge_q/_file_ge_site_ids) —
@@ -941,18 +589,6 @@ class FuelConsommationDashboardView(APIView):
             base_qs.order_by("month_year").values_list("month_year", flat=True).distinct()
         )
         total_ge_sites = base_qs.filter(month_year=all_months[-1]).count() if all_months else 0
-
-        # Statut du fichier de référence CPH — même logique que
-        # FuelConsommationListView, pour que le dashboard explique
-        # immédiatement pourquoi la conso CPH est vide (ou pas).
-        today = timezone.now().date()
-        cph_params_qs = FuelCphGeParameter.objects.all()
-        cph_parameters = {
-            "sites_configures": cph_params_qs.filter(
-                valid_from__lte=today
-            ).exclude(valid_to__lt=today).values("site_id").distinct().count(),
-            "dernier_import": cph_params_qs.order_by("-updated_at").values_list("updated_at", flat=True).first(),
-        }
 
         requested_month = (request.query_params.get("month") or "").strip()
         from_month = (request.query_params.get("from_month") or "").strip()
@@ -987,21 +623,11 @@ class FuelConsommationDashboardView(APIView):
             _sb = FuelConsommationMonthly.objects.filter(month_year=_last)
             _sk = _sb.aggregate(
                 sites_ge_valides_stan=Count("id", filter=_Q(facturation_avec_ge_fichier=True)),
-                supervision_snowflake=Count("id", filter=_Q(facturation_avec_ge_fichier=True, cph_runtime_availability_pct__gte=50)),
-                disponibilite_dse=Count("id", filter=_Q(facturation_avec_ge_fichier=True, cph_runtime_source_availability__DSE_CONTROLLER__gte=50)),
-                sites_avec_cph_calcule=Count("id", filter=_Q(facturation_avec_ge_fichier=True, conso_estimee_cph_l__isnull=False)),
             )
             _st = _sk["sites_ge_valides_stan"] or 0
-            _pct = lambda n: round(n / _st * 100, 1) if _st else None
             dashboard_stan_kpis = {
                 "month_year": _last,
                 "sites_ge_valides_stan": _st,
-                "supervision_snowflake": _sk["supervision_snowflake"] or 0,
-                "supervision_snowflake_pct": _pct(_sk["supervision_snowflake"] or 0),
-                "disponibilite_runtime_dse": _sk["disponibilite_dse"] or 0,
-                "disponibilite_runtime_dse_pct": _pct(_sk["disponibilite_dse"] or 0),
-                "sites_avec_cph_calcule": _sk["sites_avec_cph_calcule"] or 0,
-                "sites_cph_non_calcule": _st - (_sk["sites_avec_cph_calcule"] or 0),
                 "stan_importe": _st > 0,
             }
 
@@ -1011,7 +637,6 @@ class FuelConsommationDashboardView(APIView):
             "top_sites": top_sites,
             "total_ge_sites": total_ge_sites,
             "available_months": all_months,
-            "cph_parameters": cph_parameters,
             "ge_detection": ge_detection,
             "stan_kpis": dashboard_stan_kpis,
         })
@@ -1162,8 +787,10 @@ class FuelCommandeEstimationView(APIView):
     Logique d'estimateur (pas juste une moyenne brute) :
       1. Conso/jour "meilleure valeur" par mois — même priorité que
          FuelConsommationListView.serialize() : mesurée (Snowflake, puis
-         gardiennage) > estimée CPH (télémétrie) > estimée fichier "Base
-         août 26". Jamais deux sources mélangées dans un même mois.
+         gardiennage) > consommation théorique CPH du mois complet
+         (services/cph_engine.py, uniquement si tous les jours du mois sont
+         qualifiés) > estimée fichier "Base août 26". Jamais deux sources
+         mélangées dans un même mois.
       2. Moyenne PONDÉRÉE sur les mois disponibles (le plus récent pèse le
          plus), calculée en L/JOUR (pas en L/mois) pour ne pas fausser la
          projection entre un mois de 28 et un mois de 31 jours.
@@ -1234,8 +861,17 @@ class FuelCommandeEstimationView(APIView):
         ).values(
             "site_id", "site_name", "month_year", "year", "month",
             "conso_snowflake_l", "conso_gardien_l",
-            "conso_estimee_cph_l", "conso_estimee_aout26_l",
+            "conso_estimee_aout26_l",
         )
+        rows = list(rows)
+
+        from fuel_tracking.services.cph_service import compute_period
+
+        cph_by_month: dict[str, dict[str, float]] = {}
+        for my in available_months:
+            y, m = (int(x) for x in my.split("-"))
+            results = compute_period(date(y, m, 1), date(y, m, calendar.monthrange(y, m)[1]))
+            cph_by_month[my] = {r["site_id"]: r["conso_theorique_l"] for r in results if r["conso_theorique_l"] is not None}
 
         by_site: dict[str, dict] = {}
         for r in rows:
@@ -1244,8 +880,8 @@ class FuelCommandeEstimationView(APIView):
                 conso, source, measured = r["conso_snowflake_l"], "snowflake", True
             elif r["conso_gardien_l"] is not None:
                 conso, source, measured = r["conso_gardien_l"], "gardiennage", True
-            elif r["conso_estimee_cph_l"] is not None:
-                conso, source, measured = r["conso_estimee_cph_l"], "cph", False
+            elif r["site_id"] in cph_by_month.get(r["month_year"], {}):
+                conso, source, measured = cph_by_month[r["month_year"]][r["site_id"]], "cph", False
             elif r["conso_estimee_aout26_l"] is not None:
                 conso, source, measured = r["conso_estimee_aout26_l"], "fichier", False
             else:

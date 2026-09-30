@@ -227,13 +227,9 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'fuel_tracking.sync_enoc_fuel_movements_current_month',
         'schedule': crontab(minute='*/5'),
     },
-    'fuel-cph-sync-30min': {
-        'task': 'fuel_tracking.sync_fuel_cph_current_month',
-        'schedule': crontab(minute='*/30'),
-    },
-    'fuel-rapprochement-sync-30min': {
-        'task': 'fuel_tracking.sync_fuel_rapprochement_current_month',
-        'schedule': crontab(minute='*/30'),
+    'fuel-daily-facts-sync-hourly': {
+        'task': 'fuel_tracking.sync_fuel_daily_facts_recent',
+        'schedule': crontab(minute=17),
     },
     'fuel-stock-sync-5min': {
         'task': 'fuel_tracking.sync_fuel_stock_current',
@@ -316,3 +312,12 @@ ENOC_MONGO_DB_NAME  = os.getenv("ENOC_MONGO_DB_NAME", "")
 ENOC_INTEGRATION_TIMEOUT = int(os.getenv("ENOC_INTEGRATION_TIMEOUT", "30"))
 
 FUEL_TRACKING_SITE_MODEL = "core.Site"
+
+# Suivi Carburant / CPH (fuel_tracking/services/cph_engine.py)
+FUEL_CPH_COUNTRIES = [c.strip() for c in os.environ.get("FUEL_CPH_COUNTRIES", "Senegal").split(",") if c.strip()]
+# Tant que les livraisons ENOC réelles ne sont pas raccordées, tout rapprochement
+# reste « LIVRAISONS_ENOC_A_CONTROLER » (instruction §7). Ne passer à 1 qu'après raccordement.
+FUEL_ENOC_DELIVERIES_CONNECTED = os.environ.get("FUEL_ENOC_DELIVERIES_CONNECTED", "0") == "1"
+# Unités Snowflake à confirmer par `manage.py diagnose_cph_sources` (P_DC en W → kW, rendement en % → ratio).
+FUEL_CPH_P_DC_TO_KW_DIVISOR = os.environ.get("FUEL_CPH_P_DC_TO_KW_DIVISOR", "1000")
+FUEL_CPH_EFFICIENCY_TO_RATIO_DIVISOR = os.environ.get("FUEL_CPH_EFFICIENCY_TO_RATIO_DIVISOR", "100")
