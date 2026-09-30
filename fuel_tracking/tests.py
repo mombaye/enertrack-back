@@ -316,3 +316,47 @@ class CurveResolutionTests(SimpleTestCase):
         self.assertTrue(E.is_off_grid("Off-Grid"))
         self.assertFalse(E.is_off_grid("On Grid"))
         self.assertIsNone(E.is_off_grid(None))
+
+
+class ObservationFileTests(SimpleTestCase):
+    def _xlsx(self, sheets):
+        import io
+
+        import openpyxl
+
+        wb = openpyxl.Workbook()
+        wb.remove(wb.active)
+        for name, rows in sheets.items():
+            ws = wb.create_sheet(name)
+            for r in rows:
+                ws.append(r)
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    def test_abaque_file_is_redirected_to_abaque_import(self):
+        from fuel_tracking.services.fuel_observation_import import ABAQUE_FILE_ERROR, read_rows
+
+        content = self._xlsx({"Abaque CPH": [["CURVE_ID"]], "Mappage inventaire": [["GE"]]})
+        with self.assertRaisesMessage(ValueError, ABAQUE_FILE_ERROR):
+            read_rows("ABAQUE_CPH_GE_PRP_50HZ.xlsx", content)
+
+    def test_unrelated_file_gets_short_message(self):
+        from fuel_tracking.services.fuel_observation_import import read_rows
+
+        with self.assertRaisesMessage(ValueError, "n'est pas un fichier d'observation stock"):
+            read_rows("autre.xlsx", self._xlsx({"Feuil1": [["a", "b"], [1, 2]]}))
+
+    def test_partial_header_lists_only_missing_columns(self):
+        from fuel_tracking.services.fuel_observation_import import COLUMNS, read_rows
+
+        header = [c for c in COLUMNS if c != "justificatif"]
+        with self.assertRaises(ValueError) as ctx:
+            read_rows("obs.xlsx", self._xlsx({"Obs": [header]}))
+        self.assertEqual(str(ctx.exception), "Colonnes manquantes : justificatif.")
+
+    def test_template_header_with_semicolons_is_read(self):
+        from fuel_tracking.services.fuel_observation_import import COLUMNS, read_rows
+
+        content = ("﻿" + ";".join(COLUMNS) + "\r\n").encode("utf-8")
+        self.assertEqual(read_rows("modele.csv", content), [])

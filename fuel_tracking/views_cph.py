@@ -153,11 +153,14 @@ def _synthesis(rows: list[dict]) -> dict:
     }
 
 
-def _meta() -> dict:
+def _meta(request=None) -> dict:
     from django.conf import settings
-    from fuel_tracking.models import CphCurve, CphInventoryMapping, FuelDailyFactsSyncRun, FuelSiteDailyFacts
+    from fuel_tracking.models import (
+        CphCurve, CphInventoryMapping, FuelDailyFactsSyncRun, FuelObservationImport, FuelSiteDailyFacts,
+    )
 
     last_run = FuelDailyFactsSyncRun.objects.order_by("-started_at").first()
+    last_obs = FuelObservationImport.objects.order_by("-uploaded_at").first()
     curves = list(CphCurve.objects.all())
     last_curve = max(curves, key=lambda c: c.imported_at, default=None)
     return {
@@ -173,6 +176,11 @@ def _meta() -> dict:
         "mappings_total": CphInventoryMapping.objects.count(),
         "mappings_validated": CphInventoryMapping.objects.exclude(validated_curve=None).count(),
         "max_period_days": E.MAX_PERIOD_DAYS,
+        "observations_last_import": {
+            "file_name": last_obs.file_name, "at": last_obs.uploaded_at,
+            "rows_imported": last_obs.rows_imported, "rows_rejected": last_obs.rows_rejected,
+        } if last_obs else None,
+        "can_validate": bool(request and getattr(request.user, "role", None) in VALIDATOR_ROLES),
     }
 
 
@@ -213,7 +221,7 @@ class CphPeriodView(APIView):
                 "zones": sorted({r["zone"] for r in rows if r["zone"]}),
                 "countries": sorted({r["country"] for r in rows if r["country"]}),
             },
-            "meta": _meta(),
+            "meta": _meta(request),
         })
 
 

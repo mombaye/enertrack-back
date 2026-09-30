@@ -60,11 +60,19 @@ def parse_date(v) -> date | None:
     raise ValueError(f"date illisible {v!r}")
 
 
+ABAQUE_FILE_ERROR = (
+    "Ce fichier est l'abaque CPH (courbes PRP 50 Hz), pas un fichier d'observation stock. "
+    "Importez-le avec « Importer l'abaque CPH »."
+)
+
+
 def read_rows(file_name: str, content: bytes) -> list[dict]:
     name = file_name.lower()
     if name.endswith((".xlsx", ".xlsm")):
         import openpyxl
         wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        if {"abaque cph", "mappage inventaire"} & {n.strip().lower() for n in wb.sheetnames}:
+            raise ValueError(ABAQUE_FILE_ERROR)
         raw = list(wb.worksheets[0].iter_rows(values_only=True))
     elif name.endswith(".csv"):
         text = content.decode("utf-8-sig")
@@ -76,8 +84,13 @@ def read_rows(file_name: str, content: bytes) -> list[dict]:
         raise ValueError("Fichier vide.")
     header = [str(h).strip().lower() if h is not None else "" for h in raw[0]]
     missing = [c for c in COLUMNS if c not in header]
+    if len(missing) == len(COLUMNS):
+        raise ValueError(
+            "Aucune des colonnes attendues n'a été trouvée en 1re ligne : ce fichier n'est pas un fichier "
+            "d'observation stock. Téléchargez le modèle depuis la fenêtre d'import."
+        )
     if missing:
-        raise ValueError(f"Colonnes manquantes : {', '.join(missing)}. Attendu : {', '.join(COLUMNS)}.")
+        raise ValueError(f"Colonnes manquantes : {', '.join(missing)}.")
     idx = {c: header.index(c) for c in COLUMNS}
     out = []
     for n, r in enumerate(raw[1:], start=2):
