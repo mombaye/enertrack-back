@@ -277,40 +277,61 @@ class ReconciliationTests(SimpleTestCase):
 
 
 class CurveResolutionTests(SimpleTestCase):
-    def curve_model(self, status="VALIDÉ_CONSTRUCTEUR", approved=False):
+    def curve_model(self, status="VALIDÉ_CONSTRUCTEUR", power_factor=D("0.8")):
         return SimpleNamespace(curve_id="CPH-0014", manufacturer="Caterpillar", model="DE22E3", variant="",
-                               status=status, prp_kva=D("20"), prp_kw=D("16"), power_factor=D("0.8"),
-                               coef_a=D("3.2"), coef_b=D("0"), coef_c=D("2.1"), source="fiche",
-                               is_usable=(status == "VALIDÉ_CONSTRUCTEUR" or approved))
+                               status=status, prp_kva=D("20"), prp_kw=D("16"), power_factor=power_factor,
+                               coef_a=D("3.2"), coef_b=D("0"), coef_c=D("2.1"), source="fiche")
 
-    def test_unvalidated_mapping_gives_no_curve(self):
-        m = SimpleNamespace(validated_curve=None, abaque_status="CANDIDAT_UNIQUE_A_VALIDER", action_required="Valider plaque", inventory_kva=D("22"))
-        curve, reason = resolve_curve(1, "CATERPILLAR - DE22E3", D("22"), {"caterpillar - de22e3": [m]})
-        self.assertIsNone(curve)
-        self.assertIn("non validé", reason)
+    def mapping(self, curve=None, status="A_VALIDER", kva=D("22"), reasons=("score insuffisant",)):
+        return SimpleNamespace(validated_curve=curve, match_status=status, match_score=80, match_method="AUTO:X",
+                               match_reasons=list(reasons), matched_at=None, validated_at=None, validated_by=None,
+                               action_required="Valider plaque", inventory_kva=kva, pk=1)
 
-    def test_historical_curve_needs_business_approval(self):
-        m = SimpleNamespace(validated_curve=self.curve_model("HISTORIQUE_A_VALIDER"), abaque_status="", action_required="", inventory_kva=D("20"))
-        curve, reason = resolve_curve(1, "X", None, {"x": [m]})
+    def test_mapping_to_validate_gives_no_curve(self):
+        curve, reason, match = resolve_curve(1, "CATERPILLAR - DE22E3", D("22"), {"caterpillar - de22e3": [self.mapping()]})
         self.assertIsNone(curve)
-        m.validated_curve = self.curve_model("HISTORIQUE_A_VALIDER", approved=True)
-        curve, _ = resolve_curve(1, "X", None, {"x": [m]})
+        self.assertIn("à valider", reason)
+        self.assertEqual(match["statut"], "A_VALIDER")
+
+    def test_auto_validated_historical_curve_is_applied_and_keeps_its_quality_status(self):
+        m = self.mapping(self.curve_model("HISTORIQUE_A_VALIDER"), status="AUTO_VALIDE_COMPATIBLE")
+        curve, reason, match = resolve_curve(1, "X", None, {"x": [m]})
         self.assertEqual(curve.curve_id, "CPH-0014")
+        self.assertIsNone(reason)
+        self.assertEqual(match["statut"], "AUTO_VALIDE_COMPATIBLE")
+        self.assertEqual(match["courbe_statut"], "HISTORIQUE_A_VALIDER")
+        self.assertEqual(curve.status, "HISTORIQUE_A_VALIDER")
 
-    def test_multi_ge_site(self):
-        curve, reason = resolve_curve(2, "X", None, {})
+    def test_manual_validation_is_applied(self):
+        m = self.mapping(self.curve_model(), status="VALIDE_MANUELLEMENT")
+        curve, _, match = resolve_curve(1, "X", None, {"x": [m]})
+        self.assertIsNotNone(curve)
+        self.assertEqual(match["statut"], "VALIDE_MANUELLEMENT")
+
+    def test_curve_without_power_factor_is_not_applied(self):
+        m = self.mapping(self.curve_model(power_factor=None), status="AUTO_VALIDE_COMPATIBLE")
+        curve, reason, _ = resolve_curve(1, "X", None, {"x": [m]})
+        self.assertIsNone(curve)
+        self.assertIn("cos φ", reason)
+
+    def test_multi_ge_site_and_unknown_ge(self):
+        curve, reason, match = resolve_curve(2, "X", None, {})
         self.assertIsNone(curve)
         self.assertIn("multi-GE", reason)
+        self.assertEqual(match["statut"], "SITE_MULTI_GE")
+        self.assertEqual(resolve_curve(1, None, None, {})[2]["statut"], "GE_INCONNU")
+        self.assertEqual(resolve_curve(1, "ZZ - 1", None, {})[2]["statut"], "COURBE_CPH_MANQUANTE")
 
     def test_same_label_several_kva_uses_site_kva(self):
-        m30 = SimpleNamespace(validated_curve=self.curve_model(), abaque_status="", action_required="", inventory_kva=D("30"))
-        m33 = SimpleNamespace(validated_curve=None, abaque_status="CANDIDAT_UNIQUE_A_VALIDER", action_required="", inventory_kva=D("33"))
+        m30 = self.mapping(self.curve_model(), status="AUTO_VALIDE_COMPATIBLE", kva=D("30"))
+        m33 = self.mapping(None, kva=D("33"))
         mappings = {"olympian - gep30-1": [m30, m33]}
-        curve, _ = resolve_curve(1, "OLYMPIAN - GEP30-1", D("30"), mappings)
+        curve, _, _ = resolve_curve(1, "OLYMPIAN - GEP30-1", D("30"), mappings)
         self.assertIsNotNone(curve)
-        curve, reason = resolve_curve(1, "OLYMPIAN - GEP30-1", None, mappings)
+        curve, reason, match = resolve_curve(1, "OLYMPIAN - GEP30-1", None, mappings)
         self.assertIsNone(curve)
         self.assertIn("ambigu", reason)
+        self.assertEqual(match["statut"], "MODELE_AMBIGU")
 
     def test_off_grid_parsing(self):
         self.assertTrue(E.is_off_grid("Off-Grid"))
@@ -378,18 +399,18 @@ class BlocageTests(SimpleTestCase):
                              fuel_deliveries_l=D("0"), fuel_transfer_in_l=D("0"), fuel_transfer_out_l=D("0"),
                              fuel_theft_l=D("0"), fuel_drain_l=D("0"), observation_status="VALIDÉ")
 
-    def test_curve_reasons_are_classified(self):
+    def test_match_statuses_are_classified(self):
         cases = {
-            "mappage « SDMO - K22 » non validé (CANDIDAT_UNIQUE_A_VALIDER) — Valider plaque": "MAPPAGE_NON_VALIDE",
-            "courbe CPH-0048 au statut HISTORIQUE_A_VALIDER non activée par le métier": "COURBE_NON_ACTIVEE",
-            "site multi-GE (DG_COUNT = 2) : affectation d'une courbe par GE non disponible": "MULTI_GE",
-            "type de GE absent de l'inventaire Base GE": "GE_INCONNU",
-            "libellé GE « X » absent du mappage de l'abaque": "GE_HORS_ABAQUE",
-            "libellé « X » présent pour plusieurs kVA (22, 33) et kVA du site inconnu : mappage ambigu": "MAPPAGE_AMBIGU",
-            "courbe CPH-0145 sans cos φ : plafond 105 % × kVA × cos φ non vérifiable": "COURBE_SANS_COS_PHI",
+            "A_VALIDER": "MAPPAGE_NON_VALIDE",
+            "SITE_MULTI_GE": "MULTI_GE",
+            "GE_INCONNU": "GE_INCONNU",
+            "COURBE_CPH_MANQUANTE": "COURBE_CPH_MANQUANTE",
+            "MODELE_AMBIGU": "MAPPAGE_AMBIGU",
+            "AUTO_VALIDE_COMPATIBLE": "COURBE_SANS_COS_PHI",  # correspondance OK mais courbe inutilisable
         }
-        for reason, expected in cases.items():
-            self.assertEqual(self.code(outdoor(curve=None, curve_reason=reason), self.facts()), expected, reason)
+        for statut, expected in cases.items():
+            ctx = outdoor(curve=None, curve_reason="x", match={"statut": statut})
+            self.assertEqual(self.code(ctx, self.facts()), expected, statut)
 
     def test_runtime_then_observation_then_enoc(self):
         connected = E.EngineSettings(enoc_deliveries_connected=True)
@@ -410,3 +431,162 @@ class BlocageTests(SimpleTestCase):
 
     def test_data_issue_comes_first(self):
         self.assertEqual(self.code(outdoor(data_issue="plusieurs DATA_ID", curve=None, curve_reason="x"), self.facts()), "DONNEES_SITE")
+
+
+class AutoMatchingTests(SimpleTestCase):
+    """Correspondance automatique plaque → courbe (services/cph_matching.py)."""
+
+    def curve(self, cid, manufacturer, model, kva, points=(D("3.8"), D("5.2"), D("6.9")), frequency="50 Hz"):
+        return {"curve_id": cid, "manufacturer": manufacturer, "model": model, "prp_kva": D(kva), "frequency": frequency,
+                "conso_50_l_h": points[0], "conso_75_l_h": points[1], "conso_100_l_h": points[2]}
+
+    def match(self, label, kva, candidates, curves):
+        from fuel_tracking.services.cph_matching import auto_match
+        by = {c["curve_id"]: c for c in curves}
+        return auto_match(label, None if kva is None else D(kva), candidates, by, curves)
+
+    def test_unique_identical_model_is_auto_validated(self):
+        curves = [self.curve("CPH-0001", "AKSA", "AP33", "33")]
+        d = self.match("AKSA - AP33", "33", ["CPH-0001"], curves)
+        self.assertEqual(d["status"], "AUTO_VALIDE_COMPATIBLE")
+        self.assertEqual(d["curve_id"], "CPH-0001")
+        self.assertEqual(d["score"], 100)
+        self.assertTrue(d["method"].startswith("AUTO:"))
+
+    def test_variant_suffix_and_standby_rating_are_compatible(self):
+        curves = [self.curve("CPH-0048", "FG Wilson", "P33-3", "30")]
+        d = self.match("FG Wilson P33-3U", "33", ["CPH-0048"], curves)  # 33 kVA secours ≈ 1,1 × 30 kVA PRP
+        self.assertEqual(d["status"], "AUTO_VALIDE_COMPATIBLE")
+        self.assertEqual(d["score"], 80)
+
+    def test_same_kva_never_links_two_different_models(self):
+        curves = [self.curve("CPH-0121", "Rehlko / SDMO", "J200_220", "182")]
+        d = self.match("SDMO - J200", "200", ["CPH-0121"], curves)
+        self.assertEqual(d["status"], "A_VALIDER")
+        self.assertIsNone(d["curve_id"])
+        self.assertTrue(any("incompatible" in r for r in d["reasons"]))
+
+    def test_large_power_gap_is_blocking(self):
+        curves = [self.curve("CPH-0001", "AKSA", "AP33", "33")]
+        d = self.match("AKSA - AP33", "60", ["CPH-0001"], curves)
+        self.assertEqual(d["status"], "A_VALIDER")
+        self.assertTrue(any("écart de puissance" in r for r in d["reasons"]))
+
+    def test_brand_contradiction_and_60hz_are_blocking(self):
+        curves = [self.curve("CPH-0125", "SDMO", "GEP 33-3", "33")]
+        self.assertEqual(self.match("OLYMPIAN - GEP33-3", "33", ["CPH-0125"], curves)["status"], "A_VALIDER")
+        curves = [self.curve("CPH-0001", "AKSA", "AP33", "33", frequency="60 Hz")]
+        self.assertEqual(self.match("AKSA - AP33", "33", ["CPH-0001"], curves)["status"], "A_VALIDER")
+
+    def test_missing_or_unreadable_model(self):
+        curves = [self.curve("CPH-0004", "AMMAN", "M180", "180")]
+        self.assertEqual(self.match("GENERAC - 0", "15", ["CPH-0004"], curves)["status"], "A_VALIDER")
+        self.assertEqual(self.match("PA50", "50", [], curves)["status"], "COURBE_CPH_MANQUANTE")
+
+    def test_several_candidates_stay_ambiguous(self):
+        curves = [self.curve("CPH-0042", "FG Wilson", "P22-1", "20"), self.curve("CPH-0112", "Perkins", "P22-1", "20")]
+        d = self.match("FG Wilson P22-1", "22", ["CPH-0042", "CPH-0112"], curves)
+        self.assertEqual(d["status"], "MODELE_AMBIGU")
+        self.assertIsNone(d["curve_id"])
+
+    def test_duplicate_curves_with_same_points_are_not_ambiguous_but_different_ones_are(self):
+        twins = [self.curve("CPH-0048", "FG Wilson", "P33-3", "30"), self.curve("CPH-0047", "FG Wilson", "P33-3", "30")]
+        d = self.match("FG Wilson P33-3", "33", ["CPH-0048"], twins)
+        self.assertEqual(d["status"], "AUTO_VALIDE_COMPATIBLE")
+        self.assertTrue(any("CPH-0047" in r for r in d["reasons"]))
+        rivals = [self.curve("CPH-0130", "SDMO", "J220K", "220", (D("24"), D("36"), D("48"))),
+                  self.curve("CPH-0129", "SDMO", "J220K", "200", (D("21.5"), D("32"), D("43")))]
+        self.assertEqual(self.match("SDMO |J220K", "220", ["CPH-0130"], rivals)["status"], "A_VALIDER")
+
+    def test_human_decisions_are_never_overwritten(self):
+        from fuel_tracking.services.cph_matching import apply_auto_matching
+
+        class Mapping(SimpleNamespace):
+            def save(self, update_fields=None):
+                self.saved = True
+
+        curve_obj = SimpleNamespace(pk=7, curve_id="CPH-0001", manufacturer="AKSA", model="AP33", prp_kva=D("33"),
+                                    frequency="50 Hz", conso_50_l_h=D("4"), conso_75_l_h=D("5"), conso_100_l_h=D("6"))
+        base = dict(inventory_label="AKSA - AP33", inventory_kva=D("33"), candidate_curve_ids=["CPH-0001"],
+                    match_score=None, match_reasons=[], matched_at=None, validated_by_id=None, validated_at=None,
+                    validation_comment="", saved=False)
+        auto = Mapping(**base, match_status="A_VALIDER", match_method="", validated_curve_id=None)
+        removed = Mapping(**base, match_status="A_VALIDER", match_method="RETRAIT_MANUEL", validated_curve_id=None)
+        manual = Mapping(**base, match_status="VALIDE_MANUELLEMENT", match_method="MANUEL", validated_curve_id=99)
+        counts = apply_auto_matching([auto, removed, manual], [curve_obj], None)
+        self.assertEqual(auto.match_status, "AUTO_VALIDE_COMPATIBLE")
+        self.assertEqual(auto.validated_curve_id, 7)
+        self.assertFalse(removed.saved)
+        self.assertEqual(removed.match_status, "A_VALIDER")
+        self.assertFalse(manual.saved)
+        self.assertEqual(manual.validated_curve_id, 99)
+        self.assertEqual(counts, {"AUTO_VALIDE_COMPATIBLE": 1, "A_VALIDER": 1, "VALIDE_MANUELLEMENT": 1})
+
+
+class MeasuredComparisonTests(SimpleTestCase):
+    """Conso estimée (runtime × CPH) vs conso mesurée (VW_FUEL_REPORT)."""
+
+    def facts(self, measured):
+        # 10 h × CPH 3,35 L/h = 33,5 L estimés par jour
+        return {d: fact(dse_runtime_h=10, tracker_ge_on_slots=10, p_dc_ge_tracker_kw=D("8"), eff_ge_tracker=D("0.8"),
+                        measured_conso_l=m) for d, m in zip(days(OCT1, len(measured)), measured)}
+
+    def test_estimate_is_kept_when_measure_is_absent(self):
+        r = period(outdoor(), self.facts([None, None]), OCT1, OCT1 + timedelta(days=1))
+        self.assertEqual(r["conso_theorique_l"], D("67.0"))
+        c = r["comparaison"]
+        self.assertEqual(c["statut"], E.C_MESURE_ABSENTE)
+        self.assertIsNone(c["conso_mesuree_l"])
+        self.assertIsNone(c["ecart_l"])
+
+    def test_gap_is_measured_minus_estimated_on_common_days_only(self):
+        r = period(outdoor(), self.facts([D("40"), None, D("0")]), OCT1, OCT1 + timedelta(days=2))
+        c = r["comparaison"]
+        self.assertEqual(c["conso_mesuree_l"], D("40"))  # 0 mesuré reste 0, NULL reste absent
+        self.assertEqual(c["jours_mesure"], 2)
+        self.assertEqual(c["jours_communs"], 2)
+        self.assertEqual(c["conso_estimee_communs_l"], D("67.0"))
+        self.assertEqual(c["ecart_l"], D("40") - D("67.0"))
+        self.assertEqual(c["statut"], E.C_COHERENT)  # |−27 L| ≤ max(100 L, 10 %)
+        self.assertIn("2/3", c["motif"])
+
+    def test_no_cph_keeps_the_measure_and_says_why(self):
+        r = period(outdoor(curve=None, curve_reason="x"), self.facts([D("30"), D("20")]), OCT1, OCT1 + timedelta(days=1))
+        self.assertIsNone(r["cph_moy_l_h"])
+        c = r["comparaison"]
+        self.assertEqual(c["statut"], E.C_NON_CALCULEE)
+        self.assertEqual(c["conso_mesuree_l"], D("50"))
+        self.assertIsNone(c["ecart_l"])
+
+    def test_charge_and_runtime_source_availability(self):
+        r = period(outdoor(), self.facts([None, None]), OCT1, OCT1 + timedelta(days=1))
+        self.assertEqual(r["runtime_source_main"], E.RT_DSE)
+        self.assertEqual(r["runtime_source_availability"], D("1"))
+        self.assertEqual(r["charge_moy"], D("0.625"))
+
+    def test_custom_exact_dates_are_not_extended_to_the_month(self):
+        f = self.facts([D("10")] * 12)
+        r = period(outdoor(), f, date(2026, 10, 1), date(2026, 10, 12))
+        self.assertEqual(r["days"], 12)
+        self.assertEqual(r["comparaison"]["jours_communs"], 12)
+        self.assertEqual(r["daily"][-1]["date"], date(2026, 10, 12))
+
+
+class DailyFactsSqlTests(SimpleTestCase):
+    def test_measured_conso_uses_the_strict_fuel_report_filter(self):
+        from fuel_tracking.services.fuel_daily_facts_snowflake import build_daily_facts_sql
+        sql = build_daily_facts_sql([1, 2])
+        self.assertIn("DB_GFMS_ANALYTICS_DEV.GOLD.VW_FUEL_REPORT", sql)
+        self.assertIn("QUALITY_STATUS = 'OK' AND VALID_POINT_COUNT >= 2 AND DROP_DETECTED = TRUE", sql)
+        self.assertNotIn("INSERT", sql.upper().replace("INSERTED", ""))
+
+
+class BlocageNoCphTests(SimpleTestCase):
+    def test_ge_off_days_do_not_hide_a_missing_cph(self):
+        from fuel_tracking.views_cph import _blocage_code
+        f = {OCT1: fact(dse_runtime_h=0),  # GE à l'arrêt : 0 L valide
+             OCT1 + timedelta(days=1): fact(dse_runtime_h=10)}  # marche sans puissance qualifiée
+        r = period(outdoor(), f, OCT1, OCT1 + timedelta(days=1))
+        self.assertEqual(r["cph_days"], 0)
+        self.assertEqual(r["cph_status"], E.CPH_PARTIEL)
+        self.assertEqual(_blocage_code(r), "PUISSANCE_ABSENTE")

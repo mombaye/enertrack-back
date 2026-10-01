@@ -61,7 +61,7 @@ class Command(BaseCommand):
                 self.stdout.write(f"  {len(ge_rows)} DATA_ID avec GE retenus")
 
                 for w_start, w_end in SF.date_windows(d_start, d_end):
-                    facts = SF.fetch_daily_facts(list(site_by_data_id), w_start, w_end)
+                    facts = SF.fetch_daily_facts(list(site_by_data_id), w_start, w_end, country)
                     self.stdout.write(f"  {w_start} → {w_end} : {len(facts)} ligne(s) site/jour")
                     if dry:
                         continue

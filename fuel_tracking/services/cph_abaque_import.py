@@ -19,6 +19,7 @@ from django.utils import timezone
 
 from fuel_tracking.models import CphCurve, CphInventoryMapping
 from fuel_tracking.services.cph_engine import normalize_label
+from fuel_tracking.services.cph_matching import apply_auto_matching
 
 CURVE_COLUMNS = {
     "curve_id": "ID courbe", "manufacturer": "Fabricant", "model": "Modèle", "model_key": "Clé modèle",
@@ -130,10 +131,15 @@ def apply_abaque(parsed: dict, file_name: str) -> list[str]:
             obj, _ = CphInventoryMapping.objects.update_or_create(
                 inventory_label=m["inventory_label"], inventory_kva=m["inventory_kva"], defaults=defaults)
             if obj.validated_curve_id and obj.validated_curve.curve_id not in obj.candidate_curve_ids:
-                reset.append(f"{obj.inventory_label} (courbe {obj.validated_curve.curve_id})")
+                if obj.match_status == CphInventoryMapping.MatchStatus.VALIDE_MANUELLEMENT:
+                    reset.append(f"{obj.inventory_label} (courbe {obj.validated_curve.curve_id})")
                 obj.validated_curve = None
                 obj.validated_by = None
                 obj.validated_at = None
                 obj.validation_comment = ""
+                obj.match_status = CphInventoryMapping.MatchStatus.A_VALIDER
+                obj.match_method = ""
                 obj.save()
+        # Correspondance automatique des libellés fiables ; décisions humaines conservées.
+        apply_auto_matching(CphInventoryMapping.objects.all(), list(CphCurve.objects.all()), timezone.now())
     return reset

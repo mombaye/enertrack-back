@@ -822,6 +822,22 @@ class CphInventoryMapping(models.Model):
     abaque_status = models.CharField(max_length=32, choices=AbaqueStatus.choices)
     action_required = models.TextField(blank=True)
 
+    class MatchStatus(models.TextChoices):
+        AUTO_VALIDE_COMPATIBLE = "AUTO_VALIDE_COMPATIBLE", "Auto-validé (compatible)"
+        VALIDE_MANUELLEMENT = "VALIDE_MANUELLEMENT", "Validé manuellement"
+        A_VALIDER = "A_VALIDER", "À valider"
+        COURBE_CPH_MANQUANTE = "COURBE_CPH_MANQUANTE", "Courbe CPH manquante"
+        MODELE_AMBIGU = "MODELE_AMBIGU", "Modèle ambigu"
+
+    # Statut de CORRESPONDANCE plaque → courbe (services/cph_matching.py), distinct du
+    # statut de qualité de la courbe (CphCurve.status), qui n'est jamais modifié ici.
+    match_status = models.CharField(max_length=32, choices=MatchStatus.choices, default=MatchStatus.A_VALIDER, db_index=True)
+    match_score = models.IntegerField(null=True, blank=True, help_text="Score de compatibilité 0-100 du candidat unique.")
+    match_method = models.CharField(max_length=96, blank=True, help_text="AUTO:<critères> | MANUEL | RETRAIT_MANUEL")
+    match_reasons = models.JSONField(default=list, blank=True)
+    matched_at = models.DateTimeField(null=True, blank=True)
+
+    # Courbe appliquée (auto ou manuelle) ; validated_by renseigné seulement pour un choix humain.
     validated_curve = models.ForeignKey(CphCurve, null=True, blank=True, on_delete=models.PROTECT, related_name="validated_mappings")
     validated_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
     validated_at = models.DateTimeField(null=True, blank=True)
@@ -893,6 +909,12 @@ class FuelSiteDailyFacts(models.Model):
     # AC_METER — instrument AC (indoor)
     ac_active_power_avg_w = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True, help_text="ACT_ACTIVE_POWER_AVG brut (W).")
     ac_energy_p = models.DecimalField(max_digits=16, decimal_places=4, null=True, blank=True, help_text="ACT_ENERGY_P brut.")
+
+    # VW_FUEL_REPORT (DB_GFMS_ANALYTICS_DEV) — conso MESURÉE du jour, même filtre strict que la conso
+    # mensuelle : QUALITY_STATUS = 'OK' et VALID_POINT_COUNT ≥ 2 ; baisse détectée → volume de la baisse,
+    # aucune baisse ni remplissage → 0 L mesuré ; sinon NULL (jour non mesurable, jamais 0).
+    measured_conso_l = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True, help_text="Conso mesurée du jour (L), VW_FUEL_REPORT.")
+    fuel_raw_points = models.IntegerField(null=True, blank=True, help_text="RAW_POINT_COUNT du jour (VW_FUEL_REPORT).")
 
     synced_at = models.DateTimeField(default=timezone.now)
 

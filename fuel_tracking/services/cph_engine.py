@@ -120,6 +120,7 @@ class SiteContext:
     curve: Curve | None = None
     curve_reason: str | None = None         # pourquoi aucune courbe n'est appliquée
     data_issue: str | None = None           # anomalie bloquante de rattachement des faits
+    match: dict | None = None               # correspondance plaque → courbe (statut, score, méthode…)
 
 
 @dataclass
@@ -397,6 +398,8 @@ def compute_day(ctx: SiteContext, d: date, fact: dict | None, sources_eval: dict
         "curve_id": ctx.curve.curve_id if ctx.curve else None,
         "charge": None, "cph_l_h": None, "conso_l": None, "extrapolated": False,
         "status": None, "motifs": [],
+        # Conso MESURÉE du jour (VW_FUEL_REPORT) — indicateur distinct, jamais mélangé à l'estimation.
+        "measured_l": (fact or {}).get("measured_conso_l"),
     }
     if runtime_h is None:
         row["status"] = DAY_RUNTIME_ABSENT
@@ -431,6 +434,52 @@ def compute_day(ctx: SiteContext, d: date, fact: dict | None, sources_eval: dict
     if res["extrapolated"]:
         row["motifs"] = ["charge < 50 % : estimation mathématique (extrapolation de la parabole)"]
     return row
+
+
+# ─── Conso estimée (CPH) vs conso mesurée (capteur) ─────────────────────────
+
+C_NON_CALCULEE = "CONSO_ESTIMEE_NON_CALCULEE"
+C_MESURE_ABSENTE = "MESURE_ABSENTE"
+C_COHERENT = "COHERENT"
+C_ECART_A_JUSTIFIER = "ECART_A_JUSTIFIER"
+C_ECART_A_INVESTIGUER = "ECART_A_INVESTIGUER"
+_R_TO_C = {R_OK: C_COHERENT, R_A_JUSTIFIER: C_ECART_A_JUSTIFIER, R_A_INVESTIGUER: C_ECART_A_INVESTIGUER}
+
+
+def compare_measured(day_rows: list[dict], settings: EngineSettings) -> dict:
+    """
+    Écart = conso mesurée − conso estimée, calculé sur les jours COMMUNS (estimation
+    calculée ET mesure capteur exploitable) : on ne compare jamais une période
+    estimée à une mesure partielle. Seuils identiques au rapprochement stock.
+    """
+    n = len(day_rows)
+    measured = [r["measured_l"] for r in day_rows if r["measured_l"] is not None]
+    common = [r for r in day_rows if r["conso_l"] is not None and r["measured_l"] is not None]
+    out = {
+        "conso_mesuree_l": sum(measured, D0) if measured else None,
+        "jours_mesure": len(measured),
+        "jours_communs": len(common),
+        "conso_estimee_communs_l": None, "conso_mesuree_communs_l": None,
+        "ecart_l": None, "ecart_pct": None, "statut": None, "motif": None,
+    }
+    if not any(r["conso_l"] is not None for r in day_rows):
+        out["statut"] = C_NON_CALCULEE
+        out["motif"] = "conso estimée non calculée (voir le point bloquant)"
+        return out
+    if not common:
+        out["statut"] = C_MESURE_ABSENTE
+        out["motif"] = ("aucune mesure capteur exploitable sur la période (VW_FUEL_REPORT)" if not measured
+                        else "aucun jour avec à la fois une conso estimée et une mesure capteur")
+        return out
+    est = sum((r["conso_l"] for r in common), D0)
+    mes = sum((r["measured_l"] for r in common), D0)
+    ecart = mes - est
+    out.update(conso_estimee_communs_l=est, conso_mesuree_communs_l=mes, ecart_l=ecart,
+               ecart_pct=(ecart / est * 100) if est > D0 else None,
+               statut=_R_TO_C[_thresholds_status(ecart, est, settings.thresholds)])
+    out["motif"] = (f"comparaison sur {len(common)}/{n} jour(s) communs" if len(common) < n
+                    else "comparaison sur tous les jours de la période")
+    return out
 
 
 # ─── Rapprochement (instruction §7) ──────────────────────────────────────────
@@ -528,6 +577,11 @@ def compute_site_period(ctx: SiteContext, facts: dict, start: date, end: date,
         example = next(r for r in day_rows.values() if r["status"] == st)
         motifs.append(f"{st} ({cnt} j) : {'; '.join(example['motifs'][:2]) or '—'}")
 
+    comparison = compare_measured([day_rows[d] for d in days], settings)
+    charge_days = [r for r in cph_days if r["charge"] is not None]
+    charge_rt = sum((r["runtime_h"] for r in charge_days), D0)
+    main_src = max(runtime_by_src.items(), key=lambda kv: kv[1])[0] if runtime_by_src else None
+
     in_period = [o for o in observations if start <= o.start and o.end <= end]
     reconciliations = [reconcile(o, day_rows, settings) for o in in_period]
     if reconciliations:
@@ -546,7 +600,8 @@ def compute_site_period(ctx: SiteContext, facts: dict, start: date, end: date,
         "runtime_days": len(rt_days),
         "runtime_total_h": sum((r["runtime_h"] for r in rt_days), D0) if rt_days else None,
         "runtime_source_days": runtime_by_src,
-        "runtime_source_main": max(runtime_by_src.items(), key=lambda kv: kv[1])[0] if runtime_by_src else None,
+        "runtime_source_main": main_src,
+        "runtime_source_availability": sources_eval[main_src]["availability"] if main_src else None,
         "sources": {s: {k: v for k, v in ev.items() if k != "values"} for s, ev in sources_eval.items()},
         "power_source_days": power_by_src,
         "power_source_main": max(power_by_src.items(), key=lambda kv: kv[1])[0] if power_by_src else None,
@@ -554,6 +609,9 @@ def compute_site_period(ctx: SiteContext, facts: dict, start: date, end: date,
         "ac_reference": ac_ref,
         "cph_days": len(cph_days),
         "cph_moy_l_h": (cph_conso / cph_runtime) if cph_runtime > D0 else None,
+        "charge_moy": (sum((r["charge"] * r["runtime_h"] for r in charge_days), D0) / charge_rt) if charge_rt > D0 else None,
+        "comparaison": comparison,
+        "correspondance": ctx.match,
         "conso_days": len(conso_days),
         "conso_theorique_l": conso_sum if cph_status == CPH_COMPLET else None,
         "conso_partielle_l": conso_sum if cph_status == CPH_PARTIEL else None,

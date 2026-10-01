@@ -13,6 +13,7 @@ Sources :
   DB_GFMS_PROD.GOLD.GFMS_DATA_TRACKER_NC              compteur horaire (5 min)
   DB_GFMS_PROD.GOLD.RECTIFIER_EFFICIENCY_STATUS       P_DC, rendement, statut (5 min)
   DB_GFMS_ANALYTICS_PROD.GOLD.AC_METER                ACT_ACTIVE_POWER_AVG (W), ACT_ENERGY_P
+  DB_GFMS_ANALYTICS_DEV.GOLD.VW_FUEL_REPORT           conso MESURÉE du jour (même filtre strict que la conso mensuelle)
 VW_INVOICE_DATA_REPORT n'est volontairement PAS utilisé (instruction §0).
 """
 from __future__ import annotations
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 PROD = "DB_GFMS_PROD.GOLD"
 ANALYTICS = "DB_GFMS_ANALYTICS_PROD.GOLD"
+FUEL_REPORT = "DB_GFMS_ANALYTICS_DEV.GOLD"  # VW_FUEL_REPORT (cf. fuel_consommation_snowflake.py)
 DATA_ID_CHUNK = 200
 
 # Unités — À CONFIRMER avec `manage.py diagnose_cph_sources` avant la mise en
@@ -138,23 +140,44 @@ ac AS (
     WHERE DATE >= %(d_start)s AND DATE <= %(d_end)s AND DATA_ID IN ({ids})
     GROUP BY DATA_ID, DATE
 ),
+fuel AS (
+    -- Conso MESURÉE (capteur de cuve). Même filtre que la conso mensuelle :
+    -- QUALITY_STATUS = 'OK' AND VALID_POINT_COUNT >= 2. Baisse détectée → volume
+    -- de la baisse ; ni baisse ni remplissage → 0 L mesuré ; autre cas (qualité
+    -- insuffisante, remplissage sans baisse, drapeau NULL, doublon) → NULL.
+    SELECT DATA_ID AS data_id, DATE AS day,
+           IFF(COUNT(*) = 1, MAX(CASE
+               WHEN QUALITY_STATUS = 'OK' AND VALID_POINT_COUNT >= 2 AND DROP_DETECTED = TRUE
+                   THEN ESTIMATED_DROP_VOLUME_L
+               WHEN QUALITY_STATUS = 'OK' AND VALID_POINT_COUNT >= 2 AND DROP_DETECTED = FALSE AND REFILL_DETECTED = FALSE
+                   THEN 0
+           END), NULL) AS measured_l,
+           SUM(RAW_POINT_COUNT) AS raw_points
+    FROM {fuel_report}.VW_FUEL_REPORT
+    WHERE DATE >= %(d_start)s AND DATE <= %(d_end)s AND DATA_ID IN ({ids})
+      AND (%(country)s IS NULL OR COUNTRY = %(country)s)
+    GROUP BY DATA_ID, DATE
+),
 universe AS (
     SELECT data_id, day FROM genset
     UNION SELECT data_id, day FROM tracker_daily
     UNION SELECT data_id, day FROM rect_daily
     UNION SELECT data_id, day FROM ac
+    UNION SELECT data_id, day FROM fuel
 )
 SELECT u.data_id, u.day,
        g.dse_h, g.dg_on_h, g.prod_kwh,
        td.tracker_h, td.covered_min, td.ge_on_slots,
        rd.slots, rd.active_slots, rd.p_dc_ge_tracker_kw, rd.eff_ge_tracker,
        rd.p_dc_rect_active_kw, rd.eff_rect_active, rd.p_dc_day_kw, rd.eff_day,
-       a.ac_w, a.ac_energy
+       a.ac_w, a.ac_energy,
+       f.measured_l, f.raw_points
 FROM universe u
 LEFT JOIN genset g ON g.data_id = u.data_id AND g.day = u.day
 LEFT JOIN tracker_daily td ON td.data_id = u.data_id AND td.day = u.day
 LEFT JOIN rect_daily rd ON rd.data_id = u.data_id AND rd.day = u.day
 LEFT JOIN ac a ON a.data_id = u.data_id AND a.day = u.day
+LEFT JOIN fuel f ON f.data_id = u.data_id AND f.day = u.day
 """
 
 
@@ -162,10 +185,10 @@ def build_daily_facts_sql(data_ids: list[int]) -> str:
     # DATA_ID sont des entiers issus de Snowflake (jamais une saisie utilisateur).
     ids = ",".join(str(int(d)) for d in data_ids)
     statuses = ",".join(f"'{s}'" for s in RECTIFIER_ACTIVE_STATUSES)
-    return DAILY_FACTS_SQL.format(analytics=ANALYTICS, prod=PROD, ids=ids, active_statuses=statuses)
+    return DAILY_FACTS_SQL.format(analytics=ANALYTICS, prod=PROD, fuel_report=FUEL_REPORT, ids=ids, active_statuses=statuses)
 
 
-def fetch_daily_facts(data_ids: list[int], d_start: date, d_end: date) -> list[dict]:
+def fetch_daily_facts(data_ids: list[int], d_start: date, d_end: date, country: str | None = None) -> list[dict]:
     rows: list[dict] = []
     if not data_ids:
         return rows
@@ -175,12 +198,12 @@ def fetch_daily_facts(data_ids: list[int], d_start: date, d_end: date) -> list[d
         for i in range(0, len(data_ids), DATA_ID_CHUNK):
             chunk = data_ids[i:i + DATA_ID_CHUNK]
             cur.execute(build_daily_facts_sql(chunk), {
-                "d_start": d_start, "d_end": d_end,
+                "d_start": d_start, "d_end": d_end, "country": country,
                 "p_dc_div": float(P_DC_TO_KW_DIVISOR), "eff_div": float(EFFICIENCY_TO_RATIO_DIVISOR),
             })
             for (data_id, day, dse_h, dg_on_h, prod_kwh, tracker_h, covered_min, ge_on_slots,
                  slots, active_slots, p_dc_ge, eff_ge, p_dc_act, eff_act, p_dc_day, eff_day,
-                 ac_w, ac_energy) in cur.fetchall():
+                 ac_w, ac_energy, measured_l, raw_points) in cur.fetchall():
                 rows.append({
                     "data_id": int(data_id), "date": day,
                     "dse_runtime_h": _dec(dse_h), "dg_on_runtime_h": _dec(dg_on_h), "dg_production_kwh": _dec(prod_kwh),
@@ -193,6 +216,8 @@ def fetch_daily_facts(data_ids: list[int], d_start: date, d_end: date) -> list[d
                     "p_dc_rect_active_kw": _dec(p_dc_act), "eff_rect_active": _dec(eff_act),
                     "p_dc_day_kw": _dec(p_dc_day), "eff_day": _dec(eff_day),
                     "ac_active_power_avg_w": _dec(ac_w), "ac_energy_p": _dec(ac_energy),
+                    "measured_conso_l": _dec(measured_l),
+                    "fuel_raw_points": int(raw_points) if raw_points is not None else None,
                 })
     finally:
         conn.close()

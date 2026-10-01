@@ -8,6 +8,7 @@ from datetime import date, timedelta
 from django.conf import settings as dj_settings
 
 from fuel_tracking.services import cph_engine as E
+from fuel_tracking.services import cph_matching as M
 
 
 def _thresholds() -> dict:
@@ -37,31 +38,60 @@ def _curve_from_model(c) -> E.Curve:
     )
 
 
-def resolve_curve(dg_count, ge_label, ge_kva, mappings: dict) -> tuple[E.Curve | None, str | None]:
-    """mappings : libellé normalisé → [CphInventoryMapping, …] (un par kVA inventaire)."""
+def _match_info(statut, m=None, curve=None, motif=None) -> dict:
+    """Correspondance plaque → courbe exposée par site (statut distinct de la qualité de courbe)."""
+    return {
+        "statut": statut,
+        "score": getattr(m, "match_score", None),
+        "methode": getattr(m, "match_method", None) or None,
+        "date": getattr(m, "matched_at", None) or getattr(m, "validated_at", None),
+        "valide_par": getattr(getattr(m, "validated_by", None), "username", None),
+        "courbe_id": curve.curve_id if curve is not None else None,
+        "courbe_statut": curve.status if curve is not None else None,
+        "mapping_id": getattr(m, "pk", None),
+        "motif": motif,
+    }
+
+
+def resolve_curve(dg_count, ge_label, ge_kva, mappings: dict) -> tuple[E.Curve | None, str | None, dict]:
+    """
+    mappings : libellé normalisé → [CphInventoryMapping, …] (un par kVA inventaire).
+    Une courbe est appliquée si la correspondance est AUTO_VALIDE_COMPATIBLE ou
+    VALIDE_MANUELLEMENT, quel que soit le statut qualité de la courbe (affiché à part).
+    """
     if dg_count is not None and dg_count > 1:
-        return None, f"site multi-GE (DG_COUNT = {dg_count}) : affectation d'une courbe par GE non disponible"
+        reason = f"site multi-GE (DG_COUNT = {dg_count}) : affectation d'une courbe par GE non disponible"
+        return None, reason, _match_info(M.SITE_MULTI_GE, motif=reason)
     if not ge_label:
-        return None, "type de GE absent de l'inventaire Base GE"
+        reason = "type de GE absent de l'inventaire Base GE"
+        return None, reason, _match_info(M.GE_INCONNU, motif=reason)
     candidates = mappings.get(E.normalize_label(ge_label)) or []
     if not candidates:
-        return None, f"libellé GE « {ge_label} » absent du mappage de l'abaque"
+        reason = f"libellé GE « {ge_label} » absent du mappage de l'abaque : aucune courbe CPH"
+        return None, reason, _match_info(M.COURBE_CPH_MANQUANTE, motif=reason)
     if len(candidates) == 1:
         m = candidates[0]
     else:
         exact = [c for c in candidates if ge_kva is not None and c.inventory_kva == ge_kva]
         if len(exact) != 1:
             kvas = ", ".join(str(c.inventory_kva) for c in candidates)
-            return None, (f"libellé « {ge_label} » présent pour plusieurs kVA ({kvas}) et kVA du site "
-                          f"{'inconnu' if ge_kva is None else f'{ge_kva} non trouvé'} : mappage ambigu")
+            reason = (f"libellé « {ge_label} » présent pour plusieurs kVA ({kvas}) et kVA du site "
+                      f"{'inconnu' if ge_kva is None else f'{ge_kva} non trouvé'} : mappage ambigu")
+            return None, reason, _match_info(M.MODELE_AMBIGU, motif=reason)
         m = exact[0]
-    if m.validated_curve is None:
-        return None, f"mappage « {ge_label} » non validé ({m.abaque_status}) — {m.action_required or 'validation métier requise'}"
-    if not m.validated_curve.is_usable:
-        return None, f"courbe {m.validated_curve.curve_id} au statut {m.validated_curve.status} non activée par le métier"
-    if m.validated_curve.power_factor is None:
-        return None, f"courbe {m.validated_curve.curve_id} sans cos φ : plafond 105 % × kVA × cos φ non vérifiable"
-    return _curve_from_model(m.validated_curve), None
+    vc = m.validated_curve
+    if m.match_status not in M.USABLE_MATCH_STATUSES or vc is None:
+        detail = " ; ".join(m.match_reasons or []) or m.action_required or "validation requise"
+        labels = {
+            M.COURBE_CPH_MANQUANTE: "aucune courbe CPH dans l'abaque",
+            M.MODELE_AMBIGU: "plusieurs courbes candidates — choix manuel requis",
+        }
+        reason = f"correspondance « {ge_label} » {labels.get(m.match_status, 'à valider')} ({m.match_status}) — {detail}"
+        return None, reason, _match_info(m.match_status, m, motif=reason)
+    if vc.power_factor is None:
+        reason = f"courbe {vc.curve_id} sans cos φ : plafond 105 % × kVA × cos φ non vérifiable"
+        return None, reason, _match_info(m.match_status, m, vc, motif=reason)
+    return _curve_from_model(vc), None, _match_info(m.match_status, m, vc)
 
 
 def load_contexts(country: str | None = None, site_ids: list[str] | None = None, zone: str | None = None) -> list[E.SiteContext]:
@@ -95,7 +125,7 @@ def load_contexts(country: str | None = None, site_ids: list[str] | None = None,
         ge_labels.setdefault(sid, (label, kva))
 
     mappings: dict[str, list] = defaultdict(list)
-    for m in CphInventoryMapping.objects.select_related("validated_curve"):
+    for m in CphInventoryMapping.objects.select_related("validated_curve", "validated_by"):
         mappings[m.inventory_label_normalized].append(m)
 
     contexts = []
@@ -109,12 +139,12 @@ def load_contexts(country: str | None = None, site_ids: list[str] | None = None,
         else:
             kind, kind_source = None, None
         ge_label, ge_kva = ge_labels.get(sid, (None, None))
-        curve, curve_reason = resolve_curve(inv_row.dg_count, ge_label, ge_kva, mappings)
+        curve, curve_reason, match = resolve_curve(inv_row.dg_count, ge_label, ge_kva, mappings)
         ctx = E.SiteContext(
             site_id=sid, country=inv_row.country, data_id=inv_row.data_id, site_name=inv_row.site_name,
             zone=cs.get("zone"), kind=kind, kind_source=kind_source, grid_supply=inv_row.grid_supply,
             off_grid=E.is_off_grid(inv_row.grid_supply), dg_count=inv_row.dg_count,
-            ge_label=ge_label, curve=curve, curve_reason=curve_reason,
+            ge_label=ge_label, curve=curve, curve_reason=curve_reason, match=match,
         )
         if len(rows) > 1:
             ctx.data_id = None
