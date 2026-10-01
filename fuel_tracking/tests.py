@@ -308,18 +308,20 @@ class CurveResolutionTests(SimpleTestCase):
         self.assertIsNotNone(curve)
         self.assertEqual(match["statut"], "VALIDE_MANUELLEMENT")
 
-    def test_curve_without_power_factor_is_not_applied(self):
+    def test_curve_without_power_factor_is_applied_with_nominal_08(self):
+        # La puissance nominale est kVA × 0,8 : le cos φ propre à la courbe n'est plus requis.
         m = self.mapping(self.curve_model(power_factor=None), status="AUTO_VALIDE_COMPATIBLE")
-        curve, reason, _ = resolve_curve(1, "X", None, {"x": [m]})
-        self.assertIsNone(curve)
-        self.assertIn("cos φ", reason)
+        curve, reason, match = resolve_curve(1, "X", None, {"x": [m]})
+        self.assertIsNotNone(curve)
+        self.assertIsNone(reason)
+        self.assertEqual(match["curve_source_status"], "VALIDE_CONSTRUCTEUR")
 
     def test_multi_ge_site_and_unknown_ge(self):
         curve, reason, match = resolve_curve(2, "X", None, {})
         self.assertIsNone(curve)
         self.assertIn("multi-GE", reason)
         self.assertEqual(match["statut"], "SITE_MULTI_GE")
-        self.assertEqual(resolve_curve(1, None, None, {})[2]["statut"], "GE_INCONNU")
+        self.assertEqual(resolve_curve(1, None, None, {})[2]["statut"], "TYPE_GE_ABSENT")
         self.assertEqual(resolve_curve(1, "ZZ - 1", None, {})[2]["statut"], "COURBE_CPH_MANQUANTE")
 
     def test_same_label_several_kva_uses_site_kva(self):
@@ -403,10 +405,10 @@ class BlocageTests(SimpleTestCase):
         cases = {
             "A_VALIDER": "MAPPAGE_NON_VALIDE",
             "SITE_MULTI_GE": "MULTI_GE",
-            "GE_INCONNU": "GE_INCONNU",
+            "TYPE_GE_ABSENT": "TYPE_GE_ABSENT",
             "COURBE_CPH_MANQUANTE": "COURBE_CPH_MANQUANTE",
             "MODELE_AMBIGU": "MAPPAGE_AMBIGU",
-            "AUTO_VALIDE_COMPATIBLE": "COURBE_SANS_COS_PHI",  # correspondance OK mais courbe inutilisable
+            "REJETE": "MAPPAGE_NON_VALIDE",
         }
         for statut, expected in cases.items():
             ctx = outdoor(curve=None, curve_reason="x", match={"statut": statut})
@@ -470,7 +472,7 @@ class AutoMatchingTests(SimpleTestCase):
         curves = [self.curve("CPH-0001", "AKSA", "AP33", "33")]
         d = self.match("AKSA - AP33", "60", ["CPH-0001"], curves)
         self.assertEqual(d["status"], "A_VALIDER")
-        self.assertTrue(any("écart de puissance" in r for r in d["reasons"]))
+        self.assertTrue(any("puissance incompatible" in r for r in d["reasons"]))
 
     def test_brand_contradiction_and_60hz_are_blocking(self):
         curves = [self.curve("CPH-0125", "SDMO", "GEP 33-3", "33")]
@@ -590,3 +592,127 @@ class BlocageNoCphTests(SimpleTestCase):
         self.assertEqual(r["cph_days"], 0)
         self.assertEqual(r["cph_status"], E.CPH_PARTIEL)
         self.assertEqual(_blocage_code(r), "PUISSANCE_ABSENTE")
+
+
+class RulesV2Tests(SimpleTestCase):
+    """Règles finalisées : charge = P / (kVA × 0,8), motifs précis, tolérance puissance 15 %."""
+
+    def test_charge_uses_nominal_kva_times_08(self):
+        # GEP18-6 : 18 kVA, PRP 13,2 kW dans l'abaque → la charge utilise 18 × 0,8 = 14,4 kW
+        curve = E.Curve(curve_id="CPH-0103", label="Olympian GEP18-6", status="HISTORIQUE_A_VALIDER",
+                        prp_kva=D("18"), prp_kw=D("13.2"), power_factor=None, a=D("1"), b=D("2"), c=D("1"))
+        res = E.apply_curve(curve, D("7.2"))
+        self.assertEqual(res["charge"], D("0.5"))
+        self.assertEqual(res["cph_l_h"], D("1") * D("0.25") + D("2") * D("0.5") + D("1"))
+        over = E.apply_curve(curve, D("15.2"))  # > 1,05 × 14,4 = 15,12 kW
+        self.assertIsNone(over["cph_l_h"])
+        self.assertEqual(over["code"], E.MC_PUISSANCE_HORS_LIMITE)
+
+    def test_missing_nominal_power(self):
+        curve = E.Curve(curve_id="X", label="X", status="HISTORIQUE_A_VALIDER", prp_kva=None, prp_kw=None,
+                        power_factor=None, a=D("1"), b=D("1"), c=D("1"))
+        self.assertEqual(E.apply_curve(curve, D("5"))["code"], E.MC_PUISSANCE_NOMINALE_ABSENTE)
+
+    def test_precise_day_codes(self):
+        f = {
+            OCT1: fact(),                                                       # aucune donnée
+            OCT1 + timedelta(days=1): fact(dse_runtime_h=30),                   # valeur brute hors bornes
+            OCT1 + timedelta(days=2): fact(dse_runtime_h=5, tracker_ge_on_slots=10,
+                                           p_dc_ge_tracker_kw=D("8"), eff_ge_tracker=D("1.4")),  # rendement invalide
+            OCT1 + timedelta(days=3): fact(dse_runtime_h=5),                    # pas de P_DC
+        }
+        r = period(outdoor(), f, OCT1, OCT1 + timedelta(days=3))
+        codes = [d["motif_code"] for d in r["daily"]]
+        self.assertEqual(codes, [E.MC_RUNTIME_INDISPONIBLE, E.MC_RUNTIME_NON_QUALIFIE,
+                                 E.MC_RENDEMENT_INVALIDE, E.MC_PUISSANCE_INDISPONIBLE])
+        self.assertTrue(all(d["cph_l_h"] is None and d["conso_l"] is None for d in r["daily"]))
+        self.assertIsNotNone(r["motif_cph"])
+
+    def test_site_motif_comes_from_the_mapping_when_no_curve(self):
+        ctx = outdoor(curve=None, curve_reason="aucune courbe", curve_code=E.MC_COURBE_CPH_MANQUANTE)
+        r = period(ctx, {OCT1: fact(dse_runtime_h=5)}, OCT1, OCT1)
+        self.assertEqual(r["motif_cph"]["code"], E.MC_COURBE_CPH_MANQUANTE)
+        self.assertIsNone(r["cph_moy_l_h"])
+        self.assertIsNone(r["conso_theorique_l"])
+        self.assertIsNone(period(outdoor(), {OCT1: fact(dse_runtime_h=10, tracker_ge_on_slots=10,
+                                                       p_dc_ge_tracker_kw=D("8"), eff_ge_tracker=D("0.8"))},
+                                 OCT1, OCT1)["motif_cph"])
+
+    def test_indoor_power_source_label(self):
+        self.assertEqual(E.PW_INDOOR, "ESTIMATION_HISTORIQUE_LOAD_AC")
+
+    def test_power_tolerance_is_15_percent_against_curve_kva(self):
+        from fuel_tracking.services.cph_matching import auto_match
+        c = {"curve_id": "CPH-0104", "manufacturer": "OLYMPIAN", "model": "GEP30-1", "prp_kva": D("27.3"),
+             "frequency": "50 Hz", "conso_50_l_h": D("1"), "conso_75_l_h": D("2"), "conso_100_l_h": D("3")}
+        ok = auto_match("OLYMPIAN - GEP30-1", D("30"), ["CPH-0104"], {"CPH-0104": c}, [c])      # 9,9 %
+        ko = auto_match("OLYMPIAN - GEP30-1", D("33"), ["CPH-0104"], {"CPH-0104": c}, [c])      # 20,9 %
+        self.assertEqual(ok["status"], "AUTO_VALIDE_COMPATIBLE")
+        self.assertEqual(ko["status"], "A_VALIDER")
+        self.assertEqual(auto_match("OLYMPIAN - GEP30-1", D("33"), ["CPH-0104"], {"CPH-0104": c}, [c],
+                                    D("0.25"))["status"], "AUTO_VALIDE_COMPATIBLE")
+
+    def test_normalisation_examples(self):
+        from fuel_tracking.services.cph_matching import norm
+        self.assertEqual(norm("AKSA - AP33"), norm("AKSA AP33"))
+        self.assertEqual(norm("SDMO - J66"), norm("SDMO J66"))
+        self.assertEqual(norm("FG Wilson P33-3U"), norm("FG WILSON P33 3U"))
+        self.assertEqual(norm("OLYMPIAN - GEP30-1"), norm("OLYMPIAN GEP30 1"))
+
+    def test_history_and_rejection(self):
+        from fuel_tracking.services.cph_matching import apply_auto_matching
+
+        class Mapping(SimpleNamespace):
+            def save(self, update_fields=None):
+                pass
+
+        created = []
+
+        class History:
+            class objects:
+                @staticmethod
+                def create(**kw):
+                    created.append(kw)
+
+        curve_obj = SimpleNamespace(pk=7, curve_id="CPH-0001", manufacturer="AKSA", model="AP33", prp_kva=D("33"),
+                                    frequency="50 Hz", conso_50_l_h=D("4"), conso_75_l_h=D("5"), conso_100_l_h=D("6"))
+        base = dict(pk=1, inventory_label="AKSA - AP33", inventory_kva=D("33"), candidate_curve_ids=["CPH-0001"],
+                    match_score=None, match_reasons=[], matched_at=None, validated_by_id=None, validated_at=None,
+                    validation_comment="", validated_curve_id=None)
+        m = Mapping(**base, match_status="A_VALIDER", match_method="")
+        rejected = Mapping(**{**base, "pk": 2}, match_status="REJETE", match_method="RETRAIT_MANUEL")
+        apply_auto_matching([m, rejected], [curve_obj], "now", history_model=History)
+        self.assertEqual(m.match_status, "AUTO_VALIDE_COMPATIBLE")
+        self.assertEqual(rejected.match_status, "REJETE")
+        self.assertEqual(len(created), 1)
+        h = created[0]
+        self.assertEqual((h["old_status"], h["new_status"], h["new_curve_id"], h["score"]),
+                         ("A_VALIDER", "AUTO_VALIDE_COMPATIBLE", "CPH-0001", 100))
+        self.assertIn("AUTO:", h["rule"])
+
+    def test_export_rows_match_header(self):
+        from fuel_tracking.views_cph import EXPORT_HEADER, _csv_rows
+        r = period(outdoor(match={"statut": "AUTO_VALIDE_COMPATIBLE", "curve_source_status": "VALIDE_CONSTRUCTEUR"}),
+                   {OCT1: fact(dse_runtime_h=10, tracker_ge_on_slots=10, p_dc_ge_tracker_kw=D("8"), eff_ge_tracker=D("0.8")),
+                    OCT1 + timedelta(days=1): fact()}, OCT1, OCT1 + timedelta(days=1))
+        lines = list(_csv_rows([r], only_anomalies=False))
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(all(len(line) == len(EXPORT_HEADER) for line in lines))
+        anomalies = list(_csv_rows([r], only_anomalies=True))
+        self.assertEqual(len(anomalies), 2)  # site sans verdict OK : toutes ses lignes sont des anomalies
+
+
+class NoCphComparisonTests(SimpleTestCase):
+    def test_no_gap_when_only_ge_off_days_are_estimated(self):
+        f = {OCT1: fact(dse_runtime_h=0, measured_conso_l=D("12")),
+             OCT1 + timedelta(days=1): fact(dse_runtime_h=6, measured_conso_l=D("20"))}  # marche sans puissance
+        r = period(outdoor(), f, OCT1, OCT1 + timedelta(days=1))
+        self.assertEqual(r["comparaison"]["statut"], E.C_NON_CALCULEE)
+        self.assertIsNone(r["comparaison"]["ecart_l"])
+        self.assertEqual(r["comparaison"]["conso_mesuree_l"], D("32"))
+
+    def test_ge_off_whole_period_is_a_real_zero(self):
+        f = {d: fact(dse_runtime_h=0, measured_conso_l=D("0")) for d in days(OCT1, 2)}
+        r = period(outdoor(), f, OCT1, OCT1 + timedelta(days=1))
+        self.assertEqual(r["conso_theorique_l"], D("0"))
+        self.assertEqual(r["comparaison"]["ecart_l"], D("0"))

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import csv
 from datetime import date, timedelta
+from decimal import Decimal
 
 from django.db.models import Count, Max
 from django.http import HttpResponse
@@ -89,11 +90,10 @@ def _reconciliation_dict(r: dict | None):
 BLOCAGE_LABELS = {
     "DONNEES_SITE": ("cph", "Rattachement des données Snowflake à vérifier"),
     "MULTI_GE": ("cph", "Site multi-GE : une courbe par GE non gérée"),
-    "GE_INCONNU": ("cph", "Type de GE absent de la Base GE"),
+    "TYPE_GE_ABSENT": ("cph", "Type de GE absent de la Base GE"),
     "COURBE_CPH_MANQUANTE": ("cph", "Aucune courbe CPH pour ce type de GE"),
     "MAPPAGE_AMBIGU": ("cph", "Plusieurs courbes candidates (modèle ambigu)"),
     "MAPPAGE_NON_VALIDE": ("cph", "Correspondance plaque → courbe à valider"),
-    "COURBE_SANS_COS_PHI": ("cph", "Courbe sans cos φ"),
     "RUNTIME_ABSENT": ("cph", "Aucune heure de marche GE fiable"),
     "PUISSANCE_ABSENTE": ("cph", "Puissance GE non disponible"),
     "HORS_COURBE": ("cph", "Charge GE hors du domaine de la courbe"),
@@ -106,7 +106,8 @@ BLOCAGE_LABELS = {
 # Statut de correspondance (services/cph_matching.py) → point bloquant affiché.
 _MATCH_BLOCAGES = {
     M.SITE_MULTI_GE: "MULTI_GE",
-    M.GE_INCONNU: "GE_INCONNU",
+    M.TYPE_GE_ABSENT: "TYPE_GE_ABSENT",
+    M.REJETE: "MAPPAGE_NON_VALIDE",
     M.COURBE_CPH_MANQUANTE: "COURBE_CPH_MANQUANTE",
     M.MODELE_AMBIGU: "MAPPAGE_AMBIGU",
     M.A_VALIDER: "MAPPAGE_NON_VALIDE",
@@ -125,8 +126,6 @@ def _blocage_code(r: dict) -> str | None:
         return "DONNEES_SITE"
     if r["curve"] is None:
         statut = (r.get("correspondance") or {}).get("statut")
-        if statut in M.USABLE_MATCH_STATUSES:
-            return "COURBE_SANS_COS_PHI"
         return _MATCH_BLOCAGES.get(statut, "MAPPAGE_NON_VALIDE")
     if r["runtime_days"] == 0:
         return "RUNTIME_ABSENT"
@@ -184,6 +183,10 @@ def _site_summary(r: dict) -> dict:
         "charge_moy_pct": _f(r["charge_moy"] * 100 if r["charge_moy"] is not None else None, 1),
         "curve": _curve_dict(r["curve"]), "curve_reason": r["curve_reason"],
         "correspondance": r["correspondance"],
+        "mapping_status": (r["correspondance"] or {}).get("statut"),
+        "curve_source_status": (r["correspondance"] or {}).get("curve_source_status"),
+        "ge_kva": _f(r["ge_kva"], 1),
+        "motif_cph": r["motif_cph"],
         "comparaison": _comparison_dict(r["comparaison"]),
         "cph_days": r["cph_days"], "cph_moy_l_h": _f(r["cph_moy_l_h"]),
         "conso_days": r["conso_days"], "conso_theorique_l": _f(r["conso_theorique_l"]),
@@ -210,7 +213,7 @@ def _day_dict(d: dict) -> dict:
         "curve_id": d["curve_id"], "charge_pct": _f(d["charge"] * 100 if d["charge"] is not None else None, 1),
         "cph_l_h": _f(d["cph_l_h"]), "conso_l": _f(d["conso_l"]), "measured_l": _f(d["measured_l"]),
         "extrapolated": d["extrapolated"],
-        "status": d["status"], "motifs": d["motifs"],
+        "status": d["status"], "motif_code": d["motif_code"], "motifs": d["motifs"],
     }
 
 
@@ -236,10 +239,28 @@ def _apply_table_filters(rows: list[dict], params) -> list[dict]:
     sc = (params.get("statut_conso") or "").strip()
     if sc:
         rows = [r for r in rows if r["comparaison"]["statut"] == sc]
-    co = (params.get("correspondance") or "").strip()
+    co = (params.get("correspondance") or params.get("mapping_status") or "").strip()
     if co:
         rows = [r for r in rows if (r["correspondance"] or {}).get("statut") == co]
+    cs = (params.get("curve_source_status") or "").strip()
+    if cs:
+        rows = [r for r in rows if (r["correspondance"] or {}).get("curve_source_status") == cs]
+    mc = (params.get("motif_cph") or "").strip()
+    if mc:
+        rows = [r for r in rows if (r["motif_cph"] or {}).get("code") == mc]
+    dr = (params.get("dispo_runtime") or "").strip()
+    if dr in _DISPO_FILTERS:
+        rows = [r for r in rows if _DISPO_FILTERS[dr](r["runtime_source_availability"])]
     return rows
+
+
+# Disponibilité de la source runtime retenue (fraction 0-1 ; None = aucune source retenue).
+_DISPO_FILTERS = {
+    "90+": lambda a: a is not None and a >= Decimal("0.9"),
+    "50+": lambda a: a is not None and a >= Decimal("0.5"),
+    "lt50": lambda a: a is not None and a < Decimal("0.5"),
+    "aucune": lambda a: a is None,
+}
 
 
 def _synthesis(rows: list[dict]) -> dict:
@@ -258,7 +279,8 @@ def _synthesis(rows: list[dict]) -> dict:
         "blocages": _blocages_summary(rows),
         "conso": _conso_summary(rows),
         "correspondances": _count_by(rows, lambda r: (r["correspondance"] or {}).get("statut")),
-        "courbes_appliquees": _count_by(rows, lambda r: r["curve"].status if r["curve"] else None),
+        "courbes_appliquees": _count_by(rows, lambda r: M.curve_source_status(r["curve"].status) if r["curve"] else None),
+        "motifs_cph": _count_by(rows, lambda r: (r["motif_cph"] or {}).get("code")),
     }
 
 
@@ -397,50 +419,57 @@ class CphSiteDetailView(APIView):
 
 
 EXPORT_HEADER = [
-    "site_id", "site_name", "pays", "zone", "type_site", "reseau", "ge_inventaire",
+    "site_id", "site_name", "pays", "zone", "type_site", "reseau", "ge_inventaire", "puissance_nominale_ge_kva",
     "periode_debut", "periode_fin", "date",
-    "runtime_h", "source_runtime", "valeurs_brutes_runtime", "disponibilite_sources_pct", "motif_rejet_sources",
+    "runtime_h", "source_runtime", "disponibilite_runtime_retenue_pct", "valeurs_brutes_runtime", "disponibilite_sources_pct", "motif_rejet_sources",
     "p_ge_kw", "source_puissance", "detail_puissance", "p_dc_entree_kw", "load_ac_historique_kw", "dates_reference_ac",
-    "correspondance_statut", "correspondance_score", "correspondance_methode", "correspondance_date",
-    "courbe_id", "courbe_statut", "prp_kva", "prp_kw", "cos_phi", "a", "b", "c",
-    "charge_pct", "cph_l_h", "conso_estimee_l", "conso_mesuree_jour_l", "extrapolation_sous_50pct", "statut_jour", "motifs_jour",
-    "conso_theorique_periode_l", "statut_cph_periode",
+    "mapping_status", "correspondance_score", "correspondance_methode", "correspondance_date",
+    "courbe_id", "curve_source_status", "prp_kva", "prp_kw", "cos_phi", "a", "b", "c",
+    "charge_pct", "cph_l_h", "conso_estimee_l", "conso_mesuree_jour_l", "extrapolation_sous_50pct", "statut_jour",
+    "motif_cph_jour", "motifs_jour",
+    "conso_theorique_periode_l", "statut_cph_periode", "motif_cph_periode",
     "conso_mesuree_periode_l", "jours_communs", "ecart_mesuree_estimee_l", "ecart_mesuree_estimee_pct",
     "statut_conso", "motif_conso",
     "stock_initial_l", "livraisons_l", "rajouts_l", "retraits_l", "vols_l", "vidanges_l", "stock_final_l",
     "statut_livraisons", "conso_stock_l", "ecart_l", "ecart_pct", "statut", "motifs_rapprochement",
     "formule", "version_regle",
 ]
-FORMULA = ("CPH = a·x² + b·x + c, x = P_GE/P_PRP ; conso = runtime × CPH ; "
+FORMULA = ("charge = P_GE / (kVA × 0,8) ; CPH = a·charge² + b·charge + c ; conso estimée = runtime × CPH ; "
            "conso_stock = initial + livraisons + rajouts − retraits − vols − vidanges − final ; écart = conso_stock − conso_théorique")
 
 
 def _csv_rows(rows: list[dict], only_anomalies: bool):
     for r in rows:
-        if only_anomalies and r["rapprochement_statut"] == E.R_OK:
-            continue
         c, rec, ac = r["curve"], r["rapprochement"] or {}, r["ac_reference"] or {}
         avail = " | ".join(f"{s}={ev['availability'] * 100:.0f}%" for s, ev in r["sources"].items())
         rejections = " | ".join(f"{s}: {ev['rejection']}" for s, ev in r["sources"].items() if ev["rejection"])
         ref_dates = ", ".join(d.isoformat() for d in ac.get("reference_dates", []))
         match, cmp_ = r["correspondance"] or {}, r["comparaison"]
+        site_ok = r["rapprochement_statut"] == E.R_OK
+        avail_main = r["runtime_source_availability"]
+        motif_site = r["motif_cph"] or {}
         for d in r["daily"]:
+            # Anomalies : lignes non OK (site sans verdict OK) ou jour sans conso estimée calculée.
+            if only_anomalies and site_ok and d["status"] in (E.DAY_CPH_CALCULE, E.DAY_GE_ARRET):
+                continue
             yield [
                 r["site_id"], r["site_name"], r["country"], r["zone"], r["kind"], r["grid_supply"], r["ge_label"],
+                _f(r["ge_kva"], 1),
                 r["start"], r["end"], d["date"],
-                _f(d["runtime_h"]), d["runtime_source"], " | ".join(f"{k}={_f(v)}" for k, v in d["raw"].items()),
+                _f(d["runtime_h"]), d["runtime_source"], _f(avail_main * 100 if avail_main is not None else None, 1),
+                " | ".join(f"{k}={_f(v)}" for k, v in d["raw"].items()),
                 avail, rejections,
                 _f(d["p_ge_kw"]), d["power_source"], d["power_detail"], _f(d["p_dc_input_kw"]), _f(d["p_ac_aux_kw"]),
                 ref_dates if d["power_source"] == E.PW_INDOOR else "",
                 match.get("statut"), match.get("score"), match.get("methode"),
                 match["date"].isoformat() if match.get("date") else "",
-                c.curve_id if c else match.get("courbe_id") or "", c.status if c else (match.get("courbe_statut") or r["curve_reason"]),
+                c.curve_id if c else match.get("courbe_id") or "", match.get("curve_source_status") or "",
                 _f(c.prp_kva) if c else "", _f(c.prp_kw) if c else "", _f(c.power_factor) if c else "",
                 _f(c.a, 6) if c else "", _f(c.b, 6) if c else "", _f(c.c, 6) if c else "",
                 _f(d["charge"] * 100 if d["charge"] is not None else None, 1), _f(d["cph_l_h"]), _f(d["conso_l"]),
                 _f(d["measured_l"]),
-                "oui" if d["extrapolated"] else "non", d["status"], " ; ".join(d["motifs"]),
-                _f(r["conso_theorique_l"]), r["cph_status"],
+                "oui" if d["extrapolated"] else "non", d["status"], d["motif_code"] or "", " ; ".join(d["motifs"]),
+                _f(r["conso_theorique_l"]), r["cph_status"], motif_site.get("code") or "",
                 _f(cmp_["conso_mesuree_l"]), cmp_["jours_communs"], _f(cmp_["ecart_l"]), _f(cmp_["ecart_pct"], 2),
                 cmp_["statut"], cmp_["motif"],
                 _f(rec.get("stock_initial_l")), _f(rec.get("livraisons_l")), _f(rec.get("rajouts_l")),
@@ -545,7 +574,7 @@ class CphReferentielView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        from fuel_tracking.models import CphCurve, CphInventoryMapping
+        from fuel_tracking.models import CphCurve, CphInventoryMapping, CphMappingHistory
 
         curves = {c.curve_id: c for c in CphCurve.objects.select_related("business_approved_by")}
 
@@ -554,11 +583,15 @@ class CphReferentielView(APIView):
                     "prp_kva": _f(c.prp_kva), "prp_kw": _f(c.prp_kw), "power_factor": _f(c.power_factor),
                     "conso_50_l_h": _f(c.conso_50_l_h), "conso_75_l_h": _f(c.conso_75_l_h), "conso_100_l_h": _f(c.conso_100_l_h),
                     "a": _f(c.coef_a, 6), "b": _f(c.coef_b, 6), "c": _f(c.coef_c, 6), "status": c.status,
+                    "curve_source_status": M.curve_source_status(c.status),
                     "is_usable": c.is_usable, "business_approved": c.business_approved,
                     "business_approved_by": getattr(c.business_approved_by, "username", None),
                     "business_approved_at": c.business_approved_at, "source": c.source, "source_url": c.source_url,
                     "note": c.note}
 
+        history: dict[int, list] = {}
+        for h in CphMappingHistory.objects.select_related("changed_by").order_by("-changed_at", "-id"):
+            history.setdefault(h.mapping_id, []).append(h)
         mappings = []
         for m in CphInventoryMapping.objects.select_related("validated_curve", "validated_by"):
             mappings.append({
@@ -568,8 +601,13 @@ class CphReferentielView(APIView):
                 "validated_curve_id": m.validated_curve.curve_id if m.validated_curve else None,
                 "validated_by": getattr(m.validated_by, "username", None), "validated_at": m.validated_at,
                 "validation_comment": m.validation_comment,
-                "match_status": m.match_status, "match_score": m.match_score, "match_method": m.match_method,
-                "match_reasons": m.match_reasons, "matched_at": m.matched_at,
+                "match_status": m.match_status, "mapping_status": m.match_status, "match_score": m.match_score,
+                "match_method": m.match_method, "match_reasons": m.match_reasons, "matched_at": m.matched_at,
+                "history": [{
+                    "old_status": h.old_status, "new_status": h.new_status, "old_curve_id": h.old_curve_id,
+                    "new_curve_id": h.new_curve_id, "score": h.score, "rule": h.rule,
+                    "changed_by": getattr(h.changed_by, "username", None), "changed_at": h.changed_at, "comment": h.comment,
+                } for h in history.get(m.id, [])[:10]],
             })
         return Response({
             "can_validate": getattr(request.user, "role", None) in VALIDATOR_ROLES,
@@ -582,7 +620,7 @@ class CphMappingValidateView(APIView):
     permission_classes = [IsCphValidator]
 
     def post(self, request, pk):
-        from fuel_tracking.models import CphCurve, CphInventoryMapping
+        from fuel_tracking.models import CphCurve, CphInventoryMapping, CphMappingHistory
 
         m = CphInventoryMapping.objects.filter(pk=pk).first()
         if m is None:
@@ -594,7 +632,8 @@ class CphMappingValidateView(APIView):
         if not comment:
             return Response({"detail": "Commentaire de validation requis (ex. référence de plaque signalétique)."}, status=400)
         curve = CphCurve.objects.get(curve_id=curve_id)
-        # Correction manuelle : prioritaire sur l'automatique, le statut qualité de la courbe est inchangé.
+        old_status, old_curve = m.match_status, m.validated_curve.curve_id if m.validated_curve else None
+        # Correction manuelle : prioritaire sur l'automatique, le statut d'origine de la courbe est inchangé.
         m.validated_curve = curve
         m.validated_by = request.user
         m.validated_at = timezone.now()
@@ -605,24 +644,35 @@ class CphMappingValidateView(APIView):
         m.match_reasons = [f"validé manuellement par {request.user.username} : {comment}"]
         m.save(update_fields=["validated_curve", "validated_by", "validated_at", "validation_comment",
                               "match_status", "match_method", "matched_at", "match_reasons"])
+        M.record_history(CphMappingHistory, m, old_status, old_curve, curve_id, "validation manuelle", m.validated_at,
+                         user=request.user, comment=comment)
         return Response({"id": m.id, "validated_curve_id": curve_id, "validated_at": m.validated_at,
                          "match_status": m.match_status})
 
 
 class CphMappingUnvalidateView(APIView):
+    """Rejet manuel : statut REJETE, l'automatique ne le réactive plus (une validation manuelle reste possible)."""
     permission_classes = [IsCphValidator]
 
     def post(self, request, pk):
-        from fuel_tracking.models import CphInventoryMapping
+        from fuel_tracking.models import CphInventoryMapping, CphMappingHistory
 
-        # Retrait manuel : le mappage reste « à valider » et l'automatique ne le réactive plus.
-        updated = CphInventoryMapping.objects.filter(pk=pk).update(
-            validated_curve=None, validated_by=None, validated_at=None, validation_comment="",
-            match_status=CphInventoryMapping.MatchStatus.A_VALIDER, match_method=M.METHOD_MANUAL_REMOVAL,
-            matched_at=timezone.now(), match_reasons=[f"correspondance retirée manuellement par {request.user.username}"])
-        if not updated:
+        m = CphInventoryMapping.objects.select_related("validated_curve").filter(pk=pk).first()
+        if m is None:
             return Response({"detail": "Mappage introuvable."}, status=404)
-        return Response({"id": pk, "validated_curve_id": None, "match_status": CphInventoryMapping.MatchStatus.A_VALIDER})
+        comment = (request.data.get("comment") or "").strip()
+        old_status, old_curve = m.match_status, m.validated_curve.curve_id if m.validated_curve else None
+        now = timezone.now()
+        m.validated_curve, m.validated_by, m.validated_at, m.validation_comment = None, None, None, ""
+        m.match_status = CphInventoryMapping.MatchStatus.REJETE
+        m.match_method = M.METHOD_MANUAL_REMOVAL
+        m.matched_at = now
+        m.match_reasons = [f"correspondance rejetée par {request.user.username}" + (f" : {comment}" if comment else "")]
+        m.save(update_fields=["validated_curve", "validated_by", "validated_at", "validation_comment",
+                              "match_status", "match_method", "matched_at", "match_reasons"])
+        M.record_history(CphMappingHistory, m, old_status, old_curve, None, "rejet manuel", now,
+                         user=request.user, comment=comment)
+        return Response({"id": pk, "validated_curve_id": None, "match_status": m.match_status})
 
 
 class CphMappingAutoMatchView(APIView):
@@ -630,12 +680,13 @@ class CphMappingAutoMatchView(APIView):
     permission_classes = [IsCphValidator]
 
     def post(self, request):
-        from fuel_tracking.models import CphCurve, CphInventoryMapping
+        from fuel_tracking.models import CphCurve, CphInventoryMapping, CphMappingHistory
 
         qs = CphInventoryMapping.objects.all()
         if str(request.data.get("reset_removals", "")).lower() in ("1", "true"):
             qs.filter(match_method=M.METHOD_MANUAL_REMOVAL).update(match_method="")
-        counts = M.apply_auto_matching(CphInventoryMapping.objects.all(), list(CphCurve.objects.all()), timezone.now())
+        counts = M.apply_auto_matching(CphInventoryMapping.objects.all(), list(CphCurve.objects.all()), timezone.now(),
+                                       history_model=CphMappingHistory)
         return Response({"counts": counts})
 
 

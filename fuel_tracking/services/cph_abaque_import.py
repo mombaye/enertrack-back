@@ -17,9 +17,9 @@ import openpyxl
 from django.db import transaction
 from django.utils import timezone
 
-from fuel_tracking.models import CphCurve, CphInventoryMapping
+from fuel_tracking.models import CphCurve, CphInventoryMapping, CphMappingHistory
 from fuel_tracking.services.cph_engine import normalize_label
-from fuel_tracking.services.cph_matching import apply_auto_matching
+from fuel_tracking.services.cph_matching import apply_auto_matching, record_history
 
 CURVE_COLUMNS = {
     "curve_id": "ID courbe", "manufacturer": "Fabricant", "model": "Modèle", "model_key": "Clé modèle",
@@ -131,6 +131,7 @@ def apply_abaque(parsed: dict, file_name: str) -> list[str]:
             obj, _ = CphInventoryMapping.objects.update_or_create(
                 inventory_label=m["inventory_label"], inventory_kva=m["inventory_kva"], defaults=defaults)
             if obj.validated_curve_id and obj.validated_curve.curve_id not in obj.candidate_curve_ids:
+                old_status, old_curve = obj.match_status, obj.validated_curve.curve_id
                 if obj.match_status == CphInventoryMapping.MatchStatus.VALIDE_MANUELLEMENT:
                     reset.append(f"{obj.inventory_label} (courbe {obj.validated_curve.curve_id})")
                 obj.validated_curve = None
@@ -140,6 +141,9 @@ def apply_abaque(parsed: dict, file_name: str) -> list[str]:
                 obj.match_status = CphInventoryMapping.MatchStatus.A_VALIDER
                 obj.match_method = ""
                 obj.save()
+                record_history(CphMappingHistory, obj, old_status, old_curve, None, f"import abaque {file_name}",
+                               timezone.now(), comment="courbe appliquée absente des candidats du nouvel abaque")
         # Correspondance automatique des libellés fiables ; décisions humaines conservées.
-        apply_auto_matching(CphInventoryMapping.objects.all(), list(CphCurve.objects.all()), timezone.now())
+        apply_auto_matching(CphInventoryMapping.objects.all(), list(CphCurve.objects.all()), timezone.now(),
+                            history_model=CphMappingHistory)
     return reset

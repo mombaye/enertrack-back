@@ -10,19 +10,24 @@ Deux statuts DISTINCTS, jamais confondus :
       A_VALIDER               candidat unique mais incompatible ou score insuffisant (motif conservé)
       COURBE_CPH_MANQUANTE    aucune courbe candidate dans l'abaque
       MODELE_AMBIGU           plusieurs courbes candidates comparables
-    et, au niveau du site : SITE_MULTI_GE (une courbe par GE non gérée), GE_INCONNU (Base GE muette) ;
-  - statut de QUALITÉ / origine de la courbe (CphCurve.status : VALIDÉ_CONSTRUCTEUR,
-    HISTORIQUE_A_VALIDER, FICHE_ARCHIVEE_A_VALIDER, FICHE_DISTRIBUTEUR_A_VALIDER) — jamais modifié ici :
+      REJETE                  correspondance rejetée par un validateur (jamais réactivée automatiquement)
+    et, au niveau du site : SITE_MULTI_GE (une courbe par GE non gérée), TYPE_GE_ABSENT (Base GE muette) ;
+  - statut d'ORIGINE / qualité de la courbe (curve_source_status : VALIDE_CONSTRUCTEUR,
+    HISTORIQUE_A_VALIDER, ARCHIVE, DISTRIBUTEUR, lu dans CphCurve.status) — jamais modifié ici :
     une correspondance automatique ne transforme pas une courbe historique en courbe constructeur.
+
+Normalisation : majuscules, sans accents, espaces, tirets, points, slash ni ponctuation ;
+marques harmonisées par groupes d'alias. Ex. « AKSA - AP33 » = « AKSA AP33 ».
 
 Score de compatibilité (0-100) d'un candidat unique :
   modèle  60 (identique après normalisation) ou 40 (même modèle à un suffixe de variante
           alphabétique ≤ 2 caractères près, ex. P33-3U / P33-3, J66 / J66K) ; sinon contradiction ;
   marque  20 si la marque du libellé correspond à celle de la courbe (groupes d'alias),
           0 si le libellé ne porte pas de marque lisible ; marque différente → contradiction ;
-  puissance 20 si le kVA inventaire est à ± 3 % du kVA PRP ou du kVA secours (≈ 1,1 × PRP,
-          valeur souvent portée par la référence commerciale), 10 si à ± 10 %, sinon contradiction ;
+  puissance 20 si |kVA inventaire − kVA PRP de la courbe| / kVA PRP ≤ tolérance
+          (settings.FUEL_CPH_MATCH_POWER_TOLERANCE, 15 % par défaut), sinon contradiction ;
   fréquence courbe ou libellé en 60 Hz → contradiction.
+Auto-validation : candidat unique, score ≥ 70 et aucune contradiction.
 Une simple proximité de kVA n'associe jamais deux modèles différents : le modèle est obligatoire.
 """
 from __future__ import annotations
@@ -36,20 +41,39 @@ VALIDE_MANUELLEMENT = "VALIDE_MANUELLEMENT"
 A_VALIDER = "A_VALIDER"
 COURBE_CPH_MANQUANTE = "COURBE_CPH_MANQUANTE"
 MODELE_AMBIGU = "MODELE_AMBIGU"
+REJETE = "REJETE"
 SITE_MULTI_GE = "SITE_MULTI_GE"
-GE_INCONNU = "GE_INCONNU"
+TYPE_GE_ABSENT = "TYPE_GE_ABSENT"
 
 USABLE_MATCH_STATUSES = (AUTO_VALIDE_COMPATIBLE, VALIDE_MANUELLEMENT)
-MATCH_STATUSES = (AUTO_VALIDE_COMPATIBLE, VALIDE_MANUELLEMENT, A_VALIDER, COURBE_CPH_MANQUANTE, MODELE_AMBIGU)
+MATCH_STATUSES = (AUTO_VALIDE_COMPATIBLE, VALIDE_MANUELLEMENT, A_VALIDER, COURBE_CPH_MANQUANTE, MODELE_AMBIGU, REJETE)
 
 METHOD_MANUAL = "MANUEL"
-METHOD_MANUAL_REMOVAL = "RETRAIT_MANUEL"
+METHOD_MANUAL_REMOVAL = "RETRAIT_MANUEL"  # = rejet manuel (statut REJETE)
 MANUAL_METHODS = (METHOD_MANUAL, METHOD_MANUAL_REMOVAL)
 
 AUTO_THRESHOLD = 70
-STANDBY_RATIO = Decimal("1.1")
-POWER_TIGHT = Decimal("0.03")
-POWER_LOOSE = Decimal("0.10")
+DEFAULT_POWER_TOLERANCE = Decimal("0.15")
+
+# Origine / qualité de la courbe (CphCurve.status → code affiché), indépendante de la correspondance.
+CURVE_SOURCE_STATUS = {
+    "VALIDÉ_CONSTRUCTEUR": "VALIDE_CONSTRUCTEUR",
+    "HISTORIQUE_A_VALIDER": "HISTORIQUE_A_VALIDER",
+    "FICHE_ARCHIVEE_A_VALIDER": "ARCHIVE",
+    "FICHE_DISTRIBUTEUR_A_VALIDER": "DISTRIBUTEUR",
+}
+
+
+def curve_source_status(status: str | None) -> str | None:
+    return CURVE_SOURCE_STATUS.get(status, status) if status else None
+
+
+def power_tolerance() -> Decimal:
+    try:
+        from django.conf import settings
+        return Decimal(str(getattr(settings, "FUEL_CPH_MATCH_POWER_TOLERANCE", DEFAULT_POWER_TOLERANCE)))
+    except Exception:  # hors Django (tests purs)
+        return DEFAULT_POWER_TOLERANCE
 
 # Marques d'un même groupe industriel, écrites sous plusieurs formes dans l'inventaire et l'abaque.
 BRAND_ALIASES = (
@@ -122,7 +146,7 @@ def _model_is_readable(model: str) -> bool:
     return len(model) >= 2 and bool(re.search(r"[A-Z]", model)) and bool(re.search(r"\d", model))
 
 
-def score_candidate(label: str, kva, curve: dict, all_curves: list[dict]) -> dict:
+def score_candidate(label: str, kva, curve: dict, all_curves: list[dict], tolerance: Decimal | None = None) -> dict:
     """Score de compatibilité d'UNE courbe candidate ; contradictions = motifs bloquants."""
     brands = known_brands(all_curves)
     lm, label_brands, lm_raw = split_label(label, brands)
@@ -150,24 +174,18 @@ def score_candidate(label: str, kva, curve: dict, all_curves: list[dict]) -> dic
         contradictions.append(f"marque du libellé différente de « {curve.get('manufacturer')} »")
 
     prp = curve.get("prp_kva")
+    tol = power_tolerance() if tolerance is None else tolerance
     if kva is None or prp in (None, 0):
         reasons.append("puissance inventaire absente : non contrôlée")
     else:
         kva, prp = Decimal(str(kva)), Decimal(str(prp))
-        gap_prp = abs(kva / prp - 1)
-        gap_standby = abs(kva / (prp * STANDBY_RATIO) - 1)
-        gap = min(gap_prp, gap_standby)
-        ref = "PRP" if gap_prp <= gap_standby else "secours ≈ 1,1 × PRP"
-        if gap <= POWER_TIGHT:
+        gap = abs(kva - prp) / prp
+        if gap <= tol:
             score += 20
             method.append("PUISSANCE")
-            reasons.append(f"puissance compatible ({kva} kVA ↔ {prp} kVA PRP, réf. {ref})")
-        elif gap <= POWER_LOOSE:
-            score += 10
-            method.append("PUISSANCE_PROCHE")
-            reasons.append(f"puissance proche ({kva} kVA ↔ {prp} kVA PRP, écart {gap * 100:.0f} %)")
+            reasons.append(f"puissance compatible ({kva.normalize():f} kVA ↔ {prp.normalize():f} kVA, écart {gap * 100:.0f} % ≤ {tol * 100:.0f} %)")
         else:
-            contradictions.append(f"écart de puissance important ({kva} kVA inventaire ↔ {prp} kVA PRP)")
+            contradictions.append(f"puissance incompatible ({kva.normalize():f} kVA inventaire ↔ {prp.normalize():f} kVA courbe, écart {gap * 100:.0f} % > {tol * 100:.0f} %)")
 
     freq = norm(curve.get("frequency"))
     if ("60" in freq and "50" not in freq) or "60HZ" in norm(label):
@@ -194,7 +212,8 @@ def score_candidate(label: str, kva, curve: dict, all_curves: list[dict]) -> dic
     return {"score": score, "reasons": reasons, "contradictions": contradictions, "method": "+".join(method)}
 
 
-def auto_match(label: str, kva, candidate_ids: list[str], curves_by_id: dict[str, dict], all_curves: list[dict]) -> dict:
+def auto_match(label: str, kva, candidate_ids: list[str], curves_by_id: dict[str, dict], all_curves: list[dict],
+               tolerance: Decimal | None = None) -> dict:
     """Décision automatique pour un mappage (libellé, kVA) — aucune validation aveugle."""
     candidates = [curves_by_id[c] for c in candidate_ids if c in curves_by_id]
     if not candidates:
@@ -204,7 +223,7 @@ def auto_match(label: str, kva, candidate_ids: list[str], curves_by_id: dict[str
         return {"status": MODELE_AMBIGU, "curve_id": None, "score": None, "method": "AUTO",
                 "reasons": [f"{len(candidates)} courbes candidates comparables : {', '.join(c['curve_id'] for c in candidates)} — choix manuel requis"]}
     c = candidates[0]
-    s = score_candidate(label, kva, c, all_curves)
+    s = score_candidate(label, kva, c, all_curves, tolerance)
     if s["contradictions"]:
         return {"status": A_VALIDER, "curve_id": None, "score": s["score"], "method": f"AUTO:{s['method']}",
                 "reasons": s["contradictions"] + s["reasons"]}
@@ -228,14 +247,30 @@ def curve_dict(c) -> dict:
             "conso_75_l_h": c.conso_75_l_h, "conso_100_l_h": c.conso_100_l_h}
 
 
-def apply_auto_matching(mapping_qs, curve_qs, now) -> dict[str, int]:
+def record_history(history_model, mapping, old_status, old_curve_id, new_curve_id, rule, now, user=None, comment=""):
+    """Trace un changement de correspondance (ancien/nouveau statut, courbe, score, règle, auteur, date)."""
+    if history_model is None:
+        return
+    history_model.objects.create(
+        mapping_id=mapping.pk, inventory_label=mapping.inventory_label, inventory_kva=mapping.inventory_kva,
+        old_status=old_status or "", new_status=mapping.match_status,
+        old_curve_id=old_curve_id or "", new_curve_id=new_curve_id or "",
+        score=mapping.match_score, rule=rule or "", changed_by=user, changed_at=now, comment=comment or "",
+    )
+
+
+def apply_auto_matching(mapping_qs, curve_qs, now, history_model=None) -> dict[str, int]:
     """
-    (Ré)évalue les mappages. Une décision humaine (validation ou retrait manuel)
-    n'est jamais écrasée. Retourne le nombre de mappages par statut.
+    (Ré)évalue les mappages. Une décision humaine (validation ou rejet manuel)
+    n'est jamais écrasée. Chaque changement est historisé si history_model est fourni.
+    Retourne le nombre de mappages par statut.
     """
+    curve_qs = list(curve_qs)
     curves = [curve_dict(c) for c in curve_qs]
     by_id = {c["curve_id"]: c for c in curves}
     pk_by_curve_id = {c.curve_id: c.pk for c in curve_qs}
+    curve_id_by_pk = {c.pk: c.curve_id for c in curve_qs}
+    tol = power_tolerance()
     counts: dict[str, int] = {}
     for m in mapping_qs:
         manual_ok = m.match_method in MANUAL_METHODS and (
@@ -243,7 +278,8 @@ def apply_auto_matching(mapping_qs, curve_qs, now) -> dict[str, int]:
             or (m.validated_curve_id is not None and m.match_status == VALIDE_MANUELLEMENT)
         )
         if not manual_ok:
-            d = auto_match(m.inventory_label, m.inventory_kva, list(m.candidate_curve_ids or []), by_id, curves)
+            old_status, old_curve = m.match_status, curve_id_by_pk.get(m.validated_curve_id)
+            d = auto_match(m.inventory_label, m.inventory_kva, list(m.candidate_curve_ids or []), by_id, curves, tol)
             m.match_status = d["status"]
             m.match_score = d["score"]
             m.match_method = d["method"]
@@ -255,5 +291,9 @@ def apply_auto_matching(mapping_qs, curve_qs, now) -> dict[str, int]:
             m.validation_comment = ""
             m.save(update_fields=["match_status", "match_score", "match_method", "match_reasons", "matched_at",
                                   "validated_curve", "validated_by", "validated_at", "validation_comment"])
+            if (old_status, old_curve) != (m.match_status, d["curve_id"]):
+                record_history(history_model, m, old_status, old_curve, d["curve_id"],
+                               f"{d['method']} (seuil {AUTO_THRESHOLD}, tolérance puissance {tol * 100:.0f} %)", now,
+                               comment="; ".join(d["reasons"])[:1000])
         counts[m.match_status] = counts.get(m.match_status, 0) + 1
     return counts

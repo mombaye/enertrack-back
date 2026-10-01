@@ -3,6 +3,7 @@ from django.contrib import admin
 from fuel_tracking.models import (
     CphCurve,
     CphInventoryMapping,
+    CphMappingHistory,
     FuelObservationImport,
     FuelRapprochementThreshold,
 )
@@ -20,10 +21,18 @@ class CphCurveAdmin(admin.ModelAdmin):
 
 @admin.register(CphInventoryMapping)
 class CphInventoryMappingAdmin(admin.ModelAdmin):
-    list_display = ("inventory_label", "inventory_kva", "site_count", "abaque_status", "validated_curve", "validated_by", "validated_at")
-    list_filter = ("abaque_status",)
+    list_display = ("inventory_label", "inventory_kva", "site_count", "match_status", "match_score", "validated_curve", "validated_by", "matched_at")
+    list_filter = ("match_status", "abaque_status")
     search_fields = ("inventory_label",)
     readonly_fields = [f.name for f in CphInventoryMapping._meta.fields if f.name != "id"]
+
+
+@admin.register(CphMappingHistory)
+class CphMappingHistoryAdmin(admin.ModelAdmin):
+    list_display = ("changed_at", "inventory_label", "old_status", "new_status", "old_curve_id", "new_curve_id", "score", "changed_by", "rule")
+    list_filter = ("new_status",)
+    search_fields = ("inventory_label",)
+    readonly_fields = [f.name for f in CphMappingHistory._meta.fields if f.name != "id"]
 
 
 @admin.register(FuelObservationImport)

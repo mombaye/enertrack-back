@@ -321,3 +321,7 @@ FUEL_ENOC_DELIVERIES_CONNECTED = os.environ.get("FUEL_ENOC_DELIVERIES_CONNECTED"
 # Unités Snowflake à confirmer par `manage.py diagnose_cph_sources` (P_DC en W → kW, rendement en % → ratio).
 FUEL_CPH_P_DC_TO_KW_DIVISOR = os.environ.get("FUEL_CPH_P_DC_TO_KW_DIVISOR", "1000")
 FUEL_CPH_EFFICIENCY_TO_RATIO_DIVISOR = os.environ.get("FUEL_CPH_EFFICIENCY_TO_RATIO_DIVISOR", "100")
+# Correspondance plaque → courbe : écart relatif max entre kVA inventaire et kVA de la courbe.
+FUEL_CPH_MATCH_POWER_TOLERANCE = os.environ.get("FUEL_CPH_MATCH_POWER_TOLERANCE", "0.15")
+# Puissance active nominale GE = kVA × facteur (charge GE et plafond 1,05 × kVA × facteur).
+FUEL_CPH_NOMINAL_POWER_FACTOR = os.environ.get("FUEL_CPH_NOMINAL_POWER_FACTOR", "0.8")

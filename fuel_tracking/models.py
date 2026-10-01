@@ -828,6 +828,7 @@ class CphInventoryMapping(models.Model):
         A_VALIDER = "A_VALIDER", "À valider"
         COURBE_CPH_MANQUANTE = "COURBE_CPH_MANQUANTE", "Courbe CPH manquante"
         MODELE_AMBIGU = "MODELE_AMBIGU", "Modèle ambigu"
+        REJETE = "REJETE", "Rejeté"
 
     # Statut de CORRESPONDANCE plaque → courbe (services/cph_matching.py), distinct du
     # statut de qualité de la courbe (CphCurve.status), qui n'est jamais modifié ici.
@@ -854,6 +855,31 @@ class CphInventoryMapping(models.Model):
 
     def __str__(self):
         return f"{self.inventory_label} ({self.inventory_kva} kVA) → {self.validated_curve_id or self.abaque_status}"
+
+
+class CphMappingHistory(models.Model):
+    """Historique des correspondances plaque → courbe : chaque changement (auto, manuel, import)."""
+
+    mapping = models.ForeignKey(CphInventoryMapping, null=True, on_delete=models.SET_NULL, related_name="history")
+    inventory_label = models.CharField(max_length=160)
+    inventory_kva = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    old_status = models.CharField(max_length=32, blank=True)
+    new_status = models.CharField(max_length=32)
+    old_curve_id = models.CharField(max_length=16, blank=True)
+    new_curve_id = models.CharField(max_length=16, blank=True)
+    score = models.IntegerField(null=True, blank=True)
+    rule = models.CharField(max_length=160, blank=True, help_text="Règle / méthode appliquée")
+    changed_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    changed_at = models.DateTimeField(default=timezone.now, db_index=True)
+    comment = models.TextField(blank=True)
+
+    class Meta:
+        verbose_name = "Historique correspondance plaque → courbe"
+        verbose_name_plural = "Historique correspondances plaque → courbe"
+        ordering = ["-changed_at", "-id"]
+
+    def __str__(self):
+        return f"{self.inventory_label} : {self.old_status or '∅'} → {self.new_status} ({self.changed_at:%Y-%m-%d})"
 
 
 class FuelSiteInventory(models.Model):

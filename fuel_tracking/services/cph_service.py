@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import date, timedelta
+from decimal import Decimal
 
 from django.conf import settings as dj_settings
 
@@ -27,7 +28,19 @@ def engine_settings() -> E.EngineSettings:
     return E.EngineSettings(
         enoc_deliveries_connected=bool(getattr(dj_settings, "FUEL_ENOC_DELIVERIES_CONNECTED", False)),
         thresholds=_thresholds(),
+        nominal_power_factor=Decimal(str(getattr(dj_settings, "FUEL_CPH_NOMINAL_POWER_FACTOR", E.NOMINAL_POWER_FACTOR))),
     )
+
+
+# Statut de correspondance → motif précis d'absence de CPH.
+CURVE_CODES = {
+    M.COURBE_CPH_MANQUANTE: E.MC_COURBE_CPH_MANQUANTE,
+    M.A_VALIDER: E.MC_MAPPING_A_VALIDER,
+    M.REJETE: E.MC_MAPPING_A_VALIDER,
+    M.MODELE_AMBIGU: E.MC_MODELE_AMBIGU,
+    M.SITE_MULTI_GE: E.MC_SITE_MULTI_GE,
+    M.TYPE_GE_ABSENT: E.MC_TYPE_GE_ABSENT,
+}
 
 
 def _curve_from_model(c) -> E.Curve:
@@ -42,6 +55,8 @@ def _match_info(statut, m=None, curve=None, motif=None) -> dict:
     """Correspondance plaque → courbe exposée par site (statut distinct de la qualité de courbe)."""
     return {
         "statut": statut,
+        "mapping_status": statut,
+        "curve_source_status": M.curve_source_status(curve.status) if curve is not None else None,
         "score": getattr(m, "match_score", None),
         "methode": getattr(m, "match_method", None) or None,
         "date": getattr(m, "matched_at", None) or getattr(m, "validated_at", None),
@@ -57,14 +72,15 @@ def resolve_curve(dg_count, ge_label, ge_kva, mappings: dict) -> tuple[E.Curve |
     """
     mappings : libellé normalisé → [CphInventoryMapping, …] (un par kVA inventaire).
     Une courbe est appliquée si la correspondance est AUTO_VALIDE_COMPATIBLE ou
-    VALIDE_MANUELLEMENT, quel que soit le statut qualité de la courbe (affiché à part).
+    VALIDE_MANUELLEMENT, quel que soit le statut d'origine de la courbe (affiché à part).
+    La puissance nominale utilisée pour la charge est le kVA PRP de la courbe × 0,8.
     """
     if dg_count is not None and dg_count > 1:
         reason = f"site multi-GE (DG_COUNT = {dg_count}) : affectation d'une courbe par GE non disponible"
         return None, reason, _match_info(M.SITE_MULTI_GE, motif=reason)
     if not ge_label:
         reason = "type de GE absent de l'inventaire Base GE"
-        return None, reason, _match_info(M.GE_INCONNU, motif=reason)
+        return None, reason, _match_info(M.TYPE_GE_ABSENT, motif=reason)
     candidates = mappings.get(E.normalize_label(ge_label)) or []
     if not candidates:
         reason = f"libellé GE « {ge_label} » absent du mappage de l'abaque : aucune courbe CPH"
@@ -85,12 +101,10 @@ def resolve_curve(dg_count, ge_label, ge_kva, mappings: dict) -> tuple[E.Curve |
         labels = {
             M.COURBE_CPH_MANQUANTE: "aucune courbe CPH dans l'abaque",
             M.MODELE_AMBIGU: "plusieurs courbes candidates — choix manuel requis",
+            M.REJETE: "rejetée par un validateur",
         }
         reason = f"correspondance « {ge_label} » {labels.get(m.match_status, 'à valider')} ({m.match_status}) — {detail}"
         return None, reason, _match_info(m.match_status, m, motif=reason)
-    if vc.power_factor is None:
-        reason = f"courbe {vc.curve_id} sans cos φ : plafond 105 % × kVA × cos φ non vérifiable"
-        return None, reason, _match_info(m.match_status, m, vc, motif=reason)
     return _curve_from_model(vc), None, _match_info(m.match_status, m, vc)
 
 
@@ -145,6 +159,8 @@ def load_contexts(country: str | None = None, site_ids: list[str] | None = None,
             zone=cs.get("zone"), kind=kind, kind_source=kind_source, grid_supply=inv_row.grid_supply,
             off_grid=E.is_off_grid(inv_row.grid_supply), dg_count=inv_row.dg_count,
             ge_label=ge_label, curve=curve, curve_reason=curve_reason, match=match,
+            curve_code=None if curve is not None else CURVE_CODES.get(match["statut"], E.MC_MAPPING_A_VALIDER),
+            ge_kva=ge_kva,
         )
         if len(rows) > 1:
             ctx.data_id = None

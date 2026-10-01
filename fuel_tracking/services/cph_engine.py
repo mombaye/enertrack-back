@@ -46,6 +46,8 @@ RT_REDRESSEUR = "REDRESSEUR"
 RT_DAY_DG_ON = "DAY_DG_ON"
 RT_COMPTEUR = "COMPTEUR_TERRAIN"
 RUNTIME_PRIORITY = [RT_DSE, RT_REDRESSEUR, RT_DAY_DG_ON, RT_COMPTEUR]
+# Champs bruts Snowflake d'heures de marche : présents mais rejetés → RUNTIME_NON_QUALIFIE.
+RAW_RUNTIME_FIELDS = ("dse_runtime_h", "dg_on_runtime_h", "tracker_runtime_h", "rectifier_active_slots")
 RUNTIME_LABELS = {
     RT_DSE: "DSE / contrôleur GE (GENSET_REPORT.DG_RUNTIME_CONTROLLER)",
     RT_REDRESSEUR: "Redresseur actif, créneaux 5 min (RECTIFIER_EFFICIENCY_STATUS)",
@@ -56,7 +58,23 @@ RUNTIME_LABELS = {
 # Sources puissance (instruction §5)
 PW_PRODUCTION = "PRODUCTION_GE"
 PW_DC_REDRESSEUR = "DC_REDRESSEUR"
-PW_INDOOR = "INDOOR_DC_PLUS_AC_HISTORIQUE"
+PW_INDOOR = "ESTIMATION_HISTORIQUE_LOAD_AC"   # P_DC pendant GE + load AC historique (jamais ACT_ACTIVE_POWER_AVG direct)
+
+# Puissance active nominale estimée du GE = kVA de la courbe × facteur de puissance (0,8 par défaut).
+NOMINAL_POWER_FACTOR = Decimal("0.8")
+
+# Motifs précis d'absence de CPH (cph_l_h = NULL, conso_estimee_l = NULL)
+MC_RUNTIME_INDISPONIBLE = "RUNTIME_INDISPONIBLE"
+MC_RUNTIME_NON_QUALIFIE = "RUNTIME_NON_QUALIFIE"
+MC_PUISSANCE_INDISPONIBLE = "PUISSANCE_INDISPONIBLE"
+MC_PUISSANCE_HORS_LIMITE = "PUISSANCE_HORS_LIMITE"
+MC_PUISSANCE_NOMINALE_ABSENTE = "PUISSANCE_NOMINALE_ABSENTE"
+MC_RENDEMENT_INVALIDE = "RENDEMENT_REDRESSEUR_INVALIDE"
+MC_COURBE_CPH_MANQUANTE = "COURBE_CPH_MANQUANTE"
+MC_MAPPING_A_VALIDER = "MAPPING_GE_A_VALIDER"
+MC_MODELE_AMBIGU = "MODELE_GE_AMBIGU"
+MC_SITE_MULTI_GE = "SITE_MULTI_GE"
+MC_TYPE_GE_ABSENT = "TYPE_GE_ABSENT"
 
 # Statuts journaliers
 DAY_CPH_CALCULE = "CPH_CALCULE"
@@ -121,6 +139,8 @@ class SiteContext:
     curve_reason: str | None = None         # pourquoi aucune courbe n'est appliquée
     data_issue: str | None = None           # anomalie bloquante de rattachement des faits
     match: dict | None = None               # correspondance plaque → courbe (statut, score, méthode…)
+    curve_code: str | None = None           # motif précis si curve est None (COURBE_CPH_MANQUANTE…)
+    ge_kva: Decimal | None = None           # puissance nominale de l'inventaire (Base GE), information
 
 
 @dataclass
@@ -145,6 +165,7 @@ class Observation:
 class EngineSettings:
     enoc_deliveries_connected: bool = False
     thresholds: dict = field(default_factory=lambda: dict(DEFAULT_THRESHOLDS))
+    nominal_power_factor: Decimal = NOMINAL_POWER_FACTOR
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -292,7 +313,7 @@ def select_daily_runtime(day: date, sources_eval: dict) -> tuple[Decimal | None,
 # ─── Puissance GE (instruction §5) ───────────────────────────────────────────
 
 def dc_input_during_ge(ctx: SiteContext, fact: dict) -> tuple[Decimal | None, str | None, str | None]:
-    """P_DC pendant GE / rendement redresseur (0 < η ≤ 1). Retourne (kW, méthode, motif)."""
+    """P_DC pendant GE / rendement redresseur (0 < η ≤ 1), sans courant batterie. Retourne (kW, méthode, motif)."""
     if (fact.get("tracker_ge_on_slots") or 0) > 0 and fact.get("p_dc_ge_tracker_kw") is not None:
         p, eff, method = _dec(fact["p_dc_ge_tracker_kw"]), _dec(fact.get("eff_ge_tracker")), "créneaux GE du compteur terrain"
     elif ctx.off_grid is True and fact.get("p_dc_rect_active_kw") is not None:
@@ -302,8 +323,12 @@ def dc_input_during_ge(ctx: SiteContext, fact: dict) -> tuple[Decimal | None, st
     if p < D0:
         return None, method, f"P_DC négative ({p} kW)"
     if not _efficiency_ok(eff):
-        return None, method, f"rendement redresseur hors (0 ; 1] ({eff})"
+        return None, method, f"{MC_RENDEMENT_INVALIDE} : rendement redresseur hors (0 ; 1] ({eff})"
     return p / eff, method, None
+
+
+def _power_code(reason: str | None) -> str:
+    return MC_RENDEMENT_INVALIDE if reason and MC_RENDEMENT_INVALIDE in reason else MC_PUISSANCE_INDISPONIBLE
 
 
 def indoor_ac_reference(ctx: SiteContext, facts: dict, start: date, end: date) -> dict:
@@ -373,37 +398,53 @@ def ge_power(ctx: SiteContext, fact: dict | None, runtime_h: Decimal, runtime_so
 
 # ─── CPH (instruction §6) ────────────────────────────────────────────────────
 
-def apply_curve(curve: Curve, p_ge_kw: Decimal) -> dict:
-    cap = POWER_CAP_RATIO * curve.prp_kva * curve.power_factor
+def apply_curve(curve: Curve, p_ge_kw: Decimal, power_factor: Decimal = NOMINAL_POWER_FACTOR) -> dict:
+    """
+    charge_ge = p_ge_kw / (kVA nominal × 0,8) ; refus si p_ge_kw > 1,05 × kVA × 0,8 ;
+    CPH = a·charge² + b·charge + c (charge en fraction, comme les points 50/75/100 % de l'abaque).
+    """
+    if curve.prp_kva is None or curve.prp_kva <= D0:
+        return {"status": DAY_PUISSANCE_ABSENTE, "code": MC_PUISSANCE_NOMINALE_ABSENTE, "charge": None, "cph_l_h": None,
+                "extrapolated": False, "reason": f"{MC_PUISSANCE_NOMINALE_ABSENTE} : kVA nominal de la courbe {curve.curve_id} inconnu"}
+    p_nom = curve.prp_kva * power_factor
+    cap = POWER_CAP_RATIO * p_nom
     if p_ge_kw > cap:
-        return {"status": DAY_PUISSANCE_HORS_PLAFOND, "charge": None, "cph_l_h": None, "extrapolated": False,
-                "reason": f"puissance {_q(p_ge_kw)} kW > 105 % × {curve.prp_kva} kVA × {curve.power_factor} = {_q(cap)} kW"}
-    x = p_ge_kw / curve.prp_kw
+        return {"status": DAY_PUISSANCE_HORS_PLAFOND, "code": MC_PUISSANCE_HORS_LIMITE, "charge": None, "cph_l_h": None,
+                "extrapolated": False,
+                "reason": f"{MC_PUISSANCE_HORS_LIMITE} : {_q(p_ge_kw)} kW > 1,05 × {curve.prp_kva} kVA × {power_factor} = {_q(cap)} kW"}
+    x = p_ge_kw / p_nom
     if x <= D0:
-        return {"status": DAY_CPH_HORS_DOMAINE, "charge": x, "cph_l_h": None, "extrapolated": False,
-                "reason": "charge nulle ou négative"}
+        return {"status": DAY_CPH_HORS_DOMAINE, "code": MC_PUISSANCE_HORS_LIMITE, "charge": x, "cph_l_h": None,
+                "extrapolated": False, "reason": f"{MC_PUISSANCE_HORS_LIMITE} : charge nulle ou négative"}
     cph = curve.a * x * x + curve.b * x + curve.c
     if cph <= D0:
-        return {"status": DAY_CPH_HORS_DOMAINE, "charge": x, "cph_l_h": None, "extrapolated": x < EXTRAPOLATION_BELOW,
-                "reason": f"CPH ≤ 0 à charge {x * 100:.1f} % (extrapolation hors domaine de la courbe {curve.curve_id})"}
-    return {"status": DAY_CPH_CALCULE, "charge": x, "cph_l_h": cph, "extrapolated": x < EXTRAPOLATION_BELOW, "reason": None}
+        return {"status": DAY_CPH_HORS_DOMAINE, "code": MC_PUISSANCE_HORS_LIMITE, "charge": x, "cph_l_h": None,
+                "extrapolated": x < EXTRAPOLATION_BELOW,
+                "reason": f"{MC_PUISSANCE_HORS_LIMITE} : CPH ≤ 0 à charge {x * 100:.1f} % (hors domaine de la courbe {curve.curve_id})"}
+    return {"status": DAY_CPH_CALCULE, "code": None, "charge": x, "cph_l_h": cph, "extrapolated": x < EXTRAPOLATION_BELOW, "reason": None}
 
 
-def compute_day(ctx: SiteContext, d: date, fact: dict | None, sources_eval: dict, ac_ref: dict | None) -> dict:
+def compute_day(ctx: SiteContext, d: date, fact: dict | None, sources_eval: dict, ac_ref: dict | None,
+                power_factor: Decimal = NOMINAL_POWER_FACTOR) -> dict:
     runtime_h, runtime_source, runtime_motifs = select_daily_runtime(d, sources_eval)
+    raw = {src: sources_eval[src]["values"][d] for src in RUNTIME_PRIORITY}
     row = {
         "date": d, "runtime_h": runtime_h, "runtime_source": runtime_source, "runtime_motifs": runtime_motifs,
-        "raw": {src: sources_eval[src]["values"][d] for src in RUNTIME_PRIORITY},
+        "raw": raw,
         "p_ge_kw": None, "power_source": None, "power_detail": None, "p_dc_input_kw": None, "p_ac_aux_kw": None,
         "curve_id": ctx.curve.curve_id if ctx.curve else None,
         "charge": None, "cph_l_h": None, "conso_l": None, "extrapolated": False,
-        "status": None, "motifs": [],
+        "status": None, "motif_code": None, "motifs": [],
         # Conso MESURÉE du jour (VW_FUEL_REPORT) — indicateur distinct, jamais mélangé à l'estimation.
         "measured_l": (fact or {}).get("measured_conso_l"),
     }
     if runtime_h is None:
         row["status"] = DAY_RUNTIME_ABSENT
-        row["motifs"] = ["runtime_ge_h = NULL : aucune source ne passe les contrôles"] + runtime_motifs
+        # Valeur brute présente mais rejetée (bornes, disponibilité < 50 %…) ≠ aucune donnée.
+        has_raw = any(v is not None for v in raw.values()) or any(
+            (fact or {}).get(k) is not None for k in RAW_RUNTIME_FIELDS)
+        row["motif_code"] = MC_RUNTIME_NON_QUALIFIE if has_raw else MC_RUNTIME_INDISPONIBLE
+        row["motifs"] = [f"{row['motif_code']} : runtime_ge_h = NULL, aucune source ne passe les contrôles"] + runtime_motifs
         return row
     if runtime_h == D0:
         # GE à l'arrêt mesuré : 0 h × CPH = 0 L, sans puissance ni courbe.
@@ -416,16 +457,18 @@ def compute_day(ctx: SiteContext, d: date, fact: dict | None, sources_eval: dict
                p_dc_input_kw=pw.get("p_dc_input_kw"), p_ac_aux_kw=pw.get("p_ac_aux_kw"))
     missing = []
     if pw["p_ge_kw"] is None:
-        missing.append((DAY_PUISSANCE_ABSENTE, pw["reason"]))
+        code = _power_code(pw["reason"])
+        missing.append((DAY_PUISSANCE_ABSENTE, code, pw["reason"] if code in (pw["reason"] or "") else f"{code} : {pw['reason']}"))
     if ctx.curve is None:
-        missing.append((DAY_COURBE_ABSENTE, ctx.curve_reason or "aucune courbe PRP validée"))
+        code = ctx.curve_code or MC_MAPPING_A_VALIDER
+        missing.append((DAY_COURBE_ABSENTE, code, f"{code} : {ctx.curve_reason or 'aucune courbe CPH applicable'}"))
     if missing:
-        row["status"] = missing[0][0]
-        row["motifs"] = [m for _, m in missing]
+        row["status"], row["motif_code"] = missing[0][0], missing[0][1]
+        row["motifs"] = [m for _, _, m in missing]
         return row
 
-    res = apply_curve(ctx.curve, pw["p_ge_kw"])
-    row.update(charge=res["charge"], extrapolated=res["extrapolated"], status=res["status"])
+    res = apply_curve(ctx.curve, pw["p_ge_kw"], power_factor)
+    row.update(charge=res["charge"], extrapolated=res["extrapolated"], status=res["status"], motif_code=res["code"])
     if res["cph_l_h"] is None:
         row["motifs"] = [res["reason"]]
         return row
@@ -434,6 +477,25 @@ def compute_day(ctx: SiteContext, d: date, fact: dict | None, sources_eval: dict
     if res["extrapolated"]:
         row["motifs"] = ["charge < 50 % : estimation mathématique (extrapolation de la parabole)"]
     return row
+
+
+def site_cph_motif(ctx: SiteContext, day_rows: list[dict], cph_status: str) -> dict | None:
+    """Motif précis au niveau site/période quand la conso estimée n'est pas complète."""
+    if cph_status == CPH_COMPLET:
+        return None
+    if ctx.data_issue:
+        return {"code": MC_RUNTIME_INDISPONIBLE, "detail": ctx.data_issue, "jours": len(day_rows)}
+    if ctx.curve is None:
+        return {"code": ctx.curve_code or MC_MAPPING_A_VALIDER, "detail": ctx.curve_reason, "jours": len(day_rows)}
+    counts: dict[str, int] = {}
+    for r in day_rows:
+        if r["motif_code"]:
+            counts[r["motif_code"]] = counts.get(r["motif_code"], 0) + 1
+    if not counts:
+        return None
+    code = max(counts, key=counts.get)
+    detail = next((m for r in day_rows if r["motif_code"] == code for m in r["motifs"][:1]), None)
+    return {"code": code, "detail": detail, "jours": counts[code]}
 
 
 # ─── Conso estimée (CPH) vs conso mesurée (capteur) ─────────────────────────
@@ -462,7 +524,12 @@ def compare_measured(day_rows: list[dict], settings: EngineSettings) -> dict:
         "conso_estimee_communs_l": None, "conso_mesuree_communs_l": None,
         "ecart_l": None, "ecart_pct": None, "statut": None, "motif": None,
     }
-    if not any(r["conso_l"] is not None for r in day_rows):
+    computed = [r for r in day_rows if r["conso_l"] is not None]
+    # Aucun jour avec CPH alors que le GE a tourné (seuls des jours GE à l'arrêt valent 0 L) :
+    # la conso estimée n'existe pas, aucun écart n'est calculé. Un GE à l'arrêt sur TOUTE la
+    # période (0 L sur chaque jour) reste comparable : c'est un vrai 0.
+    no_cph_while_running = all(r["status"] == DAY_GE_ARRET for r in computed) and len(computed) < n
+    if not computed or no_cph_while_running:
         out["statut"] = C_NON_CALCULEE
         out["motif"] = "conso estimée non calculée (voir le point bloquant)"
         return out
@@ -544,7 +611,7 @@ def compute_site_period(ctx: SiteContext, facts: dict, start: date, end: date,
     days = list(daterange(start, end))
     sources_eval = evaluate_runtime_sources(ctx, facts, days)
     ac_ref = indoor_ac_reference(ctx, facts, start, end) if ctx.kind == "INDOOR" else None
-    day_rows = {d: compute_day(ctx, d, facts.get(d), sources_eval, ac_ref) for d in days}
+    day_rows = {d: compute_day(ctx, d, facts.get(d), sources_eval, ac_ref, settings.nominal_power_factor) for d in days}
 
     n = len(days)
     rt_days = [r for r in day_rows.values() if r["runtime_h"] is not None]
@@ -616,6 +683,8 @@ def compute_site_period(ctx: SiteContext, facts: dict, start: date, end: date,
         "conso_theorique_l": conso_sum if cph_status == CPH_COMPLET else None,
         "conso_partielle_l": conso_sum if cph_status == CPH_PARTIEL else None,
         "cph_status": cph_status,
+        "motif_cph": site_cph_motif(ctx, [day_rows[d] for d in days], cph_status),
+        "ge_kva": ctx.ge_kva,
         "day_status_counts": status_counts,
         "extrapolated_days": sum(1 for r in cph_days if r["extrapolated"]),
         "motifs": motifs,
