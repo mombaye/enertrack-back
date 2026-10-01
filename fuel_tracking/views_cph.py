@@ -5,6 +5,7 @@ la plage exacte demandée (services/cph_engine.py).
 
   GET  /api/fuel-tracking/cph/                         synthèse + tableau (pagination serveur)
   GET  /api/fuel-tracking/cph/sites/<site_id>/         détail jour par jour d'un site
+  GET  /api/fuel-tracking/cph/health/                  santé du calcul (fraîcheur, couverture, plausibilité)
   GET  /api/fuel-tracking/cph/export/controle/         export « Contrôle complet » (CSV, site × jour)
   GET  /api/fuel-tracking/cph/export/anomalies/        export « Anomalies Fuel » (statut ≠ OK)
   POST /api/fuel-tracking/cph/observations/import/     fichier d'observation standard
@@ -33,7 +34,8 @@ from rest_framework.views import APIView
 
 from fuel_tracking.services import cph_engine as E
 from fuel_tracking.services import cph_matching as M
-from fuel_tracking.services.cph_service import compute_period
+from fuel_tracking.services.cph_health import cph_health, freshness
+from fuel_tracking.services.cph_service import compute_period, compute_period_summary
 
 VALIDATOR_ROLES = {"admin", "manager"}
 
@@ -188,6 +190,7 @@ def _site_summary(r: dict) -> dict:
         "ge_kva": _f(r["ge_kva"], 1),
         "motif_cph": r["motif_cph"],
         "comparaison": _comparison_dict(r["comparaison"]),
+        "conso_specifique": _sfc_dict(r["conso_specifique"]),
         "cph_days": r["cph_days"], "cph_moy_l_h": _f(r["cph_moy_l_h"]),
         "conso_days": r["conso_days"], "conso_theorique_l": _f(r["conso_theorique_l"]),
         "conso_partielle_l": _f(r["conso_partielle_l"]), "cph_status": r["cph_status"],
@@ -197,6 +200,11 @@ def _site_summary(r: dict) -> dict:
         "rapprochement": _reconciliation_dict(r["rapprochement"]),
         "observations": len(r["reconciliations"]),
     }
+
+
+def _sfc_dict(c: dict) -> dict:
+    return {**c, "energie_ge_kwh": _f(c["energie_ge_kwh"], 1), "estimee_l_kwh": _f(c["estimee_l_kwh"], 3),
+            "mesuree_l_kwh": _f(c["mesuree_l_kwh"], 3), "plage_l_kwh": [_f(v, 2) for v in c["plage_l_kwh"]]}
 
 
 def _comparison_dict(c: dict) -> dict:
@@ -248,6 +256,8 @@ def _apply_table_filters(rows: list[dict], params) -> list[dict]:
     mc = (params.get("motif_cph") or "").strip()
     if mc:
         rows = [r for r in rows if (r["motif_cph"] or {}).get("code") == mc]
+    if (params.get("alerte_sfc") or "").strip() in ("1", "true"):
+        rows = [r for r in rows if r["conso_specifique"]["alerte_estimee"] or r["conso_specifique"]["alerte_mesuree"]]
     dr = (params.get("dispo_runtime") or "").strip()
     if dr in _DISPO_FILTERS:
         rows = [r for r in rows if _DISPO_FILTERS[dr](r["runtime_source_availability"])]
@@ -281,6 +291,10 @@ def _synthesis(rows: list[dict]) -> dict:
         "correspondances": _count_by(rows, lambda r: (r["correspondance"] or {}).get("statut")),
         "courbes_appliquees": _count_by(rows, lambda r: M.curve_source_status(r["curve"].status) if r["curve"] else None),
         "motifs_cph": _count_by(rows, lambda r: (r["motif_cph"] or {}).get("code")),
+        "alertes_sfc": {
+            "estimee": sum(1 for r in rows if r["conso_specifique"]["alerte_estimee"]),
+            "mesuree": sum(1 for r in rows if r["conso_specifique"]["alerte_mesuree"]),
+        },
     }
 
 
@@ -350,13 +364,16 @@ def _meta(request=None) -> dict:
             "rows_imported": last_obs.rows_imported, "rows_rejected": last_obs.rows_rejected,
         } if last_obs else None,
         "can_validate": bool(request and getattr(request.user, "role", None) in VALIDATOR_ROLES),
+        **{k: v for k, v in freshness().items() if k != "facts_last_date"},
     }
 
 
-def _compute(request):
+def _compute(request, with_daily: bool = True):
+    """with_daily=False : tableau et synthèse (calcul mis en cache) ; True : exports jour par jour."""
     start, end = _parse_period(request.query_params)
-    rows = compute_period(start, end, country=request.query_params.get("country") or None,
-                          zone=request.query_params.get("zone") or None)
+    fn = compute_period if with_daily else compute_period_summary
+    rows = fn(start, end, country=request.query_params.get("country") or None,
+              zone=request.query_params.get("zone") or None)
     return start, end, rows
 
 
@@ -365,7 +382,7 @@ class CphPeriodView(APIView):
 
     def get(self, request):
         try:
-            start, end, rows = _compute(request)
+            start, end, rows = _compute(request, with_daily=False)
         except ValueError as e:
             return Response({"detail": str(e)}, status=400)
         synthesis = _synthesis(rows)
@@ -392,6 +409,14 @@ class CphPeriodView(APIView):
             },
             "meta": _meta(request),
         })
+
+
+class CphHealthView(APIView):
+    """Santé du calcul : fraîcheur, synchro, référentiel, couverture, plausibilité L/kWh."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return Response(cph_health())
 
 
 class CphSiteDetailView(APIView):
@@ -430,6 +455,7 @@ EXPORT_HEADER = [
     "conso_theorique_periode_l", "statut_cph_periode", "motif_cph_periode",
     "conso_mesuree_periode_l", "jours_communs", "ecart_mesuree_estimee_l", "ecart_mesuree_estimee_pct",
     "statut_conso", "motif_conso",
+    "energie_ge_periode_kwh", "conso_specifique_estimee_l_kwh", "conso_specifique_mesuree_l_kwh", "alertes_conso_specifique",
     "stock_initial_l", "livraisons_l", "rajouts_l", "retraits_l", "vols_l", "vidanges_l", "stock_final_l",
     "statut_livraisons", "conso_stock_l", "ecart_l", "ecart_pct", "statut", "motifs_rapprochement",
     "formule", "version_regle",
@@ -444,7 +470,7 @@ def _csv_rows(rows: list[dict], only_anomalies: bool):
         avail = " | ".join(f"{s}={ev['availability'] * 100:.0f}%" for s, ev in r["sources"].items())
         rejections = " | ".join(f"{s}: {ev['rejection']}" for s, ev in r["sources"].items() if ev["rejection"])
         ref_dates = ", ".join(d.isoformat() for d in ac.get("reference_dates", []))
-        match, cmp_ = r["correspondance"] or {}, r["comparaison"]
+        match, cmp_, sfc = r["correspondance"] or {}, r["comparaison"], r["conso_specifique"]
         site_ok = r["rapprochement_statut"] == E.R_OK
         avail_main = r["runtime_source_availability"]
         motif_site = r["motif_cph"] or {}
@@ -472,6 +498,7 @@ def _csv_rows(rows: list[dict], only_anomalies: bool):
                 _f(r["conso_theorique_l"]), r["cph_status"], motif_site.get("code") or "",
                 _f(cmp_["conso_mesuree_l"]), cmp_["jours_communs"], _f(cmp_["ecart_l"]), _f(cmp_["ecart_pct"], 2),
                 cmp_["statut"], cmp_["motif"],
+                _f(sfc["energie_ge_kwh"], 1), _f(sfc["estimee_l_kwh"]), _f(sfc["mesuree_l_kwh"]), " ; ".join(sfc["alertes"]),
                 _f(rec.get("stock_initial_l")), _f(rec.get("livraisons_l")), _f(rec.get("rajouts_l")),
                 _f(rec.get("retraits_l")), _f(rec.get("vols_l")), _f(rec.get("vidanges_l")), _f(rec.get("stock_final_l")),
                 rec.get("livraisons_statut", ""), _f(rec.get("conso_stock_l")), _f(rec.get("ecart_l")),

@@ -231,6 +231,15 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'fuel_tracking.sync_fuel_daily_facts_recent',
         'schedule': crontab(minute=17),
     },
+    # Rattrapage nocturne J-35 (données arrivées en retard, conso mesurée) — Africa/Dakar = UTC.
+    'fuel-daily-facts-resync-nightly': {
+        'task': 'fuel_tracking.resync_fuel_daily_facts_nightly',
+        'schedule': crontab(hour=2, minute=41),
+    },
+    'fuel-cph-health-daily': {
+        'task': 'fuel_tracking.check_cph_health_daily',
+        'schedule': crontab(hour=6, minute=53),
+    },
     'fuel-stock-sync-5min': {
         'task': 'fuel_tracking.sync_fuel_stock_current',
         'schedule': crontab(minute='*/5'),
@@ -325,3 +334,11 @@ FUEL_CPH_EFFICIENCY_TO_RATIO_DIVISOR = os.environ.get("FUEL_CPH_EFFICIENCY_TO_RA
 FUEL_CPH_MATCH_POWER_TOLERANCE = os.environ.get("FUEL_CPH_MATCH_POWER_TOLERANCE", "0.15")
 # Puissance active nominale GE = kVA × facteur (charge GE et plafond 1,05 × kVA × facteur).
 FUEL_CPH_NOMINAL_POWER_FACTOR = os.environ.get("FUEL_CPH_NOMINAL_POWER_FACTOR", "0.8")
+# Plage de plausibilité de la consommation spécifique GE (L/kWh) : hors plage = alerte (non bloquant).
+FUEL_CPH_SFC_MIN_L_KWH = os.environ.get("FUEL_CPH_SFC_MIN_L_KWH", "0.20")
+FUEL_CPH_SFC_MAX_L_KWH = os.environ.get("FUEL_CPH_SFC_MAX_L_KWH", "0.50")
+
+# Surveillance CPH : données périmées au-delà de N jours, couverture minimale, part max d'alertes L/kWh.
+FUEL_CPH_STALE_AFTER_DAYS = os.environ.get("FUEL_CPH_STALE_AFTER_DAYS", "3")
+FUEL_CPH_MIN_COVERAGE = os.environ.get("FUEL_CPH_MIN_COVERAGE", "0.5")
+FUEL_CPH_MAX_SFC_ALERT_SHARE = os.environ.get("FUEL_CPH_MAX_SFC_ALERT_SHARE", "0.2")

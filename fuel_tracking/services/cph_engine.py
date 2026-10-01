@@ -166,6 +166,10 @@ class EngineSettings:
     enoc_deliveries_connected: bool = False
     thresholds: dict = field(default_factory=lambda: dict(DEFAULT_THRESHOLDS))
     nominal_power_factor: Decimal = NOMINAL_POWER_FACTOR
+    # Plage de plausibilité de la consommation spécifique (L/kWh) : ~0,25-0,30 à charge correcte,
+    # plus élevée à faible charge. Hors plage = alerte (jamais bloquant, jamais corrigé).
+    sfc_min_l_kwh: Decimal = Decimal("0.20")
+    sfc_max_l_kwh: Decimal = Decimal("0.50")
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -549,6 +553,33 @@ def compare_measured(day_rows: list[dict], settings: EngineSettings) -> dict:
     return out
 
 
+def specific_consumption(cph_days: list[dict], settings: EngineSettings) -> dict:
+    """
+    Consommation spécifique (L/kWh) sur les jours avec CPH : énergie GE = Σ P_GE × runtime.
+      estimée = Σ conso estimée ÷ énergie  → cohérence courbe / puissance retenue ;
+      mesurée = Σ conso mesurée ÷ énergie (jours mesurés) → indicateur terrain (perte, vol, capteur).
+    Hors plage [min ; max] = alerte, sans effet sur les valeurs calculées.
+    """
+    energy = sum((r["p_ge_kw"] * r["runtime_h"] for r in cph_days), D0)
+    measured_days = [r for r in cph_days if r["measured_l"] is not None]
+    energy_m = sum((r["p_ge_kw"] * r["runtime_h"] for r in measured_days), D0)
+    est = sum((r["conso_l"] for r in cph_days), D0) / energy if energy > D0 else None
+    mes = sum((r["measured_l"] for r in measured_days), D0) / energy_m if energy_m > D0 else None
+    lo, hi = settings.sfc_min_l_kwh, settings.sfc_max_l_kwh
+    out_of = (lambda v: None if v is None else not (lo <= v <= hi))
+    alerts = []
+    if out_of(est):
+        alerts.append(f"conso spécifique estimée {est:.2f} L/kWh hors plage [{lo} ; {hi}] : vérifier la courbe ou la puissance retenue")
+    if out_of(mes):
+        alerts.append(f"conso spécifique mesurée {mes:.2f} L/kWh hors plage [{lo} ; {hi}] : perte, vol ou capteur à contrôler")
+    return {
+        "energie_ge_kwh": energy if energy > D0 else None,
+        "estimee_l_kwh": est, "mesuree_l_kwh": mes,
+        "alerte_estimee": out_of(est), "alerte_mesuree": out_of(mes),
+        "plage_l_kwh": [lo, hi], "alertes": alerts,
+    }
+
+
 # ─── Rapprochement (instruction §7) ──────────────────────────────────────────
 
 def _thresholds_status(ecart_l: Decimal, conso_th: Decimal, t: dict) -> str:
@@ -645,6 +676,7 @@ def compute_site_period(ctx: SiteContext, facts: dict, start: date, end: date,
         motifs.append(f"{st} ({cnt} j) : {'; '.join(example['motifs'][:2]) or '—'}")
 
     comparison = compare_measured([day_rows[d] for d in days], settings)
+    specific = specific_consumption(cph_days, settings)
     charge_days = [r for r in cph_days if r["charge"] is not None]
     charge_rt = sum((r["runtime_h"] for r in charge_days), D0)
     main_src = max(runtime_by_src.items(), key=lambda kv: kv[1])[0] if runtime_by_src else None
@@ -678,6 +710,7 @@ def compute_site_period(ctx: SiteContext, facts: dict, start: date, end: date,
         "cph_moy_l_h": (cph_conso / cph_runtime) if cph_runtime > D0 else None,
         "charge_moy": (sum((r["charge"] * r["runtime_h"] for r in charge_days), D0) / charge_rt) if charge_rt > D0 else None,
         "comparaison": comparison,
+        "conso_specifique": specific,
         "correspondance": ctx.match,
         "conso_days": len(conso_days),
         "conso_theorique_l": conso_sum if cph_status == CPH_COMPLET else None,

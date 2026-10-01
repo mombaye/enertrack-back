@@ -15,6 +15,7 @@ from fuel_tracking.views_cph import (
     CphCurveRevokeView,
     CphExportAnomaliesView,
     CphExportControleView,
+    CphHealthView,
     CphMappingAutoMatchView,
     CphMappingUnvalidateView,
     CphMappingValidateView,
@@ -33,6 +34,7 @@ urlpatterns = [
     path("commandes/", FuelCommandeView.as_view(), name="fuel-commandes"),
 
     path("cph/", CphPeriodView.as_view(), name="fuel-cph"),
+    path("cph/health/", CphHealthView.as_view(), name="fuel-cph-health"),
     path("cph/sites/<str:site_id>/", CphSiteDetailView.as_view(), name="fuel-cph-site"),
     path("cph/export/controle/", CphExportControleView.as_view(), name="fuel-cph-export-controle"),
     path("cph/export/anomalies/", CphExportAnomaliesView.as_view(), name="fuel-cph-export-anomalies"),

@@ -69,16 +69,65 @@ def sync_enoc_fuel_movements_current_month(self):
         )
 
 
+DAILY_FACTS_LOCK = "fuel_tracking:daily_facts_sync_lock"
+
+
+def _run_daily_facts_sync(days: int, label: str):
+    """
+    Synchronisation des faits journaliers sous verrou : la resynchro nocturne (35 j) et la
+    synchro horaire (J-3) suppriment/réécrivent les mêmes fenêtres, elles ne doivent pas
+    se chevaucher. Cache indisponible → on exécute quand même (pas de blocage silencieux).
+    """
+    from django.core.cache import cache
+    from django.core.management import call_command
+
+    try:
+        acquired = cache.add(DAILY_FACTS_LOCK, label, timeout=3 * 3600)
+    except Exception:
+        acquired = None
+    if acquired is False:
+        logger.warning("[fuel_tracking] sync_fuel_daily_facts %s ignorée : une synchro est déjà en cours", label)
+        return
+    try:
+        call_command("sync_fuel_daily_facts", days=days)
+    except Exception:
+        logger.exception("[fuel_tracking] Échec sync_fuel_daily_facts planifiée (%s)", label)
+    finally:
+        if acquired:
+            try:
+                cache.delete(DAILY_FACTS_LOCK)
+            except Exception:
+                pass
+
+
 @shared_task(bind=True, name="fuel_tracking.sync_fuel_daily_facts_recent")
 def sync_fuel_daily_facts_recent(self):
     """Faits journaliers CPH (Snowflake, lecture seule) sur J-3 → aujourd'hui : les
     données GE/redresseur/AC_METER arrivent avec quelques jours de retard."""
-    from django.core.management import call_command
+    _run_daily_facts_sync(3, "J-3")
+
+
+@shared_task(bind=True, name="fuel_tracking.resync_fuel_daily_facts_nightly")
+def resync_fuel_daily_facts_nightly(self):
+    """Resynchro nocturne J-35 → aujourd'hui : rattrape les données arrivées en retard
+    (dont la conso mesurée VW_FUEL_REPORT) sans aucune action manuelle."""
+    _run_daily_facts_sync(35, "J-35")
+
+
+@shared_task(bind=True, name="fuel_tracking.check_cph_health_daily")
+def check_cph_health_daily(self):
+    """Contrôle quotidien : chaque anomalie est journalisée en ERROR (alerting sur les logs)."""
+    from fuel_tracking.services.cph_health import cph_health
 
     try:
-        call_command("sync_fuel_daily_facts", days=3)
+        h = cph_health()
     except Exception:
-        logger.exception("[fuel_tracking] Échec sync_fuel_daily_facts planifiée (J-3)")
+        logger.exception("[fuel_cph][SANTE] contrôle de santé impossible")
+        return
+    for i in h["issues"]:
+        logger.error("[fuel_cph][SANTE][%s] %s : %s", i["niveau"], i["code"], i["message"])
+    if h["ok"]:
+        logger.info("[fuel_cph][SANTE] OK %s", h["metrics"])
 
 
 @shared_task(bind=True, name="fuel_tracking.sync_fuel_stock_current")

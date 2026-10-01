@@ -13,9 +13,19 @@ def run_auto_matching(apps, schema_editor):
     Mapping = apps.get_model("fuel_tracking", "CphInventoryMapping")
     Curve = apps.get_model("fuel_tracking", "CphCurve")
     now = timezone.now()
-    Mapping.objects.exclude(validated_curve=None).update(
+    # Seule une validation portant un auteur est humaine ; une courbe sans auteur vient de
+    # l'automatique (cas d'un retour arrière puis ré-application) et est réévaluée.
+    Mapping.objects.exclude(validated_curve=None).exclude(validated_by=None).update(
         match_status=VALIDE_MANUELLEMENT, match_method=METHOD_MANUAL, matched_at=now)
     apply_auto_matching(Mapping.objects.all(), list(Curve.objects.all()), now)
+
+
+def backwards(apps, schema_editor):
+    """Retour arrière : retirer les courbes posées par l'automatique (aucun auteur) ;
+    les validations humaines sont conservées."""
+    Mapping = apps.get_model("fuel_tracking", "CphInventoryMapping")
+    Mapping.objects.exclude(validated_curve=None).filter(validated_by=None).update(
+        validated_curve=None, validated_at=None, validation_comment="")
 
 
 class Migration(migrations.Migration):
@@ -25,5 +35,5 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.RunPython(run_auto_matching, migrations.RunPython.noop),
+        migrations.RunPython(run_auto_matching, backwards),
     ]

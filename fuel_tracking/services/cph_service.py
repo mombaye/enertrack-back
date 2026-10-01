@@ -2,6 +2,9 @@
 """Chargement PostgreSQL → entrées du moteur cph_engine (aucun accès Snowflake ici)."""
 from __future__ import annotations
 
+import hashlib
+import logging
+
 from collections import defaultdict
 from datetime import date, timedelta
 from decimal import Decimal
@@ -10,6 +13,8 @@ from django.conf import settings as dj_settings
 
 from fuel_tracking.services import cph_engine as E
 from fuel_tracking.services import cph_matching as M
+
+logger = logging.getLogger(__name__)
 
 
 def _thresholds() -> dict:
@@ -29,6 +34,8 @@ def engine_settings() -> E.EngineSettings:
         enoc_deliveries_connected=bool(getattr(dj_settings, "FUEL_ENOC_DELIVERIES_CONNECTED", False)),
         thresholds=_thresholds(),
         nominal_power_factor=Decimal(str(getattr(dj_settings, "FUEL_CPH_NOMINAL_POWER_FACTOR", E.NOMINAL_POWER_FACTOR))),
+        sfc_min_l_kwh=Decimal(str(getattr(dj_settings, "FUEL_CPH_SFC_MIN_L_KWH", "0.20"))),
+        sfc_max_l_kwh=Decimal(str(getattr(dj_settings, "FUEL_CPH_SFC_MAX_L_KWH", "0.50"))),
     )
 
 
@@ -228,3 +235,59 @@ def compute_period(start: date, end: date, country: str | None = None, site_ids:
         E.compute_site_period(ctx, facts.get(ctx.site_id, {}), start, end, observations.get(ctx.site_id, []), es)
         for ctx in contexts
     ]
+
+
+# ─── Cache du calcul période (versionné par les données) ─────────────────────
+
+CACHE_TTL_SECONDS = 600
+
+
+def data_version() -> str:
+    """
+    Empreinte des données qui influencent le calcul : toute synchronisation, import
+    d'abaque, changement de correspondance, import d'observations ou réglage change
+    la clé, donc le cache n'est jamais servi périmé (TTL de sécurité : 10 min).
+    """
+    from django.db.models import Count, Max
+    from fuel_tracking.models import (
+        CphCurve, CphInventoryMapping, CphMappingHistory, FuelConsommationMonthly, FuelDailyFactsSyncRun,
+        FuelObservationImport, FuelSiteInventory,
+    )
+
+    parts = [
+        E.RULE_VERSION,
+        FuelDailyFactsSyncRun.objects.aggregate(i=Max("id"), f=Max("finished_at")),
+        FuelSiteInventory.objects.aggregate(s=Max("synced_at")),
+        CphCurve.objects.aggregate(i=Max("imported_at"), n=Count("id")),
+        CphInventoryMapping.objects.aggregate(m=Max("matched_at"), v=Max("validated_at"), n=Count("id")),
+        CphMappingHistory.objects.aggregate(i=Max("id")),
+        FuelObservationImport.objects.aggregate(i=Max("id")),
+        FuelConsommationMonthly.objects.aggregate(u=Max("updated_at")),
+        [str(getattr(dj_settings, k, "")) for k in (
+            "FUEL_ENOC_DELIVERIES_CONNECTED", "FUEL_CPH_NOMINAL_POWER_FACTOR", "FUEL_CPH_SFC_MIN_L_KWH",
+            "FUEL_CPH_SFC_MAX_L_KWH", "FUEL_CPH_MATCH_POWER_TOLERANCE")],
+    ]
+    return hashlib.sha1(repr(parts).encode()).hexdigest()
+
+
+def compute_period_summary(start: date, end: date, country: str | None = None, zone: str | None = None) -> list[dict]:
+    """
+    compute_period sans le détail jour par jour (inutile au tableau), mis en cache.
+    Cache indisponible (Redis en panne) → calcul direct : l'écran ne tombe jamais pour ça.
+    """
+    from django.core.cache import cache
+
+    key = "fuel_cph:" + hashlib.sha1(repr((start, end, country, zone, data_version())).encode()).hexdigest()
+    try:
+        rows = cache.get(key)
+    except Exception:
+        logger.warning("[fuel_cph] cache indisponible, calcul direct", exc_info=True)
+        rows = None
+    if rows is not None:
+        return rows
+    rows = [{k: v for k, v in r.items() if k != "daily"} for r in compute_period(start, end, country=country, zone=zone)]
+    try:
+        cache.set(key, rows, CACHE_TTL_SECONDS)
+    except Exception:
+        logger.warning("[fuel_cph] écriture cache impossible", exc_info=True)
+    return rows

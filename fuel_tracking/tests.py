@@ -2,7 +2,7 @@ from datetime import date, timedelta
 from decimal import Decimal as D
 from types import SimpleNamespace
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TestCase
 
 from fuel_tracking.services import cph_engine as E
 from fuel_tracking.services.cph_service import resolve_curve
@@ -716,3 +716,83 @@ class NoCphComparisonTests(SimpleTestCase):
         r = period(outdoor(), f, OCT1, OCT1 + timedelta(days=1))
         self.assertEqual(r["conso_theorique_l"], D("0"))
         self.assertEqual(r["comparaison"]["ecart_l"], D("0"))
+
+
+class SpecificConsumptionTests(SimpleTestCase):
+    """Consommation spécifique L/kWh (CLAUDE.md §5 : ~0,25-0,30 L/kWh, hors plage = alerte)."""
+
+    def facts(self, measured):
+        # 10 h × P = 8 / 0,8 = 10 kW → 100 kWh / jour ; CPH(0,625) = 3,35 L/h → 33,5 L / jour
+        return {d: fact(dse_runtime_h=10, tracker_ge_on_slots=10, p_dc_ge_tracker_kw=D("8"), eff_ge_tracker=D("0.8"),
+                        measured_conso_l=m) for d, m in zip(days(OCT1, len(measured)), measured)}
+
+    def test_estimated_and_measured_sfc(self):
+        r = period(outdoor(), self.facts([D("30"), None]), OCT1, OCT1 + timedelta(days=1))
+        sfc = r["conso_specifique"]
+        self.assertEqual(sfc["energie_ge_kwh"], D("200"))
+        self.assertEqual(sfc["estimee_l_kwh"], D("67.0") / D("200"))
+        self.assertEqual(sfc["mesuree_l_kwh"], D("30") / D("100"))  # seuls les jours mesurés
+        self.assertFalse(sfc["alerte_estimee"])
+        self.assertFalse(sfc["alerte_mesuree"])
+
+    def test_out_of_range_raises_an_alert_without_changing_values(self):
+        r = period(outdoor(), self.facts([D("90")]), OCT1, OCT1)
+        sfc = r["conso_specifique"]
+        self.assertTrue(sfc["alerte_mesuree"])
+        self.assertTrue(any("perte, vol ou capteur" in a for a in sfc["alertes"]))
+        self.assertEqual(r["conso_theorique_l"], D("33.5"))
+
+    def test_no_energy_means_no_ratio(self):
+        r = period(outdoor(curve=None, curve_reason="x"), self.facts([D("10")]), OCT1, OCT1)
+        self.assertIsNone(r["conso_specifique"]["estimee_l_kwh"])
+        self.assertIsNone(r["conso_specifique"]["alerte_estimee"])
+
+
+class PeriodCacheTests(SimpleTestCase):
+    def test_cache_is_versioned_and_falls_back_when_unavailable(self):
+        from unittest import mock
+
+        from fuel_tracking.services import cph_service as svc
+
+        rows = [{"site_id": "S1", "daily": [1, 2]}]
+        with mock.patch.object(svc, "compute_period", return_value=rows) as cp, \
+                mock.patch.object(svc, "data_version", return_value="v1"):
+            store = {}
+            fake = mock.Mock(get=lambda k: store.get(k), set=lambda k, v, t: store.__setitem__(k, v))
+            with mock.patch("django.core.cache.cache", fake):
+                self.assertEqual(svc.compute_period_summary(OCT1, OCT1), [{"site_id": "S1"}])  # sans détail jour
+                svc.compute_period_summary(OCT1, OCT1)
+                self.assertEqual(cp.call_count, 1)  # 2e appel servi par le cache
+            broken = mock.Mock(get=mock.Mock(side_effect=ConnectionError), set=mock.Mock(side_effect=ConnectionError))
+            with mock.patch("django.core.cache.cache", broken):
+                self.assertEqual(svc.compute_period_summary(OCT1, OCT1), [{"site_id": "S1"}])
+        with mock.patch.object(svc, "compute_period", return_value=rows) as cp, \
+                mock.patch.object(svc, "data_version", return_value="v2"), \
+                mock.patch("django.core.cache.cache", fake):
+            svc.compute_period_summary(OCT1, OCT1)
+            self.assertEqual(cp.call_count, 1)  # nouvelle version des données → recalcul
+
+
+class HealthTests(TestCase):
+    """Surveillance : données absentes / périmées, synchro en échec, référentiel absent."""
+
+    def test_empty_database_is_critical(self):
+        from fuel_tracking.services.cph_health import cph_health
+        h = cph_health()
+        codes = {i["code"] for i in h["issues"]}
+        self.assertTrue(h["critique"])
+        self.assertTrue({"FAITS_ABSENTS", "ABAQUE_ABSENT"} <= codes)
+
+    def test_stale_facts_and_failed_sync(self):
+        from fuel_tracking.models import FuelDailyFactsSyncRun, FuelSiteDailyFacts
+        from fuel_tracking.services.cph_health import cph_health, freshness
+        FuelSiteDailyFacts.objects.create(country="Senegal", data_id=1, site_id="S1", date=date.today() - timedelta(days=5))
+        FuelDailyFactsSyncRun.objects.create(date_from=date.today(), date_to=date.today(),
+                                             status=FuelDailyFactsSyncRun.Status.FAILED, error_message="timeout Snowflake")
+        f = freshness()
+        self.assertEqual(f["facts_age_days"], 5)
+        self.assertTrue(f["facts_stale"])
+        self.assertTrue(f["last_sync_failed"])
+        codes = {i["code"]: i["niveau"] for i in cph_health()["issues"]}
+        self.assertEqual(codes["FAITS_PERIMES"], "ALERTE")
+        self.assertIn("SYNC_ECHEC", codes)
