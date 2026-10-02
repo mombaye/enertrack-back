@@ -935,6 +935,7 @@ class FuelSiteDailyFacts(models.Model):
     # AC_METER — instrument AC (indoor)
     ac_active_power_avg_w = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True, help_text="ACT_ACTIVE_POWER_AVG brut (W).")
     ac_energy_p = models.DecimalField(max_digits=16, decimal_places=4, null=True, blank=True, help_text="ACT_ENERGY_P brut.")
+    ac_point_count = models.IntegerField(null=True, blank=True, help_text="Nombre de mesures ACT_ACTIVE_POWER_AVG non nulles du jour.")
 
     # VW_FUEL_REPORT (DB_GFMS_ANALYTICS_DEV) — conso MESURÉE du jour, même filtre strict que la conso
     # mensuelle : QUALITY_STATUS = 'OK' et VALID_POINT_COUNT ≥ 2 ; baisse détectée → volume de la baisse,

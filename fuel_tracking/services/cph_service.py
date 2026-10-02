@@ -30,10 +30,15 @@ def _thresholds() -> dict:
 
 
 def engine_settings() -> E.EngineSettings:
+    from django.db.models import Max
+    from fuel_tracking.models import FuelSiteDailyFacts
+
     return E.EngineSettings(
+        data_until=FuelSiteDailyFacts.objects.aggregate(v=Max("date"))["v"],
         enoc_deliveries_connected=bool(getattr(dj_settings, "FUEL_ENOC_DELIVERIES_CONNECTED", False)),
         thresholds=_thresholds(),
         nominal_power_factor=Decimal(str(getattr(dj_settings, "FUEL_CPH_NOMINAL_POWER_FACTOR", E.NOMINAL_POWER_FACTOR))),
+        ac_w_to_kw_divisor=Decimal(str(getattr(dj_settings, "FUEL_CPH_AC_POWER_TO_KW_DIVISOR", "1000"))),
         sfc_min_l_kwh=Decimal(str(getattr(dj_settings, "FUEL_CPH_SFC_MIN_L_KWH", "0.20"))),
         sfc_max_l_kwh=Decimal(str(getattr(dj_settings, "FUEL_CPH_SFC_MAX_L_KWH", "0.50"))),
     )
@@ -115,6 +120,11 @@ def resolve_curve(dg_count, ge_label, ge_kva, mappings: dict) -> tuple[E.Curve |
     return _curve_from_model(vc), None, _match_info(m.match_status, m, vc)
 
 
+def _normalize_kind(value: str | None) -> str | None:
+    v = (value or "").strip().upper()
+    return v if v in ("INDOOR", "OUTDOOR") else None
+
+
 def load_contexts(country: str | None = None, site_ids: list[str] | None = None, zone: str | None = None) -> list[E.SiteContext]:
     """Sites avec GE (SITE_ESCO_CURRENT.DG_COUNT > 0) — les sites sans GE sont exclus, pas comptés à 0 L."""
     from core.models import Site
@@ -138,12 +148,24 @@ def load_contexts(country: str | None = None, site_ids: list[str] | None = None,
     if zone:
         by_site = {sid: rows for sid, rows in by_site.items() if (core_sites.get(sid) or {}).get("zone") == zone}
 
+    # Dernière valeur renseignée par site (lignes mensuelles les plus récentes d'abord).
     ge_labels: dict[str, tuple] = {}
-    for sid, label, kva in (
-        FuelConsommationMonthly.objects.filter(site_id__in=by_site.keys(), type_ge_fichier__isnull=False)
-        .order_by("site_id", "-month_year").values_list("site_id", "type_ge_fichier", "pge_kva_fichier")
+    extras: dict[str, dict] = defaultdict(dict)
+    for row in (
+        FuelConsommationMonthly.objects.filter(site_id__in=by_site.keys())
+        .order_by("site_id", "-month_year")
+        .values("site_id", "type_ge_fichier", "pge_kva_fichier", "facturation_avec_ge_fichier",
+                "configuration_fichier", "site_type_fichier", "site_type")
     ):
-        ge_labels.setdefault(sid, (label, kva))
+        sid = row["site_id"]
+        if row["type_ge_fichier"] is not None:
+            ge_labels.setdefault(sid, (row["type_ge_fichier"], row["pge_kva_fichier"]))
+        ex = extras[sid]
+        for key, value in (("facture_avec_ge", row["facturation_avec_ge_fichier"]),
+                           ("configuration", row["configuration_fichier"]),
+                           ("site_type", row["site_type_fichier"] or row["site_type"])):
+            if value is not None and value != "" and key not in ex:
+                ex[key] = value
 
     mappings: dict[str, list] = defaultdict(list)
     for m in CphInventoryMapping.objects.select_related("validated_curve", "validated_by"):
@@ -159,6 +181,11 @@ def load_contexts(country: str | None = None, site_ids: list[str] | None = None,
             kind, kind_source = cs["site_type"], "core.Site.site_type"
         else:
             kind, kind_source = None, None
+        ex = extras.get(sid, {})
+        conf_file = _normalize_kind(ex.get("configuration"))
+        if kind is None and conf_file:
+            # Configuration déclarée par Ops (fichier ESCO facturation) quand l'inventaire est vide.
+            kind, kind_source = conf_file, "FuelConsommationMonthly.configuration_fichier"
         ge_label, ge_kva = ge_labels.get(sid, (None, None))
         curve, curve_reason, match = resolve_curve(inv_row.dg_count, ge_label, ge_kva, mappings)
         ctx = E.SiteContext(
@@ -167,7 +194,8 @@ def load_contexts(country: str | None = None, site_ids: list[str] | None = None,
             off_grid=E.is_off_grid(inv_row.grid_supply), dg_count=inv_row.dg_count,
             ge_label=ge_label, curve=curve, curve_reason=curve_reason, match=match,
             curve_code=None if curve is not None else CURVE_CODES.get(match["statut"], E.MC_MAPPING_A_VALIDER),
-            ge_kva=ge_kva,
+            ge_kva=ge_kva, facture_avec_ge=ex.get("facture_avec_ge"), site_type=ex.get("site_type"),
+            configuration_fichier=ex.get("configuration"),
         )
         if len(rows) > 1:
             ctx.data_id = None
@@ -265,7 +293,7 @@ def data_version() -> str:
         FuelConsommationMonthly.objects.aggregate(u=Max("updated_at")),
         [str(getattr(dj_settings, k, "")) for k in (
             "FUEL_ENOC_DELIVERIES_CONNECTED", "FUEL_CPH_NOMINAL_POWER_FACTOR", "FUEL_CPH_SFC_MIN_L_KWH",
-            "FUEL_CPH_SFC_MAX_L_KWH", "FUEL_CPH_MATCH_POWER_TOLERANCE")],
+            "FUEL_CPH_SFC_MAX_L_KWH", "FUEL_CPH_MATCH_POWER_TOLERANCE", "FUEL_CPH_AC_POWER_TO_KW_DIVISOR")],
     ]
     return hashlib.sha1(repr(parts).encode()).hexdigest()
 

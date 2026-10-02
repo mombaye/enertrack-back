@@ -135,7 +135,8 @@ rect_daily AS (
 ),
 ac AS (
     SELECT DATA_ID AS data_id, DATE AS day,
-           AVG(ACT_ACTIVE_POWER_AVG) AS ac_w, MAX(ACT_ENERGY_P) AS ac_energy
+           AVG(ACT_ACTIVE_POWER_AVG) AS ac_w, MAX(ACT_ENERGY_P) AS ac_energy,
+           COUNT(ACT_ACTIVE_POWER_AVG) AS ac_points
     FROM {analytics}.AC_METER
     WHERE DATE >= %(d_start)s AND DATE <= %(d_end)s AND DATA_ID IN ({ids})
     GROUP BY DATA_ID, DATE
@@ -170,7 +171,7 @@ SELECT u.data_id, u.day,
        td.tracker_h, td.covered_min, td.ge_on_slots,
        rd.slots, rd.active_slots, rd.p_dc_ge_tracker_kw, rd.eff_ge_tracker,
        rd.p_dc_rect_active_kw, rd.eff_rect_active, rd.p_dc_day_kw, rd.eff_day,
-       a.ac_w, a.ac_energy,
+       a.ac_w, a.ac_energy, a.ac_points,
        f.measured_l, f.raw_points
 FROM universe u
 LEFT JOIN genset g ON g.data_id = u.data_id AND g.day = u.day
@@ -203,7 +204,7 @@ def fetch_daily_facts(data_ids: list[int], d_start: date, d_end: date, country: 
             })
             for (data_id, day, dse_h, dg_on_h, prod_kwh, tracker_h, covered_min, ge_on_slots,
                  slots, active_slots, p_dc_ge, eff_ge, p_dc_act, eff_act, p_dc_day, eff_day,
-                 ac_w, ac_energy, measured_l, raw_points) in cur.fetchall():
+                 ac_w, ac_energy, ac_points, measured_l, raw_points) in cur.fetchall():
                 rows.append({
                     "data_id": int(data_id), "date": day,
                     "dse_runtime_h": _dec(dse_h), "dg_on_runtime_h": _dec(dg_on_h), "dg_production_kwh": _dec(prod_kwh),
@@ -216,6 +217,7 @@ def fetch_daily_facts(data_ids: list[int], d_start: date, d_end: date, country: 
                     "p_dc_rect_active_kw": _dec(p_dc_act), "eff_rect_active": _dec(eff_act),
                     "p_dc_day_kw": _dec(p_dc_day), "eff_day": _dec(eff_day),
                     "ac_active_power_avg_w": _dec(ac_w), "ac_energy_p": _dec(ac_energy),
+                    "ac_point_count": int(ac_points) if ac_points is not None else None,
                     "measured_conso_l": _dec(measured_l),
                     "fuel_raw_points": int(raw_points) if raw_points is not None else None,
                 })

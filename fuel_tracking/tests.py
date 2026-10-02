@@ -90,7 +90,7 @@ class RuntimeTests(SimpleTestCase):
         facts = {d: fact(dg_on_runtime_h=0, tracker_runtime_h=4, tracker_covered_min=1440) for d in days(OCT1, 3)}
         r = period(outdoor(off_grid=False), facts, OCT1, OCT1 + timedelta(days=2))
         self.assertFalse(r["sources"][E.RT_DAY_DG_ON]["exploitable"])
-        self.assertIn("coalescence", r["sources"][E.RT_DAY_DG_ON]["rejection"])
+        self.assertIn("COALESCENCE_ZERO_SUSPECTE", r["sources"][E.RT_DAY_DG_ON]["rejection"])
         self.assertEqual(r["daily"][0]["runtime_source"], E.RT_COMPTEUR)
 
     def test_tracker_requires_continuous_coverage(self):
@@ -184,12 +184,14 @@ class PowerAndCphTests(SimpleTestCase):
                             ac_active_power_avg_w=D("9000"))}
         day = period(ctx, facts, OCT1, OCT1)["daily"][0]
         self.assertIsNone(day["p_ge_kw"])
-        self.assertIn("profil AC historique insuffisant", day["motifs"][0])
+        self.assertIn("LOAD_AC_INDISPONIBLE", day["motifs"][0])
+        self.assertEqual(day["power_trace"][E.PM_INDOOR]["code"], E.PR_LOAD_AC_INDISPONIBLE)
 
     def test_unknown_site_kind(self):
         f = fact(dse_runtime_h=4, tracker_ge_on_slots=10, p_dc_ge_tracker_kw=5, eff_ge_tracker=D("0.9"))
         day = period(outdoor(kind=None), {OCT1: f}, OCT1, OCT1)["daily"][0]
-        self.assertIn("indoor/outdoor inconnu", day["motifs"][0])
+        self.assertIn("CONFIGURATION_INCONNUE", day["motifs"][0])
+        self.assertEqual(day["motif_code"], E.PR_CONFIGURATION_INCONNUE)
 
 
 class PeriodTests(SimpleTestCase):
@@ -796,3 +798,136 @@ class HealthTests(TestCase):
         codes = {i["code"]: i["niveau"] for i in cph_health()["issues"]}
         self.assertEqual(codes["FAITS_PERIMES"], "ALERTE")
         self.assertIn("SYNC_ECHEC", codes)
+
+
+
+class PowerFallbackTests(SimpleTestCase):
+    """Chaîne de repli puissance : DSE/production → P_DC/η (outdoor) → P_DC + load AC (indoor) → NULL."""
+
+    def indoor(self, **kw):
+        base = dict(site_id="S2", kind="INDOOR", off_grid=False, dg_count=1, curve=DE22E3)
+        base.update(kw)
+        return E.SiteContext(**base)
+
+    def ref_days(self, ac_w, p_dc=D("2.4"), eff=D("0.8"), n=6):
+        return {d: fact(dse_runtime_h=0, ac_active_power_avg_w=ac_w, p_dc_day_kw=p_dc, eff_day=eff, ac_point_count=288)
+                for d in days(OCT1 - timedelta(days=10), n)}
+
+    def test_production_is_tried_first_even_indoor(self):
+        f = {OCT1: fact(dse_runtime_h=4, dg_production_kwh=D("40"))}  # aucun P_DC, aucun historique AC
+        day = period(self.indoor(), f, OCT1, OCT1)["daily"][0]
+        self.assertEqual(day["p_ge_kw"], D("10"))
+        self.assertEqual(day["power_method"], E.PM_DIRECT)
+        self.assertEqual(day["power_trace"][E.PM_DIRECT]["statut"], "RETENUE")
+        self.assertEqual(day["power_trace"][E.PM_INDOOR]["statut"], "NON_TENTEE")
+        self.assertIsNotNone(day["cph_l_h"])
+
+    def test_fallback_to_rectifier_when_production_absent_and_trace_kept(self):
+        f = {OCT1: fact(dse_runtime_h=4, tracker_ge_on_slots=10, p_dc_ge_tracker_kw=D("8"), eff_ge_tracker=D("0.8"))}
+        day = period(outdoor(), f, OCT1, OCT1)["daily"][0]
+        self.assertEqual(day["power_method"], E.PM_PDC)
+        t = day["power_trace"]
+        self.assertEqual((t[E.PM_DIRECT]["statut"], t[E.PM_DIRECT]["code"]), ("ABSENTE", E.PR_P_DSE_INDISPONIBLE))
+        self.assertEqual(t[E.PM_PDC]["statut"], "RETENUE")
+        self.assertEqual(t[E.PM_INDOOR]["statut"], "NON_APPLICABLE")
+        self.assertIn("BATTERIE_NON_INTEGREE", day["power_detail"])
+
+    def test_method_over_cap_is_rejected_and_next_one_used(self):
+        # DE22E3 : 20 kVA × 0,8 × 1,05 = 16,8 kW ; production 100 kWh / 4 h = 25 kW → rejetée
+        f = {OCT1: fact(dse_runtime_h=4, dg_production_kwh=D("100"), tracker_ge_on_slots=10,
+                        p_dc_ge_tracker_kw=D("8"), eff_ge_tracker=D("0.8"))}
+        day = period(outdoor(), f, OCT1, OCT1)["daily"][0]
+        self.assertEqual(day["power_trace"][E.PM_DIRECT]["code"], E.MC_PUISSANCE_HORS_LIMITE)
+        self.assertEqual(day["power_method"], E.PM_PDC)
+        self.assertEqual(day["p_ge_kw"], D("10"))
+
+    def test_all_methods_failed_gives_null_with_every_reason(self):
+        f = {OCT1: fact(dse_runtime_h=4)}
+        day = period(outdoor(), f, OCT1, OCT1)["daily"][0]
+        self.assertIsNone(day["p_ge_kw"])
+        self.assertEqual(day["motif_code"], E.MC_PUISSANCE_INDISPONIBLE)
+        self.assertIn("P_DSE_INDISPONIBLE", day["motifs"][0])
+        self.assertIn("PDC_GE_INDISPONIBLE", day["motifs"][0])
+        self.assertEqual(set(day["power_rejection_codes"]), {E.PR_P_DSE_INDISPONIBLE, E.PR_PDC_GE_INDISPONIBLE})
+
+    def test_clamped_ac_is_incoherent_not_zero(self):
+        # AC 2 000 W = 2 kW < entrée DC 3 kW chaque jour : l'ancien calcul donnait 0,000 kW par écrêtage
+        ref = E.indoor_ac_reference(self.indoor(), self.ref_days(D("2000")), OCT1, OCT1)
+        self.assertEqual(ref["statut"], E.AC_INCOHERENT)
+        self.assertIsNone(ref["p_ac_aux_kw"])
+        self.assertEqual(ref["jours_ecart_negatif"], 6)
+
+    def test_true_measured_zero(self):
+        ref = E.indoor_ac_reference(self.indoor(), self.ref_days(D("3020")), OCT1, OCT1)  # 3,02 kW ≈ 3 kW entrée
+        self.assertEqual(ref["statut"], E.AC_QUALIFIE)
+        ref0 = E.indoor_ac_reference(self.indoor(), self.ref_days(D("2950")), OCT1, OCT1)  # écart −0,05 kW ≤ tolérance
+        self.assertEqual(ref0["statut"], E.AC_MESURE_ZERO)
+        self.assertEqual(ref0["p_ac_aux_kw"], D("0"))
+        self.assertEqual(ref0["mesures"], 6 * 288)
+
+    def test_ac_unit_suspected_when_value_looks_like_kw(self):
+        ref = E.indoor_ac_reference(self.indoor(), self.ref_days(D("4.5")), OCT1, OCT1)
+        self.assertEqual(ref["statut"], E.AC_UNITE_SUSPECTE)
+        self.assertIsNone(ref["p_ac_aux_kw"])
+
+    def test_separate_cph_and_stock_statuses(self):
+        f = {d: fact(dse_runtime_h=4, tracker_ge_on_slots=10, p_dc_ge_tracker_kw=D("8"), eff_ge_tracker=D("0.8"))
+             for d in days(OCT1, 2)}
+        r = period(outdoor(), f, OCT1, OCT1 + timedelta(days=1))
+        self.assertEqual(r["statut_cph"], E.SC_CPH_CALCULE)
+        self.assertEqual(r["statut_rapprochement_calcul"], E.SR_STOCK_ABSENT)
+        obs = E.Observation(start=OCT1, end=OCT1 + timedelta(days=1), opening_fuel_l=D("500"), closing_fuel_l=D("400"),
+                            fuel_deliveries_l=None, fuel_transfer_in_l=D("0"), fuel_transfer_out_l=D("0"),
+                            fuel_theft_l=D("0"), fuel_drain_l=D("0"), observation_status="VALIDÉ")
+        r2 = period(outdoor(), f, OCT1, OCT1 + timedelta(days=1), [obs])
+        self.assertEqual(r2["statut_rapprochement_calcul"], E.SR_MOUVEMENTS_ABSENTS)
+        self.assertEqual(r2["statut_cph"], E.SC_CPH_CALCULE)
+
+
+class PeriodAndSynthesisTests(SimpleTestCase):
+    """Période incomplète, conso partielle honnête, couvertures et synthèse des blocages."""
+
+    def test_days_after_last_sync_are_periode_incomplete(self):
+        f = {OCT1: fact(dse_runtime_h=4, tracker_ge_on_slots=10, p_dc_ge_tracker_kw=D("8"), eff_ge_tracker=D("0.8"))}
+        r = period(outdoor(), f, OCT1, OCT1 + timedelta(days=1), settings=E.EngineSettings(data_until=OCT1))
+        self.assertEqual(r["statut_cph"], E.SC_CPH_PARTIEL)
+        self.assertEqual(r["daily"][1]["motif_code"], E.MC_PERIODE_INCOMPLETE)
+        self.assertIn(E.MC_PERIODE_INCOMPLETE, r["blocked_days"])
+
+    def test_ge_off_days_only_is_not_a_partial_estimate(self):
+        f = {OCT1: fact(dse_runtime_h=0), OCT1 + timedelta(days=1): fact(dse_runtime_h=5)}  # puissance absente le 2e jour
+        r = period(outdoor(), f, OCT1, OCT1 + timedelta(days=1))
+        self.assertEqual(r["statut_cph"], E.SC_CPH_NON_CALCULE)
+        self.assertIsNone(r["conso_partielle_l"])
+
+    def test_curve_missing_is_counted_with_measured_volume(self):
+        f = {OCT1: fact(dse_runtime_h=4, measured_conso_l=D("12"), tracker_ge_on_slots=10,
+                        p_dc_ge_tracker_kw=D("8"), eff_ge_tracker=D("0.8"))}
+        r = period(outdoor(curve=None, curve_code=E.MC_COURBE_CPH_MANQUANTE), f, OCT1, OCT1)
+        b = r["blocked_days"][E.MC_COURBE_CPH_MANQUANTE]
+        self.assertEqual((b["jours"], b["runtime_h"], b["mesuree_l"]), (1, D("4"), D("12")))
+
+    def test_couvertures_and_diagnostic(self):
+        from fuel_tracking import views_cph as V
+
+        ok = {OCT1: fact(dse_runtime_h=4, measured_conso_l=D("10"), tracker_ge_on_slots=10,
+                         p_dc_ge_tracker_kw=D("8"), eff_ge_tracker=D("0.8"))}
+        no_power = {OCT1: fact(dse_runtime_h=4)}
+        rows = [period(outdoor(site_id="A", ge_label="CAT DE22E3"), ok, OCT1, OCT1),
+                period(outdoor(site_id="B", ge_label="CAT DE22E3"), no_power, OCT1, OCT1)]
+        cov = {c["code"]: (c["numerateur"], c["denominateur"]) for c in V._couvertures(rows)}
+        self.assertEqual(cov["conso_mesuree"], (1, 2))
+        self.assertEqual(cov["runtime"], (2, 2))
+        self.assertEqual(cov["puissance"], (1, 2))
+        self.assertEqual(cov["cph"], (1, 2))
+        self.assertEqual(cov["rapprochement"], (0, 1))
+        diag = {d["code"]: d for d in V._diagnostic_blocages(rows)}
+        self.assertEqual(diag[E.PR_PDC_GE_INDISPONIBLE]["sites"], 1)
+        self.assertEqual(diag[E.PR_P_DSE_INDISPONIBLE]["runtime_h"], 4.0)
+        self.assertEqual(diag[E.SR_STOCK_ABSENT]["sites"], 2)
+        self.assertEqual([r["site_id"] for r in V._apply_table_filters(rows, {"diag": E.PR_PDC_GE_INDISPONIBLE})], ["B"])
+        # La trace à plat expose chaque méthode tentée et les motifs de rejet.
+        flat = V._flat_trace(rows[1]["daily"][0])
+        self.assertTrue(flat["direct_dse_attempted"] and flat["pdc_rectifier_attempted"])
+        self.assertIsNone(flat["selected_power_method"])
+        self.assertEqual(len(flat["rejection_reasons"]), 2)

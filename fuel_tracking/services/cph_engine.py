@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
-RULE_VERSION = "CPH-PRP-50HZ-2026-09-28"
+RULE_VERSION = "CPH-PRP-50HZ-2026-10-02"  # chaîne de repli puissance tracée
 
 D0 = Decimal("0")
 MIN_AVAILABILITY = Decimal("0.5")
@@ -48,6 +48,7 @@ RT_COMPTEUR = "COMPTEUR_TERRAIN"
 RUNTIME_PRIORITY = [RT_DSE, RT_REDRESSEUR, RT_DAY_DG_ON, RT_COMPTEUR]
 # Champs bruts Snowflake d'heures de marche : présents mais rejetés → RUNTIME_NON_QUALIFIE.
 RAW_RUNTIME_FIELDS = ("dse_runtime_h", "dg_on_runtime_h", "tracker_runtime_h", "rectifier_active_slots")
+RUNTIME_LABEL_SHORT = {RT_DSE: "DSE", RT_REDRESSEUR: "redresseur", RT_DAY_DG_ON: "Day DG On", RT_COMPTEUR: "compteur"}
 RUNTIME_LABELS = {
     RT_DSE: "DSE / contrôleur GE (GENSET_REPORT.DG_RUNTIME_CONTROLLER)",
     RT_REDRESSEUR: "Redresseur actif, créneaux 5 min (RECTIFIER_EFFICIENCY_STATUS)",
@@ -59,6 +60,37 @@ RUNTIME_LABELS = {
 PW_PRODUCTION = "PRODUCTION_GE"
 PW_DC_REDRESSEUR = "DC_REDRESSEUR"
 PW_INDOOR = "ESTIMATION_HISTORIQUE_LOAD_AC"   # P_DC pendant GE + load AC historique (jamais ACT_ACTIVE_POWER_AVG direct)
+
+# Méthodes de puissance (chaîne de repli, dans cet ordre) et codes de rejet par méthode
+PM_DIRECT = "DIRECT_DSE_PRODUCTION"
+PM_PDC = "PDC_REDRESSEUR"
+PM_INDOOR = "INDOOR_PDC_LOAD_AC"
+POWER_METHODS = (PM_DIRECT, PM_PDC, PM_INDOOR)
+PR_P_DSE_INDISPONIBLE = "P_DSE_INDISPONIBLE"
+PR_P_DSE_INCOHERENTE = "P_DSE_INCOHERENTE"
+PR_PDC_GE_INDISPONIBLE = "PDC_GE_INDISPONIBLE"
+PR_PDC_NEGATIF = "PDC_NEGATIF"
+PR_LOAD_AC_INDISPONIBLE = "LOAD_AC_INDISPONIBLE"
+PR_LOAD_AC_INCOHERENT = "LOAD_AC_INCOHERENT"
+PR_LOAD_AC_UNITE_SUSPECTE = "LOAD_AC_UNITE_SUSPECTE"
+PR_CONFIGURATION_INCONNUE = "CONFIGURATION_INCONNUE"
+BATTERIE_NON_INTEGREE = "BATTERIE_NON_INTEGREE — validation du sens énergétique requise"
+
+# Statuts du load AC historique indoor : une médiane à 0 n'est valable que si elle est mesurée.
+AC_QUALIFIE = "LOAD_AC_QUALIFIE"
+AC_MESURE_ZERO = "LOAD_AC_MESURE_ZERO"
+AC_INDISPONIBLE = PR_LOAD_AC_INDISPONIBLE
+AC_INCOHERENT = PR_LOAD_AC_INCOHERENT
+AC_UNITE_SUSPECTE = PR_LOAD_AC_UNITE_SUSPECTE
+
+# Statuts séparés CPH / rapprochement stock
+SC_CPH_CALCULE = "CPH_CALCULE"
+SC_CPH_PARTIEL = "CPH_PARTIEL"
+SC_CPH_NON_CALCULE = "CPH_NON_CALCULE"
+SR_CALCULE = "RAPPROCHEMENT_CALCULE"
+SR_STOCK_ABSENT = "RAPPROCHEMENT_NON_CALCULE_STOCK_ABSENT"
+SR_MOUVEMENTS_ABSENTS = "RAPPROCHEMENT_NON_CALCULE_MOUVEMENTS_ABSENTS"
+SR_CPH_INCOMPLET = "RAPPROCHEMENT_NON_CALCULE_CPH_INCOMPLET"
 
 # Puissance active nominale estimée du GE = kVA de la courbe × facteur de puissance (0,8 par défaut).
 NOMINAL_POWER_FACTOR = Decimal("0.8")
@@ -75,6 +107,7 @@ MC_MAPPING_A_VALIDER = "MAPPING_GE_A_VALIDER"
 MC_MODELE_AMBIGU = "MODELE_GE_AMBIGU"
 MC_SITE_MULTI_GE = "SITE_MULTI_GE"
 MC_TYPE_GE_ABSENT = "TYPE_GE_ABSENT"
+MC_PERIODE_INCOMPLETE = "PERIODE_INCOMPLETE"   # jour postérieur à la dernière synchronisation Snowflake
 
 # Statuts journaliers
 DAY_CPH_CALCULE = "CPH_CALCULE"
@@ -141,6 +174,9 @@ class SiteContext:
     match: dict | None = None               # correspondance plaque → courbe (statut, score, méthode…)
     curve_code: str | None = None           # motif précis si curve est None (COURBE_CPH_MANQUANTE…)
     ge_kva: Decimal | None = None           # puissance nominale de l'inventaire (Base GE), information
+    facture_avec_ge: bool | None = None     # fichier ESCO « Facturation avec GE » (information, non bloquant)
+    site_type: str | None = None            # On-Grid / Off-Grid (Base GE, sinon Snowflake)
+    configuration_fichier: str | None = None  # Indoor / Outdoor déclaré dans le fichier de facturation
 
 
 @dataclass
@@ -166,6 +202,9 @@ class EngineSettings:
     enoc_deliveries_connected: bool = False
     thresholds: dict = field(default_factory=lambda: dict(DEFAULT_THRESHOLDS))
     nominal_power_factor: Decimal = NOMINAL_POWER_FACTOR
+    ac_w_to_kw_divisor: Decimal = Decimal("1000")
+    # Dernier jour synchronisé depuis Snowflake : au-delà, un jour sans fait = PERIODE_INCOMPLETE.
+    data_until: date | None = None
     # Plage de plausibilité de la consommation spécifique (L/kWh) : ~0,25-0,30 à charge correcte,
     # plus élevée à faible charge. Hors plage = alerte (jamais bloquant, jamais corrigé).
     sfc_min_l_kwh: Decimal = Decimal("0.20")
@@ -285,7 +324,7 @@ def evaluate_runtime_sources(ctx: SiteContext, facts: dict, days: list[date]) ->
                         suspect.append(d)
             if suspect:
                 rejection = (
-                    f"coalescence à zéro suspecte : Day DG On = 0 alors qu'une autre source "
+                    f"COALESCENCE_ZERO_SUSPECTE : Day DG On = 0 alors qu'une autre source "
                     f"mesure une marche ({len(suspect)} jour(s), ex. {suspect[0].isoformat()})"
                 )
         out[src] = {
@@ -323,81 +362,195 @@ def dc_input_during_ge(ctx: SiteContext, fact: dict) -> tuple[Decimal | None, st
     elif ctx.off_grid is True and fact.get("p_dc_rect_active_kw") is not None:
         p, eff, method = _dec(fact["p_dc_rect_active_kw"]), _dec(fact.get("eff_rect_active")), "créneaux redresseur actif (site off-grid)"
     else:
-        return None, None, "P_DC pendant GE indisponible (aucun créneau GE identifié)"
+        return None, None, f"{PR_PDC_GE_INDISPONIBLE} : P_DC absent pendant les créneaux GE (aucun créneau GE identifié)"
     if p < D0:
-        return None, method, f"P_DC négative ({p} kW)"
+        return None, method, f"{PR_PDC_NEGATIF} : P_DC négative ({p} kW)"
     if not _efficiency_ok(eff):
         return None, method, f"{MC_RENDEMENT_INVALIDE} : rendement redresseur hors (0 ; 1] ({eff})"
     return p / eff, method, None
 
 
-def _power_code(reason: str | None) -> str:
-    return MC_RENDEMENT_INVALIDE if reason and MC_RENDEMENT_INVALIDE in reason else MC_PUISSANCE_INDISPONIBLE
+def _reason_code(reason: str | None, default: str) -> str:
+    for code in (MC_RENDEMENT_INVALIDE, PR_PDC_GE_INDISPONIBLE, PR_PDC_NEGATIF, PR_LOAD_AC_INDISPONIBLE,
+                 PR_LOAD_AC_INCOHERENT, PR_LOAD_AC_UNITE_SUSPECTE):
+        if reason and reason.startswith(code):
+            return code
+    return default
 
 
-def indoor_ac_reference(ctx: SiteContext, facts: dict, start: date, end: date) -> dict:
+def indoor_ac_reference(ctx: SiteContext, facts: dict, start: date, end: date,
+                        settings: "EngineSettings | None" = None) -> dict:
     """
-    Load AC historique indoor : médiane de MAX(0, P_AC instrumentée − P_DC
-    entrée redresseur) sur les jours du même site où le réseau est présent et
-    le GE absent (DSE ou compteur = 0 et aucune source > 0). AC_METER est
-    journalier : la médiane est journalière, pas par créneau horaire.
+    Load AC historique indoor = médiane de (P_AC instrumentée − P_DC entrée redresseur) sur les
+    jours du même site où le réseau est présent et le GE absent (60 j d'historique, ≥ 5 jours).
+    P_AC = ACT_ACTIVE_POWER_AVG ÷ diviseur (W → kW). Statuts :
+      LOAD_AC_QUALIFIE      médiane > 0 ;
+      LOAD_AC_MESURE_ZERO   médiane brute ≈ 0 (|écart| ≤ tolérance) : vrai zéro mesuré ;
+      LOAD_AC_INCOHERENT    P_AC < P_DC entrée sur la majorité des jours : périmètre du compteur ou unité
+                            → NULL (jamais 0 par écrêtage) ;
+      LOAD_AC_UNITE_SUSPECTE P_AC brute < 50 alors que P_DC entrée ≥ 0,3 kW : valeur probablement en kW → NULL ;
+      LOAD_AC_INDISPONIBLE  pas de jour réseau, jours instrumentés insuffisants → NULL.
     """
+    div = (settings.ac_w_to_kw_divisor if settings else Decimal("1000"))
+    base = {"p_ac_aux_kw": None, "statut": AC_INDISPONIBLE, "reference_dates": [], "jours_reference": 0,
+            "mesures": None, "mediane_ac_brut": None, "mediane_ac_kw": None, "mediane_p_dc_entree_kw": None,
+            "mediane_ecart_brut_kw": None, "jours_ecart_negatif": 0, "unite_brute": "W", "diviseur": div,
+            "candidats": [], "reason": None}
     if ctx.off_grid is not False:
-        return {"p_ac_aux_kw": None, "reference_dates": [], "reason": (
-            "site off-grid : aucun jour réseau présent pour isoler le load AC" if ctx.off_grid
-            else "statut réseau inconnu : jours de référence réseau non identifiables"
-        )}
-    samples = []
-    ref_dates = []
+        base["reason"] = (f"{AC_INDISPONIBLE} : site off-grid, aucun jour réseau présent pour isoler le load AC"
+                          if ctx.off_grid else f"{AC_INDISPONIBLE} : statut réseau inconnu, jours de référence non identifiables")
+        return base
+    rows = []
     for d in daterange(start - timedelta(days=AC_REFERENCE_LOOKBACK_DAYS), end):
         f = facts.get(d)
         if not f:
             continue
-        measured = [source_value(s, f, ctx)[0] for s in (RT_DSE, RT_COMPTEUR, RT_DAY_DG_ON)]
+        measured = [source_value(s_, f, ctx)[0] for s_ in (RT_DSE, RT_COMPTEUR, RT_DAY_DG_ON)]
         direct_zero = any(v is not None and v == D0 for v in measured[:2])
         any_running = any(v is not None and v > D0 for v in measured)
         if not direct_zero or any_running:
             continue
-        ac_w = _dec(f.get("ac_active_power_avg_w"))
+        ac_raw = _dec(f.get("ac_active_power_avg_w"))
         p_dc = _dec(f.get("p_dc_day_kw"))
         eff = _dec(f.get("eff_day"))
-        if ac_w is None or ac_w < D0 or p_dc is None or p_dc < D0 or not _efficiency_ok(eff):
+        if ac_raw is None or ac_raw < D0 or p_dc is None or p_dc < D0 or not _efficiency_ok(eff):
             continue
-        samples.append(max(D0, ac_w / Decimal("1000") - p_dc / eff))
-        ref_dates.append(d)
-    if len(samples) < AC_REFERENCE_MIN_DAYS:
-        return {"p_ac_aux_kw": None, "reference_dates": ref_dates, "reason": (
-            f"profil AC historique insuffisant ({len(samples)} jour(s) réseau sans GE instrumenté(s) "
-            f"< {AC_REFERENCE_MIN_DAYS})"
-        )}
-    return {"p_ac_aux_kw": Decimal(str(statistics.median(samples))), "reference_dates": ref_dates, "reason": None}
+        rows.append({"date": d, "ac_brut": ac_raw, "ac_kw": ac_raw / div, "p_dc_entree_kw": p_dc / eff,
+                     "points": f.get("ac_point_count")})
+    base["candidats"] = rows
+    base["reference_dates"] = [r["date"] for r in rows]
+    base["jours_reference"] = len(rows)
+    pts = [r["points"] for r in rows if r["points"] is not None]
+    base["mesures"] = sum(pts) if pts else None
+    if len(rows) < AC_REFERENCE_MIN_DAYS:
+        base["reason"] = (f"{AC_INDISPONIBLE} : {len(rows)} jour(s) réseau sans GE instrumenté(s) "
+                          f"< {AC_REFERENCE_MIN_DAYS} requis")
+        return base
+    med = lambda xs: Decimal(str(statistics.median(xs)))  # noqa: E731
+    ac_raw_med = med([r["ac_brut"] for r in rows])
+    ac_kw_med = med([r["ac_kw"] for r in rows])
+    pdc_med = med([r["p_dc_entree_kw"] for r in rows])
+    raw_gaps = [r["ac_kw"] - r["p_dc_entree_kw"] for r in rows]
+    gap_med = med(raw_gaps)
+    base.update(mediane_ac_brut=ac_raw_med, mediane_ac_kw=ac_kw_med, mediane_p_dc_entree_kw=pdc_med,
+                mediane_ecart_brut_kw=gap_med, jours_ecart_negatif=sum(1 for g in raw_gaps if g < D0))
+    if ac_raw_med < Decimal("50") and pdc_med >= Decimal("0.3"):
+        base["statut"] = AC_UNITE_SUSPECTE
+        base["reason"] = (f"{AC_UNITE_SUSPECTE} : ACT_ACTIVE_POWER_AVG médian = {_q(ac_raw_med)} (brut) pour "
+                          f"{_q(pdc_med)} kW d'entrée DC : la valeur semble déjà en kW (diviseur {div}) — load AC non qualifié")
+        return base
+    tolerance = max(Decimal("0.1"), pdc_med * Decimal("0.1"))
+    if gap_med < -tolerance:
+        base["statut"] = AC_INCOHERENT
+        base["reason"] = (f"{AC_INCOHERENT} : P_AC instrumentée ({_q(ac_kw_med)} kW médian) < entrée DC "
+                          f"({_q(pdc_med)} kW) sur {base['jours_ecart_negatif']}/{len(rows)} jours : "
+                          "le compteur AC ne couvre pas tout le site ou l'unité est erronée — pas de 0 par écrêtage")
+        return base
+    value = med([max(D0, g) for g in raw_gaps])
+    base["p_ac_aux_kw"] = value
+    base["statut"] = AC_QUALIFIE if value > D0 else AC_MESURE_ZERO
+    return base
 
 
-def ge_power(ctx: SiteContext, fact: dict | None, runtime_h: Decimal, runtime_source: str, ac_ref: dict | None) -> dict:
-    if fact is None:
-        return {"p_ge_kw": None, "source": None, "detail": None, "reason": "aucune donnée de puissance ce jour"}
-    if ctx.kind == "OUTDOOR":
-        prod = _dec(fact.get("dg_production_kwh"))
-        if runtime_source == RT_DSE and prod is not None and prod > D0 and runtime_h > D0:
-            return {"p_ge_kw": prod / runtime_h, "source": PW_PRODUCTION,
-                    "detail": f"DG_PRODUCTION_KWH {_q(prod)} kWh / runtime DSE {_q(runtime_h)} h", "reason": None}
-        p_in, method, reason = dc_input_during_ge(ctx, fact)
+def _attempt(applicable: bool = True) -> dict:
+    return {"tentee": False, "statut": "NON_APPLICABLE" if not applicable else "NON_TENTEE",
+            "valeur_kw": None, "code": None, "motif": None, "detail": None}
+
+
+def ge_power(ctx: SiteContext, fact: dict | None, runtime_h: Decimal, runtime_source: str, ac_ref: dict | None,
+             cap_kw: Decimal | None = None) -> dict:
+    """
+    Chaîne de repli de la puissance GE pour un jour (runtime > 0) :
+      1. DIRECT_DSE_PRODUCTION  DG_PRODUCTION_KWH ÷ runtime (énergie du jour ÷ heures de marche) ;
+      2. PDC_REDRESSEUR         outdoor : P_DC pendant GE ÷ rendement (sans batterie) ;
+      3. INDOOR_PDC_LOAD_AC     indoor : P_DC pendant GE ÷ rendement + load AC historique qualifié.
+    Chaque méthode est tentée, retenue ou rejetée avec un code ; une méthode au-delà du plafond
+    1,05 × kVA × 0,8 est rejetée et la suivante est tentée. NULL seulement si toutes échouent.
+    """
+    trace = {PM_DIRECT: _attempt(), PM_PDC: _attempt(ctx.kind == "OUTDOOR"), PM_INDOOR: _attempt(ctx.kind == "INDOOR")}
+    raw = {"production_kwh": None, "p_dse_kw": None, "p_dc_kw": None, "rendement": None, "ac_avg_brut": None}
+    fact = fact or {}
+    raw["production_kwh"] = _dec(fact.get("dg_production_kwh"))
+    raw["ac_avg_brut"] = _dec(fact.get("ac_active_power_avg_w"))
+
+    def capped(method: str, p: Decimal) -> bool:
+        if cap_kw is not None and p > cap_kw:
+            t = trace[method]
+            t.update(statut="REJETEE", code=MC_PUISSANCE_HORS_LIMITE, valeur_kw=p,
+                     motif=f"{MC_PUISSANCE_HORS_LIMITE} : {_q(p)} kW > 1,05 × kVA × 0,8 = {_q(cap_kw)} kW")
+            return True
+        return False
+
+    selected = None
+    # 1. Production GE / runtime (toute configuration).
+    t = trace[PM_DIRECT]
+    t["tentee"] = True
+    prod = raw["production_kwh"]
+    if prod is None:
+        t.update(statut="ABSENTE", code=PR_P_DSE_INDISPONIBLE, motif=f"{PR_P_DSE_INDISPONIBLE} : DG_PRODUCTION_KWH absente ce jour")
+    elif prod <= D0:
+        t.update(statut="REJETEE", code=PR_P_DSE_INCOHERENTE,
+                 motif=f"{PR_P_DSE_INCOHERENTE} : production {prod} kWh alors que runtime {_q(runtime_h)} h > 0")
+    else:
+        p = prod / runtime_h
+        raw["p_dse_kw"] = p
+        if not capped(PM_DIRECT, p):
+            t.update(statut="RETENUE", valeur_kw=p,
+                     detail=f"DG_PRODUCTION_KWH {_q(prod)} kWh ÷ runtime {RUNTIME_LABEL_SHORT.get(runtime_source, runtime_source)} {_q(runtime_h)} h")
+            selected = (PM_DIRECT, PW_PRODUCTION, p, t["detail"], {})
+
+    # 2 / 3. Méthodes redresseur (configuration connue uniquement).
+    if selected is None and ctx.kind in ("OUTDOOR", "INDOOR"):
+        method = PM_PDC if ctx.kind == "OUTDOOR" else PM_INDOOR
+        t = trace[method]
+        t["tentee"] = True
+        p_in, how, reason = dc_input_during_ge(ctx, fact) if fact else (None, None, f"{PR_PDC_GE_INDISPONIBLE} : aucune donnée ce jour")
+        if fact:
+            if how and "compteur" in how:
+                raw["p_dc_kw"], raw["rendement"] = _dec(fact.get("p_dc_ge_tracker_kw")), _dec(fact.get("eff_ge_tracker"))
+            elif how:
+                raw["p_dc_kw"], raw["rendement"] = _dec(fact.get("p_dc_rect_active_kw")), _dec(fact.get("eff_rect_active"))
         if p_in is None:
-            return {"p_ge_kw": None, "source": None, "detail": None, "reason": f"outdoor : {reason}"}
-        return {"p_ge_kw": p_in, "source": PW_DC_REDRESSEUR,
-                "detail": f"P_DC / rendement sur {method} (charge batterie non ajoutée)", "reason": None}
-    if ctx.kind == "INDOOR":
-        p_in, method, reason = dc_input_during_ge(ctx, fact)
-        if p_in is None:
-            return {"p_ge_kw": None, "source": None, "detail": None, "reason": f"indoor : {reason}"}
-        if ac_ref is None or ac_ref["p_ac_aux_kw"] is None:
-            return {"p_ge_kw": None, "source": None, "detail": None,
-                    "reason": f"indoor : {ac_ref['reason'] if ac_ref else 'profil AC non calculé'}"}
-        return {"p_ge_kw": p_in + ac_ref["p_ac_aux_kw"], "source": PW_INDOOR,
-                "detail": (f"P_DC pendant GE {_q(p_in)} kW ({method}) + load AC historique "
-                           f"{_q(ac_ref['p_ac_aux_kw'])} kW (médiane de {len(ac_ref['reference_dates'])} jours)"),
-                "p_dc_input_kw": p_in, "p_ac_aux_kw": ac_ref["p_ac_aux_kw"], "reason": None}
-    return {"p_ge_kw": None, "source": None, "detail": None, "reason": "type de site indoor/outdoor inconnu"}
+            t.update(statut="ABSENTE" if _reason_code(reason, PR_PDC_GE_INDISPONIBLE) == PR_PDC_GE_INDISPONIBLE else "REJETEE",
+                     code=_reason_code(reason, PR_PDC_GE_INDISPONIBLE), motif=reason)
+        elif method == PM_PDC:
+            if not capped(method, p_in):
+                t.update(statut="RETENUE", valeur_kw=p_in,
+                         detail=f"P_DC ÷ rendement sur {how} ; {BATTERIE_NON_INTEGREE}")
+                selected = (method, PW_DC_REDRESSEUR, p_in, t["detail"], {"p_dc_input_kw": p_in})
+        else:
+            if ac_ref is None or ac_ref["p_ac_aux_kw"] is None:
+                reason = (ac_ref or {}).get("reason") or f"{AC_INDISPONIBLE} : profil AC non calculé"
+                t.update(statut="REJETEE", code=_reason_code(reason, PR_LOAD_AC_INDISPONIBLE), motif=reason)
+            else:
+                p = p_in + ac_ref["p_ac_aux_kw"]
+                if not capped(method, p):
+                    detail = (f"P_DC pendant GE {_q(p_in)} kW ({how}) + load AC historique {_q(ac_ref['p_ac_aux_kw'])} kW "
+                              f"[{ac_ref['statut']}, médiane de {ac_ref['jours_reference']} jours] ; {BATTERIE_NON_INTEGREE}")
+                    t.update(statut="RETENUE", valeur_kw=p, detail=detail)
+                    selected = (method, PW_INDOOR, p, detail, {"p_dc_input_kw": p_in, "p_ac_aux_kw": ac_ref["p_ac_aux_kw"]})
+    elif selected is None:
+        for m in (PM_PDC, PM_INDOOR):
+            trace[m].update(code=PR_CONFIGURATION_INCONNUE,
+                            motif=f"{PR_CONFIGURATION_INCONNUE} : configuration Indoor/Outdoor inconnue, méthode redresseur non applicable")
+
+    rejections = [t["motif"] for t in trace.values() if t["motif"] and t["statut"] != "RETENUE"]
+    codes = [t["code"] for t in trace.values() if t["code"]]
+    if selected:
+        method, source, p, detail, extra = selected
+        return {"p_ge_kw": p, "source": source, "method": method, "detail": detail, "reason": None, "code": None,
+                "trace": trace, "raw": raw, "rejection_codes": codes, "rejections": rejections, **extra}
+    if MC_PUISSANCE_HORS_LIMITE in codes:
+        code = MC_PUISSANCE_HORS_LIMITE
+    elif MC_RENDEMENT_INVALIDE in codes:
+        code = MC_RENDEMENT_INVALIDE
+    elif ctx.kind not in ("OUTDOOR", "INDOOR"):
+        code = PR_CONFIGURATION_INCONNUE
+    else:
+        code = MC_PUISSANCE_INDISPONIBLE
+    return {"p_ge_kw": None, "source": None, "method": None, "detail": None, "code": code,
+            "reason": f"{code} : " + " ; ".join(rejections) + " ; aucune méthode de puissance applicable",
+            "trace": trace, "raw": raw, "rejection_codes": codes, "rejections": rejections}
 
 
 # ─── CPH (instruction §6) ────────────────────────────────────────────────────
@@ -439,6 +592,7 @@ def compute_day(ctx: SiteContext, d: date, fact: dict | None, sources_eval: dict
         "curve_id": ctx.curve.curve_id if ctx.curve else None,
         "charge": None, "cph_l_h": None, "conso_l": None, "extrapolated": False,
         "status": None, "motif_code": None, "motifs": [],
+        "power_method": None, "power_trace": None, "power_raw": None, "power_rejection_codes": [], "power_cap_kw": None,
         # Conso MESURÉE du jour (VW_FUEL_REPORT) — indicateur distinct, jamais mélangé à l'estimation.
         "measured_l": (fact or {}).get("measured_conso_l"),
     }
@@ -456,13 +610,17 @@ def compute_day(ctx: SiteContext, d: date, fact: dict | None, sources_eval: dict
         row["conso_l"] = D0
         return row
 
-    pw = ge_power(ctx, fact, runtime_h, runtime_source, ac_ref)
+    cap = (POWER_CAP_RATIO * ctx.curve.prp_kva * power_factor
+           if ctx.curve is not None and ctx.curve.prp_kva is not None and ctx.curve.prp_kva > D0 else None)
+    pw = ge_power(ctx, fact, runtime_h, runtime_source, ac_ref, cap)
     row.update(p_ge_kw=pw["p_ge_kw"], power_source=pw["source"], power_detail=pw["detail"],
-               p_dc_input_kw=pw.get("p_dc_input_kw"), p_ac_aux_kw=pw.get("p_ac_aux_kw"))
+               p_dc_input_kw=pw.get("p_dc_input_kw"), p_ac_aux_kw=pw.get("p_ac_aux_kw"),
+               power_method=pw["method"], power_trace=pw["trace"], power_raw=pw["raw"],
+               power_rejection_codes=pw["rejection_codes"], power_cap_kw=cap)
     missing = []
     if pw["p_ge_kw"] is None:
-        code = _power_code(pw["reason"])
-        missing.append((DAY_PUISSANCE_ABSENTE, code, pw["reason"] if code in (pw["reason"] or "") else f"{code} : {pw['reason']}"))
+        status = DAY_PUISSANCE_HORS_PLAFOND if pw["code"] == MC_PUISSANCE_HORS_LIMITE else DAY_PUISSANCE_ABSENTE
+        missing.append((status, pw["code"], pw["reason"]))
     if ctx.curve is None:
         code = ctx.curve_code or MC_MAPPING_A_VALIDER
         missing.append((DAY_COURBE_ABSENTE, code, f"{code} : {ctx.curve_reason or 'aucune courbe CPH applicable'}"))
@@ -635,14 +793,31 @@ def reconcile(obs: Observation, day_rows: dict, settings: EngineSettings) -> dic
             "motifs": [] if ecart_pct is not None else ["conso théorique = 0 L : écart % non calculable"]}
 
 
+def rapprochement_calc_status(rec: dict | None) -> str:
+    """Statut du calcul de rapprochement, séparé du statut CPH."""
+    if rec is None or rec.get("stock_initial_l") is None or rec.get("stock_final_l") is None:
+        return SR_STOCK_ABSENT
+    if rec["statut"] in (R_OK, R_A_JUSTIFIER, R_A_INVESTIGUER):
+        return SR_CALCULE
+    if rec["statut"] == R_CPH_NON_CALCULE:
+        return SR_CPH_INCOMPLET
+    return SR_MOUVEMENTS_ABSENTS
+
+
 # ─── Période complète pour un site ───────────────────────────────────────────
 
 def compute_site_period(ctx: SiteContext, facts: dict, start: date, end: date,
                         observations: list[Observation], settings: EngineSettings) -> dict:
     days = list(daterange(start, end))
     sources_eval = evaluate_runtime_sources(ctx, facts, days)
-    ac_ref = indoor_ac_reference(ctx, facts, start, end) if ctx.kind == "INDOOR" else None
+    ac_ref = indoor_ac_reference(ctx, facts, start, end, settings) if ctx.kind == "INDOOR" else None
     day_rows = {d: compute_day(ctx, d, facts.get(d), sources_eval, ac_ref, settings.nominal_power_factor) for d in days}
+    if settings.data_until is not None:
+        for d, r in day_rows.items():
+            if d > settings.data_until and d not in facts and r["status"] == DAY_RUNTIME_ABSENT:
+                r["motif_code"] = MC_PERIODE_INCOMPLETE
+                r["motifs"] = [f"{MC_PERIODE_INCOMPLETE} : jour postérieur à la dernière donnée Snowflake "
+                               f"({settings.data_until.isoformat()}), runtime non encore disponible"]
 
     n = len(days)
     rt_days = [r for r in day_rows.values() if r["runtime_h"] is not None]
@@ -654,6 +829,30 @@ def compute_site_period(ctx: SiteContext, facts: dict, start: date, end: date,
     power_by_src: dict[str, int] = {}
     for r in cph_days:
         power_by_src[r["power_source"]] = power_by_src.get(r["power_source"], 0) + 1
+    # Méthode de puissance retenue sur tous les jours de marche où une puissance est qualifiée.
+    power_by_method: dict[str, int] = {}
+    running_days = [r for r in day_rows.values() if r["runtime_h"] is not None and r["runtime_h"] > D0]
+    for r in running_days:
+        if r["power_method"]:
+            power_by_method[r["power_method"]] = power_by_method.get(r["power_method"], 0) + 1
+    # Jours non calculés : codes de blocage (chaque méthode échouée compte) et runtime concerné.
+    blocked: dict[str, dict] = {}
+    for r in day_rows.values():
+        if r["conso_l"] is not None:
+            continue
+        codes = set(r["power_rejection_codes"] or []) if r["status"] in (DAY_PUISSANCE_ABSENTE, DAY_PUISSANCE_HORS_PLAFOND) else set()
+        if r["motif_code"]:
+            codes.add(r["motif_code"])
+        if ctx.curve is None and r["runtime_h"] is not None and r["runtime_h"] > D0:
+            # Courbe absente : motif de site, compté même si la puissance manque aussi ce jour-là.
+            codes.add(ctx.curve_code or MC_MAPPING_A_VALIDER)
+        for c in codes:
+            b = blocked.setdefault(c, {"jours": 0, "runtime_h": D0, "mesuree_l": None})
+            b["jours"] += 1
+            if r["runtime_h"] is not None:
+                b["runtime_h"] += r["runtime_h"]
+            if r["measured_l"] is not None:
+                b["mesuree_l"] = (b["mesuree_l"] or D0) + r["measured_l"]
     status_counts: dict[str, int] = {}
     for r in day_rows.values():
         status_counts[r["status"]] = status_counts.get(r["status"], 0) + 1
@@ -689,11 +888,21 @@ def compute_site_period(ctx: SiteContext, facts: dict, start: date, end: date,
     else:
         rapprochement_statut, rapprochement_ref = R_DONNEES_INCOMPLETES, None
 
+    statut_cph = (SC_CPH_CALCULE if cph_status == CPH_COMPLET
+                  else SC_CPH_PARTIEL if cph_status == CPH_PARTIEL and cph_days else SC_CPH_NON_CALCULE)
+    statut_rappro = rapprochement_calc_status(rapprochement_ref)
     return {
+        "statut_cph": statut_cph,
+        "statut_rapprochement_calcul": statut_rappro,
+        "power_method_days": power_by_method,
+        "running_days": len(running_days),
+        "blocked_days": blocked,
         "site_id": ctx.site_id, "site_name": ctx.site_name, "country": ctx.country, "zone": ctx.zone,
         "data_id": ctx.data_id, "kind": ctx.kind, "kind_source": ctx.kind_source,
         "grid_supply": ctx.grid_supply, "off_grid": ctx.off_grid, "dg_count": ctx.dg_count,
         "ge_label": ctx.ge_label, "data_issue": ctx.data_issue,
+        "facture_avec_ge": ctx.facture_avec_ge, "site_type": ctx.site_type,
+        "configuration_fichier": ctx.configuration_fichier,
         "curve": ctx.curve, "curve_reason": ctx.curve_reason,
         "start": start, "end": end, "days": n,
         "runtime_days": len(rt_days),
@@ -714,7 +923,8 @@ def compute_site_period(ctx: SiteContext, facts: dict, start: date, end: date,
         "correspondance": ctx.match,
         "conso_days": len(conso_days),
         "conso_theorique_l": conso_sum if cph_status == CPH_COMPLET else None,
-        "conso_partielle_l": conso_sum if cph_status == CPH_PARTIEL else None,
+        # Une somme de seuls jours GE à l'arrêt (0 L) n'est pas une conso estimée partielle : NULL.
+        "conso_partielle_l": conso_sum if cph_status == CPH_PARTIEL and cph_days else None,
         "cph_status": cph_status,
         "motif_cph": site_cph_motif(ctx, [day_rows[d] for d in days], cph_status),
         "ge_kva": ctx.ge_kva,

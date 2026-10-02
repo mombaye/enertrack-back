@@ -199,7 +199,173 @@ def _site_summary(r: dict) -> dict:
         "rapprochement_statut": r["rapprochement_statut"],
         "rapprochement": _reconciliation_dict(r["rapprochement"]),
         "observations": len(r["reconciliations"]),
+        # Statuts séparés : un CPH calculé sans relevé de stock reste « CPH_CALCULE ».
+        "statut_cph": r["statut_cph"],
+        "statut_rapprochement_calcul": r["statut_rapprochement_calcul"],
+        "facture_avec_ge": r["facture_avec_ge"],
+        "site_type": r["site_type"],
+        "configuration": r["kind"],
+        "configuration_fichier": r["configuration_fichier"],
+        "running_days": r["running_days"],
+        "power_method_main": _power_method_main(r),
+        "power_method_days": r["power_method_days"],
+        "blocked_days": {c: {"jours": b["jours"], "runtime_h": _f(b["runtime_h"]), "mesuree_l": _f(b["mesuree_l"])}
+                         for c, b in r["blocked_days"].items()},
+        "diag_codes": sorted(_diag_codes(r)),
+        "ac_statut": (r["ac_reference"] or {}).get("statut"),
+        "p_ac_aux_kw": _f((r["ac_reference"] or {}).get("p_ac_aux_kw")),
     }
+
+
+def _power_method_main(r: dict) -> str | None:
+    days = r["power_method_days"]
+    return max(days.items(), key=lambda kv: kv[1])[0] if days else None
+
+
+def _ac_reference_dict(ac: dict | None) -> dict | None:
+    """Diagnostic complet du load AC historique indoor (valeurs brutes lues, unités, médianes)."""
+    if ac is None:
+        return None
+    return {
+        "statut": ac["statut"], "p_ac_aux_kw": _f(ac["p_ac_aux_kw"]), "reason": ac["reason"],
+        "jours_reference": ac["jours_reference"], "mesures": ac["mesures"],
+        "reference_dates": ac["reference_dates"],
+        "mediane_ac_brut": _f(ac["mediane_ac_brut"], 1), "mediane_ac_kw": _f(ac["mediane_ac_kw"]),
+        "mediane_p_dc_entree_kw": _f(ac["mediane_p_dc_entree_kw"]),
+        "mediane_ecart_brut_kw": _f(ac["mediane_ecart_brut_kw"]),
+        "jours_ecart_negatif": ac["jours_ecart_negatif"],
+        "unite_brute": ac["unite_brute"], "unite_convertie": "kW", "diviseur": _f(ac["diviseur"], 0),
+        "candidats": [{"date": c["date"], "ac_brut": _f(c["ac_brut"], 1), "ac_kw": _f(c["ac_kw"]),
+                       "p_dc_entree_kw": _f(c["p_dc_entree_kw"]), "points": c["points"]} for c in ac["candidats"]],
+    }
+
+
+def _trace_dict(trace: dict | None) -> dict | None:
+    if trace is None:
+        return None
+    return {m: {**t, "valeur_kw": _f(t["valeur_kw"])} for m, t in trace.items()}
+
+
+def _flat_trace(d: dict) -> dict:
+    """Trace à plat demandée pour l'audit (une ligne par site × jour)."""
+    t = d["power_trace"] or {}
+    get = lambda m, k: (t.get(m) or {}).get(k)  # noqa: E731
+    return {
+        "direct_dse_attempted": bool(get(E.PM_DIRECT, "tentee")), "direct_dse_status": get(E.PM_DIRECT, "statut"),
+        "pdc_rectifier_attempted": bool(get(E.PM_PDC, "tentee")), "pdc_rectifier_status": get(E.PM_PDC, "statut"),
+        "indoor_ac_attempted": bool(get(E.PM_INDOOR, "tentee")), "indoor_ac_status": get(E.PM_INDOOR, "statut"),
+        "selected_power_method": d["power_method"], "selected_power_kw": _f(d["p_ge_kw"]),
+        "rejection_reasons": [x["motif"] for x in t.values() if x.get("motif") and x.get("statut") != "RETENUE"],
+    }
+
+
+# Synthèse des blocages (diagnostic) : codes jour (chaque méthode échouée compte) + codes site.
+DIAG_LABELS = {
+    E.MC_PERIODE_INCOMPLETE: "Période incomplète (jours après la dernière donnée Snowflake)",
+    E.MC_RUNTIME_INDISPONIBLE: "Runtime indisponible",
+    E.MC_RUNTIME_NON_QUALIFIE: "Runtime non qualifié",
+    E.MC_PUISSANCE_INDISPONIBLE: "Puissance GE indisponible (toutes méthodes échouées)",
+    E.PR_P_DSE_INDISPONIBLE: "Puissance DSE / production GE indisponible",
+    E.PR_P_DSE_INCOHERENTE: "Production GE incohérente avec le runtime",
+    E.PR_PDC_GE_INDISPONIBLE: "P_DC pendant GE indisponible",
+    E.PR_PDC_NEGATIF: "P_DC négative",
+    E.MC_RENDEMENT_INVALIDE: "Rendement redresseur invalide",
+    E.PR_LOAD_AC_INDISPONIBLE: "Load AC historique indisponible",
+    E.PR_LOAD_AC_INCOHERENT: "Load AC incohérent (P_AC < P_DC entrée)",
+    E.PR_LOAD_AC_UNITE_SUSPECTE: "Unité Active Power Avg suspecte",
+    E.AC_MESURE_ZERO: "Load AC réellement égal à zéro (mesuré)",
+    E.PR_CONFIGURATION_INCONNUE: "Configuration Indoor/Outdoor inconnue",
+    E.MC_PUISSANCE_HORS_LIMITE: "Puissance au-delà de 1,05 × kVA × 0,8",
+    E.MC_PUISSANCE_NOMINALE_ABSENTE: "kVA nominal de la courbe absent",
+    E.MC_COURBE_CPH_MANQUANTE: "Courbe CPH manquante",
+    E.MC_MAPPING_A_VALIDER: "Mapping à valider",
+    E.MC_MODELE_AMBIGU: "Modèle ambigu",
+    E.MC_TYPE_GE_ABSENT: "Type GE absent",
+    E.MC_SITE_MULTI_GE: "Site multi-GE",
+    E.SR_STOCK_ABSENT: "Stock absent",
+    E.SR_MOUVEMENTS_ABSENTS: "Mouvements stock absents ou non validés (dont livraisons ENOC à contrôler)",
+}
+# Codes portés par le site (pas par des jours non calculés) : informatif ou rapprochement.
+_SITE_DIAG = {E.AC_MESURE_ZERO, E.SR_STOCK_ABSENT, E.SR_MOUVEMENTS_ABSENTS}
+
+
+def _diag_codes(r: dict) -> set[str]:
+    codes = set(r["blocked_days"])
+    if (r["ac_reference"] or {}).get("statut") == E.AC_MESURE_ZERO:
+        codes.add(E.AC_MESURE_ZERO)
+    if r["statut_rapprochement_calcul"] in (E.SR_STOCK_ABSENT, E.SR_MOUVEMENTS_ABSENTS):
+        codes.add(r["statut_rapprochement_calcul"])
+    return codes
+
+
+def _diagnostic_blocages(rows: list[dict]) -> list[dict]:
+    """
+    Par motif : sites, runtime concerné, conso mesurée disponible et volume potentiel non calculé.
+    Volume potentiel = runtime des jours bloqués × CPH moyen du site sur ses jours calculés :
+    indicatif, seulement si le site a un CPH ailleurs sur la période (jamais une valeur de calcul).
+    """
+    out = []
+    for code, label in DIAG_LABELS.items():
+        sites = [r for r in rows if code in _diag_codes(r)]
+        runtime, mesuree, potentiel, sites_potentiel = E.D0, None, None, 0
+        for r in sites:
+            if code in _SITE_DIAG:
+                rt = r["runtime_total_h"] or E.D0
+                ms = r["comparaison"]["conso_mesuree_l"]
+            else:
+                b = r["blocked_days"][code]
+                rt, ms = b["runtime_h"], b["mesuree_l"]
+                if r["cph_moy_l_h"] is not None and rt > E.D0:
+                    potentiel = (potentiel or E.D0) + rt * r["cph_moy_l_h"]
+                    sites_potentiel += 1
+            runtime += rt
+            if ms is not None:
+                mesuree = (mesuree or E.D0) + ms
+        out.append({
+            "code": code, "label": label, "type": "site" if code in _SITE_DIAG else "jour",
+            "bloquant": code != E.AC_MESURE_ZERO,
+            "sites": len(sites), "jours": sum(r["blocked_days"].get(code, {}).get("jours", 0) for r in sites),
+            "runtime_h": _f(runtime, 1), "conso_mesuree_l": _f(mesuree, 1),
+            "volume_potentiel_l": _f(potentiel, 1), "sites_volume_potentiel": sites_potentiel,
+            "filtre": {"diag": code},
+        })
+    return out
+
+
+def _pct(num: int, den: int):
+    return round(100 * num / den, 1) if den else None
+
+
+def _couvertures(rows: list[dict]) -> list[dict]:
+    """Six couvertures distinctes (jamais un KPI « couverture » ambigu)."""
+    with_cph = [r for r in rows if r["statut_cph"] in (E.SC_CPH_CALCULE, E.SC_CPH_PARTIEL)]
+    rt_ok = [r for r in rows if r["runtime_days"] > 0]
+    running = [r for r in rt_ok if r["running_days"] > 0]
+    typed = [r for r in rows if r["ge_label"]]
+    items = [
+        ("conso_mesuree", "Couverture consommation mesurée",
+         sum(1 for r in rows if r["comparaison"]["conso_mesuree_l"] is not None), len(rows),
+         "Sites avec une conso mesurée capteur (VW_FUEL_REPORT, QUALITY_STATUS = OK, ≥ 2 points) sur la période "
+         "÷ sites GE du périmètre. Ne dit rien du CPH."),
+        ("runtime", "Couverture runtime qualifié", len(rt_ok), len(rows),
+         "Sites avec au moins un jour de runtime qualifié (source disponible ≥ 50 %) ÷ sites GE."),
+        ("mapping", "Couverture mapping GE → courbe",
+         sum(1 for r in typed if r["curve"] is not None), len(typed),
+         "Sites dont la plaque GE a une courbe utilisable (auto-validée ou validée) ÷ sites GE avec un type de GE connu."),
+        ("puissance", "Couverture puissance GE qualifiée",
+         sum(1 for r in running if r["power_method_days"]), len(running),
+         "Sites avec au moins un jour de puissance GE qualifiée (production, P_DC/η ou P_DC + load AC) "
+         "÷ sites avec runtime qualifié et GE en marche."),
+        ("cph", "Couverture CPH calculé", len(with_cph), len(rows),
+         "Sites avec une conso estimée CPH complète ou partielle ÷ sites GE "
+         f"(complet : {sum(1 for r in with_cph if r['statut_cph'] == E.SC_CPH_CALCULE)}, "
+         f"partiel : {sum(1 for r in with_cph if r['statut_cph'] == E.SC_CPH_PARTIEL)})."),
+        ("rapprochement", "Couverture rapprochement stock",
+         sum(1 for r in with_cph if r["statut_rapprochement_calcul"] == E.SR_CALCULE), len(with_cph),
+         "Sites avec stock et mouvements complets et validés (écart calculé) ÷ sites avec CPH calculé."),
+    ]
+    return [{"code": c, "label": lbl, "numerateur": n, "denominateur": d, "pct": _pct(n, d), "definition": df}
+            for c, lbl, n, d, df in items]
 
 
 def _sfc_dict(c: dict) -> dict:
@@ -222,6 +388,11 @@ def _day_dict(d: dict) -> dict:
         "cph_l_h": _f(d["cph_l_h"]), "conso_l": _f(d["conso_l"]), "measured_l": _f(d["measured_l"]),
         "extrapolated": d["extrapolated"],
         "status": d["status"], "motif_code": d["motif_code"], "motifs": d["motifs"],
+        "power_method": d["power_method"], "power_trace": _trace_dict(d["power_trace"]),
+        "power_cap_kw": _f(d["power_cap_kw"]),
+        "power_raw": {k: _f(v) for k, v in (d["power_raw"] or {}).items()} or None,
+        "power_rejection_codes": d["power_rejection_codes"],
+        **_flat_trace(d),
     }
 
 
@@ -258,6 +429,16 @@ def _apply_table_filters(rows: list[dict], params) -> list[dict]:
         rows = [r for r in rows if (r["motif_cph"] or {}).get("code") == mc]
     if (params.get("alerte_sfc") or "").strip() in ("1", "true"):
         rows = [r for r in rows if r["conso_specifique"]["alerte_estimee"] or r["conso_specifique"]["alerte_mesuree"]]
+    for key, getter in (("statut_cph", lambda r: r["statut_cph"]),
+                        ("statut_rapprochement_calcul", lambda r: r["statut_rapprochement_calcul"]),
+                        ("power_method", lambda r: _power_method_main(r) or "AUCUNE"),
+                        ("configuration", lambda r: r["kind"] or "INCONNUE")):
+        v = (params.get(key) or "").strip()
+        if v:
+            rows = [r for r in rows if getter(r) == v]
+    dg = (params.get("diag") or "").strip()
+    if dg:
+        rows = [r for r in rows if dg in _diag_codes(r)]
     dr = (params.get("dispo_runtime") or "").strip()
     if dr in _DISPO_FILTERS:
         rows = [r for r in rows if _DISPO_FILTERS[dr](r["runtime_source_availability"])]
@@ -287,6 +468,12 @@ def _synthesis(rows: list[dict]) -> dict:
         "donnees_incompletes": count(lambda r: r["rapprochement_statut"] == E.R_DONNEES_INCOMPLETES),
         "rapprochement_cph_non_calcule": count(lambda r: r["rapprochement_statut"] == E.R_CPH_NON_CALCULE),
         "blocages": _blocages_summary(rows),
+        "couvertures": _couvertures(rows),
+        "diagnostic_blocages": _diagnostic_blocages(rows),
+        "statuts_cph": _count_by(rows, lambda r: r["statut_cph"]),
+        "statuts_rapprochement_calcul": _count_by(rows, lambda r: r["statut_rapprochement_calcul"]),
+        "methodes_puissance": _count_by(rows, _power_method_main),
+        "load_ac_statuts": _count_by(rows, lambda r: (r["ac_reference"] or {}).get("statut")),
         "conso": _conso_summary(rows),
         "correspondances": _count_by(rows, lambda r: (r["correspondance"] or {}).get("statut")),
         "courbes_appliquees": _count_by(rows, lambda r: M.curve_source_status(r["curve"].status) if r["curve"] else None),
@@ -377,6 +564,14 @@ def _compute(request, with_daily: bool = True):
     return start, end, rows
 
 
+def _periode_info(start: date, end: date) -> dict:
+    """PÉRIODE INCOMPLÈTE : la période demandée dépasse les faits Snowflake disponibles."""
+    last = freshness()["facts_last_date"]
+    missing = (end - last).days if last and end > last else ((end - start).days + 1 if last is None else 0)
+    return {"incomplete": missing > 0, "donnees_jusqu_au": last,
+            "jours_sans_donnees": min(missing, (end - start).days + 1)}
+
+
 class CphPeriodView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -401,7 +596,9 @@ class CphPeriodView(APIView):
             "data": [_site_summary(r) for r in page_rows],
             "pagination": {"page": page, "limit": limit, "total": total, "totalPages": total_pages,
                            "hasNext": page < total_pages, "hasPrev": page > 1},
+            "periode": _periode_info(start, end),
             "filters": {
+                "power_methods": sorted({_power_method_main(r) or "AUCUNE" for r in rows}),
                 "runtime_sources": sorted({r["runtime_source_main"] or "AUCUNE" for r in rows}),
                 "power_sources": sorted({r["power_source_main"] or "AUCUNE" for r in rows}),
                 "zones": sorted({r["zone"] for r in rows if r["zone"]}),
@@ -433,11 +630,9 @@ class CphSiteDetailView(APIView):
         r = rows[0]
         return Response({
             **_site_summary(r),
-            "ac_reference": None if r["ac_reference"] is None else {
-                "p_ac_aux_kw": _f(r["ac_reference"]["p_ac_aux_kw"]),
-                "reference_dates": r["ac_reference"]["reference_dates"],
-                "reason": r["ac_reference"]["reason"],
-            },
+            "ac_reference": _ac_reference_dict(r["ac_reference"]),
+            "batterie": E.BATTERIE_NON_INTEGREE,
+            "periode": _periode_info(start, end),
             "reconciliations": [_reconciliation_dict(x) for x in r["reconciliations"]],
             "daily": [_day_dict(d) for d in r["daily"]],
         })
@@ -458,6 +653,18 @@ EXPORT_HEADER = [
     "energie_ge_periode_kwh", "conso_specifique_estimee_l_kwh", "conso_specifique_mesuree_l_kwh", "alertes_conso_specifique",
     "stock_initial_l", "livraisons_l", "rajouts_l", "retraits_l", "vols_l", "vidanges_l", "stock_final_l",
     "statut_livraisons", "conso_stock_l", "ecart_l", "ecart_pct", "statut", "motifs_rapprochement",
+    # Chaîne puissance complète (méthodes tentées, valeurs brutes) et statuts séparés.
+    "facture_avec_ge", "type_site_on_off", "configuration", "configuration_fichier",
+    "statut_cph", "statut_rapprochement_calcul", "jours_calcules", "jours_periode", "jours_ge_en_marche",
+    "methode_puissance_retenue", "puissance_retenue_kw",
+    "m1_direct_dse_tentee", "m1_direct_dse_statut", "m1_direct_dse_kw", "m1_direct_dse_motif",
+    "m2_pdc_redresseur_tentee", "m2_pdc_redresseur_statut", "m2_pdc_redresseur_kw", "m2_pdc_redresseur_motif",
+    "m3_indoor_load_ac_tentee", "m3_indoor_load_ac_statut", "m3_indoor_load_ac_kw", "m3_indoor_load_ac_motif",
+    "production_ge_kwh", "p_dse_kw", "p_dc_brut_kw", "rendement_brut", "active_power_avg_brut_w",
+    "plafond_puissance_kw", "codes_rejet_puissance",
+    "load_ac_statut", "load_ac_jours_reference", "load_ac_mesures", "load_ac_mediane_brut_w",
+    "load_ac_mediane_kw", "load_ac_mediane_p_dc_entree_kw", "load_ac_diviseur", "load_ac_motif",
+    "batterie",
     "formule", "version_regle",
 ]
 FORMULA = ("charge = P_GE / (kVA × 0,8) ; CPH = a·charge² + b·charge + c ; conso estimée = runtime × CPH ; "
@@ -504,8 +711,31 @@ def _csv_rows(rows: list[dict], only_anomalies: bool):
                 rec.get("livraisons_statut", ""), _f(rec.get("conso_stock_l")), _f(rec.get("ecart_l")),
                 _f(rec.get("ecart_pct"), 2), r["rapprochement_statut"],
                 " ; ".join(rec.get("motifs", [])) or ("aucune observation de stock sur la période" if not rec else ""),
+                *_power_columns(r, d, ac),
                 FORMULA, E.RULE_VERSION,
             ]
+
+
+def _power_columns(r: dict, d: dict, ac: dict) -> list:
+    t, raw = d["power_trace"] or {}, d["power_raw"] or {}
+    cols = [
+        {True: "oui", False: "non"}.get(r["facture_avec_ge"], ""), r["site_type"], r["kind"] or "INCONNUE",
+        r["configuration_fichier"], r["statut_cph"], r["statut_rapprochement_calcul"],
+        r["conso_days"], r["days"], r["running_days"],
+        d["power_method"], _f(d["p_ge_kw"]),
+    ]
+    for m in E.POWER_METHODS:
+        x = t.get(m) or {}
+        cols += ["oui" if x.get("tentee") else "non", x.get("statut") or "", _f(x.get("valeur_kw")), x.get("motif") or ""]
+    cols += [
+        _f(raw.get("production_kwh")), _f(raw.get("p_dse_kw")), _f(raw.get("p_dc_kw")), _f(raw.get("rendement"), 4),
+        _f(raw.get("ac_avg_brut"), 1), _f(d["power_cap_kw"]), " | ".join(d["power_rejection_codes"] or []),
+        ac.get("statut") or "", ac.get("jours_reference") if ac else "", ac.get("mesures") if ac else "",
+        _f(ac.get("mediane_ac_brut"), 1), _f(ac.get("mediane_ac_kw")), _f(ac.get("mediane_p_dc_entree_kw")),
+        _f(ac.get("diviseur"), 0), ac.get("reason") or "",
+        E.BATTERIE_NON_INTEGREE if d["power_method"] in (E.PM_PDC, E.PM_INDOOR) else "",
+    ]
+    return cols
 
 
 class _CphExportView(APIView):
