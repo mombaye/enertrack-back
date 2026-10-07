@@ -103,6 +103,7 @@ BLOCAGE_LABELS = {
     "OBSERVATION_ABSENTE": ("rapprochement", "Aucun relevé de stock sur la période"),
     "OBSERVATION_INCOMPLETE": ("rapprochement", "Relevé de stock incomplet ou non validé"),
     "LIVRAISONS_ENOC": ("rapprochement", "Livraisons ENOC à contrôler"),
+    "HORS_PERIMETRE_GE": ("cph", "Site sans GE confirmé par Snowflake : hors calcul carburant"),
 }
 
 # Statut de correspondance (services/cph_matching.py) → point bloquant affiché.
@@ -123,7 +124,13 @@ _DAY_STATUS_CODES = {
 }
 
 
+def _ge(r: dict) -> bool:
+    return r.get("perimetre", E.PERIMETRE_GE) == E.PERIMETRE_GE
+
+
 def _blocage_code(r: dict) -> str | None:
+    if not _ge(r):
+        return "HORS_PERIMETRE_GE"
     if r["data_issue"]:
         return "DONNEES_SITE"
     if r["curve"] is None:
@@ -157,6 +164,8 @@ def _blocage(r: dict) -> dict | None:
     rec = r["rapprochement"] or {}
     if code == "DONNEES_SITE":
         detail = r["data_issue"]
+    elif code == "HORS_PERIMETRE_GE":
+        detail = (r["motif_cph"] or {}).get("detail")
     elif r["curve"] is None:
         detail = r["curve_reason"]
     elif etape == "rapprochement" or code == "CPH_PARTIEL":
@@ -170,6 +179,7 @@ def _blocage(r: dict) -> dict | None:
 def _site_summary(r: dict) -> dict:
     return {
         "blocage": _blocage(r),
+        "perimetre": r.get("perimetre", E.PERIMETRE_GE),
         "site_id": r["site_id"], "site_name": r["site_name"], "country": r["country"], "zone": r["zone"],
         "kind": r["kind"], "kind_source": r["kind_source"], "grid_supply": r["grid_supply"], "off_grid": r["off_grid"],
         "dg_count": r["dg_count"], "ge_label": r["ge_label"], "data_issue": r["data_issue"],
@@ -290,6 +300,8 @@ _SITE_DIAG = {E.AC_MESURE_ZERO, E.SR_STOCK_ABSENT, E.SR_MOUVEMENTS_ABSENTS}
 
 
 def _diag_codes(r: dict) -> set[str]:
+    if not _ge(r):
+        return set()
     codes = set(r["blocked_days"])
     if (r["ac_reference"] or {}).get("statut") == E.AC_MESURE_ZERO:
         codes.add(E.AC_MESURE_ZERO)
@@ -397,6 +409,9 @@ def _day_dict(d: dict) -> dict:
 
 
 def _apply_table_filters(rows: list[dict], params) -> list[dict]:
+    pe = (params.get("perimetre") or "").strip()
+    if pe:
+        rows = [r for r in rows if r.get("perimetre", E.PERIMETRE_GE) == pe]
     site = (params.get("site") or "").strip().lower()
     if site:
         rows = [r for r in rows if site in r["site_id"].lower() or site in (r["site_name"] or "").lower()]
@@ -454,10 +469,16 @@ _DISPO_FILTERS = {
 }
 
 
-def _synthesis(rows: list[dict]) -> dict:
+def _synthesis(all_rows: list[dict]) -> dict:
+    # Indicateurs CPH sur les seuls sites avec GE confirmé ; les autres sont comptés à part.
+    rows = [r for r in all_rows if _ge(r)]
+    others = [r for r in all_rows if not _ge(r)]
     count = lambda pred: sum(1 for r in rows if pred(r))  # noqa: E731
     return {
         "sites": len(rows),
+        "sites_total": len(all_rows),
+        "sites_sans_ge": len(others),
+        "sites_ge_a_confirmer": sum(1 for r in others if (r["motif_cph"] or {}).get("code") == E.MC_GE_A_CONFIRMER),
         "cph_calcules": count(lambda r: r["cph_days"] > 0),
         "conso_theorique_complete": count(lambda r: r["cph_status"] == E.CPH_COMPLET),
         "cph_non_calcule": count(lambda r: r["cph_status"] == E.CPH_NON_CALCULE_PERIODE),
@@ -598,6 +619,7 @@ class CphPeriodView(APIView):
                            "hasNext": page < total_pages, "hasPrev": page > 1},
             "periode": _periode_info(start, end),
             "filters": {
+                "perimetres": {E.PERIMETRE_GE: synthesis["sites"], E.PERIMETRE_SANS_GE: synthesis["sites_sans_ge"]},
                 "power_methods": sorted({_power_method_main(r) or "AUCUNE" for r in rows}),
                 "runtime_sources": sorted({r["runtime_source_main"] or "AUCUNE" for r in rows}),
                 "power_sources": sorted({r["power_source_main"] or "AUCUNE" for r in rows}),
@@ -626,7 +648,7 @@ class CphSiteDetailView(APIView):
         except ValueError as e:
             return Response({"detail": str(e)}, status=400)
         if not rows:
-            return Response({"detail": "Site absent de l'inventaire des sites avec GE."}, status=404)
+            return Response({"detail": "Site absent du référentiel (inventaire Snowflake et fichiers Ops)."}, status=404)
         r = rows[0]
         return Response({
             **_site_summary(r),
@@ -673,6 +695,10 @@ FORMULA = ("charge = P_GE / (kVA × 0,8) ; CPH = a·charge² + b·charge + c ; c
 
 def _csv_rows(rows: list[dict], only_anomalies: bool):
     for r in rows:
+        if not _ge(r):
+            if not only_anomalies:
+                yield _out_of_scope_line(r)
+            continue
         c, rec, ac = r["curve"], r["rapprochement"] or {}, r["ac_reference"] or {}
         avail = " | ".join(f"{s}={ev['availability'] * 100:.0f}%" for s, ev in r["sources"].items())
         rejections = " | ".join(f"{s}: {ev['rejection']}" for s, ev in r["sources"].items() if ev["rejection"])
@@ -714,6 +740,23 @@ def _csv_rows(rows: list[dict], only_anomalies: bool):
                 *_power_columns(r, d, ac),
                 FORMULA, E.RULE_VERSION,
             ]
+
+
+def _out_of_scope_line(r: dict) -> list:
+    """Site sans GE confirmé : une ligne période, sans valeur calculée (jamais 0 L)."""
+    line = dict.fromkeys(EXPORT_HEADER, "")
+    line.update({
+        "site_id": r["site_id"], "site_name": r["site_name"], "pays": r["country"], "zone": r["zone"],
+        "type_site": r["kind"], "reseau": r["grid_supply"], "ge_inventaire": r["ge_label"],
+        "puissance_nominale_ge_kva": _f(r["ge_kva"], 1), "periode_debut": r["start"], "periode_fin": r["end"],
+        "statut_cph_periode": r["statut_cph"], "motif_cph_periode": (r["motif_cph"] or {}).get("code"),
+        "statut_conso": r["comparaison"]["statut"], "motif_conso": r["comparaison"]["motif"],
+        "facture_avec_ge": {True: "oui", False: "non"}.get(r["facture_avec_ge"], ""), "type_site_on_off": r["site_type"],
+        "configuration": r["kind"] or "INCONNUE", "configuration_fichier": r["configuration_fichier"],
+        "statut_cph": r["statut_cph"], "jours_periode": r["days"], "statut": r["rapprochement_statut"],
+        "formule": FORMULA, "version_regle": E.RULE_VERSION,
+    })
+    return [line[h] for h in EXPORT_HEADER]
 
 
 def _power_columns(r: dict, d: dict, ac: dict) -> list:

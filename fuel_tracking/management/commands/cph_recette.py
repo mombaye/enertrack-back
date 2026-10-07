@@ -30,7 +30,9 @@ class Command(BaseCommand):
 
     def handle(self, *args, start, end, country, examples, **opts):
         w = self.stdout.write
-        rows = compute_period(start, end, country=country)
+        all_rows = compute_period(start, end, country=country)
+        rows = [r for r in all_rows if r["perimetre"] == E.PERIMETRE_GE]
+        others = [r for r in all_rows if r["perimetre"] != E.PERIMETRE_GE]
         has = lambda m: [r for r in rows if r["power_method_days"].get(m)]  # noqa: E731
         periode = V._periode_info(start, end)
         w(self.style.MIGRATE_HEADING(f"== Recette CPH {start} → {end} · règle {E.RULE_VERSION}"))
@@ -38,6 +40,9 @@ class Command(BaseCommand):
             w(self.style.WARNING(f"PÉRIODE INCOMPLÈTE : faits Snowflake jusqu'au {periode['donnees_jusqu_au']} "
                                  f"({periode['jours_sans_donnees']} jour(s) sans données)."))
         counts = [
+            ("Sites du référentiel (affichés)", len(all_rows)),
+            ("Sites hors calcul (sans GE confirmé)", len(others)),
+            ("  dont GE déclaré Ops non confirmé", sum(1 for r in others if r["motif_cph"]["code"] == E.MC_GE_A_CONFIRMER)),
             ("Sites GE du périmètre", len(rows)),
             ("Runtime qualifié", sum(1 for r in rows if r["runtime_days"] > 0)),
             ("Mapping valide (courbe utilisable)", sum(1 for r in rows if r["curve"] is not None)),

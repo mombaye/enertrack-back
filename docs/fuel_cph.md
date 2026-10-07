@@ -108,3 +108,14 @@ conso mesurée (÷ sites GE), runtime qualifié (÷ sites GE), mapping GE → co
 puissance qualifiée (÷ sites avec runtime qualifié et GE en marche), CPH calculé (÷ sites GE), rapprochement stock
 (÷ sites avec CPH calculé). `synthesis.diagnostic_blocages` donne par motif : sites, jours, runtime concerné, conso
 mesurée disponible et volume potentiel indicatif (runtime bloqué × CPH moyen du site sur ses jours calculés).
+
+## 8. Périmètre affiché : tout le parc
+
+Le tableau « Suivis Consommations » (API `cph/`) liste **tous** les sites du référentiel : imports Ops
+(`FuelConsommationMonthly`, dont « ESCO SN Facturation par site », 3 301 sites) et inventaire Snowflake.
+- `perimetre = GE` : DG_COUNT Snowflake > 0 → calcul CPH complet ; seuls ces sites entrent dans les KPI, couvertures et blocages.
+- `perimetre = SANS_GE` : affiché hors calcul (`NON_CONCERNE_SANS_GE`), aucune valeur, jamais 0 L. Motif `SITE_SANS_GE`, ou
+  `GE_NON_CONFIRME_SNOWFLAKE` quand Ops déclare un GE (Facturé avec GE = Oui, type de GE, typologie GE) que Snowflake ne confirme pas.
+- Filtre API `perimetre=GE|SANS_GE` ; Contrôle CPH affiche les sites GE par défaut.
+- Vérification d'un fichier Ops : `python manage.py check_fuel_site_coverage --file Proposition_de_load_092026_v1.xlsx`
+  (sites absents, écarts de casse ; code retour 1 si un site manque).

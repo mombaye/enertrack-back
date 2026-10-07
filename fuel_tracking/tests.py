@@ -931,3 +931,26 @@ class PeriodAndSynthesisTests(SimpleTestCase):
         self.assertTrue(flat["direct_dse_attempted"] and flat["pdc_rectifier_attempted"])
         self.assertIsNone(flat["selected_power_method"])
         self.assertEqual(len(flat["rejection_reasons"]), 2)
+
+
+class OutOfScopeSitesTests(SimpleTestCase):
+    """Tout le parc apparaît : sites sans GE confirmé listés hors calcul, exclus des KPI CPH."""
+
+    def test_out_of_scope_row_has_no_value_and_is_excluded_from_kpis(self):
+        from fuel_tracking import views_cph as V
+
+        ctx = E.SiteContext(site_id="X1", kind="OUTDOOR", facture_avec_ge=True)
+        reason = f"{E.MC_GE_A_CONFIRMER} : Facturé avec GE = Oui côté Ops mais DG_COUNT Snowflake = 0"
+        out = E.out_of_scope_period(ctx, OCT1, OCT1 + timedelta(days=2), E.MC_GE_A_CONFIRMER, reason, E.EngineSettings())
+        self.assertEqual((out["perimetre"], out["statut_cph"]), (E.PERIMETRE_SANS_GE, E.SC_NON_CONCERNE))
+        self.assertIsNone(out["conso_theorique_l"])
+        self.assertIsNone(out["conso_partielle_l"])
+        self.assertEqual(out["comparaison"]["statut"], E.C_NON_CONCERNE)
+        ge = period(outdoor(site_id="A"), {OCT1: fact(dse_runtime_h=0)}, OCT1, OCT1 + timedelta(days=2))
+        syn = V._synthesis([ge, out])
+        self.assertEqual((syn["sites"], syn["sites_total"], syn["sites_sans_ge"], syn["sites_ge_a_confirmer"]), (1, 2, 1, 1))
+        self.assertEqual({c["denominateur"] for c in syn["couvertures"] if c["code"] in ("runtime", "cph")}, {1})
+        self.assertEqual(V._blocage_code(out), "HORS_PERIMETRE_GE")
+        self.assertEqual([r["site_id"] for r in V._apply_table_filters([ge, out], {"perimetre": "SANS_GE"})], ["X1"])
+        line = V._out_of_scope_line(out)
+        self.assertEqual(len(line), len(V.EXPORT_HEADER))

@@ -207,6 +207,91 @@ def load_contexts(country: str | None = None, site_ids: list[str] | None = None,
     return contexts
 
 
+def load_out_of_scope(end: date, exclude: set[str], country: str | None = None, site_ids: list[str] | None = None,
+                      zone: str | None = None) -> list[tuple[E.SiteContext, str, str]]:
+    """
+    Autres sites du référentiel (FuelConsommationMonthly : Snowflake + fichiers Ops/Stan,
+    et inventaire SITE_ESCO_CURRENT) sans GE confirmé par Snowflake. Retourne
+    (contexte, code, motif) : SITE_SANS_GE, ou GE_NON_CONFIRME_SNOWFLAKE quand Ops déclare
+    un GE (Facturé avec GE = Oui, type de GE, typologie « GE ») que Snowflake ne confirme pas.
+    """
+    from core.models import Site
+    from fuel_tracking.models import FuelConsommationMonthly, FuelSiteInventory
+
+    month = end.strftime("%Y-%m")
+    info: dict[str, dict] = {}
+    qs = FuelConsommationMonthly.objects.filter(month_year__lte=month).exclude(site_id__in=exclude)
+    if country:
+        qs = qs.filter(country=country)
+    if site_ids:
+        qs = qs.filter(site_id__in=site_ids)
+    for row in qs.order_by("site_id", "-month_year").values(
+            "site_id", "site_name", "country", "zone_fichier", "configuration_fichier", "facturation_avec_ge_fichier",
+            "site_type_fichier", "site_type", "type_ge_fichier", "pge_kva_fichier", "typology_fichier", "typo_simple_fichier",
+            "typology"):
+        cur = info.setdefault(row["site_id"], {})
+        for k, v in row.items():
+            if v not in (None, "") and k not in cur:
+                cur[k] = v
+    inv_rows: dict[str, list] = defaultdict(list)
+    inv = FuelSiteInventory.objects.exclude(site_id__in=exclude)
+    if country:
+        inv = inv.filter(country=country)
+    if site_ids:
+        inv = inv.filter(site_id__in=site_ids)
+    for row in inv.order_by("site_id", "data_id"):
+        inv_rows[row.site_id].append(row)
+        info.setdefault(row.site_id, {}).setdefault("site_name", row.site_name)
+        info[row.site_id].setdefault("country", row.country)
+    if not info:
+        return []
+    core_sites = {s["site_id"]: s for s in Site.objects.filter(site_id__in=info.keys()).values(
+        "site_id", "zone", "installed_site_type", "site_type")}
+
+    out = []
+    for sid, ex in sorted(info.items()):
+        cs = core_sites.get(sid) or {}
+        site_zone = cs.get("zone") or (ex.get("zone_fichier") or "").strip() or None
+        if zone and site_zone != zone:
+            continue
+        kind = cs.get("installed_site_type") or cs.get("site_type") or _normalize_kind(ex.get("configuration_fichier"))
+        rows = inv_rows.get(sid, [])
+        counts = {r.dg_count for r in rows}
+        if not rows:
+            reason = "site absent de l'inventaire Snowflake SITE_ESCO_CURRENT (DG_COUNT inconnu)"
+        elif counts == {None}:
+            reason = "DG_COUNT Snowflake inconnu ou contradictoire"
+        else:
+            reason = f"DG_COUNT Snowflake = {max(c or 0 for c in counts)}"
+        typo = " ".join(str(ex.get(k) or "") for k in ("typology_fichier", "typo_simple_fichier", "typology")).upper()
+        declared = [lbl for ok, lbl in (
+            (ex.get("facturation_avec_ge_fichier") is True, "Facturé avec GE = Oui"),
+            (bool(ex.get("type_ge_fichier")), f"type de GE {ex.get('type_ge_fichier')}"),
+            (" GE" in f" {typo}".replace("_", " "), "typologie GE"),
+        ) if ok]
+        if declared:
+            code = E.MC_GE_A_CONFIRMER
+            reason = (f"{code} : {' ; '.join(declared)} côté Ops mais {reason} — présence GE à confirmer, "
+                      "hors calcul carburant tant que Snowflake ne la confirme pas")
+        else:
+            code = E.MC_SITE_SANS_GE
+            reason = f"{code} : {reason} — site hors calcul carburant (pas compté à 0 L)"
+        ctx = E.SiteContext(
+            site_id=sid, country=ex.get("country"), data_id=rows[0].data_id if len(rows) == 1 else None,
+            site_name=ex.get("site_name"), zone=site_zone, kind=kind,
+            kind_source=("core.Site" if cs.get("installed_site_type") or cs.get("site_type")
+                         else "FuelConsommationMonthly.configuration_fichier" if kind else None),
+            grid_supply=rows[0].grid_supply if rows else None, off_grid=None,
+            dg_count=max((c for c in counts if c is not None), default=None),
+            ge_label=ex.get("type_ge_fichier"), curve=None, curve_reason=reason, curve_code=code,
+            ge_kva=ex.get("pge_kva_fichier"), facture_avec_ge=ex.get("facturation_avec_ge_fichier"),
+            site_type=ex.get("site_type_fichier") or ex.get("site_type"),
+            configuration_fichier=ex.get("configuration_fichier"),
+        )
+        out.append((ctx, code, reason))
+    return out
+
+
 def load_facts(contexts: list[E.SiteContext], start: date, end: date) -> dict[str, dict[date, dict]]:
     from fuel_tracking.models import FuelSiteDailyFacts
 
@@ -259,10 +344,17 @@ def compute_period(start: date, end: date, country: str | None = None, site_ids:
     facts = load_facts(contexts, start, end)
     observations = load_observations([c.site_id for c in contexts], start, end)
     es = engine_settings()
-    return [
+    rows = [
         E.compute_site_period(ctx, facts.get(ctx.site_id, {}), start, end, observations.get(ctx.site_id, []), es)
         for ctx in contexts
     ]
+    # Tout le parc apparaît : les sites sans GE confirmé sont listés hors calcul, avec leur motif.
+    from fuel_tracking.models import FuelSiteInventory
+
+    ge_ids = set(FuelSiteInventory.objects.filter(dg_count__gt=0).values_list("site_id", flat=True))
+    others = load_out_of_scope(end, ge_ids, country=country, site_ids=site_ids, zone=zone)
+    rows += [E.out_of_scope_period(ctx, start, end, code, reason, es) for ctx, code, reason in others]
+    return rows
 
 
 # ─── Cache du calcul période (versionné par les données) ─────────────────────

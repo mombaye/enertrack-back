@@ -61,7 +61,8 @@ def cph_health(today: date | None = None) -> dict:
     metrics: dict = {}
     if f["facts_last_date"]:
         end = min(today - timedelta(days=1), f["facts_last_date"])
-        rows = compute_period_summary(end - timedelta(days=6), end)
+        rows = [r for r in compute_period_summary(end - timedelta(days=6), end)
+                if r.get("perimetre", "GE") == "GE"]
         eligible = [r for r in rows if r["curve"] is not None and r["runtime_days"] > 0]
         computed = [r for r in eligible if r["cph_days"] > 0]
         sfc_alerts = [r for r in computed if r["conso_specifique"]["alerte_estimee"]]

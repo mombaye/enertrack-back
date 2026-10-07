@@ -92,6 +92,16 @@ SR_STOCK_ABSENT = "RAPPROCHEMENT_NON_CALCULE_STOCK_ABSENT"
 SR_MOUVEMENTS_ABSENTS = "RAPPROCHEMENT_NON_CALCULE_MOUVEMENTS_ABSENTS"
 SR_CPH_INCOMPLET = "RAPPROCHEMENT_NON_CALCULE_CPH_INCOMPLET"
 
+# Périmètre : seuls les sites avec GE confirmé par Snowflake (DG_COUNT > 0) sont calculés ;
+# les autres sites du référentiel sont affichés « hors calcul » avec leur motif, jamais à 0 L.
+PERIMETRE_GE = "GE"
+PERIMETRE_SANS_GE = "SANS_GE"
+SC_NON_CONCERNE = "NON_CONCERNE_SANS_GE"
+MC_SITE_SANS_GE = "SITE_SANS_GE"
+MC_GE_A_CONFIRMER = "GE_NON_CONFIRME_SNOWFLAKE"
+C_NON_CONCERNE = "NON_CONCERNE_SANS_GE"
+R_NON_CONCERNE = "NON_CONCERNE"
+
 # Puissance active nominale estimée du GE = kVA de la courbe × facteur de puissance (0,8 par défaut).
 NOMINAL_POWER_FACTOR = Decimal("0.8")
 
@@ -892,6 +902,7 @@ def compute_site_period(ctx: SiteContext, facts: dict, start: date, end: date,
                   else SC_CPH_PARTIEL if cph_status == CPH_PARTIEL and cph_days else SC_CPH_NON_CALCULE)
     statut_rappro = rapprochement_calc_status(rapprochement_ref)
     return {
+        "perimetre": PERIMETRE_GE,
         "statut_cph": statut_cph,
         "statut_rapprochement_calcul": statut_rappro,
         "power_method_days": power_by_method,
@@ -936,3 +947,24 @@ def compute_site_period(ctx: SiteContext, facts: dict, start: date, end: date,
         "rapprochement": rapprochement_ref,
         "daily": [day_rows[d] for d in days],
     }
+
+
+def out_of_scope_period(ctx: SiteContext, start: date, end: date, code: str, reason: str,
+                        settings: EngineSettings) -> dict:
+    """
+    Site du référentiel sans GE confirmé (DG_COUNT Snowflake ≤ 0 ou absent) : affiché pour que
+    tout le parc apparaisse, mais hors calcul carburant — aucune valeur, aucun 0 L, motif explicite.
+    Mêmes clés que compute_site_period pour l'API et les exports.
+    """
+    r = compute_site_period(ctx, {}, start, end, [], settings)
+    n = r["days"]
+    r.update(
+        perimetre=PERIMETRE_SANS_GE, statut_cph=SC_NON_CONCERNE, statut_rapprochement_calcul=None,
+        power_method_days={}, running_days=0, blocked_days={}, runtime_source_days={}, runtime_source_main=None,
+        runtime_source_availability=None, day_status_counts={}, motifs=[reason], reconciliations=[],
+        rapprochement_statut=R_NON_CONCERNE, rapprochement=None, ac_reference=None,
+        conso_theorique_l=None, conso_partielle_l=None,
+        motif_cph={"code": code, "detail": reason, "jours": n}, daily=[],
+    )
+    r["comparaison"] = {**r["comparaison"], "statut": C_NON_CONCERNE, "motif": reason}
+    return r
