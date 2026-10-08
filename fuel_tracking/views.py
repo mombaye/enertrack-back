@@ -893,7 +893,7 @@ class FuelCommandeEstimationView(APIView):
         cph_by_month: dict[str, dict[str, float]] = {}
         for my in available_months:
             y, m = (int(x) for x in my.split("-"))
-            results = compute_period(date(y, m, 1), date(y, m, calendar.monthrange(y, m)[1]))
+            results = compute_period(date(y, m, 1), date(y, m, calendar.monthrange(y, m)[1]), include_out_of_scope=False)
             cph_by_month[my] = {r["site_id"]: r["conso_theorique_l"] for r in results if r["conso_theorique_l"] is not None}
 
         by_site: dict[str, dict] = {}

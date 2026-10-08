@@ -351,7 +351,8 @@ def load_observations(site_ids: list[str], start: date, end: date) -> dict[str, 
 
 
 def compute_period(start: date, end: date, country: str | None = None, site_ids: list[str] | None = None,
-                   zone: str | None = None) -> list[dict]:
+                   zone: str | None = None, include_out_of_scope: bool = True) -> list[dict]:
+    """include_out_of_scope=False : sites avec GE seulement (calculs qui n'utilisent que la conso estimée)."""
     if end < start:
         raise ValueError("La date de fin précède la date de début.")
     if (end - start).days + 1 > E.MAX_PERIOD_DAYS:
@@ -372,7 +373,8 @@ def compute_period(start: date, end: date, country: str | None = None, site_ids:
     from fuel_tracking.models import FuelSiteInventory
 
     ge_ids = set(FuelSiteInventory.objects.filter(dg_count__gt=0).values_list("site_id", flat=True))
-    others = load_out_of_scope(end, ge_ids, country=country, site_ids=site_ids, zone=zone)
+    others = (load_out_of_scope(end, ge_ids, country=country, site_ids=site_ids, zone=zone)
+              if include_out_of_scope else [])
     rows += [E.out_of_scope_period(ctx, start, end, code, reason, es) for ctx, code, reason in others]
     for r in rows:
         r["hors_referentiel"] = not in_referential(r["site_id"], ref)
