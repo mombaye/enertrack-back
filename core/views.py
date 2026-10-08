@@ -142,6 +142,14 @@ class SiteImportView(APIView):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        # Fichier Ops « Proposition_de_load » : référentiel + load du mois (core/site_proposition_import.py).
+        from .site_proposition_import import import_proposition, is_proposition_file
+
+        file_bytes = file.read()
+        if is_proposition_file(file_bytes):
+            return Response(import_proposition(file_bytes, request.user), status=status.HTTP_200_OK)
+        file.seek(0)
+
         try:
             df = pd.read_excel(file)
         except Exception as e:

@@ -207,6 +207,9 @@ def load_contexts(country: str | None = None, site_ids: list[str] | None = None,
     return contexts
 
 
+CORE_COUNTRIES = {"sen": "Senegal"}
+
+
 def load_out_of_scope(end: date, exclude: set[str], country: str | None = None, site_ids: list[str] | None = None,
                       zone: str | None = None) -> list[tuple[E.SiteContext, str, str]]:
     """
@@ -243,10 +246,21 @@ def load_out_of_scope(end: date, exclude: set[str], country: str | None = None, 
         inv_rows[row.site_id].append(row)
         info.setdefault(row.site_id, {}).setdefault("site_name", row.site_name)
         info[row.site_id].setdefault("country", row.country)
+    # Référentiel commun (Gestion des sites → Import Sites) : un site importé apparaît aussi ici.
+    core_qs = Site.objects.exclude(site_id__in=exclude)
+    if site_ids:
+        core_qs = core_qs.filter(site_id__in=site_ids)
+    core_sites = {}
+    for cs in core_qs.values("site_id", "name", "country", "zone", "installed_site_type", "site_type"):
+        site_country = CORE_COUNTRIES.get(cs["country"], cs["country"])
+        if country and site_country != country:
+            continue
+        core_sites[cs["site_id"]] = cs
+        ex = info.setdefault(cs["site_id"], {})
+        ex.setdefault("site_name", cs["name"])
+        ex.setdefault("country", site_country)
     if not info:
         return []
-    core_sites = {s["site_id"]: s for s in Site.objects.filter(site_id__in=info.keys()).values(
-        "site_id", "zone", "installed_site_type", "site_type")}
 
     out = []
     for sid, ex in sorted(info.items()):
@@ -263,6 +277,8 @@ def load_out_of_scope(end: date, exclude: set[str], country: str | None = None, 
             reason = "DG_COUNT Snowflake inconnu ou contradictoire"
         else:
             reason = f"DG_COUNT Snowflake = {max(c or 0 for c in counts)}"
+        if not rows and sid in core_sites and not ({"zone_fichier", "typology", "typology_fichier"} & ex.keys()):
+            reason = "site du référentiel (Gestion des sites) absent de l'inventaire Snowflake SITE_ESCO_CURRENT"
         typo = " ".join(str(ex.get(k) or "") for k in ("typology_fichier", "typo_simple_fichier", "typology")).upper()
         declared = [lbl for ok, lbl in (
             (ex.get("facturation_avec_ge_fichier") is True, "Facturé avec GE = Oui"),
@@ -368,6 +384,7 @@ def data_version() -> str:
     d'abaque, changement de correspondance, import d'observations ou réglage change
     la clé, donc le cache n'est jamais servi périmé (TTL de sécurité : 10 min).
     """
+    from core.models import Site
     from django.db.models import Count, Max
     from fuel_tracking.models import (
         CphCurve, CphInventoryMapping, CphMappingHistory, FuelConsommationMonthly, FuelDailyFactsSyncRun,
@@ -383,6 +400,7 @@ def data_version() -> str:
         CphMappingHistory.objects.aggregate(i=Max("id")),
         FuelObservationImport.objects.aggregate(i=Max("id")),
         FuelConsommationMonthly.objects.aggregate(u=Max("updated_at")),
+        Site.objects.aggregate(u=Max("updated_at"), n=Count("id")),
         [str(getattr(dj_settings, k, "")) for k in (
             "FUEL_ENOC_DELIVERIES_CONNECTED", "FUEL_CPH_NOMINAL_POWER_FACTOR", "FUEL_CPH_SFC_MIN_L_KWH",
             "FUEL_CPH_SFC_MAX_L_KWH", "FUEL_CPH_MATCH_POWER_TOLERANCE", "FUEL_CPH_AC_POWER_TO_KW_DIVISOR")],
