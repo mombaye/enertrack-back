@@ -2411,6 +2411,36 @@ class SuiviConsoView(APIView):
                 "zone": r["site__zone"],
             })
 
+        # ─────────────────────────────────────────────────────────────
+        # 2c) Base de sites commune : TOUS les sites de Gestion des sites
+        # (core.Site) apparaissent, pour chaque mois de la période, même sans
+        # facture, estimation ni donnée Snowflake — les valeurs absentes
+        # restent vides (« — » à l'écran), jamais 0.
+        # ─────────────────────────────────────────────────────────────
+        months = []
+        y, m = ys, ms
+        while (y, m) <= (ye, me):
+            months.append((y, m))
+            y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+
+        # ?avec_sites_sans_donnees=0 : seulement les site×mois avec une donnée (graphiques).
+        with_empty = request.query_params.get("avec_sites_sans_donnees", "1") not in ("0", "false")
+        ref_qs = Site.objects.all() if with_empty else Site.objects.none()
+        if zone:
+            ref_qs = ref_qs.filter(zone=zone.upper())
+        if search:
+            ref_qs = ref_qs.filter(Q(site_id__icontains=search) | Q(name__icontains=search))
+        if typo:
+            ref_qs = ref_qs.filter(
+                Q(billing_typology__icontains=typo)
+                | Q(installed_typology__icontains=typo)
+                | Q(ordered_typology__icontains=typo)
+            )
+        for sid, name, site_zone in ref_qs.values_list("site_id", "name", "zone"):
+            site_meta.setdefault(sid, {"site_id": sid, "site_name": name, "zone": site_zone})
+            for y, m in months:
+                all_keys.add((sid, y, m))
+
         site_ids_in_result = {sid for sid, _, _ in all_keys}
 
         # ─────────────────────────────────────────────────────────────
