@@ -119,3 +119,12 @@ Le tableau « Suivis Consommations » (API `cph/`) liste **tous** les sites du r
 - Filtre API `perimetre=GE|SANS_GE` ; Contrôle CPH affiche les sites GE par défaut.
 - Vérification d'un fichier Ops : `python manage.py check_fuel_site_coverage --file Proposition_de_load_092026_v1.xlsx`
   (sites absents, écarts de casse ; code retour 1 si un site manque).
+
+## 9. Base de sites unique (Gestion des sites)
+
+Tous les onglets Suivi Carburant (Dashboard, Suivis Consommations, Contrôle CPH, Stock, Commandes, Estimation)
+n'affichent que les sites du référentiel commun `core.Site` (page **Gestion des sites**), comme les autres modules.
+Mise à jour : Gestion des sites → **Import Sites** avec le fichier Ops « Proposition_de_load_MMYYYY.xlsx » (création des
+sites manquants, mise à jour sans effacement, load du mois). Un site connu de Snowflake / ENOC / fichiers Ops mais absent
+du référentiel n'est pas affiché ; il est compté (`sites_hors_referentiel`) avec un bandeau invitant à l'importer.
+Référentiel vide → aucun filtre. Code : `fuel_tracking/services/site_referential.py`, `core/site_proposition_import.py`.

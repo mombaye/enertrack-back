@@ -585,6 +585,14 @@ def _compute(request, with_daily: bool = True):
     return start, end, rows
 
 
+def _ge_outside_referential() -> int:
+    """Sites avec GE (Snowflake) absents de Gestion des sites : non affichés, à importer."""
+    from fuel_tracking.models import FuelSiteInventory
+    from fuel_tracking.services.site_referential import restrict
+
+    return restrict(FuelSiteInventory.objects.filter(dg_count__gt=0))[1]
+
+
 def _periode_info(start: date, end: date) -> dict:
     """PÉRIODE INCOMPLÈTE : la période demandée dépasse les faits Snowflake disponibles."""
     last = freshness()["facts_last_date"]
@@ -618,6 +626,7 @@ class CphPeriodView(APIView):
             "pagination": {"page": page, "limit": limit, "total": total, "totalPages": total_pages,
                            "hasNext": page < total_pages, "hasPrev": page > 1},
             "periode": _periode_info(start, end),
+            "sites_hors_referentiel": _ge_outside_referential(),
             "filters": {
                 "perimetres": {E.PERIMETRE_GE: synthesis["sites"], E.PERIMETRE_SANS_GE: synthesis["sites_sans_ge"]},
                 "power_methods": sorted({_power_method_main(r) or "AUCUNE" for r in rows}),

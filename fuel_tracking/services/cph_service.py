@@ -356,7 +356,12 @@ def compute_period(start: date, end: date, country: str | None = None, site_ids:
         raise ValueError("La date de fin précède la date de début.")
     if (end - start).days + 1 > E.MAX_PERIOD_DAYS:
         raise ValueError(f"Période limitée à {E.MAX_PERIOD_DAYS} jours.")
-    contexts = load_contexts(country=country, site_ids=site_ids, zone=zone)
+    from fuel_tracking.services.site_referential import in_referential, referential_upper_ids
+
+    # Base de sites unique : seuls les sites de Gestion des sites (core.Site) sont affichés.
+    ref = referential_upper_ids()
+    contexts = [c for c in load_contexts(country=country, site_ids=site_ids, zone=zone)
+                if in_referential(c.site_id, ref)]
     facts = load_facts(contexts, start, end)
     observations = load_observations([c.site_id for c in contexts], start, end)
     es = engine_settings()
@@ -368,7 +373,8 @@ def compute_period(start: date, end: date, country: str | None = None, site_ids:
     from fuel_tracking.models import FuelSiteInventory
 
     ge_ids = set(FuelSiteInventory.objects.filter(dg_count__gt=0).values_list("site_id", flat=True))
-    others = load_out_of_scope(end, ge_ids, country=country, site_ids=site_ids, zone=zone)
+    others = [o for o in load_out_of_scope(end, ge_ids, country=country, site_ids=site_ids, zone=zone)
+              if in_referential(o[0].site_id, ref)]
     rows += [E.out_of_scope_period(ctx, start, end, code, reason, es) for ctx, code, reason in others]
     return rows
 

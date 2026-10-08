@@ -77,8 +77,10 @@ def _compute_ge_detection(month):
 
     from fuel_tracking.models import FuelConsommationMonthly
 
+    from fuel_tracking.services.site_referential import restrict
+
     file_site_ids = set(_file_site_ids())
-    detection_base = FuelConsommationMonthly.objects.filter(month_year=month)
+    detection_base, _ = restrict(FuelConsommationMonthly.objects.filter(month_year=month))
     detection_agg = detection_base.aggregate(
         total_sites=Count("id"),
         avec_ge=Count("id", filter=Q(has_genset=True)),
@@ -199,7 +201,12 @@ class FuelConsommationListView(APIView):
         # données selon le filtre"). Les filtres Avec GE/Sans GE/Avec GE mais
         # pas de données portent donc à nouveau sur le plein effectif — voir
         # `ge_detection` plus bas pour le détail Snowflake/ENOC/fichier.
-        qs = FuelConsommationMonthly.objects.filter(month_year=month).order_by("site_id")
+        from fuel_tracking.services.site_referential import referential_upper_ids, restrict
+
+        # Base de sites unique : référentiel Gestion des sites (voir services/site_referential.py).
+        ref_ids = referential_upper_ids()
+        qs, sites_hors_referentiel = restrict(
+            FuelConsommationMonthly.objects.filter(month_year=month).order_by("site_id"), ref_ids)
 
         # Recoupement Snowflake/ENOC/fichiers — voir _compute_ge_detection,
         # partagé avec FuelConsommationDashboardView pour que les 2 panneaux
@@ -213,7 +220,7 @@ class FuelConsommationListView(APIView):
         # Dénominateur : facturation_avec_ge_fichier=True (fichier Stan, 463 en sept. 2026).
         # Si le mois sélectionné n'a pas encore été importé (0 sites Stan), on
         # cherche le mois le plus récent avec données Stan pour fallback.
-        _stan_base = FuelConsommationMonthly.objects.filter(month_year=month)
+        _stan_base, _ = restrict(FuelConsommationMonthly.objects.filter(month_year=month), ref_ids)
         _stan_total = _stan_base.filter(facturation_avec_ge_fichier=True).count()
         # Supervision / disponibilité DSE / CPH calculés : voir l'onglet
         # Contrôle CPH (calcul au grain site/jour sur la plage exacte).
@@ -481,6 +488,7 @@ class FuelConsommationListView(APIView):
             "available_months": available_months,
             "sources": sources,
             "kpis": kpis,
+            "sites_hors_referentiel": sites_hors_referentiel,
             "ge_detection": ge_detection,
         })
 
@@ -583,8 +591,12 @@ class FuelConsommationDashboardView(APIView):
         # affichent des totaux identiques. Pas le réseau entier (3 356
         # sites) : les sites sans GE n'ont structurellement aucune conso
         # fuel possible, ça diluerait le sens de cette page.
+        from fuel_tracking.services.site_referential import referential_upper_ids, restrict
+
         file_ge_site_ids = _file_ge_site_ids()
-        base_qs = FuelConsommationMonthly.objects.filter(_effective_ge_q(file_ge_site_ids))
+        ref_ids = referential_upper_ids()
+        base_qs, sites_hors_referentiel = restrict(
+            FuelConsommationMonthly.objects.filter(_effective_ge_q(file_ge_site_ids)), ref_ids)
         all_months = list(
             base_qs.order_by("month_year").values_list("month_year", flat=True).distinct()
         )
@@ -620,7 +632,7 @@ class FuelConsommationDashboardView(APIView):
         if trend_months:
             from django.db.models import Count, Q as _Q
             _last = trend_months[-1]
-            _sb = FuelConsommationMonthly.objects.filter(month_year=_last)
+            _sb, _ = restrict(FuelConsommationMonthly.objects.filter(month_year=_last), ref_ids)
             _sk = _sb.aggregate(
                 sites_ge_valides_stan=Count("id", filter=_Q(facturation_avec_ge_fichier=True)),
             )
@@ -639,6 +651,7 @@ class FuelConsommationDashboardView(APIView):
             "available_months": all_months,
             "ge_detection": ge_detection,
             "stan_kpis": dashboard_stan_kpis,
+            "sites_hors_referentiel": sites_hors_referentiel,
         })
 
 
@@ -700,7 +713,11 @@ class FuelCommandeView(APIView):
             "typologie": [serialize_synthese(r) for r in synth_qs.filter(group_type=FuelCommandeSynthese.GroupType.TYPOLOGIE)],
         }
 
-        sites_qs = FuelSuiviCommandeSite.objects.filter(month_year=month).order_by("site_id")
+        from fuel_tracking.services.site_referential import referential_upper_ids, restrict
+
+        ref_ids = referential_upper_ids()
+        sites_qs, sites_hors_referentiel = restrict(
+            FuelSuiviCommandeSite.objects.filter(month_year=month).order_by("site_id"), ref_ids)
 
         search = (request.query_params.get("search") or "").strip()
         if search:
@@ -709,7 +726,7 @@ class FuelCommandeView(APIView):
         # "Rupture de stock prévue" — estimation_stock_final_l < 0, calculée
         # AVANT le filtre search pour un KPI stable qu'une recherche soit
         # active ou non (même principe que ge_counts ailleurs dans ce fichier).
-        kpis_qs = FuelSuiviCommandeSite.objects.filter(month_year=month)
+        kpis_qs, _ = restrict(FuelSuiviCommandeSite.objects.filter(month_year=month), ref_ids)
         kpis = kpis_qs.aggregate(
             total_sites=Count("id"),
             total_commande_avec_marge_l=Sum("commande_avec_marge_l"),
@@ -771,6 +788,7 @@ class FuelCommandeView(APIView):
                     "hasPrev": page > 1,
                 },
                 "kpis": kpis,
+                "sites_hors_referentiel": sites_hors_referentiel,
             },
         })
 
@@ -856,9 +874,12 @@ class FuelCommandeEstimationView(APIView):
         target_month = f"{target_year:04d}-{target_month_num:02d}"
         nb_jours_cible = calendar.monthrange(target_year, target_month_num)[1]
 
-        rows = FuelConsommationMonthly.objects.filter(
+        from fuel_tracking.services.site_referential import restrict
+
+        rows, _ = restrict(FuelConsommationMonthly.objects.filter(
             month_year__in=available_months, has_genset=True,
-        ).values(
+        ))
+        rows = rows.values(
             "site_id", "site_name", "month_year", "year", "month",
             "conso_snowflake_l", "conso_gardien_l",
             "conso_estimee_aout26_l",
@@ -1023,7 +1044,9 @@ class FuelStockListView(APIView):
             },
         }
 
-        qs = FuelStockSnapshot.objects.all().order_by("site_id")
+        from fuel_tracking.services.site_referential import restrict
+
+        qs, sites_hors_referentiel = restrict(FuelStockSnapshot.objects.all().order_by("site_id"))
 
         search = (request.query_params.get("search") or "").strip()
         if search:
@@ -1128,4 +1151,5 @@ class FuelStockListView(APIView):
             },
             "sources": sources,
             "kpis": kpis,
+            "sites_hors_referentiel": sites_hors_referentiel,
         })

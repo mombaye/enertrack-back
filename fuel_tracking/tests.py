@@ -954,3 +954,22 @@ class OutOfScopeSitesTests(SimpleTestCase):
         self.assertEqual([r["site_id"] for r in V._apply_table_filters([ge, out], {"perimetre": "SANS_GE"})], ["X1"])
         line = V._out_of_scope_line(out)
         self.assertEqual(len(line), len(V.EXPORT_HEADER))
+
+
+class SiteReferentialTests(TestCase):
+    """Base de sites unique : Gestion des sites (core.Site) délimite les sites affichés."""
+
+    def test_restrict_to_referential_case_insensitive(self):
+        from core.models import Site
+        from fuel_tracking.models import FuelSiteInventory
+        from fuel_tracking.services.site_referential import restrict
+
+        for i, sid in enumerate(("DkR_0001", "DKR_0002", "ZZZ_0003")):
+            FuelSiteInventory.objects.create(country="Senegal", data_id=i + 1, site_id=sid, dg_count=1)
+        qs, outside = restrict(FuelSiteInventory.objects.all())
+        self.assertEqual((qs.count(), outside), (3, 0))  # référentiel vide : aucun filtre
+        Site.objects.create(site_id="DKR_0001", name="A")
+        Site.objects.create(site_id="DKR_0002", name="B")
+        qs, outside = restrict(FuelSiteInventory.objects.all())
+        self.assertEqual(sorted(qs.values_list("site_id", flat=True)), ["DKR_0002", "DkR_0001"])
+        self.assertEqual(outside, 1)
