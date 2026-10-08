@@ -201,9 +201,9 @@ class FuelConsommationListView(APIView):
         # données selon le filtre"). Les filtres Avec GE/Sans GE/Avec GE mais
         # pas de données portent donc à nouveau sur le plein effectif — voir
         # `ge_detection` plus bas pour le détail Snowflake/ENOC/fichier.
-        from fuel_tracking.services.site_referential import referential_upper_ids, restrict
+        from fuel_tracking.services.site_referential import in_referential, referential_upper_ids, restrict
 
-        # Base de sites unique : référentiel Gestion des sites (voir services/site_referential.py).
+        # Base de sites commune : les sites absents de Gestion des sites sont affichés et signalés.
         ref_ids = referential_upper_ids()
         qs, sites_hors_referentiel = restrict(
             FuelConsommationMonthly.objects.filter(month_year=month).order_by("site_id"), ref_ids)
@@ -420,6 +420,7 @@ class FuelConsommationListView(APIView):
 
             return {
                 "site_id": row.site_id,
+                "hors_referentiel": not in_referential(row.site_id, ref_ids),
                 "site_name": row.site_name,
                 "typology": row.typology_fichier or row.typology,
                 "typologie_simple": row.typo_simple_fichier,
@@ -713,7 +714,7 @@ class FuelCommandeView(APIView):
             "typologie": [serialize_synthese(r) for r in synth_qs.filter(group_type=FuelCommandeSynthese.GroupType.TYPOLOGIE)],
         }
 
-        from fuel_tracking.services.site_referential import referential_upper_ids, restrict
+        from fuel_tracking.services.site_referential import in_referential, referential_upper_ids, restrict
 
         ref_ids = referential_upper_ids()
         sites_qs, sites_hors_referentiel = restrict(
@@ -759,6 +760,7 @@ class FuelCommandeView(APIView):
         def serialize_site(row):
             return {
                 "site_id": row.site_id,
+                "hors_referentiel": not in_referential(row.site_id, ref_ids),
                 "site_name": row.site_name,
                 "typologie_contractuelle": row.typologie_contractuelle,
                 "load_commande": float(row.load_commande),
@@ -1044,9 +1046,10 @@ class FuelStockListView(APIView):
             },
         }
 
-        from fuel_tracking.services.site_referential import restrict
+        from fuel_tracking.services.site_referential import in_referential, referential_upper_ids, restrict
 
-        qs, sites_hors_referentiel = restrict(FuelStockSnapshot.objects.all().order_by("site_id"))
+        ref_ids = referential_upper_ids()
+        qs, sites_hors_referentiel = restrict(FuelStockSnapshot.objects.all().order_by("site_id"), ref_ids)
 
         search = (request.query_params.get("search") or "").strip()
         if search:
@@ -1120,6 +1123,7 @@ class FuelStockListView(APIView):
 
             return {
                 "site_id": row.site_id,
+                "hors_referentiel": not in_referential(row.site_id, ref_ids),
                 "site_name": row.site_name,
                 "typology": row.typology,
                 "site_type": row.site_type,

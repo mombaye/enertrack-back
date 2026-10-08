@@ -358,10 +358,9 @@ def compute_period(start: date, end: date, country: str | None = None, site_ids:
         raise ValueError(f"Période limitée à {E.MAX_PERIOD_DAYS} jours.")
     from fuel_tracking.services.site_referential import in_referential, referential_upper_ids
 
-    # Base de sites unique : seuls les sites de Gestion des sites (core.Site) sont affichés.
+    # Tous les sites restent affichés ; ceux absents de Gestion des sites sont signalés (hors_referentiel).
     ref = referential_upper_ids()
-    contexts = [c for c in load_contexts(country=country, site_ids=site_ids, zone=zone)
-                if in_referential(c.site_id, ref)]
+    contexts = load_contexts(country=country, site_ids=site_ids, zone=zone)
     facts = load_facts(contexts, start, end)
     observations = load_observations([c.site_id for c in contexts], start, end)
     es = engine_settings()
@@ -373,9 +372,10 @@ def compute_period(start: date, end: date, country: str | None = None, site_ids:
     from fuel_tracking.models import FuelSiteInventory
 
     ge_ids = set(FuelSiteInventory.objects.filter(dg_count__gt=0).values_list("site_id", flat=True))
-    others = [o for o in load_out_of_scope(end, ge_ids, country=country, site_ids=site_ids, zone=zone)
-              if in_referential(o[0].site_id, ref)]
+    others = load_out_of_scope(end, ge_ids, country=country, site_ids=site_ids, zone=zone)
     rows += [E.out_of_scope_period(ctx, start, end, code, reason, es) for ctx, code, reason in others]
+    for r in rows:
+        r["hors_referentiel"] = not in_referential(r["site_id"], ref)
     return rows
 
 

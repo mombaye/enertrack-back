@@ -180,6 +180,7 @@ def _site_summary(r: dict) -> dict:
     return {
         "blocage": _blocage(r),
         "perimetre": r.get("perimetre", E.PERIMETRE_GE),
+        "hors_referentiel": r.get("hors_referentiel", False),
         "site_id": r["site_id"], "site_name": r["site_name"], "country": r["country"], "zone": r["zone"],
         "kind": r["kind"], "kind_source": r["kind_source"], "grid_supply": r["grid_supply"], "off_grid": r["off_grid"],
         "dg_count": r["dg_count"], "ge_label": r["ge_label"], "data_issue": r["data_issue"],
@@ -409,6 +410,9 @@ def _day_dict(d: dict) -> dict:
 
 
 def _apply_table_filters(rows: list[dict], params) -> list[dict]:
+    hr = (params.get("hors_referentiel") or "").strip()
+    if hr in ("1", "true"):
+        rows = [r for r in rows if r.get("hors_referentiel")]
     pe = (params.get("perimetre") or "").strip()
     if pe:
         rows = [r for r in rows if r.get("perimetre", E.PERIMETRE_GE) == pe]
@@ -585,14 +589,6 @@ def _compute(request, with_daily: bool = True):
     return start, end, rows
 
 
-def _ge_outside_referential() -> int:
-    """Sites avec GE (Snowflake) absents de Gestion des sites : non affichés, à importer."""
-    from fuel_tracking.models import FuelSiteInventory
-    from fuel_tracking.services.site_referential import restrict
-
-    return restrict(FuelSiteInventory.objects.filter(dg_count__gt=0))[1]
-
-
 def _periode_info(start: date, end: date) -> dict:
     """PÉRIODE INCOMPLÈTE : la période demandée dépasse les faits Snowflake disponibles."""
     last = freshness()["facts_last_date"]
@@ -626,7 +622,7 @@ class CphPeriodView(APIView):
             "pagination": {"page": page, "limit": limit, "total": total, "totalPages": total_pages,
                            "hasNext": page < total_pages, "hasPrev": page > 1},
             "periode": _periode_info(start, end),
-            "sites_hors_referentiel": _ge_outside_referential(),
+            "sites_hors_referentiel": sum(1 for r in rows if r.get("hors_referentiel")),
             "filters": {
                 "perimetres": {E.PERIMETRE_GE: synthesis["sites"], E.PERIMETRE_SANS_GE: synthesis["sites_sans_ge"]},
                 "power_methods": sorted({_power_method_main(r) or "AUCUNE" for r in rows}),

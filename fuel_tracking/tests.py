@@ -957,19 +957,21 @@ class OutOfScopeSitesTests(SimpleTestCase):
 
 
 class SiteReferentialTests(TestCase):
-    """Base de sites unique : Gestion des sites (core.Site) délimite les sites affichés."""
+    """Base de sites commune : les sites absents de Gestion des sites restent affichés, signalés."""
 
-    def test_restrict_to_referential_case_insensitive(self):
+    def test_sites_outside_referential_are_shown_and_counted(self):
         from core.models import Site
         from fuel_tracking.models import FuelSiteInventory
-        from fuel_tracking.services.site_referential import restrict
+        from fuel_tracking.services.site_referential import in_referential, referential_upper_ids, restrict
 
         for i, sid in enumerate(("DkR_0001", "DKR_0002", "ZZZ_0003")):
             FuelSiteInventory.objects.create(country="Senegal", data_id=i + 1, site_id=sid, dg_count=1)
         qs, outside = restrict(FuelSiteInventory.objects.all())
-        self.assertEqual((qs.count(), outside), (3, 0))  # référentiel vide : aucun filtre
+        self.assertEqual((qs.count(), outside), (3, 0))  # référentiel vide : rien n'est signalé
         Site.objects.create(site_id="DKR_0001", name="A")
         Site.objects.create(site_id="DKR_0002", name="B")
         qs, outside = restrict(FuelSiteInventory.objects.all())
-        self.assertEqual(sorted(qs.values_list("site_id", flat=True)), ["DKR_0002", "DkR_0001"])
-        self.assertEqual(outside, 1)
+        self.assertEqual((qs.count(), outside), (3, 1))  # tous affichés, ZZZ_0003 compté
+        ref = referential_upper_ids()
+        self.assertTrue(in_referential("DkR_0001", ref))
+        self.assertFalse(in_referential("ZZZ_0003", ref))

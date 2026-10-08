@@ -120,11 +120,11 @@ Le tableau « Suivis Consommations » (API `cph/`) liste **tous** les sites du r
 - Vérification d'un fichier Ops : `python manage.py check_fuel_site_coverage --file Proposition_de_load_092026_v1.xlsx`
   (sites absents, écarts de casse ; code retour 1 si un site manque).
 
-## 9. Base de sites unique (Gestion des sites)
+## 9. Base de sites commune (Gestion des sites)
 
-Tous les onglets Suivi Carburant (Dashboard, Suivis Consommations, Contrôle CPH, Stock, Commandes, Estimation)
-n'affichent que les sites du référentiel commun `core.Site` (page **Gestion des sites**), comme les autres modules.
-Mise à jour : Gestion des sites → **Import Sites** avec le fichier Ops « Proposition_de_load_MMYYYY.xlsx » (création des
-sites manquants, mise à jour sans effacement, load du mois). Un site connu de Snowflake / ENOC / fichiers Ops mais absent
-du référentiel n'est pas affiché ; il est compté (`sites_hors_referentiel`) avec un bandeau invitant à l'importer.
-Référentiel vide → aucun filtre. Code : `fuel_tracking/services/site_referential.py`, `core/site_proposition_import.py`.
+Le référentiel `core.Site` (page **Gestion des sites**) est la base de sites de toute la plateforme. Mise à jour :
+Gestion des sites → **Import Sites** avec le fichier Ops « Proposition_de_load_MMYYYY.xlsx » (création des sites
+manquants, mise à jour sans effacement, load du mois). Dans Suivi Carburant, les sites connus uniquement de Snowflake /
+ENOC / fichiers Ops restent **affichés**, avec la mention « Hors Gestion des sites » (`hors_referentiel` par ligne,
+`sites_hors_referentiel` en compteur, filtre API `hors_referentiel=1`) pour être importés. Rapprochement sans tenir
+compte de la casse. Code : `fuel_tracking/services/site_referential.py`, `core/site_proposition_import.py`.
