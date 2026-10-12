@@ -11,6 +11,7 @@ from .views import (
     SonatelBillingStatsAPIView,
     ImpactedSitesAPIView,
     FNPSitesAPIView,
+    BillingSiteSearchAPIView,
     GridSiteListAPIView,
 )
 
@@ -40,5 +41,6 @@ urlpatterns = [
     path("sonatel-billing/stats/", SonatelBillingStatsAPIView.as_view()),
     path("billing/impacted-sites/", ImpactedSitesAPIView.as_view(), name="impacted-sites"),
     path("sonatel-billing/fnp/", FNPSitesAPIView.as_view(), name="sb-fnp"),
+    path("sonatel-billing/sites-search/", BillingSiteSearchAPIView.as_view(), name="sb-sites-search"),
     path("billing/grid-site-list/", GridSiteListAPIView.as_view(), name="billing-grid-site-list"),
 ]

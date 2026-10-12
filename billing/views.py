@@ -2613,3 +2613,37 @@ class GridSiteListAPIView(APIView):
             "columns": columns,
             "rows": rows,
         })
+
+
+class BillingSiteSearchAPIView(APIView):
+    """
+    GET /sonatel-billing/sites-search/?search=DKR&limit=20
+
+    Recherche de site pour /billing/suivi sur la base commune Gestion des sites (core.Site),
+    et pas seulement sur les sites liés à un contrat Senelec : un site sans contrat reste
+    sélectionnable (ses indicateurs de facturation sont alors vides). Format compatible avec
+    contract-site-links (id, site_id, site_pk, numero_compte_contrat — premier contrat lié ou null).
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        q = (request.query_params.get("search") or "").strip()
+        try:
+            limit = min(100, max(1, int(request.query_params.get("limit", 20))))
+        except ValueError:
+            limit = 20
+        qs = Site.objects.all()
+        if q:
+            qs = qs.filter(Q(site_id__icontains=q) | Q(name__icontains=q))
+        sites = list(qs.order_by("site_id").values("pk", "site_id", "name")[:limit])
+        contracts: dict[int, str] = {}
+        for site_pk, contract in (
+            ContractSiteLink.objects.filter(site_id__in=[s["pk"] for s in sites])
+            .order_by("site_id", "-last_seen_at").values_list("site_id", "numero_compte_contrat")
+        ):
+            contracts.setdefault(site_pk, contract)
+        return Response([
+            {"id": s["pk"], "site_pk": s["pk"], "site_id": s["site_id"], "site_name": s["name"],
+             "numero_compte_contrat": contracts.get(s["pk"])}
+            for s in sites
+        ])
