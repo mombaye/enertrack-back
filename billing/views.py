@@ -2635,7 +2635,7 @@ class BillingSiteSearchAPIView(APIView):
         qs = Site.objects.all()
         if q:
             qs = qs.filter(Q(site_id__icontains=q) | Q(name__icontains=q))
-        sites = list(qs.order_by("site_id").values("pk", "site_id", "name")[:limit])
+        sites = list(qs.order_by("site_id").values("pk", "site_id", "name", "contract_number")[:limit])
         contracts: dict[int, str] = {}
         for site_pk, contract in (
             ContractSiteLink.objects.filter(site_id__in=[s["pk"] for s in sites])
@@ -2644,6 +2644,7 @@ class BillingSiteSearchAPIView(APIView):
             contracts.setdefault(site_pk, contract)
         return Response([
             {"id": s["pk"], "site_pk": s["pk"], "site_id": s["site_id"], "site_name": s["name"],
-             "numero_compte_contrat": contracts.get(s["pk"])}
+             # Lien de facturation, sinon numéro de contrat saisi dans Gestion des sites.
+             "numero_compte_contrat": contracts.get(s["pk"]) or (s["contract_number"] or None)}
             for s in sites
         ])
