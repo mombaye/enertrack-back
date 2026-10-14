@@ -8,6 +8,9 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.parsers import MultiPartParser
+from rest_framework.pagination import PageNumberPagination
+from rest_framework.decorators import action
+from django.db.models import Count, Q
 
 import pandas as pd
 
@@ -28,13 +31,55 @@ def protected_ping(request):
     return Response({"message": f"Bonjour {request.user.username}, accès autorisé."})
 
 
+class SitePagination(PageNumberPagination):
+    """Gestion des sites : pagination serveur, taille de page demandée par le client (max 1000)."""
+    page_size = 20
+    page_size_query_param = "page_size"
+    max_page_size = 1000
+
+
 class SiteViewSet(viewsets.ModelViewSet):
     queryset = Site.objects.all()
     serializer_class = SiteSerializer
+    pagination_class = SitePagination
+
+    def _base_queryset(self):
+        return Site.objects.filter(country=self.request.user.pays)
 
     def get_queryset(self):
-        user_country = self.request.user.pays
-        return Site.objects.filter(country=user_country).order_by('zone', 'name')
+        qs = self._base_queryset().order_by('zone', 'name')
+        if self.action != "list":
+            return qs
+        # Filtres serveur (page Gestion des sites) : recherche, zone, type, paiement, scope.
+        p = self.request.query_params
+        q = (p.get("search") or "").strip()
+        if q:
+            qs = qs.filter(
+                Q(site_id__icontains=q) | Q(name__icontains=q) | Q(contract_number__icontains=q)
+                | Q(meter_number__icontains=q) | Q(installed_typology__icontains=q) | Q(configuration__icontains=q)
+            )
+        if (p.get("zone") or "all") != "all":
+            qs = qs.filter(zone__iexact=p["zone"])
+        if (p.get("site_type") or "all") != "all":
+            qs = qs.filter(site_type__iexact=p["site_type"])
+        if (p.get("invoice_payment") or "all") != "all":
+            qs = qs.filter(invoice_payment__iexact=p["invoice_payment"])
+        if (p.get("scope_status") or "all") != "all":
+            qs = qs.filter(scope_status=p["scope_status"])
+        return qs
+
+    @action(detail=False, methods=["get"])
+    def stats(self, request):
+        """Compteurs de la page Gestion des sites, calculés en base (pas de chargement de tous les sites)."""
+        agg = self._base_queryset().aggregate(
+            total=Count("id"),
+            modernized=Count("id", filter=Q(modernized=True)),
+            solar_pending=Count("id", filter=Q(not_yet_solarized=True)),
+            indoor=Count("id", filter=Q(site_type__iexact="indoor")),
+            in_scope=Count("id", filter=Q(scope_status="IN_SCOPE")),
+        )
+        zones = sorted(z for z in self._base_queryset().values_list("zone", flat=True).distinct() if z)
+        return Response({**agg, "zones": zones})
 
 
 class SiteImportView(APIView):
