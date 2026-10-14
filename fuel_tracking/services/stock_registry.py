@@ -267,9 +267,10 @@ def guard_comparisons(site_id: str, observations=None, tanks=None) -> list[dict]
     loli = [o for o in observations if o.source_type == "LOLIFORCE"]
     scss = [o for o in observations if o.source_type == "SCSS"]
     out = []
+    single_tank = len(tanks) <= 1  # une seule cuve (ou aucune) : l'identifiant de cuve n'est pas discriminant
     for a in loli:
         for b in scss:
-            if (a.tank_id or None) != (b.tank_id or None):
+            if not single_tank and (a.tank_id or None) != (b.tank_id or None):
                 continue
             if abs(a.observation_datetime - b.observation_datetime) >= COMPARISON_WINDOW:
                 continue
@@ -493,13 +494,13 @@ def reconvert_site_observations(site_id: str, user=None) -> int:
         inp = ObservationInput(o.source_type, o.source_event_id, o.site_id, o.observation_datetime, o.level_raw,
                                _f(o.level_value), o.level_unit, o.tank_id, review_flags=o.review_flags)
         new, _ = build_observation(inp, tanks, guard)
-        before = (o.level_liters, o.conversion_status, o.validation_status)
-        after = (new.level_liters, new.conversion_status, new.validation_status)
+        before = (o.tank_id, o.level_liters, o.conversion_status, o.validation_status)
+        after = (new.tank_id, new.level_liters, new.conversion_status, new.validation_status)
         if before != after:
             log_correction("OBSERVATION", o.pk, "SYSTEM", "Reconversion après modification du référentiel cuve",
                            site_id=site_id, field="level_liters/conversion/validation", old=before, new=after, user=user,
                            author_label=None if user else "système")
-            for f in ("level_liters", "conversion_method", "conversion_status", "conversion_message", "capacity_l",
+            for f in ("tank_id", "level_liters", "conversion_method", "conversion_status", "conversion_message", "capacity_l",
                       "validation_status", "validation_reason", "guard_scope_status"):
                 setattr(o, f, getattr(new, f))
             o.save()

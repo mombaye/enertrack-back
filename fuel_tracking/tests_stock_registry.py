@@ -322,6 +322,22 @@ class ComparisonAndRetainedTests(TestCase):
         ret = R.fuel_stock_retained(now=self.now)["DKR_0001"]
         self.assertIsNone(ret["stock_l"])  # ni moyenne (700) ni choix silencieux
 
+    def test_single_tank_site_compares_even_if_one_reading_has_no_tank_id(self):
+        self.obs("LOLIFORCE", 500, 10, tank_id=None)
+        self.obs("SCSS", 900, 30, tank_id="1")
+        self.assertEqual(R.guard_comparisons("DKR_0001")[0]["status"], R.STOCK_CONFLICT)
+
+    def test_reconversion_after_tank_validation_sets_tank_id(self):
+        Site.objects.create(site_id="DKR_0009", name="NINE")
+        t = tank("DKR_0009", validated=False, shape="RECTANGULAR", length_m=1, width_m=1, height_m=1, capacity_l=1000, diameter_m=None)
+        o = FuelStockObservation.objects.create(source_type="LOLIFORCE", source_event_id="x", site_id="DKR_0009",
+                                                observation_datetime=self.now, level_raw="10", level_value=10, level_unit="CM",
+                                                conversion_status="PENDING_TANK_MAPPING", validation_status="PENDING")
+        R.correct_tank(t, {}, None, "ok", validate=True)
+        R.reconvert_site_observations("DKR_0009")
+        o.refresh_from_db()
+        self.assertEqual((o.tank_id, float(o.level_liters)), ("1", 100.0))
+
     def test_not_comparable_beyond_48h_or_without_capacity(self):
         self.obs("LOLIFORCE", 500, 10)
         self.obs("SCSS", 900, 70)

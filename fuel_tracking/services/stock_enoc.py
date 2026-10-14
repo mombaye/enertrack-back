@@ -157,7 +157,7 @@ def _counterpart(m) -> str | None:
 def _raw_level(v, unit) -> str | None:
     if v is None:
         return None
-    return f"{v} {unit or '?'}"
+    return f"{float(v):g} {unit or '?'}"
 
 
 TRACKED_MOVEMENT_FIELDS = ("site_id", "movement_type", "movement_datetime", "requested_quantity_l", "quantity_l",

@@ -22,8 +22,6 @@ GET /api/fuel-tracking/stock/ (Snowflake + ENOC, information technique) est inch
 """
 from __future__ import annotations
 
-from datetime import timedelta
-
 from django.db.models import Count, Q
 from django.utils import timezone
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
@@ -109,10 +107,9 @@ def build_registry_rows(now=None) -> tuple[list[dict], dict]:
     for sid, src in FuelStockObservation.objects.filter(source_type__in=R.GUARD_SOURCES).values_list("site_id", "source_type").distinct():
         by_source.setdefault(sid, set()).add(src)
     conflict_sites = set()
-    recent = now - timedelta(days=30)
     for sid, srcs in by_source.items():
         if len(srcs) == 2:
-            obs = list(FuelStockObservation.objects.filter(site_id=sid, source_type__in=R.GUARD_SOURCES, observation_datetime__gte=recent)
+            obs = list(FuelStockObservation.objects.filter(site_id=sid, source_type__in=R.GUARD_SOURCES)
                        .exclude(validation_status="REJECTED"))
             if any(c["status"] == R.STOCK_CONFLICT for c in R.guard_comparisons(sid, obs)):
                 conflict_sites.add(sid)
