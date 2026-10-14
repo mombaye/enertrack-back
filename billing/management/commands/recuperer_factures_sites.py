@@ -47,8 +47,10 @@ class Command(BaseCommand):
         parser.add_argument("--to", dest="to_month", default=f"{year}-10")
         parser.add_argument("--site", action="append", default=[], help="Site(s) précis (répétable)")
         parser.add_argument("--dry-run", action="store_true", help="Bilan seulement, aucune modification")
+        parser.add_argument("--csv", default=None,
+                            help="Écrit les listes complètes (contrats ambigus / inconnus, sites sans facture) dans ce fichier CSV")
 
-    def handle(self, *args, from_month, to_month, site, dry_run, **opts):
+    def handle(self, *args, from_month, to_month, site, dry_run, csv, **opts):
         ys, ms = parse_month(from_month)
         ye, me = parse_month(to_month)
         months = []
@@ -66,6 +68,7 @@ class Command(BaseCommand):
             sites = sites.filter(site_id__in=site)
         totals = {"sites": 0, "avec_contrat": 0, "scope_modifies": 0, "liens_crees": 0,
                   "liens_reaffectes": 0, "factures_rattachees": 0}
+        ambiguous: dict[str, set[str]] = {}
         with transaction.atomic():
             for s in sites.iterator():
                 totals["sites"] += 1
@@ -75,13 +78,21 @@ class Command(BaseCommand):
                 if scope and scope != s.scope_status:
                     totals["scope_modifies"] += 1
                     Site.objects.filter(pk=s.pk).update(scope_status=scope)
-                for k, v in sync_site_contracts(s).items():
+                res = sync_site_contracts(s)
+                for contract, sids in res.pop("ambigus"):
+                    ambiguous.setdefault(contract, set()).update(sids)
+                for k, v in res.items():
                     if k in totals:
                         totals[k] += v
             if dry_run:
                 transaction.set_rollback(True)
         w(self.style.MIGRATE_HEADING(("[DRY RUN] " if dry_run else "") + "1. Rattachement des factures aux sites"))
         w("   " + " · ".join(f"{k} : {v}" for k, v in totals.items()))
+        w(f"   contrats ambigus (saisis sur plusieurs fiches, non modifiés) : {len(ambiguous)}")
+        for contract, sids in sorted(ambiguous.items())[:20]:
+            w(f"     {contract} : {', '.join(sorted(sids))}")
+        if len(ambiguous) > 20:
+            w(f"     … {len(ambiguous) - 20} autre(s) (voir --csv)")
 
         # 2. Bilan mois par mois sur la période.
         period_q = Q()
@@ -130,4 +141,17 @@ class Command(BaseCommand):
                 w("     " + ", ".join(without[:40]) + (" …" if len(without) > 40 else ""))
         if missing:
             w(self.style.WARNING(f"\nMois sans facture importée : {', '.join(missing)}"))
+        if csv and not site:
+            import csv as csvlib
+
+            with open(csv, "w", newline="", encoding="utf-8-sig") as fh:
+                wr = csvlib.writer(fh, delimiter=";")
+                wr.writerow(["type", "valeur", "detail"])
+                for contract, sids in sorted(ambiguous.items()):
+                    wr.writerow(["contrat_ambigu", contract, " | ".join(sorted(sids))])
+                for contract in orphans:
+                    wr.writerow(["contrat_inconnu", contract, "facturé mais absent de Gestion des sites"])
+                for sid in without:
+                    wr.writerow(["site_sans_facture", sid, "Aktivco + redevance Grid, aucune facture sur la période"])
+            w(f"Listes complètes écrites dans {csv}")
         w(self.style.SUCCESS("\nTerminé." if not dry_run else "\nDRY RUN terminé — aucune modification enregistrée."))

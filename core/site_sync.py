@@ -51,13 +51,35 @@ def site_contracts(site) -> list[str]:
     return out
 
 
+def other_sites_with_contract(site, contract: str) -> list[str]:
+    """Autres sites de Gestion des sites dont la fiche porte aussi ce numéro de contrat."""
+    from core.models import Site
+
+    out = []
+    for other in Site.objects.filter(contract_number__icontains=contract).exclude(pk=site.pk).only("site_id", "contract_number"):
+        if contract in site_contracts(other):
+            out.append(other.site_id)
+    return out
+
+
 def sync_site_contracts(site) -> dict:
-    """Crée / réaffecte les liens contrat → site et rattache les factures de ces contrats au site."""
+    """
+    Crée / réaffecte les liens contrat → site et rattache les factures de ces contrats au site.
+    Un contrat saisi sur PLUSIEURS fiches de Gestion des sites est ambigu : ni lien ni facture n'est
+    modifié (aucun basculement d'un site à l'autre), il est seulement signalé (stats["ambigus"]).
+    """
     from billing.models import ContractSiteLink, SonatelInvoice
 
     contracts = site_contracts(site)
-    stats = {"contrats": len(contracts), "liens_crees": 0, "liens_reaffectes": 0, "factures_rattachees": 0}
+    stats = {"contrats": len(contracts), "liens_crees": 0, "liens_reaffectes": 0, "factures_rattachees": 0,
+             "ambigus": []}
+    resolved = []
     for contract in contracts:
+        others = other_sites_with_contract(site, contract)
+        if others:
+            stats["ambigus"].append((contract, [site.site_id, *others]))
+            continue
+        resolved.append(contract)
         link = ContractSiteLink.objects.filter(numero_compte_contrat=contract).first()
         if link is None:
             ContractSiteLink.objects.create(numero_compte_contrat=contract, site=site)
@@ -68,9 +90,9 @@ def sync_site_contracts(site) -> dict:
             link.site = site
             link.save(update_fields=["site", "last_seen_at"])
             stats["liens_reaffectes"] += 1
-    if contracts:
+    if resolved:
         stats["factures_rattachees"] = (
-            SonatelInvoice.objects.filter(numero_compte_contrat__in=contracts)
+            SonatelInvoice.objects.filter(numero_compte_contrat__in=resolved)
             .exclude(site_id=site.pk).update(site=site)
         )
     return stats

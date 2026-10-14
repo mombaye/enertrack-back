@@ -46,7 +46,8 @@ class Command(BaseCommand):
                     total["liens_reaffectes"] += sum(1 for c in contracts if c in linked and linked[c] != s.pk)
                     continue
                 for k, v in sync_site_contracts(s).items():
-                    total[k] += v
+                    if k in total:
+                        total[k] += v
             if dry_run:
                 transaction.set_rollback(True)
         self.stdout.write(("DRY RUN — aucune modification. " if dry_run else "") +

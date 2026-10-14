@@ -19,7 +19,10 @@ class RecupererFacturesTests(TestCase):
         Site.objects.bulk_create([Site(site_id="DKR_2834", name="RUF44", contract_number="22005301879",
                                        invoice_payment="Aktivco", grid_fee=True)])  # sans signal : cas « existant »
         out = io.StringIO()
-        call_command("recuperer_factures_sites", "--from", "2026-07", "--to", "2026-09", stdout=out)
+        import os, tempfile
+        path = os.path.join(tempfile.mkdtemp(), "bilan.csv")
+        call_command("recuperer_factures_sites", "--from", "2026-07", "--to", "2026-09", "--csv", path, stdout=out)
+        self.assertTrue(open(path, encoding="utf-8-sig").read().startswith("type;valeur;detail"))
         text = out.getvalue()
         self.assertEqual(SonatelInvoice.objects.get(pk=inv.pk).site.site_id, "DKR_2834")
         self.assertIn("1 visibles (1 sites)", text)
