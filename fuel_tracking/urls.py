@@ -9,6 +9,21 @@ from fuel_tracking.views import (
     FuelConsommationListView,
     FuelStockListView,
 )
+from fuel_tracking.views_stock import (
+    GuardScopeCloseView,
+    GuardScopeView,
+    ImportBatchListView,
+    ImportBatchRelaunchView,
+    ImportBatchRowsView,
+    MovementRejectView,
+    MovementValidateView,
+    ObservationRejectView,
+    ObservationValidateView,
+    StockRegistrySiteView,
+    StockRegistryView,
+    TankDetailView,
+    TankListView,
+)
 from fuel_tracking.views_cph import (
     CphAbaqueImportView,
     CphCurveApproveView,
@@ -30,6 +45,20 @@ urlpatterns = [
     path("consommation/dashboard/", FuelConsommationDashboardView.as_view(), name="fuel-consommation-dashboard"),
     path("consommation/", FuelConsommationListView.as_view(), name="fuel-consommation"),
     path("stock/", FuelStockListView.as_view(), name="fuel-stock"),
+    # Registre unifié de stock (Phase 1) — voir views_stock.py
+    path("stock/registre/", StockRegistryView.as_view(), name="fuel-stock-registre"),
+    path("stock/registre/<str:site_id>/", StockRegistrySiteView.as_view(), name="fuel-stock-registre-site"),
+    path("stock/observations/<int:pk>/valider/", ObservationValidateView.as_view(), name="fuel-stock-obs-valider"),
+    path("stock/observations/<int:pk>/rejeter/", ObservationRejectView.as_view(), name="fuel-stock-obs-rejeter"),
+    path("stock/mouvements/<int:pk>/valider/", MovementValidateView.as_view(), name="fuel-stock-mv-valider"),
+    path("stock/mouvements/<int:pk>/rejeter/", MovementRejectView.as_view(), name="fuel-stock-mv-rejeter"),
+    path("stock/cuves/", TankListView.as_view(), name="fuel-stock-cuves"),
+    path("stock/cuves/<int:pk>/", TankDetailView.as_view(), name="fuel-stock-cuve"),
+    path("stock/imports/", ImportBatchListView.as_view(), name="fuel-stock-imports"),
+    path("stock/imports/<int:pk>/lignes/", ImportBatchRowsView.as_view(), name="fuel-stock-import-lignes"),
+    path("stock/imports/<int:pk>/relancer/", ImportBatchRelaunchView.as_view(), name="fuel-stock-import-relancer"),
+    path("stock/gardiennage/", GuardScopeView.as_view(), name="fuel-stock-gardiennage"),
+    path("stock/gardiennage/<int:pk>/cloturer/", GuardScopeCloseView.as_view(), name="fuel-stock-gardiennage-cloturer"),
     path("commandes/estimation/", FuelCommandeEstimationView.as_view(), name="fuel-commandes-estimation"),
     path("commandes/", FuelCommandeView.as_view(), name="fuel-commandes"),
 

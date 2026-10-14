@@ -67,6 +67,13 @@ def sync_enoc_fuel_movements_current_month(self):
         logger.exception(
             "[fuel_tracking] Échec sync_enoc_fuel_movements planifiée (%s → %s)", prev, current
         )
+    # Registre stock : projection des mouvements ENOC déjà synchronisés (aucune connexion ENOC en plus).
+    try:
+        from fuel_tracking.services.stock_enoc import sync_enoc_to_registry
+
+        sync_enoc_to_registry()
+    except Exception:
+        logger.exception("[fuel_tracking] Échec projection ENOC → registre stock")
 
 
 DAILY_FACTS_LOCK = "fuel_tracking:daily_facts_sync_lock"
@@ -153,3 +160,18 @@ def auto_import_stan_periodic(self):
         call_command("auto_import_stan")
     except Exception:
         logger.exception("[fuel_tracking] Échec auto_import_stan planifiée")
+
+
+@shared_task(bind=True, name="fuel_tracking.process_fuel_import_incoming")
+def process_fuel_import_incoming(self):
+    """Registre stock : traite les fichiers déposés dans FUEL_IMPORT_ROOT/incoming/{loliforce,scss,closing}."""
+    from fuel_tracking.services.stock_import_pipeline import root, scan_incoming
+
+    if not root().exists():
+        logger.warning("[fuel_tracking] FUEL_IMPORT_ROOT introuvable (%s) : répertoire partagé non monté", root())
+        return
+    try:
+        for b in scan_incoming():
+            logger.info("[fuel_tracking] import stock %s %s → %s (%s)", b.source_type, b.file_name, b.status, b.status_message)
+    except Exception:
+        logger.exception("[fuel_tracking] Échec traitement des fichiers du registre stock")

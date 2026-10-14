@@ -255,6 +255,12 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'fuel_tracking.auto_import_stan_periodic',
         'schedule': crontab(minute='*/15'),
     },
+    # Registre stock : fichiers déposés dans FUEL_IMPORT_ROOT/incoming/{loliforce,scss,closing}
+    # (dédoublonnage par empreinte : un fichier déjà traité n'est jamais réimporté).
+    'fuel-stock-registry-incoming-15min': {
+        'task': 'fuel_tracking.process_fuel_import_incoming',
+        'schedule': crontab(minute='7,22,37,52'),
+    },
 }
 
 # Cache Redis (DB 1, distincte du broker Celery en DB 0) — utilisé notamment pour
@@ -318,6 +324,12 @@ ENOC_MONGO_PORT     = int(os.getenv("ENOC_MONGO_PORT", "27017"))
 ENOC_MONGO_USERNAME = os.getenv("ENOC_MONGO_USERNAME", "")
 ENOC_MONGO_PASSWORD = os.getenv("ENOC_MONGO_PASSWORD", "")
 ENOC_MONGO_DB_NAME  = os.getenv("ENOC_MONGO_DB_NAME", "")
+
+# Registre stock carburant (Suivis Stock) — répertoire partagé monté (voir docker-compose.yml) :
+#   incoming/{loliforce,scss,closing}, processing, accepted, rejected, archive.
+FUEL_IMPORT_ROOT = os.getenv("FUEL_IMPORT_ROOT", "/mnt/Suivi_carburant_prod")
+# Tolérance de dépassement de capacité cuve (en %) avant de déclarer un volume invalide.
+FUEL_CAPACITY_TOLERANCE_PCT = float(os.getenv("FUEL_CAPACITY_TOLERANCE_PCT", "5"))
 ENOC_INTEGRATION_TIMEOUT = int(os.getenv("ENOC_INTEGRATION_TIMEOUT", "30"))
 
 FUEL_TRACKING_SITE_MODEL = "core.Site"

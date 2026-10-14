@@ -1010,3 +1010,302 @@ class FuelObservation(models.Model):
         verbose_name = "Observation stock carburant"
         verbose_name_plural = "Observations stock carburant"
         indexes = [models.Index(fields=["site_id", "observation_start", "observation_end"])]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 1 — Registre unifié de stock et de mouvements carburant (Suivis Stock).
+# Sources : ENOC (connecteur existant, via FuelEnocMovement), fichiers des
+# sociétés de gardiennage (Loliforce, SCSS), Closing (référentiel cuves) et
+# historique refueling. Règles : une donnée absente reste NULL (jamais 0),
+# aucun relevé ni mouvement n'est supprimé physiquement, toute correction est
+# tracée (FuelRegistryCorrection). Voir docs/fuel_stock_registry.md.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class FuelImportBatch(models.Model):
+    """Un fichier reçu (répertoire monté FUEL_IMPORT_ROOT ou upload) — fichier original jamais modifié."""
+
+    class SourceType(models.TextChoices):
+        ENOC = "ENOC", "ENOC"
+        LOLIFORCE = "LOLIFORCE", "Loliforce"
+        SCSS = "SCSS", "SCSS"
+        CLOSING = "CLOSING", "Closing (référentiel cuves)"
+        HISTORICAL_REFUELING = "HISTORICAL_REFUELING", "Historique refueling"
+
+    class Status(models.TextChoices):
+        RECEIVED = "RECEIVED", "Reçu"
+        PROCESSING = "PROCESSING", "En traitement"
+        VALIDATION_REQUIRED = "VALIDATION_REQUIRED", "Validation requise"
+        ACCEPTED = "ACCEPTED", "Accepté"
+        REJECTED = "REJECTED", "Rejeté"
+        FAILED = "FAILED", "Échec technique"
+
+    source_type = models.CharField(max_length=32, choices=SourceType.choices, db_index=True)
+    file_name = models.CharField(max_length=255)
+    file_hash = models.CharField(max_length=64, db_index=True, help_text="SHA-256 du fichier original.")
+    file_size = models.BigIntegerField(null=True, blank=True)
+    stored_path = models.CharField(max_length=1024, null=True, blank=True, help_text="Emplacement actuel du fichier (accepted/rejected).")
+    archive_path = models.CharField(max_length=1024, null=True, blank=True, help_text="Copie d'archive immuable.")
+    report_path = models.CharField(max_length=1024, null=True, blank=True)
+    origin = models.CharField(max_length=16, default="FOLDER", help_text="FOLDER (répertoire monté), UPLOAD (interface), ENOC (connecteur).")
+    status = models.CharField(max_length=24, choices=Status.choices, default=Status.RECEIVED, db_index=True)
+    status_message = models.TextField(null=True, blank=True)
+    duplicate_of = models.ForeignKey("self", null=True, blank=True, on_delete=models.SET_NULL, related_name="duplicates")
+    relaunch_of = models.ForeignKey("self", null=True, blank=True, on_delete=models.SET_NULL, related_name="relaunches")
+    relaunch_reason = models.TextField(null=True, blank=True)
+    rows_total = models.IntegerField(default=0)
+    rows_accepted = models.IntegerField(default=0)
+    rows_warning = models.IntegerField(default=0)
+    rows_rejected = models.IntegerField(default=0)
+    rows_pending = models.IntegerField(default=0)
+    rows_duplicate = models.IntegerField(default=0)
+    summary = models.JSONField(default=dict, blank=True)
+    received_at = models.DateTimeField(default=timezone.now)
+    processed_at = models.DateTimeField(null=True, blank=True)
+    received_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+
+    class Meta:
+        db_table = "fuel_import_batch"
+        ordering = ["-received_at"]
+        verbose_name = "Lot d'import carburant"
+        verbose_name_plural = "Lots d'import carburant"
+
+
+class FuelImportRow(models.Model):
+    """Ligne brute d'un lot — chargée telle quelle AVANT toute interprétation."""
+
+    class ValidationStatus(models.TextChoices):
+        ACCEPTED = "ACCEPTED", "Acceptée"
+        WARNING = "WARNING", "Acceptée avec alerte"
+        REJECTED = "REJECTED", "Rejetée"
+        PENDING = "PENDING", "En attente de validation"
+
+    batch = models.ForeignKey(FuelImportBatch, on_delete=models.PROTECT, related_name="rows")
+    sheet_name = models.CharField(max_length=128, null=True, blank=True)
+    row_number = models.IntegerField()
+    raw_payload = models.JSONField(default=dict)
+    site_id_raw = models.CharField(max_length=128, null=True, blank=True)
+    site_id_resolved = models.CharField(max_length=64, null=True, blank=True, db_index=True)
+    event_datetime = models.DateTimeField(null=True, blank=True)
+    validation_status = models.CharField(max_length=16, choices=ValidationStatus.choices, default=ValidationStatus.PENDING, db_index=True)
+    messages = models.JSONField(default=list, blank=True, help_text="[{code, message}] — contrôles appliqués à la ligne.")
+    row_fingerprint = models.CharField(max_length=64, null=True, blank=True, db_index=True)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "fuel_import_row"
+        ordering = ["batch_id", "sheet_name", "row_number"]
+        indexes = [models.Index(fields=["batch", "validation_status"])]
+
+
+class FuelTankMaster(models.Model):
+    """Référentiel cuve (forme, dimensions, capacité, abaque) — utilisé pour cm → L seulement s'il est VALIDÉ."""
+
+    class Shape(models.TextChoices):
+        HORIZONTAL_CYLINDER = "HORIZONTAL_CYLINDER", "Cylindre horizontal"
+        VERTICAL_CYLINDER = "VERTICAL_CYLINDER", "Cylindre vertical"
+        RECTANGULAR = "RECTANGULAR", "Parallélépipède"
+        HORIZONTAL_ELLIPTICAL = "HORIZONTAL_ELLIPTICAL", "Cylindre elliptique horizontal"
+        CUSTOM_CURVE = "CUSTOM_CURVE", "Abaque (courbe de jaugeage)"
+
+    class ValidationStatus(models.TextChoices):
+        PENDING = "PENDING", "À valider"
+        VALIDATED = "VALIDATED", "Validée"
+        REJECTED = "REJECTED", "Rejetée"
+
+    site_id = models.CharField(max_length=64, db_index=True)
+    tank_id = models.CharField(max_length=32, help_text="Identifiant de la cuve sur le site (1, 2…). Jamais déduit automatiquement d'un relevé.")
+    shape = models.CharField(max_length=32, choices=Shape.choices, null=True, blank=True)
+    length_m = models.DecimalField(max_digits=8, decimal_places=4, null=True, blank=True)
+    width_m = models.DecimalField(max_digits=8, decimal_places=4, null=True, blank=True)
+    height_m = models.DecimalField(max_digits=8, decimal_places=4, null=True, blank=True)
+    diameter_m = models.DecimalField(max_digits=8, decimal_places=4, null=True, blank=True)
+    capacity_l = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True)
+    calibration_curve = models.JSONField(null=True, blank=True, help_text="[[niveau_cm, volume_L], …] croissant.")
+    calibration_validated = models.BooleanField(default=False)
+    source_type = models.CharField(max_length=32, default="MANUAL", help_text="CLOSING, HISTORICAL_REFUELING ou MANUAL.")
+    source_batch = models.ForeignKey(FuelImportBatch, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    validation_status = models.CharField(max_length=16, choices=ValidationStatus.choices, default=ValidationStatus.PENDING, db_index=True)
+    validated_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    validated_at = models.DateTimeField(null=True, blank=True)
+    active = models.BooleanField(default=True)
+    comment = models.TextField(null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "fuel_tank_master"
+        ordering = ["site_id", "tank_id"]
+        constraints = [models.UniqueConstraint(fields=["site_id", "tank_id"], name="uniq_fuel_tank_site_tank")]
+
+
+class FuelGuardScope(models.Model):
+    """Périmètre de gardiennage configuré : quel prestataire relève quel site, sur quelle période."""
+
+    class Provider(models.TextChoices):
+        LOLIFORCE = "LOLIFORCE", "Loliforce"
+        SCSS = "SCSS", "SCSS"
+
+    site_id = models.CharField(max_length=64, db_index=True)
+    provider = models.CharField(max_length=16, choices=Provider.choices, db_index=True)
+    active_from = models.DateField()
+    active_to = models.DateField(null=True, blank=True)
+    comment = models.TextField(null=True, blank=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "fuel_guard_scope"
+        ordering = ["site_id", "-active_from"]
+
+
+class FuelStockObservation(models.Model):
+    """Relevé de niveau de cuve, quelle qu'en soit la source. Jamais supprimé ; corrections tracées."""
+
+    class SourceType(models.TextChoices):
+        ENOC = "ENOC", "ENOC"
+        LOLIFORCE = "LOLIFORCE", "Loliforce"
+        SCSS = "SCSS", "SCSS"
+        SNOWFLAKE = "SNOWFLAKE", "Snowflake (information technique)"
+        CLOSING = "CLOSING", "Closing"
+
+    class Unit(models.TextChoices):
+        L = "L", "Litres"
+        CM = "CM", "Centimètres"
+
+    class ConversionMethod(models.TextChoices):
+        DIRECT_LITERS = "DIRECT_LITERS", "Relevé direct en litres"
+        TANK_CURVE = "TANK_CURVE", "Abaque cuve validé"
+        GEOMETRIC_CALCULATION = "GEOMETRIC_CALCULATION", "Calcul géométrique (dimensions validées)"
+        NONE = "NONE", "Aucune"
+
+    class ConversionStatus(models.TextChoices):
+        VALID = "VALID", "Valide"
+        PENDING_TANK_MAPPING = "PENDING_TANK_MAPPING", "Cuve à référencer / valider"
+        INVALID = "INVALID", "Invalide"
+
+    class ValidationStatus(models.TextChoices):
+        PENDING = "PENDING", "À valider"
+        VALIDATED = "VALIDATED", "Validé"
+        REJECTED = "REJECTED", "Rejeté"
+
+    source_type = models.CharField(max_length=16, choices=SourceType.choices, db_index=True)
+    source_event_id = models.CharField(max_length=128, help_text="Identifiant de l'événement source (ENOC : request_code:before|after ; fichier : empreinte).")
+    batch = models.ForeignKey(FuelImportBatch, null=True, blank=True, on_delete=models.PROTECT, related_name="observations")
+    import_row = models.ForeignKey(FuelImportRow, null=True, blank=True, on_delete=models.PROTECT, related_name="observations")
+    site_id = models.CharField(max_length=64, db_index=True)
+    tank_id = models.CharField(max_length=32, null=True, blank=True)
+    observation_datetime = models.DateTimeField(db_index=True)
+    level_raw = models.CharField(max_length=128, null=True, blank=True, help_text="Valeur telle que saisie à la source.")
+    level_value = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True)
+    level_unit = models.CharField(max_length=4, choices=Unit.choices, null=True, blank=True)
+    level_liters = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True)
+    conversion_method = models.CharField(max_length=24, choices=ConversionMethod.choices, default=ConversionMethod.NONE)
+    conversion_status = models.CharField(max_length=24, choices=ConversionStatus.choices, default=ConversionStatus.PENDING_TANK_MAPPING, db_index=True)
+    conversion_message = models.TextField(null=True, blank=True)
+    capacity_l = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True, help_text="Capacité de la (des) cuve(s) validée(s) au moment de la conversion.")
+    hour_meter = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    source_user = models.CharField(max_length=255, null=True, blank=True)
+    source_reference = models.CharField(max_length=255, null=True, blank=True)
+    guard_scope_status = models.CharField(max_length=24, null=True, blank=True, help_text="IN_SCOPE, NOT_CONFIGURED, PROVIDER_MISMATCH (sources gardiennage).")
+    comment = models.TextField(null=True, blank=True)
+    proof_reference = models.CharField(max_length=512, null=True, blank=True)
+    validation_status = models.CharField(max_length=16, choices=ValidationStatus.choices, default=ValidationStatus.PENDING, db_index=True)
+    validation_reason = models.TextField(null=True, blank=True)
+    review_flags = models.JSONField(default=list, blank=True, help_text="Motifs de revue indépendants de la conversion (conflit même source, demande ENOC non clôturée…).")
+    validated_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    validated_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "fuel_stock_observation"
+        ordering = ["-observation_datetime"]
+        constraints = [models.UniqueConstraint(fields=["source_type", "source_event_id"], name="uniq_fuel_stock_obs_source_event")]
+        indexes = [
+            models.Index(fields=["site_id", "observation_datetime"]),
+            models.Index(fields=["validation_status", "conversion_status"]),
+        ]
+
+
+class FuelMovement(models.Model):
+    """Mouvement de carburant (livraison, appoint, transfert, retrait, vol, vidange, correction)."""
+
+    class SourceType(models.TextChoices):
+        ENOC = "ENOC", "ENOC"
+        HISTORICAL_REFUELING = "HISTORICAL_REFUELING", "Historique refueling"
+        CLOSING = "CLOSING", "Closing"
+
+    class MovementType(models.TextChoices):
+        DELIVERY_EYDON = "DELIVERY_EYDON", "Livraison Eydon"
+        DELIVERY_TOTAL_CARD = "DELIVERY_TOTAL_CARD", "Livraison carte Total"
+        ADD = "ADD", "Appoint"
+        TRANSFER_IN = "TRANSFER_IN", "Transfert entrant (ponction reçue)"
+        TRANSFER_OUT = "TRANSFER_OUT", "Transfert sortant (ponction)"
+        WITHDRAWAL = "WITHDRAWAL", "Retrait"
+        THEFT = "THEFT", "Vol"
+        DRAIN = "DRAIN", "Vidange"
+        CORRECTION = "CORRECTION", "Correction"
+
+    class Status(models.TextChoices):
+        DECLARED = "DECLARED", "Déclaré"
+        CLOSED = "CLOSED", "Clôturé à la source"
+        VALIDATED = "VALIDATED", "Validé"
+        REJECTED = "REJECTED", "Rejeté"
+
+    source_type = models.CharField(max_length=24, choices=SourceType.choices, db_index=True)
+    source_event_id = models.CharField(max_length=128)
+    batch = models.ForeignKey(FuelImportBatch, null=True, blank=True, on_delete=models.PROTECT, related_name="movements")
+    import_row = models.ForeignKey(FuelImportRow, null=True, blank=True, on_delete=models.PROTECT, related_name="movements")
+    site_id = models.CharField(max_length=64, db_index=True)
+    counterpart_site_id = models.CharField(max_length=64, null=True, blank=True, help_text="Site / dépôt source ou destination d'un transfert.")
+    tank_id = models.CharField(max_length=32, null=True, blank=True)
+    movement_type = models.CharField(max_length=24, choices=MovementType.choices, null=True, blank=True, db_index=True)
+    movement_datetime = models.DateTimeField(null=True, blank=True, db_index=True)
+    requested_quantity_l = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True)
+    quantity_l = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True, help_text="Quantité réellement mouvementée ; NULL si non déclarée (jamais 0 par défaut).")
+    level_before_raw = models.CharField(max_length=64, null=True, blank=True)
+    level_after_raw = models.CharField(max_length=64, null=True, blank=True)
+    hour_meter_before = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    hour_meter_after = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    supplier = models.CharField(max_length=128, null=True, blank=True)
+    ticket_reference = models.CharField(max_length=128, null=True, blank=True)
+    delivery_note = models.CharField(max_length=128, null=True, blank=True)
+    proof_reference = models.CharField(max_length=512, null=True, blank=True)
+    source_user = models.CharField(max_length=255, null=True, blank=True)
+    source_status = models.CharField(max_length=64, null=True, blank=True, help_text="Statut brut à la source (ENOC pending/validated/done, fichier Soldé/En cours…).")
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.DECLARED, db_index=True)
+    alerts = models.JSONField(default=list, blank=True, help_text="[{code, message}] — contrôles (sans ticket, sans preuve, demande seule…).")
+    comment = models.TextField(null=True, blank=True)
+    validated_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    validated_at = models.DateTimeField(null=True, blank=True)
+    validation_reason = models.TextField(null=True, blank=True)
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "fuel_movement"
+        ordering = ["-movement_datetime"]
+        constraints = [models.UniqueConstraint(fields=["source_type", "source_event_id"], name="uniq_fuel_movement_source_event")]
+        indexes = [models.Index(fields=["site_id", "movement_datetime"])]
+
+
+class FuelRegistryCorrection(models.Model):
+    """Piste d'audit : toute validation, rejet ou correction (ancienne valeur, nouvelle valeur, auteur, date, motif)."""
+
+    entity = models.CharField(max_length=24, db_index=True, help_text="OBSERVATION, MOVEMENT, TANK, GUARD_SCOPE, BATCH.")
+    entity_id = models.BigIntegerField(db_index=True)
+    site_id = models.CharField(max_length=64, null=True, blank=True, db_index=True)
+    action = models.CharField(max_length=24, help_text="VALIDATE, REJECT, CORRECT, CREATE, SYSTEM.")
+    field = models.CharField(max_length=64, null=True, blank=True)
+    old_value = models.TextField(null=True, blank=True)
+    new_value = models.TextField(null=True, blank=True)
+    reason = models.TextField()
+    author = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    author_label = models.CharField(max_length=128, null=True, blank=True, help_text="« système » / « import #id » si pas d'utilisateur.")
+    created_at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        db_table = "fuel_registry_correction"
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["entity", "entity_id"])]
