@@ -1,5 +1,5 @@
 """
-Registre stock — traite les fichiers déposés dans FUEL_IMPORT_ROOT/incoming/{loliforce,scss,closing}
+Registre stock — traite les fichiers déposés dans FUEL_IMPORT_ROOT/incoming/{loliforce,scss,closing,modeles_cuves}
 (même traitement que la tâche planifiée toutes les 15 minutes).
 
     python manage.py process_fuel_import_incoming

@@ -1031,6 +1031,7 @@ class FuelImportBatch(models.Model):
         SCSS = "SCSS", "SCSS"
         CLOSING = "CLOSING", "Closing (référentiel cuves)"
         HISTORICAL_REFUELING = "HISTORICAL_REFUELING", "Historique refueling"
+        TANK_MODELS = "TANK_MODELS", "Bibliothèque de modèles de cuves (calculateur)"
 
     class Status(models.TextChoices):
         RECEIVED = "RECEIVED", "Reçu"
@@ -1098,8 +1099,56 @@ class FuelImportRow(models.Model):
         indexes = [models.Index(fields=["batch", "validation_status"])]
 
 
+class FuelTankModel(models.Model):
+    """
+    Bibliothèque des MODÈLES de cuves (calculateur universel de Steve, onglet « Tank DB ») : formes, cotes,
+    profils de fond, capacité de plaque. Un modèle n'est PAS une cuve installée sur un site.
+    """
+
+    class Status(models.TextChoices):
+        COMPLET = "COMPLET", "Complet"
+        A_CONFIRMER = "A_CONFIRMER", "À confirmer (écart plaque / géométrie > 5 %)"
+        INCOMPLET = "INCOMPLET", "Incomplet (forme ou cotes insuffisantes)"
+
+    tank_model_id = models.CharField(max_length=64, unique=True)
+    country = models.CharField(max_length=64, null=True, blank=True)
+    source_file = models.CharField(max_length=255, null=True, blank=True)
+    source_sheet = models.CharField(max_length=128, null=True, blank=True)
+    source_row = models.IntegerField(null=True, blank=True)
+    source_label = models.CharField(max_length=255, null=True, blank=True, help_text="Libellé « Type / Shape » du fichier.")
+    shape_code = models.CharField(max_length=16, null=True, blank=True, help_text="Famille du calculateur : h-circ, h-elli, h-oblo, v-cyl, v-tronc, rect.")
+    shape_label = models.CharField(max_length=128, null=True, blank=True)
+    tank_family = models.CharField(max_length=128, null=True, blank=True)
+    nominal_capacity_l = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True, help_text="Capacité de plaque.")
+    dimension_1_cm = models.DecimalField(max_digits=10, decimal_places=3, null=True, blank=True)
+    dimension_2_cm = models.DecimalField(max_digits=10, decimal_places=3, null=True, blank=True)
+    dimension_3_cm = models.DecimalField(max_digits=10, decimal_places=3, null=True, blank=True)
+    bottom_profile = models.CharField(max_length=16, null=True, blank=True)
+    bottom_z_cm = models.DecimalField(max_digits=10, decimal_places=3, null=True, blank=True)
+    top_profile = models.CharField(max_length=16, null=True, blank=True)
+    top_z_cm = models.DecimalField(max_digits=10, decimal_places=3, null=True, blank=True)
+    geometric_full_l = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True)
+    calibration_k = models.DecimalField(max_digits=10, decimal_places=6, null=True, blank=True)
+    plate_gap_pct = models.DecimalField(max_digits=8, decimal_places=2, null=True, blank=True, help_text="(géométrie − plaque) / plaque, en %.")
+    geometric_formula_version = models.CharField(max_length=64, null=True, blank=True)
+    calibration_formula_version = models.CharField(max_length=64, null=True, blank=True)
+    calibration_method = models.CharField(max_length=128, null=True, blank=True)
+    model_status = models.CharField(max_length=16, choices=Status.choices, default=Status.INCOMPLET, db_index=True)
+    status_reason = models.TextField(null=True, blank=True)
+    import_batch = models.ForeignKey(FuelImportBatch, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "fuel_tank_model"
+        ordering = ["tank_model_id"]
+
+
 class FuelTankMaster(models.Model):
-    """Référentiel cuve (forme, dimensions, capacité, abaque) — utilisé pour cm → L seulement s'il est VALIDÉ."""
+    """
+    Cuve RÉELLEMENT présente sur un site (table fuel_site_tank) : forme et cotes observées, capacité de plaque,
+    modèle de la bibliothèque s'il est connu, preuve. Utilisée pour cm → L uniquement si elle est VALIDÉE.
+    """
 
     class Shape(models.TextChoices):
         HORIZONTAL_CYLINDER = "HORIZONTAL_CYLINDER", "Cylindre horizontal"
@@ -1109,23 +1158,52 @@ class FuelTankMaster(models.Model):
         CUSTOM_CURVE = "CUSTOM_CURVE", "Abaque (courbe de jaugeage)"
 
     class ValidationStatus(models.TextChoices):
-        PENDING = "PENDING", "À valider"
-        VALIDATED = "VALIDATED", "Validée"
-        REJECTED = "REJECTED", "Rejetée"
+        VALIDEE = "VALIDEE", "Validée"
+        PROPOSEE = "PROPOSEE", "Proposée"
+        A_CONFIRMER = "A_CONFIRMER", "À confirmer"
+        INCOMPLETE = "INCOMPLETE", "Incomplète"
+        PLUSIEURS_CUVES_A_IDENTIFIER = "PLUSIEURS_CUVES_A_IDENTIFIER", "Plusieurs cuves à identifier"
+        REJETEE = "REJETEE", "Rejetée"
+
+    class ModelMatch(models.TextChoices):
+        NONE = "NONE", "Aucun modèle"
+        PROPOSED = "PROPOSED", "Modèle proposé"
+        CONFIRMED = "CONFIRMED", "Modèle confirmé"
+        REJECTED = "REJECTED", "Modèle écarté"
 
     site_id = models.CharField(max_length=64, db_index=True)
     tank_id = models.CharField(max_length=32, help_text="Identifiant de la cuve sur le site (1, 2…). Jamais déduit automatiquement d'un relevé.")
-    shape = models.CharField(max_length=32, choices=Shape.choices, null=True, blank=True)
+    tank_model = models.ForeignKey(FuelTankModel, null=True, blank=True, on_delete=models.PROTECT, related_name="site_tanks")
+    model_match_status = models.CharField(max_length=16, choices=ModelMatch.choices, default=ModelMatch.NONE)
+    shape = models.CharField(max_length=32, choices=Shape.choices, null=True, blank=True, help_text="tank_shape_observed (forme relevée).")
+    shape_family = models.CharField(max_length=16, null=True, blank=True, help_text="Famille du calculateur (h-circ, rect…).")
+    dimension_1_cm = models.DecimalField(max_digits=10, decimal_places=3, null=True, blank=True)
+    dimension_2_cm = models.DecimalField(max_digits=10, decimal_places=3, null=True, blank=True)
+    dimension_3_cm = models.DecimalField(max_digits=10, decimal_places=3, null=True, blank=True)
+    bottom_profile = models.CharField(max_length=16, null=True, blank=True, help_text="Profil des fonds (plat si inconnu dans la source).")
+    bottom_z_cm = models.DecimalField(max_digits=10, decimal_places=3, null=True, blank=True)
+    top_profile = models.CharField(max_length=16, null=True, blank=True)
+    top_z_cm = models.DecimalField(max_digits=10, decimal_places=3, null=True, blank=True)
     length_m = models.DecimalField(max_digits=8, decimal_places=4, null=True, blank=True)
     width_m = models.DecimalField(max_digits=8, decimal_places=4, null=True, blank=True)
     height_m = models.DecimalField(max_digits=8, decimal_places=4, null=True, blank=True)
     diameter_m = models.DecimalField(max_digits=8, decimal_places=4, null=True, blank=True)
-    capacity_l = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True)
+    capacity_l = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True, help_text="Capacité déclarée par la source (le Closing la recalcule depuis les cotes).")
+    capacity_plate_l = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True, help_text="Capacité de plaque (sert au volume calibré).")
+    capacity_plate_source = models.CharField(max_length=255, null=True, blank=True)
+    serial_number = models.CharField(max_length=128, null=True, blank=True)
+    number_of_tanks_on_site = models.IntegerField(null=True, blank=True)
     calibration_curve = models.JSONField(null=True, blank=True, help_text="[[niveau_cm, volume_L], …] croissant.")
     calibration_validated = models.BooleanField(default=False)
-    source_type = models.CharField(max_length=32, default="MANUAL", help_text="CLOSING, HISTORICAL_REFUELING ou MANUAL.")
+    source_type = models.CharField(max_length=32, default="MANUAL", help_text="CLOSING, HISTORICAL_REFUELING, ENOC, TERRAIN ou MANUAL.")
     source_batch = models.ForeignKey(FuelImportBatch, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
-    validation_status = models.CharField(max_length=16, choices=ValidationStatus.choices, default=ValidationStatus.PENDING, db_index=True)
+    source_file = models.CharField(max_length=255, null=True, blank=True)
+    source_sheet = models.CharField(max_length=128, null=True, blank=True)
+    source_row = models.IntegerField(null=True, blank=True)
+    proof_reference = models.CharField(max_length=512, null=True, blank=True)
+    observed_at = models.DateTimeField(null=True, blank=True)
+    validation_status = models.CharField(max_length=32, choices=ValidationStatus.choices, default=ValidationStatus.INCOMPLETE, db_index=True)
+    validation_reason = models.TextField(null=True, blank=True)
     validated_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
     validated_at = models.DateTimeField(null=True, blank=True)
     active = models.BooleanField(default=True)
@@ -1134,7 +1212,7 @@ class FuelTankMaster(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        db_table = "fuel_tank_master"
+        db_table = "fuel_site_tank"
         ordering = ["site_id", "tank_id"]
         constraints = [models.UniqueConstraint(fields=["site_id", "tank_id"], name="uniq_fuel_tank_site_tank")]
 
@@ -1177,17 +1255,20 @@ class FuelStockObservation(models.Model):
         DIRECT_LITERS = "DIRECT_LITERS", "Relevé direct en litres"
         TANK_CURVE = "TANK_CURVE", "Abaque cuve validé"
         GEOMETRIC_CALCULATION = "GEOMETRIC_CALCULATION", "Calcul géométrique (dimensions validées)"
+        CALIBRATED = "CALIBRATED", "Volume calibré (géométrie × capacité de plaque)"
         NONE = "NONE", "Aucune"
 
     class ConversionStatus(models.TextChoices):
         VALID = "VALID", "Valide"
+        GEOMETRIC_ONLY = "GEOMETRIC_ONLY", "Volume géométrique seulement (capacité de plaque à confirmer)"
         PENDING_TANK_MAPPING = "PENDING_TANK_MAPPING", "Cuve à référencer / valider"
         INVALID = "INVALID", "Invalide"
 
     class ValidationStatus(models.TextChoices):
-        PENDING = "PENDING", "À valider"
-        VALIDATED = "VALIDATED", "Validé"
+        PENDING = "PENDING", "À traiter"
+        VALIDATED = "VALIDATED", "Validé (auto ou manuel)"
         REJECTED = "REJECTED", "Rejeté"
+        NON_EXPLOITABLE = "NON_EXPLOITABLE", "Non exploitable (conservé)"
 
     source_type = models.CharField(max_length=16, choices=SourceType.choices, db_index=True)
     source_event_id = models.CharField(max_length=128, help_text="Identifiant de l'événement source (ENOC : request_code:before|after ; fichier : empreinte).")
@@ -1204,6 +1285,15 @@ class FuelStockObservation(models.Model):
     conversion_status = models.CharField(max_length=24, choices=ConversionStatus.choices, default=ConversionStatus.PENDING_TANK_MAPPING, db_index=True)
     conversion_message = models.TextField(null=True, blank=True)
     capacity_l = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True, help_text="Capacité de la (des) cuve(s) validée(s) au moment de la conversion.")
+    volume_geometric_l = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True, help_text="Volume géométrique (valeur technique).")
+    volume_calibrated_l = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True, help_text="Volume calibré sur la capacité de plaque.")
+    declared_liters = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True, help_text="Litres déclarés par la source (valeur brute).")
+    level_cm = models.DecimalField(max_digits=10, decimal_places=3, null=True, blank=True, help_text="Niveau en cm relevé (même si des litres sont aussi déclarés).")
+    cm_liters_gap_l = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True, help_text="Écart litres déclarés − conversion du niveau cm.")
+    fill_pct = models.DecimalField(max_digits=6, decimal_places=1, null=True, blank=True)
+    conversion_rule = models.CharField(max_length=255, null=True, blank=True)
+    tank_model_ref = models.CharField(max_length=64, null=True, blank=True)
+    issue_codes = models.JSONField(default=list, blank=True, help_text="Codes des contrôles en échec (pilotent l'action à faire).")
     hour_meter = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
     source_user = models.CharField(max_length=255, null=True, blank=True)
     source_reference = models.CharField(max_length=255, null=True, blank=True)
@@ -1237,6 +1327,7 @@ class FuelMovement(models.Model):
         CLOSING = "CLOSING", "Closing"
 
     class MovementType(models.TextChoices):
+        DELIVERY = "DELIVERY", "Livraison confirmée"
         DELIVERY_EYDON = "DELIVERY_EYDON", "Livraison Eydon"
         DELIVERY_TOTAL_CARD = "DELIVERY_TOTAL_CARD", "Livraison carte Total"
         ADD = "ADD", "Appoint"
@@ -1276,6 +1367,10 @@ class FuelMovement(models.Model):
     source_status = models.CharField(max_length=64, null=True, blank=True, help_text="Statut brut à la source (ENOC pending/validated/done, fichier Soldé/En cours…).")
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.DECLARED, db_index=True)
     alerts = models.JSONField(default=list, blank=True, help_text="[{code, message}] — contrôles (sans ticket, sans preuve, demande seule…).")
+    raw_operation_type = models.CharField(max_length=128, null=True, blank=True, help_text="Valeur brute de la source (type d'opération ENOC, source / sens du fichier).")
+    source_category = models.CharField(max_length=32, null=True, blank=True, db_index=True, help_text="Classification (RELEVE_STOCK, LIVRAISON_CONFIRMEE, DEMANDE_LIVRAISON, …, INCONNU).")
+    mapping_rule = models.CharField(max_length=255, null=True, blank=True, help_text="Règle de classification appliquée (version).")
+    retained_in_stock = models.BooleanField(default=False, help_text="Mouvement réel exploitable pour le stock (jamais une demande ni une carte Total).")
     comment = models.TextField(null=True, blank=True)
     validated_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
     validated_at = models.DateTimeField(null=True, blank=True)
@@ -1309,3 +1404,35 @@ class FuelRegistryCorrection(models.Model):
         db_table = "fuel_registry_correction"
         ordering = ["-created_at"]
         indexes = [models.Index(fields=["entity", "entity_id"])]
+
+
+class FuelEnocTypeMapping(models.Model):
+    """
+    Classification administrable et versionnée des types d'opération ENOC. Une valeur brute non configurée
+    est INCONNU (file d'exceptions) : jamais classée automatiquement comme mouvement réel.
+    """
+
+    class Category(models.TextChoices):
+        RELEVE_STOCK = "RELEVE_STOCK", "Relevé de stock"
+        LIVRAISON_CONFIRMEE = "LIVRAISON_CONFIRMEE", "Livraison confirmée"
+        DEMANDE_LIVRAISON = "DEMANDE_LIVRAISON", "Demande de livraison (jamais une livraison)"
+        AJOUT = "AJOUT", "Ajout"
+        TRANSFERT_ENTRANT = "TRANSFERT_ENTRANT", "Transfert entrant"
+        TRANSFERT_SORTANT = "TRANSFERT_SORTANT", "Transfert sortant"
+        RETRAIT = "RETRAIT", "Retrait"
+        VOL = "VOL", "Vol"
+        VIDANGE = "VIDANGE", "Vidange"
+        CARTE_TOTAL = "CARTE_TOTAL", "Carte Total (contrôle / preuve)"
+        INCONNU = "INCONNU", "Inconnu"
+
+    raw_value = models.CharField(max_length=128, db_index=True, help_text="Type d'opération ENOC normalisé (majuscules).")
+    category = models.CharField(max_length=32, choices=Category.choices)
+    version = models.IntegerField(default=1)
+    active = models.BooleanField(default=True, db_index=True)
+    comment = models.TextField(null=True, blank=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "fuel_enoc_type_mapping"
+        ordering = ["raw_value", "-version"]

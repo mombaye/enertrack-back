@@ -3,7 +3,8 @@
 Pipeline des fichiers du registre stock — répertoire partagé monté FUEL_IMPORT_ROOT
 (prod : /mnt/Suivi_carburant_prod) :
 
-    incoming/loliforce/   incoming/scss/   incoming/closing/     ← dépôt des fichiers
+    incoming/loliforce/   incoming/scss/   incoming/closing/   incoming/modeles_cuves/   ← dépôt des fichiers
+      (modeles_cuves : calculateur de cuves de Steve → bibliothèque fuel_tank_model)
     processing/                                                 ← en cours de traitement
     accepted/  rejected/                                        ← fichier original + rapport CSV
     archive/AAAA-MM/                                            ← copie d'archive immuable (empreinte en préfixe)
@@ -30,7 +31,8 @@ from fuel_tracking.services import stock_import_files as F
 
 logger = logging.getLogger(__name__)
 
-INCOMING = {"loliforce": "LOLIFORCE", "scss": "SCSS", "closing": "CLOSING"}
+# Ordre de traitement : modèles de cuves, puis affectations (Closing), puis relevés (conversion possible dès l'import).
+INCOMING = {"modeles_cuves": "TANK_MODELS", "closing": "CLOSING", "loliforce": "LOLIFORCE", "scss": "SCSS"}
 ACCEPTED_EXT = (".xlsx", ".xlsm", ".xlsb")
 
 

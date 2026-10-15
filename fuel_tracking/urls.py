@@ -10,6 +10,10 @@ from fuel_tracking.views import (
     FuelStockListView,
 )
 from fuel_tracking.views_stock import (
+    EnergyAuditView,
+    EnocTypesView,
+    StockWorkQueueView,
+    TankModelListView,
     GuardScopeCloseView,
     GuardScopeView,
     ImportBatchListView,
@@ -47,6 +51,10 @@ urlpatterns = [
     path("stock/", FuelStockListView.as_view(), name="fuel-stock"),
     # Registre unifié de stock (Phase 1) — voir views_stock.py
     path("stock/registre/", StockRegistryView.as_view(), name="fuel-stock-registre"),
+    path("stock/a-traiter/", StockWorkQueueView.as_view(), name="fuel-stock-a-traiter"),
+    path("stock/enoc/types/", EnocTypesView.as_view(), name="fuel-stock-enoc-types"),
+    path("stock/modeles-cuves/", TankModelListView.as_view(), name="fuel-stock-modeles-cuves"),
+    path("stock/audit-profil-energetique/", EnergyAuditView.as_view(), name="fuel-stock-audit-profil"),
     path("stock/registre/<str:site_id>/", StockRegistrySiteView.as_view(), name="fuel-stock-registre-site"),
     path("stock/observations/<int:pk>/valider/", ObservationValidateView.as_view(), name="fuel-stock-obs-valider"),
     path("stock/observations/<int:pk>/rejeter/", ObservationRejectView.as_view(), name="fuel-stock-obs-rejeter"),

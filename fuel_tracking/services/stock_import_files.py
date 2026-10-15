@@ -8,9 +8,10 @@ interprétation — fuel_import_row.raw_payload — puis contrôlées une à une
                       TYPE DE GE, PUISSANCE GE, [CONTACT AGENT], Relevé en CM, Relevé en litres,
                       Compteur horaire (h), Date de relevé, Commentaires, Site gardé par.
                       → fuel_stock_observation (source LOLIFORCE / SCSS).
-  CLOSING (.xlsb)   : feuille « Synthese conso fuel » — initialisation du référentiel cuves uniquement
-                      (forme, dimensions, capacité ; GE et capteurs conservés en brut). Les quantités
-                      calculées du closing ne sont PAS des relevés certifiés : aucune observation créée.
+  CLOSING (.xlsb)   : feuille « Synthese conso fuel » — affectation site → cuve (fuel_site_tank : forme, cotes,
+                      capacité ; GE et capteurs conservés en brut). Les quantités calculées du closing ne sont
+                      PAS des relevés certifiés : aucune observation créée.
+  TANK_MODELS       : calculateur de Steve (onglet « Tank DB ») → bibliothèque fuel_tank_model.
   HISTORICAL_REFUELING : feuille « Suivi refueling … » → fuel_movement (historique) ; feuille « Coef cuve »
                       → propositions de cuves (À VALIDER) pour les sites sans cuve référencée.
 
@@ -326,9 +327,15 @@ def process_guard_file(batch, file_bytes: bytes, file_name: str) -> dict:
         if isinstance(rec.get("hour_meter"), (datetime, date)):
             reject("COLUMN_SHIFT", "Date trouvée dans la colonne compteur horaire : colonnes décalées.")
         readings = lt.readings or cm.readings
+        cm_with_l = None
         if lt.readings and cm.readings:
+            if len(lt.readings) == 1 and len(cm.readings) == 1 and cm.readings[0].unit == "CM":
+                cm_with_l = cm.readings[0].value
             messages.append({"code": "CM_AND_L", "message": f"Deux relevés saisis (cm : {rec.get('cm')} ; L : {rec.get('l')}) : "
-                             "le relevé en litres est utilisé, le relevé en cm est conservé en commentaire."})
+                             "les deux valeurs sont conservées, les litres déclarés restent la valeur brute et l'écart avec "
+                             "la conversion du niveau cm est calculé."})
+        if d is not None and d < batch.received_at.date() - timedelta(days=7):
+            messages.append({"code": "OLD_READING", "message": f"Relevé du {d:%d/%m/%Y}, plus de 7 jours avant la réception du fichier : conservé, signalé."})
         for p in (cm, lt):
             messages.extend(p.messages)
         if not readings:
@@ -365,16 +372,14 @@ def process_guard_file(batch, file_bytes: bytes, file_name: str) -> dict:
                     source_type=provider, source_event_id=event_id, site_id=site_id, observation_datetime=as_utc_datetime(d),
                     level_raw=rd.raw, level_value=rd.value, level_unit=rd.unit, tank_id=rd.tank_id, hour_meter=hour_meter,
                     source_user=rec.get("contact"), source_reference=f"{file_name} · {sheet} · ligne {n}",
-                    comment=" — ".join(comment_parts) or None,
+                    comment=" — ".join(comment_parts) or None, cm_value=cm_with_l if rd.unit == "L" else None,
                 )
                 obs, obs_msgs = R.build_observation(inp, tanks_by_site.get(site_id, []), guard)
                 conflict = R.same_source_conflict(obs)
                 if conflict:
-                    obs.review_flags = [conflict]
-                    if obs.validation_status == "VALIDATED":
-                        obs.validation_status = "PENDING"
-                        obs.validation_reason = conflict
-                    obs_msgs.append({"code": "SAME_SOURCE_CONFLICT", "message": conflict})
+                    inp.review_flags = [conflict]
+                    obs, obs_msgs = R.build_observation(inp, tanks_by_site.get(site_id, []), guard)
+                    obs_msgs.append(conflict)
                 obs.batch = batch
                 obs.import_row = row
                 obs.save()
@@ -430,6 +435,20 @@ def movement_type_for(source: str | None, direction: str | None) -> str | None:
     return None
 
 
+REFUEL_RULE = "Fichier refueling : source × sens × statut (v1)"
+
+
+def category_for(mtype: str | None, src_status: str | None) -> str:
+    """Classification d'une ligne d'historique refueling (mêmes catégories que ENOC)."""
+    if mtype is None:
+        return "INCONNU"
+    if mtype == "DELIVERY_TOTAL_CARD":
+        return "CARTE_TOTAL"
+    if mtype == "DELIVERY_EYDON":
+        return "LIVRAISON_CONFIRMEE" if (src_status or "").lower() == "soldé" else "DEMANDE_LIVRAISON"
+    return {"TRANSFER_IN": "TRANSFERT_ENTRANT", "TRANSFER_OUT": "TRANSFERT_SORTANT", "WITHDRAWAL": "RETRAIT"}.get(mtype, "INCONNU")
+
+
 def _level_raw(l_val, cm_val) -> str | None:
     parts = []
     if l_val not in (None, ""):
@@ -441,21 +460,25 @@ def _level_raw(l_val, cm_val) -> str | None:
 
 def process_refueling_file(batch, file_bytes: bytes, file_name: str) -> dict:
     from fuel_tracking.models import FuelMovement
+    from fuel_tracking.services.stock_tanks import apply_plate_evidence
 
     resolver = R.SiteResolver()
     existing = set(FuelMovement.objects.filter(source_type="HISTORICAL_REFUELING").values_list("source_event_id", flat=True))
     stats = {"mouvements_crees": 0, "doublons": 0, "cuves_proposees": 0, "codes": {}}
+    plate_evidence: dict[str, list] = {}
     for sheet, rows in iter_sheets(file_bytes, file_name):
         title = sheet.strip().lower()
         if title.startswith("suivi refueling"):
-            _process_refuel_sheet(batch, sheet, rows, resolver, existing, stats, file_name)
+            _process_refuel_sheet(batch, sheet, rows, resolver, existing, stats, file_name, plate_evidence)
         elif title == "coef cuve":
             stats["cuves_proposees"] += _process_tank_sheet(batch, sheet, rows, resolver, stats, only_new_sites=True)
+    apply_plate_evidence(batch, plate_evidence, stats)
     return stats
 
 
-def _process_refuel_sheet(batch, sheet, rows, resolver, existing, stats, file_name):
+def _process_refuel_sheet(batch, sheet, rows, resolver, existing, stats, file_name, plate_evidence):
     from fuel_tracking.models import FuelImportRow, FuelMovement
+    from fuel_tracking.services.stock_tanks import plate_from_cuve_cell
 
     header = None
     for n, row in enumerate(rows, start=1):
@@ -489,6 +512,10 @@ def _process_refuel_sheet(batch, sheet, rows, resolver, existing, stats, file_na
         requested = parse_number(rec.get("requested"))
         ticket = rec.get("ticket")
         ticket = str(int(ticket)) if isinstance(ticket, float) and ticket.is_integer() else (str(ticket).strip() if ticket else None)
+        if site_id:
+            plate = plate_from_cuve_cell(rec.get("cuve"))
+            if plate:
+                plate_evidence.setdefault(site_id, []).append((plate, f"{file_name} · {sheet} · ligne {n}"))
         if rejected:
             ir.validation_status = "REJECTED"
             ir.messages = messages
@@ -509,10 +536,13 @@ def _process_refuel_sheet(batch, sheet, rows, resolver, existing, stats, file_na
         existing.add(event_id)
         alerts = list(messages)
         src_status = (str(rec.get("status")).strip() if rec.get("status") else None)
+        category = category_for(mtype, src_status)
         if mtype in ("DELIVERY_EYDON", "DELIVERY_TOTAL_CARD", "ADD"):
             if not ticket:
                 alerts.append({"code": "DELIVERY_WITHOUT_TICKET", "message": "Livraison sans ticket FMS."})
             alerts.append({"code": "DELIVERY_WITHOUT_PROOF", "message": "Aucune preuve (photo / bon) dans le fichier historique."})
+        if category == "CARTE_TOTAL":
+            alerts.append({"code": "TOTAL_CARD", "message": "Carte Total : information de contrôle, jamais une livraison automatique."})
         if (src_status or "").lower() != "soldé":
             alerts.append({"code": "DELIVERY_REQUESTED_ONLY", "message": f"Demande non soldée (statut {src_status or 'vide'}) : quantité demandée seulement."})
         alerts.append({"code": "QUANTITY_NOT_DECLARED", "message": "Seule la quantité demandée est connue : quantité réalisée non déclarée (laissée vide)."})
@@ -535,7 +565,8 @@ def _process_refuel_sheet(batch, sheet, rows, resolver, existing, stats, file_na
             supplier=("EYDON" if mtype == "DELIVERY_EYDON" else "TOTAL" if mtype == "DELIVERY_TOTAL_CARD" else None),
             ticket_reference=ticket, source_user=(str(rec.get("responsable"))[:255] if rec.get("responsable") else None),
             source_status=src_status, status="CLOSED" if (src_status or "").lower() == "soldé" else "DECLARED",
-            alerts=alerts, comment=comment or None,
+            alerts=alerts, comment=comment or None, raw_operation_type=f"{rec.get('source') or '—'} / {rec.get('direction') or '—'}"[:128],
+            source_category=category, mapping_rule=REFUEL_RULE, retained_in_stock=False,
         )
         stats["mouvements_crees"] += 1
         _count(stats, alerts)
@@ -546,7 +577,10 @@ def _count(stats, messages):
         stats["codes"][m["code"]] = stats["codes"].get(m["code"], 0) + 1
 
 
-# ── Référentiel cuves (Closing, Coef cuve) ───────────────────────────────────
+# ── Affectation site → cuve (Closing, Coef cuve) ─────────────────────────────
+# Le Closing donne forme + cotes (m) + capacité RECALCULÉE depuis les cotes (fonds plats) : la cuve est
+# reprise en famille du calculateur (cotes en cm, profil de fond « plat », celui du calcul Closing) ;
+# la capacité recalculée n'est jamais prise pour une capacité de plaque.
 
 SHAPES = {
     "cuve cylindrique horizontale": TC.HORIZONTAL_CYLINDER,
@@ -559,13 +593,13 @@ TANK_COLS = {
     "id du site": "site_id", "forme géométrique cuve": "shape", "longueur [m]": "length", "largeur [m]": "width",
     "hauteur [m]": "height", "diamètre [m]": "diameter", "capacité cuve (l)": "capacity",
 }
-CLOSING_EXTRA = ("nombre de ge installé [ex: 1,2,3 …]", "marque ge installé #1", "type de ge #1", "puissance prp (kva) #1",
-                 "fuel sensor fonctionnel et visible sur gfms [oui/non]")
+CLOSING_EXTRA = ("nom du site", "site name", "nombre de ge installé [ex: 1,2,3 …]", "marque ge installé #1", "type de ge #1",
+                 "puissance prp (kva) #1", "fuel sensor fonctionnel et visible sur gfms [oui/non]")
 
 
 def process_closing_file(batch, file_bytes: bytes, file_name: str) -> dict:
     resolver = R.SiteResolver()
-    stats = {"cuves_creees": 0, "cuves_mises_a_jour": 0, "codes": {}}
+    stats = {"cuves_creees": 0, "cuves_mises_a_jour": 0, "statuts": {}, "codes": {}}
     found = False
     for sheet, rows in iter_sheets(file_bytes, file_name, only={"Synthese conso fuel"}):
         found = True
@@ -580,8 +614,26 @@ def _dim(v):
     return n if n is not None and n > 0 else None
 
 
+def _cm(v):
+    return None if v is None else round(v * 100, 3)
+
+
+def tank_fields_from_meters(shape, length, width, height, diameter) -> dict:
+    fam = TC.SHAPE_TO_FAMILY.get(shape)
+    d = {"shape": shape, "shape_family": fam, "length_m": length, "width_m": width, "height_m": height, "diameter_m": diameter,
+         "bottom_profile": "plat", "top_profile": "plat", "dimension_1_cm": None, "dimension_2_cm": None, "dimension_3_cm": None}
+    if fam == "h-circ":
+        d["dimension_1_cm"], d["dimension_3_cm"] = _cm(diameter), _cm(length)
+    elif fam == "v-cyl":
+        d["dimension_1_cm"], d["dimension_2_cm"] = _cm(diameter), _cm(height)
+    elif fam:
+        d["dimension_1_cm"], d["dimension_2_cm"], d["dimension_3_cm"] = _cm(width), _cm(height), _cm(length)
+    return d
+
+
 def _process_tank_sheet(batch, sheet, rows, resolver, stats, only_new_sites: bool) -> int:
     from fuel_tracking.models import FuelImportRow, FuelTankMaster
+    from fuel_tracking.services.stock_tanks import assess_closing_tank, is_derived_capacity, library_models, propose_model
 
     header = None
     per_site_count: dict[str, int] = {}
@@ -608,6 +660,7 @@ def _process_tank_sheet(batch, sheet, rows, resolver, stats, only_new_sites: boo
         if rec.get("shape"):
             per_site_count[sid] = per_site_count.get(sid, 0) + 1
 
+    models = library_models()
     created = 0
     order: dict[str, int] = {}
     existing_sites = set(FuelTankMaster.objects.values_list("site_id", flat=True))
@@ -631,28 +684,51 @@ def _process_tank_sheet(batch, sheet, rows, resolver, stats, only_new_sites: boo
         else:
             order[site_id] = order.get(site_id, 0) + 1
             tank_id = str(order[site_id])
-            multi = per_site_count.get(site_raw.upper(), 0) > 1
-            spec = dict(shape=SHAPES[shape_label], length_m=_dim(rec.get("length")), width_m=_dim(rec.get("width")),
-                        height_m=_dim(rec.get("height")), diameter_m=_dim(rec.get("diameter")), capacity_l=_dim(rec.get("capacity")))
-            t = TC.TankSpec(site_id, tank_id, **spec)
-            try:
-                geo = TC.geometric_volume_l(t, t.physical_height_cm() or 0)
-            except TC.MissingDimensions:
-                geo = None
-                messages.append({"code": "MISSING_DIMENSIONS", "message": "Dimensions incomplètes pour la forme : conversion géométrique impossible."})
-            if spec["capacity_l"] is None:
+            n_tanks = per_site_count.get(site_raw.upper(), 0)
+            multi = n_tanks > 1
+            fields = tank_fields_from_meters(SHAPES[shape_label], _dim(rec.get("length")), _dim(rec.get("width")),
+                                             _dim(rec.get("height")), _dim(rec.get("diameter")))
+            declared = _dim(rec.get("capacity"))
+            spec = TC.TankSpec(site_id, tank_id, family=fields["shape_family"], d1=fields["dimension_1_cm"],
+                               d2=fields["dimension_2_cm"], d3=fields["dimension_3_cm"], declared_capacity_l=declared)
+            geo = spec.geometric_capacity_l()
+            if geo is None:
+                messages.append({"code": "MISSING_DIMENSIONS", "message": "Cotes incomplètes pour la forme : calcul géométrique impossible."})
+            if declared is None:
                 messages.append({"code": "MISSING_CAPACITY", "message": "Capacité absente du fichier" + (f" (géométrie : {geo:.0f} L)." if geo else ".")})
-            elif geo and abs(geo - spec["capacity_l"]) > 0.05 * spec["capacity_l"]:
-                messages.append({"code": "CAPACITY_GEOMETRY_MISMATCH", "message": f"Capacité {spec['capacity_l']:.0f} L ≠ géométrie {geo:.0f} L."})
+            elif geo and is_derived_capacity(declared, geo):
+                messages.append({"code": "CAPACITY_DERIVED", "message": f"Capacité {declared:.0f} L recalculée depuis les cotes (fonds plats) : ce n'est pas une capacité de plaque."})
+            elif geo and abs(geo - declared) > 0.05 * declared:
+                messages.append({"code": "CAPACITY_GEOMETRY_MISMATCH", "message": f"Capacité {declared:.0f} L ≠ géométrie {geo:.0f} L."})
             if multi:
-                messages.append({"code": "TANK_ORDER_TO_CONFIRM", "message": f"{per_site_count[site_raw.upper()]} cuves pour ce site : numérotation {tank_id} selon l'ordre du fichier, à confirmer."})
+                messages.append({"code": "TANK_ORDER_TO_CONFIRM", "message": f"{n_tanks} cuves pour ce site sans identifiant : numérotation provisoire {tank_id} selon l'ordre du fichier."})
+            if batch.source_type == "CLOSING":
+                status, why = assess_closing_tank(spec, declared, multi)
+            else:
+                status, why = R.tank_status_for(spec, n_tanks)
+                if status == "PROPOSEE" and not multi:
+                    why = "Cotes du fichier refueling (Coef cuve) : à confirmer."
+                if multi:
+                    status, why = "PLUSIEURS_CUVES_A_IDENTIFIER", "Plusieurs cuves mentionnées pour ce site sans identifiant."
+            model, mwhy = propose_model(spec, models)
+            values = {**fields, "capacity_l": declared, "number_of_tanks_on_site": n_tanks or None, "source_file": batch.file_name[:255],
+                      "source_sheet": sheet[:128], "source_row": n, "validation_status": status, "validation_reason": why}
+            if declared and geo and not is_derived_capacity(declared, geo):
+                values["capacity_plate_l"] = declared
+                values["capacity_plate_source"] = f"{batch.source_type} {batch.file_name} · {sheet} · ligne {n}"
+            if model is not None:
+                values["tank_model"], values["model_match_status"] = model, "PROPOSED"
+                messages.append({"code": "MODEL_PROPOSED", "message": mwhy})
+            messages.append({"code": f"TANK_{status}", "message": why})
             if only_new_sites and site_id in existing_sites:
                 messages.append({"code": "TANK_ALREADY_REFERENCED", "message": "Cuve(s) déjà référencée(s) pour ce site : proposition non appliquée."})
                 ir.validation_status = "WARNING"
             else:
-                ir.validation_status = "PENDING"
+                ir.validation_status = "ACCEPTED" if status == "VALIDEE" else "PENDING"
                 ir.save()
-                outcome = _upsert_tank(batch, site_id, tank_id, spec, ir, messages)
+                outcome = _upsert_tank(batch, site_id, tank_id, values, messages)
+                stats["statuts"] = stats.get("statuts", {})
+                stats["statuts"][status] = stats["statuts"].get(status, 0) + 1
                 if outcome == "created":
                     created += 1
                     stats["cuves_creees"] = stats.get("cuves_creees", 0) + 1
@@ -666,34 +742,62 @@ def _process_tank_sheet(batch, sheet, rows, resolver, stats, only_new_sites: boo
     return created
 
 
-def _upsert_tank(batch, site_id, tank_id, spec, ir, messages) -> str:
+GEOMETRY_FIELDS = ("shape", "shape_family", "dimension_1_cm", "dimension_2_cm", "dimension_3_cm", "length_m", "width_m",
+                   "height_m", "diameter_m", "capacity_l", "capacity_plate_l")
+
+
+def _same(a, b) -> bool:
+    if a is None or b is None:
+        return a is None and b is None
+    try:
+        return abs(float(a) - float(b)) < 1e-6
+    except (TypeError, ValueError):
+        return str(a) == str(b)
+
+
+def _upsert_tank(batch, site_id, tank_id, values, messages) -> str:
     from fuel_tracking.models import FuelTankMaster
 
     tank = FuelTankMaster.objects.filter(site_id=site_id, tank_id=tank_id).first()
     label = f"import #{batch.pk} ({batch.source_type})"
     if tank is None:
         tank = FuelTankMaster.objects.create(site_id=site_id, tank_id=tank_id, source_type=batch.source_type, source_batch=batch,
-                                             comment=f"Proposition {batch.source_type} — à valider.", **spec)
-        R.log_correction("TANK", tank.pk, "CREATE", f"Création depuis {label}", site_id=site_id, author_label=label)
+                                             comment=f"Cuve issue de {batch.source_type}.", **values)
+        R.log_correction("TANK", tank.pk, "CREATE", f"Création depuis {label} — {values['validation_reason']}", site_id=site_id,
+                         new=values["validation_status"], author_label=label)
         return "created"
-    changes = {k: v for k, v in spec.items() if v is not None and (getattr(tank, k) is None or float(getattr(tank, k)) != v)
-               if k != "shape"}
-    if spec["shape"] != tank.shape:
-        changes["shape"] = spec["shape"]
-    if not changes:
+    changes = {k: v for k, v in values.items() if k in GEOMETRY_FIELDS and v is not None and not _same(getattr(tank, k), v)}
+    if tank.validated_by_id is not None or (tank.validation_status in ("VALIDEE", "REJETEE") and tank.source_type != batch.source_type):
+        if changes:
+            messages.append({"code": "TANK_DIFFERS_FROM_VALIDATED",
+                             "message": "Valeurs différentes de la cuve validée : cuve inchangée ("
+                                        + ", ".join(f"{k} {getattr(tank, k)} → {v}" for k, v in changes.items()) + ")."})
+            return "differs_validated"
         return "unchanged"
-    if tank.validation_status == "VALIDATED":
-        messages.append({"code": "TANK_DIFFERS_FROM_VALIDATED",
-                         "message": "Valeurs différentes de la cuve validée : cuve validée inchangée ("
-                                    + ", ".join(f"{k} {getattr(tank, k)} → {v}" for k, v in changes.items()) + ")."})
-        return "differs_validated"
+    status_change = values["validation_status"] != tank.validation_status
+    if not changes and not status_change:
+        return "unchanged"
     for k, v in changes.items():
         R.log_correction("TANK", tank.pk, "CORRECT", f"Mise à jour depuis {label}", site_id=site_id, field=k,
                          old=getattr(tank, k), new=v, author_label=label)
         setattr(tank, k, v)
+    if status_change:
+        R.log_correction("TANK", tank.pk, "SYSTEM", values["validation_reason"], site_id=site_id, field="validation_status",
+                         old=tank.validation_status, new=values["validation_status"], author_label=label)
+    for k in ("validation_status", "validation_reason", "source_file", "source_sheet", "source_row", "number_of_tanks_on_site",
+              "bottom_profile", "top_profile"):
+        setattr(tank, k, values.get(k))
+    if values.get("tank_model") is not None and tank.tank_model_id is None:
+        tank.tank_model, tank.model_match_status = values["tank_model"], "PROPOSED"
     tank.source_batch = batch
     tank.save()
     return "updated"
+
+
+def _process_tank_models(batch, file_bytes: bytes, file_name: str) -> dict:
+    from fuel_tracking.services.stock_tanks import process_tank_models_file
+
+    return process_tank_models_file(batch, file_bytes, file_name)
 
 
 PROCESSORS = {
@@ -701,4 +805,5 @@ PROCESSORS = {
     "SCSS": process_guard_file,
     "CLOSING": process_closing_file,
     "HISTORICAL_REFUELING": process_refueling_file,
+    "TANK_MODELS": _process_tank_models,
 }

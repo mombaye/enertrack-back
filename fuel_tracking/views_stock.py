@@ -40,15 +40,20 @@ ALERT_LABELS = {
     "NO_DATA": "Aucun relevé",
     "NOT_RETAINED": "Aucun stock retenu",
     "STALE": f"Relevé de plus de {STALE_DAYS} jours",
-    "PENDING_VALIDATION": "Relevé(s) à valider",
+    "PENDING_VALIDATION": "Relevé(s) à traiter",
     "STOCK_CONFLICT": "Conflit Loliforce / SCSS",
-    "TANK_NOT_REFERENCED": "Cuve non référencée",
-    "TANK_PENDING": "Cuve à valider",
-    "MULTI_TANK_WITHOUT_ID": "Plusieurs cuves sans identifiant",
+    "TANK_NOT_REFERENCED": "Aucune cuve connue",
+    "TANK_PENDING": "Cuve à confirmer",
+    "TANK_INCOMPLETE": "Cuve incomplète",
+    "MULTI_TANK_WITHOUT_ID": "Plusieurs cuves à identifier",
+    "PLATE_MISSING": "Capacité de plaque à confirmer",
     "LOW_STOCK_CRITICAL": f"Stock < {FILL_CRITICAL} %",
     "LOW_STOCK": f"Stock < {FILL_WARNING} %",
     "GUARD_NOT_CONFIGURED": "Gardiennage non configuré",
 }
+STATUT_LABELS = {"RETENU": "Stock retenu", "INDISPONIBLE": "Indisponible (action requise)", "AUCUNE_DONNEE": "Aucune donnée"}
+KPI_DENOMINATOR = "sites du référentiel Gestion des sites (périmètre du registre stock)"
+COUNTRY_LABELS = {"sen": "Sénégal", "civ": "Côte d'Ivoire", "cam": "Cameroun", "td": "Tchad", "bfa": "Burkina Faso"}
 
 
 def _f(v):
@@ -88,19 +93,23 @@ def build_registry_rows(now=None) -> tuple[list[dict], dict]:
     """Une ligne par site du référentiel (et par site présent dans le registre), avec stock retenu et alertes."""
     from core.models import Site
     from fuel_tracking.models import FuelImportBatch, FuelMovement, FuelStockObservation, FuelTankMaster
+    from fuel_tracking.services.site_energy_profile import energy_profiles
 
     now = now or timezone.now()
     today = now.date()
-    sites = {s["site_id"]: s for s in Site.objects.values("site_id", "name", "installed_typology", "billing_typology", "zone")}
+    sites = {s["site_id"]: s for s in Site.objects.values("site_id", "name", "installed_typology", "billing_typology", "zone", "country")}
     retained = R.fuel_stock_retained(now=now)
     for sid in retained:
-        sites.setdefault(sid, {"site_id": sid, "name": None, "installed_typology": None, "billing_typology": None, "zone": None})
+        sites.setdefault(sid, {"site_id": sid, "name": None, "installed_typology": None, "billing_typology": None, "zone": None, "country": None})
+    profiles = energy_profiles()
 
     pending = dict(FuelStockObservation.objects.filter(validation_status="PENDING").values_list("site_id").annotate(n=Count("id")))
-    multi = set(FuelStockObservation.objects.filter(validation_status="PENDING", conversion_message__contains="aucune attribution automatique")
-                .values_list("site_id", flat=True).distinct())
+    pending_codes: dict[str, set] = {}
+    for sid, codes in FuelStockObservation.objects.filter(validation_status="PENDING").values_list("site_id", "issue_codes"):
+        pending_codes.setdefault(sid, set()).update(codes or [])
     tanks: dict[str, list] = {}
-    for t in FuelTankMaster.objects.filter(active=True).values("site_id", "tank_id", "validation_status", "capacity_l"):
+    for t in FuelTankMaster.objects.filter(active=True).exclude(validation_status="REJETEE").values(
+            "site_id", "tank_id", "validation_status", "capacity_plate_l", "tank_model__tank_model_id", "model_match_status"):
         tanks.setdefault(t["site_id"], []).append(t)
     scopes = R.guard_scopes_by_site()
     by_source = {}
@@ -117,7 +126,7 @@ def build_registry_rows(now=None) -> tuple[list[dict], dict]:
     last_validated, last_any = {}, {}
     for mv in (FuelMovement.objects.exclude(status="REJECTED").order_by("site_id", "-movement_datetime")
                .values("id", "site_id", "movement_type", "movement_datetime", "quantity_l", "requested_quantity_l", "status",
-                       "proof_reference", "ticket_reference", "source_type")):
+                       "proof_reference", "ticket_reference", "source_type", "source_category", "retained_in_stock")):
         last_any.setdefault(mv["site_id"], mv)
         if mv["status"] == "VALIDATED":
             last_validated.setdefault(mv["site_id"], mv)
@@ -126,24 +135,33 @@ def build_registry_rows(now=None) -> tuple[list[dict], dict]:
     for sid, s in sites.items():
         r = retained.get(sid)
         t = tanks.get(sid, [])
+        codes = pending_codes.get(sid, set())
         alerts = []
         if r is None:
             alerts.append("NO_DATA")
         elif r["stock_l"] is None:
             alerts.append("NOT_RETAINED")
-        if r and r["stock_l"] is not None and r["age_hours"] is not None and r["age_hours"] > STALE_DAYS * 24:
+        if r and r["observation_datetime"] is not None and r["age_hours"] is not None and r["age_hours"] > STALE_DAYS * 24:
             alerts.append("STALE")
         if pending.get(sid):
             alerts.append("PENDING_VALIDATION")
-        if sid in conflict_sites:
+        if sid in conflict_sites or "STOCK_CONFLICT" in codes:
             alerts.append("STOCK_CONFLICT")
         if not t:
             alerts.append("TANK_NOT_REFERENCED")
-        elif any(x["validation_status"] != "VALIDATED" for x in t):
-            alerts.append("TANK_PENDING")
-        if sid in multi:
+        else:
+            st = {x["validation_status"] for x in t}
+            if st & {"PROPOSEE", "A_CONFIRMER"}:
+                alerts.append("TANK_PENDING")
+            if "INCOMPLETE" in st:
+                alerts.append("TANK_INCOMPLETE")
+            if "PLUSIEURS_CUVES_A_IDENTIFIER" in st:
+                alerts.append("MULTI_TANK_WITHOUT_ID")
+        if "MULTI_TANK_WITHOUT_ID" in codes and "MULTI_TANK_WITHOUT_ID" not in alerts:
             alerts.append("MULTI_TANK_WITHOUT_ID")
-        if r and r.get("fill_pct") is not None:
+        if codes & {"PLATE_MISSING", "PLATE_INCOHERENT"}:
+            alerts.append("PLATE_MISSING")
+        if r and r.get("fill_pct") is not None and r["stock_l"] is not None:
             if r["fill_pct"] < FILL_CRITICAL:
                 alerts.append("LOW_STOCK_CRITICAL")
             elif r["fill_pct"] < FILL_WARNING:
@@ -153,11 +171,20 @@ def build_registry_rows(now=None) -> tuple[list[dict], dict]:
             alerts.append("GUARD_NOT_CONFIGURED")
         mv = last_validated.get(sid)
         mv_any = last_any.get(sid)
+        validated_tanks = [x for x in t if x["validation_status"] == "VALIDEE"]
+        model_refs = sorted({x["tank_model__tank_model_id"] for x in t if x["tank_model__tank_model_id"]})
+        prof = profiles.get(sid) or {}
         rows.append({
             "site_id": sid,
             "site_name": s.get("name"),
-            "typologie": s.get("installed_typology") or s.get("billing_typology"),
+            "pays": COUNTRY_LABELS.get(s.get("country") or "", s.get("country")),
             "zone": s.get("zone"),
+            "typologie": s.get("installed_typology") or s.get("billing_typology"),
+            "environnement": prof.get("environnement", "Inconnu"),
+            "raccordement": prof.get("raccordement", "Inconnu"),
+            "ge": prof.get("ge", "Inconnu"),
+            "solaire": prof.get("solaire", "Inconnu"),
+            "profil_energetique": prof.get("profil", "Incomplet / à confirmer"),
             "gardiennage_attendu": guard,
             "stock_l": r["stock_l"] if r else None,
             "source": r["source_type"] if r else None,
@@ -168,28 +195,40 @@ def build_registry_rows(now=None) -> tuple[list[dict], dict]:
             "level_unit": r["level_unit"] if r else None,
             "conversion_method": r["conversion_method"] if r else None,
             "conversion_status": r["conversion_status"] if r else None,
+            "conversion_rule": r.get("conversion_rule") if r else None,
+            "volume_geometric_l": r.get("volume_geometric_l") if r else None,
+            "volume_calibrated_l": r.get("volume_calibrated_l") if r else None,
             "validation_status": r["validation_status"] if r else None,
+            "statut_releve": r.get("statut_releve") if r else None,
+            "issue_codes": r.get("issue_codes", []) if r else [],
+            "modele_cuve": (r.get("tank_model_ref") if r else None) or (", ".join(model_refs) if model_refs else None),
+            "modele_statut": (t[0]["model_match_status"] if len(t) == 1 else None),
             "capacity_l": r["capacity_l"] if r else None,
-            "fill_pct": r["fill_pct"] if r else None,
+            "fill_pct": r["fill_pct"] if r and r["stock_l"] is not None else None,
             "statut": "RETENU" if r and r["stock_l"] is not None else ("INDISPONIBLE" if r else "AUCUNE_DONNEE"),
             "unavailable_reason": (r["unavailable_reason"] if r else R.UNAVAILABLE_NO_OBS),
             "alerts": alerts,
             "pending_count": pending.get(sid, 0),
             "tanks_total": len(t),
-            "tanks_validated": sum(1 for x in t if x["validation_status"] == "VALIDATED"),
+            "tanks_validated": len(validated_tanks),
+            "tank_statuses": sorted({x["validation_status"] for x in t}),
             "last_validated_movement": _mv(mv),
             "last_movement": _mv(mv_any),
         })
     rows.sort(key=lambda x: x["site_id"])
+    tank_counts = dict(FuelTankMaster.objects.filter(active=True).values_list("validation_status").annotate(n=Count("id")))
     kpis = {
         "sites_total": len(rows),
+        "denominateur": KPI_DENOMINATOR,
         "sites_stock_retenu": sum(1 for r in rows if r["statut"] == "RETENU"),
         "sites_indisponible": sum(1 for r in rows if r["statut"] == "INDISPONIBLE"),
         "sites_sans_donnee": sum(1 for r in rows if r["statut"] == "AUCUNE_DONNEE"),
         "releves_a_valider": sum(pending.values()),
         "sites_conflit": len(conflict_sites),
-        "cuves_validees": FuelTankMaster.objects.filter(active=True, validation_status="VALIDATED").count(),
-        "cuves_a_valider": FuelTankMaster.objects.filter(active=True, validation_status="PENDING").count(),
+        "sites_cuve_validee": sum(1 for r in rows if r["tanks_validated"]),
+        "cuves_validees": tank_counts.get("VALIDEE", 0),
+        "cuves_a_valider": sum(v for k, v in tank_counts.items() if k not in ("VALIDEE", "REJETEE")),
+        "cuves_par_statut": tank_counts,
         "imports_a_valider": FuelImportBatch.objects.filter(status="VALIDATION_REQUIRED").count(),
     }
     return rows, kpis
@@ -229,12 +268,18 @@ class StockRegistryView(APIView):
             "pagination": _pagination(page, limit, total),
             "kpis": kpis,
             "alert_labels": ALERT_LABELS,
+            "statut_labels": STATUT_LABELS,
             "can_validate": getattr(request.user, "role", None) in VALIDATOR_ROLES,
             "regles": {
                 "tolerance_capacite_pct": R.tolerance_pct(),
                 "comparaison": "Loliforce / SCSS : même site, relevés en litres à moins de 48 h, capacité validée ; "
                                "écart ≤ max(100 L, 10 % capacité) → cohérent, sinon conflit (aucune moyenne).",
                 "snowflake": "Information technique uniquement : jamais retenu comme stock.",
+                "stock_retenu": "Cuve site VALIDÉE + litres natifs ou conversion validée (volume calibré sur la plaque) + capacité "
+                                "contrôlée + statut AUTO_VALIDÉ ou VALIDÉ_MANUELLEMENT. Priorité entre relevés du même jour : "
+                                + " > ".join(R.source_priority()) + ".",
+                "profil_energetique": "Environnement, raccordement, GE et solaire viennent de champs sources explicites ; jamais "
+                                      "déduits de la typologie. Inconnu si la source est vide.",
             },
         })
 
@@ -247,8 +292,12 @@ def _obs(o):
         "conversion_status": o.conversion_status, "conversion_message": o.conversion_message, "capacity_l": _f(o.capacity_l),
         "hour_meter": _f(o.hour_meter), "source_user": o.source_user, "source_reference": o.source_reference,
         "guard_scope_status": o.guard_scope_status, "comment": o.comment, "proof_reference": o.proof_reference,
-        "validation_status": o.validation_status, "validation_reason": o.validation_reason, "review_flags": o.review_flags,
+        "validation_status": o.validation_status, "validation_reason": o.validation_reason, "review_flags": R._flags(o.review_flags),
         "validated_by": getattr(o.validated_by, "username", None), "validated_at": o.validated_at, "batch_id": o.batch_id,
+        "statut_releve": R.display_status(o), "issues": [R.issue_detail(c) for c in (o.issue_codes or [])],
+        "volume_geometric_l": _f(o.volume_geometric_l), "volume_calibrated_l": _f(o.volume_calibrated_l),
+        "declared_liters": _f(o.declared_liters), "level_cm": _f(o.level_cm), "cm_liters_gap_l": _f(o.cm_liters_gap_l),
+        "fill_pct": _f(o.fill_pct), "conversion_rule": o.conversion_rule, "tank_model_ref": o.tank_model_ref,
     }
 
 
@@ -262,19 +311,32 @@ def _movement(m):
         "proof_reference": m.proof_reference, "source_user": m.source_user, "source_status": m.source_status, "status": m.status,
         "alerts": m.alerts, "comment": m.comment, "validation_reason": m.validation_reason,
         "validated_by": getattr(m.validated_by, "username", None), "validated_at": m.validated_at, "batch_id": m.batch_id,
+        "raw_operation_type": m.raw_operation_type, "source_category": m.source_category, "mapping_rule": m.mapping_rule,
+        "retained_in_stock": m.retained_in_stock,
     }
 
 
 def _tank(t):
     spec = R.TC.TankSpec.from_model(t)
+    full = spec.geometric_capacity_l()
+    cal = spec.calibration()
+    m = t.tank_model if t.tank_model_id else None
     return {
-        "id": t.id, "site_id": t.site_id, "tank_id": t.tank_id, "shape": t.shape, "length_m": _f(t.length_m), "width_m": _f(t.width_m),
-        "height_m": _f(t.height_m), "diameter_m": _f(t.diameter_m), "capacity_l": _f(t.capacity_l),
-        "geometric_capacity_l": round(spec.geometric_capacity_l(), 1) if spec.geometric_capacity_l() else None,
-        "physical_height_cm": spec.physical_height_cm(), "calibration_curve": t.calibration_curve,
+        "id": t.id, "site_id": t.site_id, "tank_id": t.tank_id, "shape": t.shape, "shape_family": spec.family,
+        "dimension_1_cm": spec.d1, "dimension_2_cm": spec.d2, "dimension_3_cm": spec.d3,
+        "bottom_profile": spec.bottom, "bottom_z_cm": spec.bz, "top_profile": spec.top, "top_z_cm": spec.tz,
+        "length_m": _f(t.length_m), "width_m": _f(t.width_m), "height_m": _f(t.height_m), "diameter_m": _f(t.diameter_m),
+        "capacity_l": _f(t.capacity_l), "capacity_plate_l": _f(t.capacity_plate_l), "capacity_plate_source": t.capacity_plate_source,
+        "geometric_capacity_l": round(full, 1) if full else None, "calibration_k": round(cal["k"], 4) if cal["k"] else None,
+        "plate_gap_pct": cal["gap_pct"], "plate_coherent": cal["coherent"],
+        "physical_height_cm": spec.useful_height_cm(), "calibration_curve": t.calibration_curve,
         "calibration_validated": t.calibration_validated, "source_type": t.source_type, "source_batch_id": t.source_batch_id,
-        "validation_status": t.validation_status, "validated_by": getattr(t.validated_by, "username", None),
-        "validated_at": t.validated_at, "active": t.active, "comment": t.comment,
+        "source_file": t.source_file, "source_sheet": t.source_sheet, "source_row": t.source_row, "proof_reference": t.proof_reference,
+        "serial_number": t.serial_number, "number_of_tanks_on_site": t.number_of_tanks_on_site, "observed_at": t.observed_at,
+        "tank_model_id": m.tank_model_id if m else None, "tank_model_label": f"{m.source_label or m.shape_label} · {_f(m.nominal_capacity_l) or '—'} L" if m else None,
+        "model_match_status": t.model_match_status,
+        "validation_status": t.validation_status, "validation_reason": t.validation_reason,
+        "validated_by": getattr(t.validated_by, "username", None), "validated_at": t.validated_at, "active": t.active, "comment": t.comment,
     }
 
 
@@ -290,7 +352,7 @@ class StockRegistrySiteView(APIView):
         sid = site["site_id"] if site else site_id
         obs = list(FuelStockObservation.objects.filter(site_id=sid).select_related("validated_by").order_by("-observation_datetime", "-id")[:300])
         mvs = list(FuelMovement.objects.filter(site_id=sid).select_related("validated_by").order_by("-movement_datetime", "-id")[:300])
-        tanks = list(FuelTankMaster.objects.filter(site_id=sid).select_related("validated_by"))
+        tanks = list(FuelTankMaster.objects.filter(site_id=sid).select_related("validated_by", "tank_model"))
         snap = FuelStockSnapshot.objects.filter(site_id__iexact=sid, snapshot_year__isnull=True).first()
         corrections = FuelRegistryCorrection.objects.filter(site_id=sid).select_related("author")[:200]
         scopes = R.guard_scopes_by_site([sid]).get(sid, [])
@@ -377,8 +439,7 @@ class MovementRejectView(MovementValidateView):
     validate = False
 
 
-TANK_FIELDS = ("shape", "length_m", "width_m", "height_m", "diameter_m", "capacity_l", "calibration_curve",
-               "calibration_validated", "active", "comment")
+TANK_FIELDS = R.TANK_EDITABLE
 
 
 class TankListView(APIView):
@@ -391,7 +452,7 @@ class TankListView(APIView):
     def get(self, request):
         from fuel_tracking.models import FuelTankMaster
 
-        qs = FuelTankMaster.objects.select_related("validated_by").order_by("site_id", "tank_id")
+        qs = FuelTankMaster.objects.select_related("validated_by", "tank_model").order_by("site_id", "tank_id")
         if request.query_params.get("site_id"):
             qs = qs.filter(site_id__iexact=request.query_params["site_id"])
         if request.query_params.get("statut"):
@@ -491,8 +552,8 @@ class ImportBatchListView(APIView):
         source_type = str(request.data.get("source_type") or "").upper()
         if f is None:
             return Response({"detail": "Fichier manquant."}, status=400)
-        if source_type not in ("LOLIFORCE", "SCSS", "CLOSING", "HISTORICAL_REFUELING"):
-            return Response({"detail": "Type de source invalide (LOLIFORCE, SCSS, CLOSING, HISTORICAL_REFUELING)."}, status=400)
+        if source_type not in ("LOLIFORCE", "SCSS", "CLOSING", "HISTORICAL_REFUELING", "TANK_MODELS"):
+            return Response({"detail": "Type de source invalide (LOLIFORCE, SCSS, CLOSING, HISTORICAL_REFUELING, TANK_MODELS)."}, status=400)
         if not f.name.lower().endswith(P.ACCEPTED_EXT):
             return Response({"detail": "Format accepté : .xlsx, .xlsm, .xlsb."}, status=400)
         try:
@@ -616,3 +677,95 @@ class GuardScopeCloseView(APIView):
         except ValueError as e:
             return Response({"detail": str(e)}, status=400)
         return Response({"id": s.id, "active_to": s.active_to})
+
+
+class StockWorkQueueView(APIView):
+    """GET stock/a-traiter/ → compteurs ; ?categorie=…&page=&search= → liste filtrée avec action à faire."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from fuel_tracking.services import stock_work_queue as W
+
+        cat = request.query_params.get("categorie")
+        payload = {"can_validate": getattr(request.user, "role", None) in VALIDATOR_ROLES}
+        if not cat:
+            return Response({**payload, "counters": W.counters()})
+        try:
+            items = W.build(cat)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=400)
+        search = (request.query_params.get("search") or "").strip().lower()
+        if search:
+            items = [i for i in items if search in (i["site_id"] or "").lower()]
+        page, limit = _page(request, default=25, maximum=200)
+        label = next((label for key, label, _ in W.CATEGORIES if key == cat), cat)
+        return Response({**payload, "categorie": cat, "label": label, "data": items[(page - 1) * limit:page * limit],
+                         "pagination": _pagination(page, limit, len(items))})
+
+
+class EnocTypesView(APIView):
+    """GET : dictionnaire réel des types ENOC + classification ; POST : nouvelle version (admin, manager)."""
+
+    permission_classes = [IsAuthenticated]
+    parser_classes = [JSONParser]
+
+    def get_permissions(self):
+        return [IsCphValidator()] if self.request.method == "POST" else [IsAuthenticated()]
+
+    def get(self, request):
+        from fuel_tracking.models import FuelEnocTypeMapping
+        from fuel_tracking.services.stock_enoc import enoc_type_dictionary
+
+        return Response({"data": enoc_type_dictionary(),
+                         "categories": [{"key": k, "label": v} for k, v in FuelEnocTypeMapping.Category.choices],
+                         "can_validate": getattr(request.user, "role", None) in VALIDATOR_ROLES,
+                         "regles": ["Une demande de livraison n'est jamais une livraison réelle.",
+                                    "Carte Total : information de contrôle / preuve, jamais une livraison automatique.",
+                                    "Type inconnu : file d'exceptions, jamais classé automatiquement comme mouvement réel.",
+                                    "Livraison confirmée retenue seulement avec site, date, quantité et preuve / référence."]})
+
+    def post(self, request):
+        from fuel_tracking.services.stock_enoc import set_enoc_mapping, sync_enoc_to_registry
+
+        try:
+            m = set_enoc_mapping(request.data.get("raw_value"), str(request.data.get("category") or ""), request.user,
+                                 str(request.data.get("reason") or "").strip())
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=400)
+        stats = sync_enoc_to_registry()  # reclassement immédiat (tracé)
+        return Response({"raw_value": m.raw_value, "category": m.category, "version": m.version,
+                         "mouvements_mis_a_jour": stats.get("mouvements_mis_a_jour", 0)}, status=201)
+
+
+class TankModelListView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from fuel_tracking.models import FuelTankModel
+        from fuel_tracking.services import tank_geometry as G
+
+        rows = []
+        for m in FuelTankModel.objects.all():
+            rows.append({
+                "tank_model_id": m.tank_model_id, "country": m.country, "source_file": m.source_file, "source_sheet": m.source_sheet,
+                "source_row": m.source_row, "source_label": m.source_label, "shape_code": m.shape_code, "shape_label": m.shape_label,
+                "nominal_capacity_l": _f(m.nominal_capacity_l), "dimension_1_cm": _f(m.dimension_1_cm), "dimension_2_cm": _f(m.dimension_2_cm),
+                "dimension_3_cm": _f(m.dimension_3_cm), "bottom_profile": m.bottom_profile, "bottom_z_cm": _f(m.bottom_z_cm),
+                "top_profile": m.top_profile, "geometric_full_l": _f(m.geometric_full_l), "calibration_k": _f(m.calibration_k),
+                "plate_gap_pct": _f(m.plate_gap_pct), "model_status": m.model_status, "status_reason": m.status_reason,
+                "geometric_formula_version": m.geometric_formula_version, "sites": m.site_tanks.count(),
+            })
+        return Response({"data": rows, "familles": G.FAMILIES, "profils": G.PROFILES,
+                         "version_moteur": G.GEOMETRIC_FORMULA_VERSION})
+
+
+class EnergyAuditView(APIView):
+    """Audit des champs sources du profil énergétique (couverture, valeurs, règles)."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from fuel_tracking.services.site_energy_profile import audit_energy_fields
+
+        return Response({"data": audit_energy_fields()})

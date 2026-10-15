@@ -164,7 +164,7 @@ def auto_import_stan_periodic(self):
 
 @shared_task(bind=True, name="fuel_tracking.process_fuel_import_incoming")
 def process_fuel_import_incoming(self):
-    """Registre stock : traite les fichiers déposés dans FUEL_IMPORT_ROOT/incoming/{loliforce,scss,closing}."""
+    """Registre stock : traite les fichiers déposés dans FUEL_IMPORT_ROOT/incoming/{loliforce,scss,closing,modeles_cuves}."""
     from fuel_tracking.services.stock_import_pipeline import root, scan_incoming
 
     if not root().exists():

@@ -255,7 +255,7 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'fuel_tracking.auto_import_stan_periodic',
         'schedule': crontab(minute='*/15'),
     },
-    # Registre stock : fichiers déposés dans FUEL_IMPORT_ROOT/incoming/{loliforce,scss,closing}
+    # Registre stock : fichiers déposés dans FUEL_IMPORT_ROOT/incoming/{loliforce,scss,closing,modeles_cuves}
     # (dédoublonnage par empreinte : un fichier déjà traité n'est jamais réimporté).
     'fuel-stock-registry-incoming-15min': {
         'task': 'fuel_tracking.process_fuel_import_incoming',
@@ -326,10 +326,16 @@ ENOC_MONGO_PASSWORD = os.getenv("ENOC_MONGO_PASSWORD", "")
 ENOC_MONGO_DB_NAME  = os.getenv("ENOC_MONGO_DB_NAME", "")
 
 # Registre stock carburant (Suivis Stock) — répertoire partagé monté (voir docker-compose.yml) :
-#   incoming/{loliforce,scss,closing}, processing, accepted, rejected, archive.
+#   incoming/{loliforce,scss,closing,modeles_cuves}, processing, accepted, rejected, archive.
 FUEL_IMPORT_ROOT = os.getenv("FUEL_IMPORT_ROOT", "/mnt/Suivi_carburant_prod")
 # Tolérance de dépassement de capacité cuve (en %) avant de déclarer un volume invalide.
 FUEL_CAPACITY_TOLERANCE_PCT = float(os.getenv("FUEL_CAPACITY_TOLERANCE_PCT", "5"))
+# Priorité des sources entre relevés validés du même jour (stock retenu). Snowflake n'est jamais retenu.
+FUEL_STOCK_SOURCE_PRIORITY = tuple(
+    x.strip() for x in os.getenv("FUEL_STOCK_SOURCE_PRIORITY", "TERRAIN_PREUVE,LOLIFORCE,SCSS,ENOC").split(",") if x.strip()
+)
+# Conflit Loliforce / SCSS : prestataire prioritaire (LOLIFORCE ou SCSS) ; vide = exception (les deux à traiter).
+FUEL_GUARD_CONFLICT_PRIORITY = os.getenv("FUEL_GUARD_CONFLICT_PRIORITY", "")
 ENOC_INTEGRATION_TIMEOUT = int(os.getenv("ENOC_INTEGRATION_TIMEOUT", "30"))
 
 FUEL_TRACKING_SITE_MODEL = "core.Site"

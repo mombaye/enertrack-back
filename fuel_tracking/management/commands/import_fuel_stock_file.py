@@ -6,6 +6,7 @@ Le fichier source n'est ni modifié ni déplacé : une copie d'archive est écri
     python manage.py import_fuel_stock_file --type SCSS --file data_imports/REMONTE_CARBURANT_OCTOBRE_2026.xlsx
     python manage.py import_fuel_stock_file --type CLOSING --file data_imports/Synthese_Conso_Fuel_Aout_2026.xlsb
     python manage.py import_fuel_stock_file --type HISTORICAL_REFUELING --file data_imports/Suivi_refueling_Septembre.xlsx
+    python manage.py import_fuel_stock_file --type TANK_MODELS --file data_imports/Senegal_Tank_DB_Calculateur.xlsx
     python manage.py import_fuel_stock_file ... --dry-run   # contrôles et bilan, rien n'est enregistré
 """
 import json
@@ -25,7 +26,7 @@ class Command(BaseCommand):
     help = "Importe un fichier dans le registre stock carburant."
 
     def add_arguments(self, parser):
-        parser.add_argument("--type", required=True, choices=["LOLIFORCE", "SCSS", "CLOSING", "HISTORICAL_REFUELING"])
+        parser.add_argument("--type", required=True, choices=["LOLIFORCE", "SCSS", "CLOSING", "HISTORICAL_REFUELING", "TANK_MODELS"])
         parser.add_argument("--file", required=True)
         parser.add_argument("--dry-run", action="store_true")
 
