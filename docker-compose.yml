@@ -51,8 +51,8 @@ services:
       #   pour monter le vrai répertoire ESCO à la place du fallback dev.
       - "${ESCO_HOST_PATH:-./data_imports/grid_sites}:/code/data_imports/grid_sites:ro"
       # Registre stock carburant : répertoire partagé (incoming/, accepted/, rejected/, archive/…),
-      # lecture-écriture (les fichiers traités sont déplacés). Hôte : FUEL_IMPORT_HOST_PATH (défaut /mnt/Suivi_carburant_prod).
-      - "${FUEL_IMPORT_HOST_PATH:-/mnt/Suivi_carburant_prod}:/mnt/Suivi_carburant_prod"
+      # lecture-écriture (les fichiers traités sont déplacés). Hôte : FUEL_IMPORT_HOST_PATH (défaut /mnt/suivi_carburant_prod = montage CIFS du partage, minuscule).
+      - "${FUEL_IMPORT_HOST_PATH:-/mnt/suivi_carburant_prod}:/mnt/Suivi_carburant_prod"
     depends_on:
       db:
         condition: service_healthy
@@ -72,7 +72,7 @@ services:
       # Même volume partagé que web pour lire les fichiers uploadés
       - media_data:/code/media
       # Registre stock carburant : la tâche planifiée traite incoming/ (voir service web).
-      - "${FUEL_IMPORT_HOST_PATH:-/mnt/Suivi_carburant_prod}:/mnt/Suivi_carburant_prod"
+      - "${FUEL_IMPORT_HOST_PATH:-/mnt/suivi_carburant_prod}:/mnt/Suivi_carburant_prod"
     depends_on:
       db:
         condition: service_healthy
