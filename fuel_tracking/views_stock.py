@@ -215,6 +215,7 @@ def build_registry_rows(now=None) -> tuple[list[dict], dict]:
             "last_validated_movement": _mv(mv),
             "last_movement": _mv(mv_any),
         })
+        rows[-1].update(_next_action(rows[-1]))
     rows.sort(key=lambda x: x["site_id"])
     tank_counts = dict(FuelTankMaster.objects.filter(active=True).values_list("validation_status").annotate(n=Count("id")))
     kpis = {
@@ -230,8 +231,28 @@ def build_registry_rows(now=None) -> tuple[list[dict], dict]:
         "cuves_a_valider": sum(v for k, v in tank_counts.items() if k not in ("VALIDEE", "REJETEE")),
         "cuves_par_statut": tank_counts,
         "imports_a_valider": FuelImportBatch.objects.filter(status="VALIDATION_REQUIRED").count(),
+        "sites_action_requise": sum(1 for r in rows if r["prochaine_action"]),
     }
     return rows, kpis
+
+
+def _next_action(row: dict) -> dict:
+    """Prochaine action en langage simple pour la vue compacte (champ additif, aucune règle de calcul)."""
+    for code in row["issue_codes"]:
+        d = R.issue_detail(code)
+        return {"prochaine_action": d["action"], "prochaine_action_type": d["action_type"], "anomalie": d["anomalie"]}
+    if row["statut"] == "AUCUNE_DONNEE":
+        return {"prochaine_action": None, "prochaine_action_type": None, "anomalie": "Aucun relevé reçu"}
+    if row["tanks_validated"] == 0:
+        return {"prochaine_action": "Renseigner puis valider la cuve du site", "prochaine_action_type": "OPEN_TANK",
+                "anomalie": "Aucune cuve validée"}
+    if row["statut"] == "INDISPONIBLE" or row["pending_count"]:
+        return {"prochaine_action": "Contrôler puis valider ou rejeter le relevé", "prochaine_action_type": "VALIDATE_OBS",
+                "anomalie": "Relevé à traiter"}
+    if "GUARD_NOT_CONFIGURED" in row["alerts"]:
+        d = R.issue_detail("NOT_CONFIGURED")
+        return {"prochaine_action": d["action"], "prochaine_action_type": "SET_GUARD", "anomalie": d["anomalie"]}
+    return {"prochaine_action": None, "prochaine_action_type": None, "anomalie": None}
 
 
 def _mv(mv):
@@ -255,6 +276,11 @@ class StockRegistryView(APIView):
             rows = [r for r in rows if r["statut"] == q["statut"]]
         if q.get("alerte"):
             rows = [r for r in rows if q["alerte"] in r["alerts"]]
+        if q.get("action_requise") in ("1", "true"):
+            rows = [r for r in rows if r["prochaine_action"]]
+        if q.get("tri") == "priorite":  # vue simple : stock connu, puis action requise, puis sans relevé
+            rank = {"RETENU": 0, "INDISPONIBLE": 1, "AUCUNE_DONNEE": 2}
+            rows = sorted(rows, key=lambda r: (rank.get(r["statut"], 3), r["site_id"]))
         if q.get("source"):
             rows = [r for r in rows if r["source"] == q["source"]]
         if q.get("gardiennage"):

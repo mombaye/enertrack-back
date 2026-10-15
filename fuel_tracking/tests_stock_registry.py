@@ -596,6 +596,8 @@ class EnocRegistryTests(TestCase):
         self.assertEqual((req.source_category, req.quantity_l, req.retained_in_stock), ("DEMANDE_LIVRAISON", None, False))
         card = FuelMovement.objects.get(source_event_id="REQ-4")
         self.assertEqual((card.source_category, card.movement_type, card.retained_in_stock), ("CARTE_TOTAL", "DELIVERY_TOTAL_CARD", False))
+        queued = {i["ref"].get("movement_id") for i in W.build("mouvements_sans_preuve")}
+        self.assertFalse(queued & {req.id, card.id})  # ni une demande ni une carte Total ne sont des livraisons sans preuve
         with self.assertRaises(ValueError):
             card.quantity_l = Decimal("150")
             R.validate_movement(card, None, "test")
@@ -743,6 +745,19 @@ class AuditAndApiTests(TmpRootMixin, TestCase):
         row = self.client.get("/api/fuel-tracking/stock/registre/?search=DKR_0001").json()["data"][0]
         self.assertIsNone(row["last_validated_movement"])
         self.assertEqual(row["last_movement"]["status"], "CLOSED")
+
+    def test_next_action_and_action_filter(self):
+        P.process_bytes(xlsx({"K": [HEAD, guard_row("DKR_0001", cm=10)]}), "a.xlsx", "LOLIFORCE", origin="UPLOAD")
+        self.client.force_authenticate(self.analyst)
+        r = self.client.get("/api/fuel-tracking/stock/registre/?action_requise=1").json()
+        row = next(x for x in r["data"] if x["site_id"] == "DKR_0001")
+        self.assertEqual(row["statut"], "INDISPONIBLE")
+        self.assertTrue(row["prochaine_action"])  # sans cuve validée : action explicite, jamais un simple « à valider »
+        self.assertEqual(r["kpis"]["sites_action_requise"], r["pagination"]["total"])
+        none = self.client.get("/api/fuel-tracking/stock/registre/?statut=AUCUNE_DONNEE").json()["data"]
+        self.assertTrue(all(x["prochaine_action"] is None for x in none))
+        ranked = self.client.get("/api/fuel-tracking/stock/registre/?tri=priorite&limit=200").json()["data"]
+        self.assertEqual(ranked[0]["site_id"], "DKR_0001")  # relevé présent avant les sites sans relevé
 
     def test_upload_models_and_enoc_types_api(self):
         self.client.force_authenticate(self.manager)

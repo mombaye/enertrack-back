@@ -122,10 +122,13 @@ def build(category: str) -> list[dict]:
                            "Renseigner la cuve du site (forme, cotes, capacité de plaque, preuve)")
                 for t in tanks.filter(validation_status="INCOMPLETE").order_by("site_id", "tank_id")]
     if category == "plusieurs_cuves":
-        items = [_tank_item(t, f"{t.number_of_tanks_on_site or 'plusieurs'} cuves mentionnées sans identifiant",
-                            "une fiche par cuve, numérotée sur site", "Identifier chaque cuve du site (numéro, forme, cotes)")
-                 for t in tanks.filter(validation_status="PLUSIEURS_CUVES_A_IDENTIFIER").order_by("site_id", "tank_id")]
-        seen = {i["site_id"] for i in items}
+        items, seen = [], set()
+        for t in tanks.filter(validation_status="PLUSIEURS_CUVES_A_IDENTIFIER").order_by("site_id", "tank_id"):
+            if t.site_id in seen:  # une seule ligne par site : l'action (identifier les cuves) porte sur le site
+                continue
+            seen.add(t.site_id)
+            items.append(_tank_item(t, f"{t.number_of_tanks_on_site or 'plusieurs'} cuves mentionnées sans identifiant",
+                                    "une fiche par cuve, numérotée sur site", "Identifier chaque cuve du site (numéro, forme, cotes)"))
         items += [i for i in _grouped_obs(Obs.objects.filter(validation_status="PENDING"), {"MULTI_TANK_WITHOUT_ID"})
                   if i["site_id"] not in seen]
         return items
@@ -152,7 +155,9 @@ def build(category: str) -> list[dict]:
         return out
     if category == "mouvements_sans_preuve":
         out = []
-        for m in FuelMovement.objects.exclude(status__in=["REJECTED"]).order_by("-movement_datetime"):
+        # Une demande ou une carte Total n'est jamais une livraison : pas de preuve de livraison attendue.
+        for m in (FuelMovement.objects.exclude(status__in=["REJECTED"])
+                  .exclude(source_category__in=["CARTE_TOTAL", "DEMANDE_LIVRAISON"]).order_by("-movement_datetime")):
             if not any(a.get("code") == "DELIVERY_WITHOUT_PROOF" for a in m.alerts or []) or m.proof_reference:
                 continue
             qty = _f(m.quantity_l)

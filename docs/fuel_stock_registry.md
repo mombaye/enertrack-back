@@ -295,3 +295,16 @@ Audit : `python manage.py audit_site_energy_fields` ou `GET stock/audit-profil-e
 ## Nouveaux endpoints
 `GET stock/a-traiter/[?categorie=]`, `GET/POST stock/enoc/types/`, `GET stock/modeles-cuves/`,
 `GET stock/audit-profil-energetique/` — tous additifs.
+
+## Vue simple (Suivis Stock)
+
+L'onglet est organisé en 3 vues : **Stock des sites** (par défaut), **À traiter**, **Imports & paramètres**.
+
+- Vue simple du registre : 7 colonnes (Site, Stock, Dernier relevé, État, Que faire ?, Dernier mouvement, action).
+  La vue détaillée (toutes les colonnes) reste disponible par un bouton.
+- Champs additifs du registre (`GET stock/registre/`) : `anomalie`, `prochaine_action`, `prochaine_action_type`
+  (null = rien à faire / aucun relevé) ; KPI `sites_action_requise`.
+- Paramètres additifs : `action_requise=1` (sites avec une action), `tri=priorite`
+  (stock connu, puis action requise, puis sans relevé ; défaut inchangé = tri par site).
+- « Mouvements sans preuve » exclut les demandes de livraison et les cartes Total (jamais des livraisons).
+- « Plusieurs cuves à identifier » : une ligne par site.
