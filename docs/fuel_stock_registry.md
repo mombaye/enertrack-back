@@ -235,3 +235,63 @@ L'ancien `GET stock/` (Snowflake + ENOC) est inchangé.
 - Le périmètre de gardiennage est vide à l'installation. Tant qu'il n'est pas configuré, les relevés Loliforce / SCSS sont À VALIDER.
 - Sites multi-cuves dans « Coef cuve » : la numérotation 1, 2 suit l'ordre du fichier et doit être confirmée (`TANK_ORDER_TO_CONFIRM`).
 - La correspondance des types d'opération ENOC est heuristique (AJOUT, PONCTION, RETRAIT…). Les types non reconnus sont signalés (`MISSING_MOVEMENT_TYPE`) et à confirmer avec `--audit-eydon`.
+
+---
+
+# Itération 2 — Cuves : bibliothèque de modèles, affectation site → cuve, conversion calibrée, file « À traiter »
+
+## Deux référentiels distincts
+- `fuel_tank_model` : bibliothèque de MODÈLES issue du calculateur de Steve (`Senegal_Tank_DB_Calculateur.xlsx`, onglet
+  « Tank DB », déposé dans `incoming/modeles_cuves/` ou importé avec le type `TANK_MODELS`). Statut COMPLET (écart plaque /
+  géométrie ≤ 5 %), A_CONFIRMER (> 5 %), INCOMPLET (forme / cotes / profil non reconnus). Un modèle n'est jamais une cuve de site.
+- `fuel_site_tank` (ancienne table `fuel_tank_master`, renommée, migration 0044) : cuve RÉELLEMENT présente sur un site.
+  Statuts VALIDEE, PROPOSEE, A_CONFIRMER, INCOMPLETE, PLUSIEURS_CUVES_A_IDENTIFIER, REJETEE. Cotes en cm selon la famille du
+  calculateur, profils de fond, capacité de plaque (+ source), modèle relié (PROPOSED / CONFIRMED / REJECTED), preuve,
+  fichier / onglet / ligne source.
+
+## Moteur (services/tank_geometry.py, version steve-v1)
+Reprise exacte de la Notice du calculateur : 6 familles, 8 profils de fond, tables Ψ / Φ extraites de l'onglet « Profils »
+(`fuel_tracking/data/tank_profiles_steve_v1.json`). Recoupé avec l'onglet « Barèmes » (8 cuves, 0 à 200 cm) : écart max
+4·10⁻¹² L ; exemple du Calculateur (cuve #2, 27 cm) : 645,217 L géométrique, 592,084 L calibré. Volume calibré =
+géométrique × k, k = plaque / géométrie pleine. Jamais de « litres par cm » générique.
+
+## Affectation
+- Closing : forme + cotes reconnues + capacité déclarée cohérente (≤ 5 %) → VALIDEE ; la capacité du Closing est recalculée
+  depuis les cotes (fonds plats) : elle n'est jamais prise pour une capacité de plaque.
+- Refueling (colonne CUVE, valeur ronde) : capacité de plaque appliquée si cohérente à 5 % avec la géométrie ; site sans cuve →
+  cuve A_CONFIRMER (capacité connue, cotes à relever). « Coef cuve » : propositions (PROPOSEE / PLUSIEURS_CUVES_A_IDENTIFIER).
+- Modèle proposé uniquement si famille + cotes correspondent sans ambiguïté (± 3 cm section, ± 5 cm longueur), jamais sur la
+  capacité. Confirmer le modèle (UI « Corriger cuve ») applique sa géométrie et sa plaque, chaque champ tracé.
+- `python manage.py evaluate_site_tanks [--dry-run]` réévalue les cuves non validées humainement et reconvertit les relevés.
+
+## Conversion et stock retenu
+Cuve VALIDEE requise. Plaque cohérente → volume CALIBRÉ retenu ; sans plaque (ou plaque incohérente) → volume géométrique
+conservé comme valeur TECHNIQUE (statut GEOMETRIC_ONLY), retenu seulement par validation manuelle explicite. Chaque relevé
+conserve niveau brut, unité, volumes géométrique / calibré / retenu, capacité, remplissage, règle, modèle, statut, codes
+d'anomalie. cm + litres : les deux conservés, écart calculé (> max(100 L ; 10 %) → à traiter). Relevé > 7 jours à la
+réception : signalé, conservé. Stock retenu : cuve VALIDEE, jour le plus récent, priorité `FUEL_STOCK_SOURCE_PRIORITY`
+(TERRAIN_PREUVE > LOLIFORCE > SCSS > ENOC) ; jamais si un relevé du jour vise une cuve non référencée. Conflit Loliforce /
+SCSS : `FUEL_GUARD_CONFLICT_PRIORITY` (vide = exception).
+
+Statuts affichés : AUTO_VALIDE, VALIDE_MANUELLEMENT, A_TRAITER (toujours avec anomalie + règle + action), REJETE, NON_EXPLOITABLE.
+
+## « À traiter — actions requises » (`GET stock/a-traiter/`)
+Cuves à confirmer, cuves incomplètes, plusieurs cuves à identifier, relevés cm non convertibles, relevés dépassant la
+capacité, conflits Loliforce / SCSS, gardiennage à configurer, mouvements ENOC non classifiés, mouvements sans preuve, sites
+sans relevé récent — chaque ligne : site, date, source, anomalie, valeur brute, attendu, règle échouée, action, historique.
+
+## ENOC
+`fuel_enoc_type_mapping` : classification administrable et versionnée (RELEVE_STOCK, LIVRAISON_CONFIRMEE, DEMANDE_LIVRAISON,
+AJOUT, TRANSFERT_ENTRANT/SORTANT, RETRAIT, VOL, VIDANGE, CARTE_TOTAL, INCONNU). Type non configuré → INCONNU (file
+d'exceptions, valeur brute visible), jamais un mouvement réel. Demande sans opération → DEMANDE_LIVRAISON, jamais retenue.
+CARTE_TOTAL → contrôle, jamais retenue. LIVRAISON_CONFIRMEE retenue seulement avec site, date, quantité et preuve / référence.
+`python manage.py enoc_types` (dictionnaire réel + suggestion non appliquée) ; `--set VALEUR CATEGORIE --reason "…"`.
+
+## Profil énergétique (colonnes séparées de la TYPOLOGIE, inchangée)
+Environnement (Gestion des sites, type installé), Raccordement (Snowflake GRID_SUPPLY_MODIFIED), GE (Snowflake DG_COUNT, sinon
+périmètre fuel), Solaire (Gestion des sites « non encore solarisé »). Jamais déduit du code de typologie ; « Inconnu » sinon.
+Audit : `python manage.py audit_site_energy_fields` ou `GET stock/audit-profil-energetique/`.
+
+## Nouveaux endpoints
+`GET stock/a-traiter/[?categorie=]`, `GET/POST stock/enoc/types/`, `GET stock/modeles-cuves/`,
+`GET stock/audit-profil-energetique/` — tous additifs.

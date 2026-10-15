@@ -81,7 +81,8 @@ def _obs_item(o, codes: list[str], count: int) -> dict:
 
 def _grouped_obs(qs, code_filter=None) -> list[dict]:
     by_site = {}
-    for o in qs.order_by("site_id", "-observation_datetime", "-id"):
+    for o in qs.only("id", "site_id", "observation_datetime", "issue_codes", "level_raw", "level_unit", "source_type",
+                     "capacity_l").order_by("site_id", "-observation_datetime", "-id"):
         codes = [c for c in (o.issue_codes or [])]
         if code_filter and not (set(codes) & code_filter):
             continue
@@ -169,8 +170,13 @@ def build(category: str) -> list[dict]:
         return out
     if category == "sites_sans_releve_recent":
         limit = timezone.now() - timedelta(days=STALE_DAYS)
+        from django.db.models import Max
+
+        last = dict(Obs.objects.exclude(source_type__in=("SNOWFLAKE", "CLOSING")).values_list("site_id").annotate(d=Max("observation_datetime")))
+        stale = {sid for sid, d in last.items() if d < limit}
         latest = {}
-        for o in Obs.objects.exclude(source_type__in=("SNOWFLAKE", "CLOSING")).order_by("site_id", "-observation_datetime", "-id"):
+        for o in (Obs.objects.filter(site_id__in=stale).exclude(source_type__in=("SNOWFLAKE", "CLOSING"))
+                  .only("id", "site_id", "observation_datetime", "level_raw", "source_type").order_by("site_id", "-observation_datetime", "-id")):
             latest.setdefault(o.site_id, o)
         out = []
         for sid, o in sorted(latest.items()):
