@@ -48,11 +48,11 @@ class Command(BaseCommand):
                 if not site or provider not in ("LOLIFORCE", "SCSS") or not start:
                     errors.append(f"ligne {n} : site={rec.get('site_id')!r} provider={rec.get('provider')!r} début={rec.get('active_from')!r}")
                     continue
+                sites.add(site)  # réévalué même si le périmètre existait déjà (relancer l'import réapplique)
                 obj, was_created = FuelGuardScope.objects.get_or_create(site_id=site, provider=provider, active_from=start,
                                                                         defaults={"active_to": end, "comment": rec.get("comment") or None})
                 if was_created:
                     created += 1
-                    sites.add(site)
                     log_correction("GUARD_SCOPE", obj.pk, "CREATE", f"Import {path.name}", site_id=site, new=f"{provider} {start}→{end or '…'}",
                                    author_label=f"import {path.name}")
             if dry_run:

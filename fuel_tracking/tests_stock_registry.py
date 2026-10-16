@@ -801,6 +801,20 @@ class AuditAndApiTests(TmpRootMixin, TestCase):
         o = FuelStockObservation.objects.get()
         self.assertEqual((o.guard_scope_status, o.validation_status), ("IN_SCOPE", "VALIDATED"))
 
+    def test_guard_scope_clears_not_configured_even_if_reading_stays_pending(self):
+        from django.core.management import call_command
+        tank("DKR_0001", status="PROPOSEE")
+        P.process_bytes(xlsx({"K": [HEAD, guard_row("DKR_0001", cm=10)]}), "a.xlsx", "LOLIFORCE", origin="UPLOAD")
+        self.assertIn("NOT_CONFIGURED", FuelStockObservation.objects.get().issue_codes)
+        path = Path(tempfile.mkdtemp()) / "p.csv"
+        path.write_text("site_id;provider;active_from\nDKR_0001;LOLIFORCE;01/01/2026\n", encoding="utf-8")
+        for _ in range(2):  # relancer l'import réévalue sans dupliquer le périmètre
+            call_command("import_fuel_guard_scope", file=str(path), stdout=io.StringIO())
+        o = FuelStockObservation.objects.get()
+        self.assertEqual((o.guard_scope_status, o.validation_status), ("IN_SCOPE", "PENDING"))  # cuve seulement proposée
+        self.assertNotIn("NOT_CONFIGURED", o.issue_codes)
+        self.assertEqual(FuelGuardScope.objects.count(), 1)
+
     def test_guard_scope_api_reevaluates(self):
         tank("DKR_0001")
         P.process_bytes(xlsx({"K": [HEAD, guard_row("DKR_0001", cm=10)]}), "a.xlsx", "LOLIFORCE", origin="UPLOAD")

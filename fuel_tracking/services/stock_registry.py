@@ -734,8 +734,12 @@ def reconvert_site_observations(site_id: str, user=None) -> int:
                                _f(o.level_value), o.level_unit, o.tank_id,
                                review_flags=[f for f in _flags(o.review_flags) if f["code"] not in ("CM_L_GAP",)], cm_value=cm_extra)
         new, _ = build_observation(inp, tanks, guard)
-        before = (o.tank_id, _f(o.level_liters), o.conversion_status, o.validation_status, _f(o.volume_geometric_l))
-        after = (new.tank_id, _f(new.level_liters), new.conversion_status, new.validation_status, _f(new.volume_geometric_l))
+        # Le statut de gardiennage et les anomalies comptent aussi : un site qui entre dans un périmètre perd son
+        # anomalie « gardiennage non configuré » même si le relevé reste à valider (cuve seulement proposée).
+        before = (o.tank_id, _f(o.level_liters), o.conversion_status, o.validation_status, _f(o.volume_geometric_l),
+                  o.guard_scope_status, sorted(set(o.issue_codes or []) - {"STOCK_CONFLICT"}))
+        after = (new.tank_id, _f(new.level_liters), new.conversion_status, new.validation_status, _f(new.volume_geometric_l),
+                 new.guard_scope_status, sorted(set(new.issue_codes or []) - {"STOCK_CONFLICT"}))
         if before != after:
             log_correction("OBSERVATION", o.pk, "SYSTEM", "Reconversion après modification du référentiel cuve / gardiennage",
                            site_id=site_id, field="cuve/litres/conversion/statut/géométrique", old=before, new=after, user=user,
