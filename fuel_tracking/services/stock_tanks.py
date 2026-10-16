@@ -296,11 +296,20 @@ def evaluate_site_tanks(user=None, dry_run=False) -> dict:
     counts = {}
     for t in FuelTankMaster.objects.filter(active=True):
         counts[t.site_id] = counts.get(t.site_id, 0) + 1
-    for t in FuelTankMaster.objects.filter(active=True).select_related("tank_model"):
+    for t in FuelTankMaster.objects.filter(active=True).select_related("tank_model", "source_batch"):
         stats["evaluees"] += 1
         if t.validated_by_id is not None:
             stats["statuts"][t.validation_status] = stats["statuts"].get(t.validation_status, 0) + 1
             continue
+        if t.source_type != "CLOSING" and t.source_batch_id and t.source_batch.source_type == "CLOSING":
+            # Réparation : cuve mise à jour par le Closing mais restée marquée de sa source d'origine (refueling).
+            R.log_correction("TANK", t.pk, "SYSTEM", "Cuve reprise par le référentiel Closing (source corrigée)", site_id=t.site_id,
+                             field="source_type", old=t.source_type, new="CLOSING", user=user,
+                             author_label=None if user else "système (règles cuves)")
+            t.source_type = "CLOSING"
+            if not dry_run:
+                FuelTankMaster.objects.filter(pk=t.pk).update(source_type="CLOSING")
+            stats["sources_corrigees"] = stats.get("sources_corrigees", 0) + 1
         spec = TC.TankSpec.from_model(t)
         multi = counts.get(t.site_id, 0) > 1 and t.source_type == "HISTORICAL_REFUELING"
         if t.source_type == "CLOSING":

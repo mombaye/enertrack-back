@@ -273,6 +273,24 @@ class TankLibraryAndAssignmentTests(TmpRootMixin, TestCase):
         self.assertEqual(FuelTankMaster.objects.get(site_id="DKR_0003").validation_status, "A_CONFIRMER")
         self.assertFalse(FuelTankMaster.objects.filter(site_id="DKR_0004").exists())
 
+    def test_closing_takes_over_refueling_proposal_and_survives_evaluation(self):
+        geo = math.pi * 0.62 ** 2 * 1.62 * 1000
+        t = tank("DKR_0001", status="PROPOSEE", family="h-circ", dims=(124, None, 162), plate=None, source_type="HISTORICAL_REFUELING")
+        self.closing([[None, "DKR_0001", "A", "Cuve Cylindrique Horizontale", 1.62, None, None, 1.24, geo]])
+        t.refresh_from_db()
+        self.assertEqual((t.source_type, t.validation_status), ("CLOSING", "VALIDEE"))
+        T.evaluate_site_tanks()
+        t.refresh_from_db()
+        self.assertEqual(t.validation_status, "VALIDEE")  # la réévaluation applique la règle Closing, pas celle du refueling
+
+    def test_evaluation_repairs_tank_updated_by_closing_with_stale_source(self):
+        geo = math.pi * 0.62 ** 2 * 1.62 * 1000
+        b = self.closing([[None, "DKR_0001", "A", "Cuve Cylindrique Horizontale", 1.62, None, None, 1.24, geo]])
+        FuelTankMaster.objects.filter(site_id="DKR_0001").update(source_type="HISTORICAL_REFUELING", validation_status="PROPOSEE")
+        r = T.evaluate_site_tanks()
+        t = FuelTankMaster.objects.get(site_id="DKR_0001")
+        self.assertEqual((t.source_batch_id, t.source_type, t.validation_status, r["sources_corrigees"]), (b.pk, "CLOSING", "VALIDEE", 1))
+
     def test_model_never_proposed_on_capacity_alone_or_ambiguity(self):
         P.process_bytes(steve_workbook(), "steve.xlsx", "TANK_MODELS", origin="UPLOAD")
         models = T.library_models()

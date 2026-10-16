@@ -775,8 +775,15 @@ def _upsert_tank(batch, site_id, tank_id, values, messages) -> str:
             return "differs_validated"
         return "unchanged"
     status_change = values["validation_status"] != tank.validation_status
-    if not changes and not status_change:
+    # Le Closing est le référentiel des cuves : il reprend une cuve proposée par une autre source (refueling) ;
+    # sinon la réévaluation lui réappliquerait la règle de l'ancienne source.
+    takeover = batch.source_type == "CLOSING" and tank.source_type != "CLOSING"
+    if not changes and not status_change and not takeover:
         return "unchanged"
+    if takeover:
+        R.log_correction("TANK", tank.pk, "SYSTEM", f"Cuve reprise par le référentiel Closing ({label})", site_id=site_id,
+                         field="source_type", old=tank.source_type, new="CLOSING", author_label=label)
+        tank.source_type = "CLOSING"
     for k, v in changes.items():
         R.log_correction("TANK", tank.pk, "CORRECT", f"Mise à jour depuis {label}", site_id=site_id, field=k,
                          old=getattr(tank, k), new=v, author_label=label)
