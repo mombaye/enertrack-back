@@ -14,7 +14,7 @@ from django.db import transaction
 
 from fuel_tracking.models import FuelGuardScope
 from fuel_tracking.services.stock_import_files import iter_sheets, parse_date
-from fuel_tracking.services.stock_registry import SiteResolver, log_correction
+from fuel_tracking.services.stock_registry import SiteResolver, log_correction, reconvert_site_observations
 
 
 class Command(BaseCommand):
@@ -37,7 +37,7 @@ class Command(BaseCommand):
             rows = [list(r) for _, it in iter_sheets(data, path.name) for r in it]
         header = [str(h or "").strip().lower() for h in rows[0]]
         resolver = SiteResolver()
-        created, errors = 0, []
+        created, errors, sites = 0, [], set()
         with transaction.atomic():
             for n, r in enumerate(rows[1:], start=2):
                 rec = dict(zip(header, r))
@@ -52,10 +52,14 @@ class Command(BaseCommand):
                                                                         defaults={"active_to": end, "comment": rec.get("comment") or None})
                 if was_created:
                     created += 1
+                    sites.add(site)
                     log_correction("GUARD_SCOPE", obj.pk, "CREATE", f"Import {path.name}", site_id=site, new=f"{provider} {start}→{end or '…'}",
                                    author_label=f"import {path.name}")
             if dry_run:
                 transaction.set_rollback(True)
-        self.stdout.write(("DRY RUN — " if dry_run else "") + f"{created} périmètre(s) créé(s), {len(errors)} ligne(s) en erreur.")
+        # Comme l'écran : les relevés déjà importés des sites concernés sont réévalués (statut gardiennage, validation).
+        reevaluated = 0 if dry_run else sum(reconvert_site_observations(s) or 0 for s in sorted(sites))
+        self.stdout.write(("DRY RUN — " if dry_run else "") + f"{created} périmètre(s) créé(s), {len(errors)} ligne(s) en erreur, "
+                          f"{reevaluated} relevé(s) réévalué(s).")
         for e in errors[:50]:
             self.stdout.write("  " + e)

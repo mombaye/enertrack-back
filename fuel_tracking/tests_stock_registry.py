@@ -789,6 +789,18 @@ class AuditAndApiTests(TmpRootMixin, TestCase):
         self.assertEqual(self.client.post("/api/fuel-tracking/stock/enoc/types/", {"raw_value": "X", "category": "AJOUT", "reason": "x"}, format="json").status_code, 403)
         self.assertEqual(self.client.get("/api/fuel-tracking/stock/audit-profil-energetique/").status_code, 200)
 
+    def test_guard_scope_command_reevaluates(self):
+        from django.core.management import call_command
+        tank("DKR_0001")
+        P.process_bytes(xlsx({"K": [HEAD, guard_row("DKR_0001", cm=10)]}), "a.xlsx", "LOLIFORCE", origin="UPLOAD")
+        path = Path(tempfile.mkdtemp()) / "perimetre.csv"
+        path.write_text("site_id;provider;active_from\ndkr_0001;LOLIFORCE;01/01/2026\n", encoding="utf-8")
+        out = io.StringIO()
+        call_command("import_fuel_guard_scope", file=str(path), stdout=out)
+        self.assertIn("1 périmètre(s) créé(s)", out.getvalue())
+        o = FuelStockObservation.objects.get()
+        self.assertEqual((o.guard_scope_status, o.validation_status), ("IN_SCOPE", "VALIDATED"))
+
     def test_guard_scope_api_reevaluates(self):
         tank("DKR_0001")
         P.process_bytes(xlsx({"K": [HEAD, guard_row("DKR_0001", cm=10)]}), "a.xlsx", "LOLIFORCE", origin="UPLOAD")
