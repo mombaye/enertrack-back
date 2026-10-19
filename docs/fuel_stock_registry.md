@@ -328,7 +328,7 @@ QUE de l'opération ENOC.
 |---|---|
 | Carte Total ouverte / approuvée / sans quantité réelle | DEMANDE_CARTE_TOTAL, aucun impact |
 | Carte Total terminée + site + quantité > 0 en L + date réelle + preuve, sans incohérence bloquante | RAVITAILLEMENT_DECLARE_AVEC_PREUVE, **À_RAPPROCHER** (« Ravitaillement ENOC déclaré et justifié ; rapprochement stock requis ») |
-| Ponction | NATURE_A_QUALIFIER (« Signification métier de Ponction non validée »), aucun impact |
+| Ponction | Transfert inter-sites validé par Steve : voir « Ponction ENOC » ci-dessous (double écriture OUT/IN, somme nulle) |
 | Truck incomplet | LIVRAISON_A_CONFIRMER, aucun impact |
 | Truck terminé complet avec preuve | LIVRAISON_DECLAREE_A_RAPPROCHER, **À_RAPPROCHER** |
 | Autre type | conservé sans interprétation (NATURE_A_QUALIFIER s'il est terminé) |
@@ -348,3 +348,19 @@ NON_CALCULABLE, INCOHERENT, CALCULE_NON_CERTIFIE, CERTIFIE. CPH et Snowflake aff
 
 **Audit de parité** : `python manage.py enoc_parity_audit [--limit 20] [--mongo] [--out fichier.md]` (lecture seule).
 Lien vers ENOC optionnel : variable `ENOC_REQUEST_URL_TEMPLATE` (ex. `https://…/fuel/requests/{reference}`).
+
+## Ponction ENOC — transfert inter-sites (règle validée par Steve)
+
+- `site_id` de la demande = **site destinataire** ; champ « Site source » de la section Ponction = **site source**. Jamais d'inversion.
+- Volume comptable = `approved_quantity_l` uniquement (jamais la quantité demandée, la variation de niveau ni une estimation).
+- Conditions (toutes requises) : type PONCTION ; statut dans `FUEL_PONCTION_ACCEPTED_STATUSES` (défaut `validated,validee,validée`) ; site source et destinataire résolus ; quantité approuvée > 0 ; date de validation ; niveau cuve source avant et après ; bon de transfert ; valideur manager.
+  Manquant → `TRANSFERT_A_COMPLETER`, aucun impact stock, champs manquants listés. Statut rejeté → `REJETEE`.
+- Ponction complète → deux lignes `FuelMovement` (`movement_type=TRANSFERT_INTERSITE`, `source_system` ENOC, qualification `ELIGIBLE_STOCK_REEL`) partageant `transfer_id = ENOC-PONCTION-<référence ENOC>` :
+  `OUT` au site source (`impact_stock_l = −approuvé`, contrepartie = destinataire) et `IN` au destinataire (`+approuvé`, contrepartie = source). `source_event_id = <transfer_id>:OUT|IN`, idempotent.
+  La ligne « demande » n'est jamais retenue. Si la Ponction redevient incomplète ou rejetée, les deux écritures sont neutralisées (non retenues), jamais supprimées.
+- Date du mouvement = date de validation ENOC ; dates de création, planifiée et clôture conservées à part (la date planifiée n'est jamais présentée comme réelle).
+- Contrôle : `variation_source_l = après − avant` ; `ecart_controle_l = |variation + approuvé|`. Si écart > max(`FUEL_PONCTION_GAP_MIN_L`=20 L ; `FUEL_PONCTION_GAP_PCT`=10 % de l'approuvé) → alerte `ECART_NIVEAU_PONCTION_A_CONTROLER` dans la file Fuel Manager. L'acquittement (`POST stock/enoc/<id>/rapprocher/` décision `acquitter`) ne modifie jamais le volume approuvé.
+- Contrôle d'équilibre : `services/stock_enoc.py::check_transfer_balance()` (somme des impacts par `transfer_id` = 0 exactement), repris dans `enoc_parity_audit` section 4 bis.
+- Bilan stock : `transferts_entree` / `transferts_sortie` ; une Ponction incomplète touchant le site rend le bilan NON_CALCULABLE aux deux sites.
+- API : `GET stock/enoc/?ponction=avec_ecart|a_completer|comptabilisees|attente_fm`.
+- Noms exacts des champs de la section Ponction dans Mongo : à confirmer via `enoc_parity_audit --mongo` (section 4 bis liste les clés trouvées et les conditions manquantes).
