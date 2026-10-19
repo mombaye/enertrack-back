@@ -138,6 +138,19 @@ def _apply_qualification(fields: dict, q) -> dict:
         return fields
     eligible = q.execution_state == "ELIGIBLE_STOCK_REEL"
     fields["retained_in_stock"] = bool(q.stock_impact and eligible)
+    if q.type_family == "PONCTION":
+        # La demande Ponction reste une ligne d'information : l'impact stock est porté par les 2 écritures transfer_id.
+        fields["retained_in_stock"], fields["movement_type"] = False, None
+        fields["source_category"] = {"COMPTABILISE": "PONCTION_COMPTABILISEE", "TRANSFERT_A_COMPLETER": "PONCTION_A_COMPLETER",
+                                     "REJETE": "PONCTION_REJETEE"}.get(q.transfer_status, "INCONNU")
+        if q.transfer_status == "REJETE":
+            fields["status"] = "REJECTED"
+        fields["quantity_l"] = q.approved_quantity_l
+        fields["counterpart_site_id"] = q.ponction_source_site_resolved or q.ponction_source_site_id
+        fields["mapping_rule"] = f"{q.transfer_id or ''} · {q.execution_state} : {q.reason}"[:255]
+        fields["alerts"] = [a for a in fields["alerts"] if a["code"] != "ENOC_TYPE_UNKNOWN"] + \
+            [{"code": f"ENOC_{q.execution_state}", "message": q.reason}]
+        return fields
     if eligible:
         fields["source_category"], fields["movement_type"] = "LIVRAISON_CONFIRMEE", "DELIVERY"
     elif q.business_classification == "REJETEE":
@@ -152,7 +165,7 @@ def _apply_qualification(fields: dict, q) -> dict:
     fields["quantity_l"] = q.actual_quantity_l
     fields["mapping_rule"] = f"{fields['mapping_rule']} · {q.execution_state} : {q.reason}"[:255]
     fields["proof_reference"] = ", ".join(q.proof_urls_or_ids or [])[:512] or fields.get("proof_reference")
-    keep_unknown = q.type_family in ("PONCTION", "AUTRE")  # seuls ces types restent « à classifier »
+    keep_unknown = q.type_family == "AUTRE"  # seul un type non reconnu reste « à classifier »
     fields["alerts"] = [a for a in fields["alerts"] if keep_unknown or a["code"] != "ENOC_TYPE_UNKNOWN"] + \
         [{"code": f"ENOC_{q.execution_state}", "message": q.reason}]
     return fields
@@ -354,6 +367,8 @@ def sync_enoc_to_registry(since=None, user=None, only_ids=None) -> dict:
                         old.save()
                         stats["releves_mis_a_jour"] += 1
                         changed_any = True
+            if _sync_transfer(qualified.get(m.pk), get_batch, stats):
+                changed_any = True
             if not changed_any:
                 stats["inchanges"] += 1
         if batch is not None:
@@ -366,6 +381,77 @@ def sync_enoc_to_registry(since=None, user=None, only_ids=None) -> dict:
             batch.save()
     stats["lot"] = batch.pk if batch else None
     return stats
+
+
+TRANSFER_TRACKED = ("site_id", "counterpart_site_id", "quantity_l", "impact_stock_l", "movement_datetime", "retained_in_stock",
+                    "status", "proof_reference", "source_user", "alerts")
+
+
+def _sync_transfer(q, get_batch, stats) -> bool:
+    """
+    Ponction comptabilisée → deux écritures liées par transfer_id : OUT au site source (−quantité approuvée),
+    IN au site destinataire = site_id de la demande (+quantité approuvée). Somme des impacts = 0.
+    Ponction non comptabilisée (à compléter, rejetée) → aucune écriture ; une écriture existante est neutralisée (tracé).
+    """
+    from fuel_tracking.models import FuelMovement
+
+    if q is None or q.type_family != "PONCTION" or not q.transfer_id:
+        return False
+    existing = {mv.movement_direction: mv for mv in FuelMovement.objects.filter(source_type="ENOC", transfer_id=q.transfer_id)}
+    changed = False
+    if q.transfer_status == "COMPTABILISE" and q.approved_quantity_l and q.ponction_source_site_resolved and q.site_id_resolved:
+        qty = q.approved_quantity_l
+        fm = [a for a in (q.alerts or []) if a.get("code") == "ECART_NIVEAU_PONCTION_A_CONTROLER"]
+        legs = {"OUT": (q.ponction_source_site_resolved, -qty, q.site_id_resolved),
+                "IN": (q.site_id_resolved, qty, q.ponction_source_site_resolved)}
+        for direction, (site, impact, counterpart) in legs.items():
+            values = dict(site_id=site, counterpart_site_id=counterpart, movement_type="TRANSFERT_INTERSITE", movement_direction=direction,
+                          quantity_l=qty, impact_stock_l=impact, transfer_id=q.transfer_id, movement_datetime=q.approved_at,
+                          retained_in_stock=True, status="CLOSED", source_status=q.raw_status, source_category="TRANSFERT_INTERSITE",
+                          raw_operation_type=q.raw_movement_type, proof_reference=(q.transfer_note or "")[:512] or None,
+                          source_user=q.validator_name, alerts=[{"code": a["code"], "message": a["message"]} for a in fm],
+                          mapping_rule=f"Ponction validée {q.transfer_id} : quantité approuvée, date de validation ENOC"[:255],
+                          comment=f"Réf. ENOC {q.enoc_reference}")
+            mv = existing.get(direction)
+            if mv is None:
+                FuelMovement.objects.create(source_type="ENOC", source_event_id=f"{q.transfer_id}:{direction}"[:128], batch=get_batch(),
+                                            **values)
+                stats["transferts_crees"] = stats.get("transferts_crees", 0) + 1
+                changed = True
+                continue
+            diffs = {f: (getattr(mv, f), values[f]) for f in TRANSFER_TRACKED if str(getattr(mv, f)) != str(values[f])
+                     and not (f.endswith("_l") and _same_num(getattr(mv, f), values[f]))}
+            if diffs:
+                for f, (old, new) in diffs.items():
+                    R.log_correction("MOVEMENT", mv.pk, "SYSTEM", "Mise à jour à la source ENOC (Ponction)", site_id=mv.site_id,
+                                     field=f, old=old, new=new, author_label="ENOC")
+                for f, v in values.items():
+                    setattr(mv, f, v)
+                mv.save()
+                changed = True
+        return changed
+    for mv in existing.values():
+        if mv.retained_in_stock:
+            R.log_correction("MOVEMENT", mv.pk, "SYSTEM", f"Ponction {q.transfer_status} : écriture de transfert neutralisée",
+                             site_id=mv.site_id, field="retained_in_stock", old=True, new=False, author_label="ENOC")
+            mv.retained_in_stock = False
+            mv.status = "REJECTED" if q.transfer_status == "REJETE" else "DECLARED"
+            mv.save()
+            stats["transferts_neutralises"] = stats.get("transferts_neutralises", 0) + 1
+            changed = True
+    return changed
+
+
+def check_transfer_balance() -> list[dict]:
+    """Contrôle global : pour chaque transfer_id retenu, la somme des impacts doit être exactement 0 (2 écritures)."""
+    from django.db.models import Count, Sum
+
+    from fuel_tracking.models import FuelMovement
+
+    rows = (FuelMovement.objects.filter(transfer_id__isnull=False, retained_in_stock=True).values("transfer_id")
+            .annotate(total=Sum("impact_stock_l"), n=Count("id")))
+    return [{"transfer_id": r["transfer_id"], "somme_impacts_l": float(r["total"] or 0), "ecritures": r["n"]}
+            for r in rows if (r["total"] or 0) != 0 or r["n"] != 2]
 
 
 def _same_num(a, b) -> bool:

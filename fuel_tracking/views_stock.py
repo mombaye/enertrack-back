@@ -338,7 +338,8 @@ def _movement(m):
         "alerts": m.alerts, "comment": m.comment, "validation_reason": m.validation_reason,
         "validated_by": getattr(m.validated_by, "username", None), "validated_at": m.validated_at, "batch_id": m.batch_id,
         "raw_operation_type": m.raw_operation_type, "source_category": m.source_category, "mapping_rule": m.mapping_rule,
-        "retained_in_stock": m.retained_in_stock,
+        "retained_in_stock": m.retained_in_stock, "movement_direction": m.movement_direction,
+        "impact_stock_l": _f(m.impact_stock_l), "transfer_id": m.transfer_id,
     }
 
 

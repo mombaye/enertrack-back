@@ -1338,6 +1338,7 @@ class FuelMovement(models.Model):
         THEFT = "THEFT", "Vol"
         DRAIN = "DRAIN", "Vidange"
         CORRECTION = "CORRECTION", "Correction"
+        TRANSFERT_INTERSITE = "TRANSFERT_INTERSITE", "Transfert inter-sites (Ponction)"
 
     class Status(models.TextChoices):
         DECLARED = "DECLARED", "Déclaré"
@@ -1372,6 +1373,11 @@ class FuelMovement(models.Model):
     source_category = models.CharField(max_length=32, null=True, blank=True, db_index=True, help_text="Classification (RELEVE_STOCK, LIVRAISON_CONFIRMEE, DEMANDE_LIVRAISON, …, INCONNU).")
     mapping_rule = models.CharField(max_length=255, null=True, blank=True, help_text="Règle de classification appliquée (version).")
     retained_in_stock = models.BooleanField(default=False, help_text="Mouvement réel exploitable pour le stock (jamais une demande ni une carte Total).")
+    movement_direction = models.CharField(max_length=3, null=True, blank=True, help_text="IN / OUT (transferts inter-sites).")
+    impact_stock_l = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True,
+                                         help_text="Impact signé sur le stock du site (+ entrée, − sortie).")
+    transfer_id = models.CharField(max_length=160, null=True, blank=True, db_index=True,
+                                   help_text="Identifiant commun des deux écritures d'un transfert (somme des impacts = 0).")
     comment = models.TextField(null=True, blank=True)
     validated_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
     validated_at = models.DateTimeField(null=True, blank=True)
@@ -1466,6 +1472,18 @@ class FuelEnocQualifiedMovement(models.Model):
         ELIGIBLE_STOCK_REEL = "ELIGIBLE_STOCK_REEL", "Éligible stock réel"
         REJETEE = "REJETEE", "Rejetée"
         NATURE_A_QUALIFIER = "NATURE_A_QUALIFIER", "Nature à qualifier"
+        TRANSFERT_A_COMPLETER = "TRANSFERT_A_COMPLETER", "Transfert à compléter"
+
+    class TransferStatus(models.TextChoices):
+        NON_APPLICABLE = "NON_APPLICABLE", "Non applicable (pas une Ponction)"
+        TRANSFERT_A_COMPLETER = "TRANSFERT_A_COMPLETER", "Transfert à compléter"
+        COMPTABILISE = "COMPTABILISE", "Comptabilisé (double écriture)"
+        REJETE = "REJETE", "Rejeté"
+
+    class FuelManagerAlert(models.TextChoices):
+        AUCUNE = "AUCUNE", "Aucune"
+        EN_ATTENTE = "EN_ATTENTE", "En attente Fuel Manager"
+        TRAITEE = "TRAITEE", "Traitée par le Fuel Manager"
 
     class Reconciliation(models.TextChoices):
         NON_REQUIS = "NON_REQUIS", "Non requis (aucun impact stock possible en l'état)"
@@ -1513,6 +1531,26 @@ class FuelEnocQualifiedMovement(models.Model):
     field_sources = models.JSONField(default=dict, blank=True, help_text="Champ canonique → chemin brut ENOC utilisé.")
     source_fingerprint = models.CharField(max_length=64, blank=True, default="")
     synced_at = models.DateTimeField(null=True, blank=True)
+
+    # Ponction (règle validée par Steve) : site_id principal = DESTINATAIRE, « Site source » = SOURCE ;
+    # volume comptable = approved_quantity_l ; double écriture liée par transfer_id (somme des impacts = 0).
+    transfer_id = models.CharField(max_length=160, null=True, blank=True, db_index=True)
+    transfer_status = models.CharField(max_length=24, choices=TransferStatus.choices, default=TransferStatus.NON_APPLICABLE, db_index=True)
+    ponction_source_site_id = models.CharField(max_length=128, null=True, blank=True, help_text="« Site source » brut ENOC")
+    ponction_source_site_resolved = models.CharField(max_length=64, null=True, blank=True, db_index=True)
+    source_level_before_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    source_level_after_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    source_level_before_cm = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    source_level_after_cm = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    source_variation_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True,
+                                             help_text="niveau après − niveau avant au site source (contrôle, jamais comptable)")
+    control_gap_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True,
+                                        help_text="abs(variation_source + quantité approuvée)")
+    transfer_note = models.CharField(max_length=255, null=True, blank=True, help_text="Bon de transfert (référence ou pièce)")
+    fuel_manager_alert = models.CharField(max_length=16, choices=FuelManagerAlert.choices, default=FuelManagerAlert.AUCUNE, db_index=True)
+    fuel_manager_reviewed_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    fuel_manager_reviewed_at = models.DateTimeField(null=True, blank=True)
+    fuel_manager_comment = models.TextField(null=True, blank=True)
 
     # Qualification eGrid (axe B — indépendant du type brut)
     type_family = models.CharField(max_length=16, choices=TypeFamily.choices, db_index=True)

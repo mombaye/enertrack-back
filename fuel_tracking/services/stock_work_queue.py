@@ -26,6 +26,10 @@ CATEGORIES = [
     ("gardiennage_a_configurer", "Gardiennage à configurer", "Relevés de gardiennage d'un site sans périmètre configuré ou d'un autre prestataire."),
     ("mouvements_enoc_a_rapprocher", "Mouvements ENOC à rapprocher", "Carte Total / Truck terminés avec quantité, date et preuve : "
      "aucun impact stock tant qu'ils ne sont pas rapprochés d'un relevé terrain ou d'un stock cohérent."),
+    ("ponctions_fuel_manager", "Ponctions — alerte Fuel Manager", "Ponction comptabilisée (volume approuvé) dont la variation de niveau "
+     "du site source s'écarte du volume approuvé au-delà du seuil (max(20 L ; 10 %)) : contrôle Fuel Manager."),
+    ("ponctions_a_completer", "Ponctions à compléter", "Ponction ENOC sans toutes les informations requises : aucune écriture stock "
+     "tant qu'elle n'est pas complète (champs manquants indiqués)."),
     ("mouvements_enoc_inconnus", "Mouvements ENOC non classifiés", "Type d'opération ENOC absent de la configuration (valeur brute visible)."),
     ("mouvements_sans_preuve", "Mouvements sans preuve", "Livraisons / appoints sans photo ni pièce justificative."),
     ("sites_sans_releve_recent", "Sites sans relevé récent", f"Dernier relevé de plus de {STALE_DAYS} jours."),
@@ -156,6 +160,29 @@ def build(category: str) -> list[dict]:
                 "action": "Rapprocher avec un relevé terrain / stock, ou rejeter (motif obligatoire)", "action_type": "RECONCILE_ENOC",
                 "ref": {"enoc_id": q.pk}, "count": 1,
                 "message": f"{q.site_id_resolved or q.site_id} — {q.raw_movement_type} {q.enoc_reference} à rapprocher.",
+            })
+        return out
+    if category in ("ponctions_fuel_manager", "ponctions_a_completer"):
+        from fuel_tracking.models import FuelEnocQualifiedMovement
+
+        qs = FuelEnocQualifiedMovement.objects.filter(type_family="PONCTION")
+        qs = qs.filter(fuel_manager_alert="EN_ATTENTE") if category == "ponctions_fuel_manager" else \
+            qs.filter(transfer_status="TRANSFERT_A_COMPLETER").exclude(raw_status__in=["pending", "rejected"])
+        out = []
+        for q in qs.order_by("-approved_at", "-requested_at"):
+            fm = category == "ponctions_fuel_manager"
+            out.append({
+                "site_id": q.ponction_source_site_resolved or q.ponction_source_site_id or q.site_id_resolved or "—",
+                "date": q.approved_at or q.requested_at, "source": "ENOC",
+                "anomalie": "écart de niveau à contrôler" if fm else "Ponction à compléter",
+                "valeur_brute": (f"réf. {q.enoc_reference} : {q.ponction_source_site_id or '?'} → {q.site_id or '?'}, approuvé "
+                                 f"{_f(q.approved_quantity_l)} L, variation source {_f(q.source_variation_l)} L, écart {_f(q.control_gap_l)} L"),
+                "attendu": "variation source ≈ −quantité approuvée" if fm else "toutes les informations de transfert",
+                "regle": q.reason if not fm else "écart > max(20 L ; 10 % approuvé) — le volume approuvé reste comptabilisé",
+                "action": "Contrôler l'écart puis acquitter l'alerte (motif obligatoire)" if fm
+                else "Compléter dans ENOC : " + ", ".join(q.missing_conditions or []),
+                "action_type": "RECONCILE_ENOC", "ref": {"enoc_id": q.pk}, "count": 1,
+                "message": f"Ponction {q.enoc_reference} : {'alerte Fuel Manager' if fm else 'à compléter'}.",
             })
         return out
     if category == "mouvements_enoc_inconnus":

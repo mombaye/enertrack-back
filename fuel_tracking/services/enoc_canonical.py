@@ -87,6 +87,35 @@ REJECTED_STATUSES = {"rejected", "cancelled", "canceled", "annule", "annulé", "
 REASON_TC_OK = "Ravitaillement ENOC déclaré et justifié ; rapprochement stock requis"
 REASON_TRUCK_OK = "Livraison Truck déclarée et justifiée ; rapprochement stock requis"
 REASON_PONCTION = "Signification métier de Ponction non validée"
+# Règle Ponction validée par Steve : site_id principal = DESTINATAIRE ; « Site source » (section Ponction) = SOURCE.
+PONC = {
+    "source_site": ("source_site_id", "site_source_id", "site_source", "source_site", "from_site_id", "site_id_source",
+                    "origin_site_id", "site_origine", "source"),
+    "lvl_before": ("source_level_before", "level_before_source", "niveau_avant_source", "level_before", "niveau_avant"),
+    "lvl_before_unit": ("source_level_before_unit", "level_before_source_unit", "level_before_unit", "unit", "unite"),
+    "lvl_after": ("source_level_after", "level_after_source", "niveau_apres_source", "level_after", "niveau_apres"),
+    "lvl_after_unit": ("source_level_after_unit", "level_after_source_unit", "level_after_unit", "unit", "unite"),
+    "lvl_before_l": ("source_level_before_liters", "source_level_before_l", "level_before_liters", "level_before_l"),
+    "lvl_after_l": ("source_level_after_liters", "source_level_after_l", "level_after_liters", "level_after_l"),
+    "lvl_before_cm": ("source_level_before_cm", "level_before_cm"),
+    "lvl_after_cm": ("source_level_after_cm", "level_after_cm"),
+    "note": ("transfer_note_number", "transfer_note", "bon_transfert", "bon_de_transfert", "transfer_slip_number",
+             "transfer_slip", "numero_bon", "bon_number", "reference_bon", "bon"),
+}
+PONCTION_OK_STATUSES_DEFAULT = ("validated", "validee", "validée")
+
+
+def ponction_settings() -> dict:
+    from django.conf import settings
+
+    statuses = getattr(settings, "FUEL_PONCTION_ACCEPTED_STATUSES", None) or PONCTION_OK_STATUSES_DEFAULT
+    return {"statuses": {str(x).strip().lower() for x in statuses},
+            "gap_min_l": Decimal(str(getattr(settings, "FUEL_PONCTION_GAP_MIN_L", 20))),
+            "gap_pct": Decimal(str(getattr(settings, "FUEL_PONCTION_GAP_PCT", 10)))}
+
+
+def transfer_id_for(reference: str | None) -> str | None:
+    return f"ENOC-PONCTION-{reference}" if reference else None
 
 
 # ── Lecture brute ──────────────────────────────────────────────────────────────────────────────────────────
@@ -224,6 +253,68 @@ def type_family(raw_type: str | None) -> str:
     return "AUTRE"
 
 
+def ponction_section(docs: dict[str, dict]) -> tuple[dict, str | None]:
+    """Section « Ponction » brute (opération, puis demande, puis élément REST historique)."""
+    for name in ("operation", "request", "rest"):
+        v = (docs.get(name) or {}).get("ponction")
+        if isinstance(v, dict) and v:
+            return v, f"{name}.ponction"
+    return {}, None
+
+
+def extract_ponction(docs: dict[str, dict], src: dict) -> dict:
+    sec, base = ponction_section(docs)
+    out = {"ponction_source_site_id": None, "source_level_before_l": None, "source_level_after_l": None,
+           "source_level_before_cm": None, "source_level_after_cm": None, "transfer_note": None, "_ponction_section": bool(sec),
+           "_source_level_unknown": {}}
+    if not sec:
+        return out
+
+    def first(field):
+        for k in PONC[field]:
+            v = sec.get(k)
+            if not _empty(v):
+                return v, f"{base}.{k}"
+        return None, None
+
+    v, path = first("source_site")
+    if isinstance(v, dict):
+        v = v.get("site_id") or v.get("id") or v.get("code")
+    if not _empty(v):
+        out["ponction_source_site_id"] = str(v).strip()[:128]
+        src["ponction_source_site"] = path
+    for side in ("before", "after"):
+        lit, p_l = first(f"lvl_{side}_l")
+        cm, p_cm = first(f"lvl_{side}_cm")
+        val, p_v = first(f"lvl_{side}")
+        unit, _ = first(f"lvl_{side}_unit")
+        u = unit_of(unit)
+        lit, cm, val = num(lit), num(cm), num(val)
+        if val is not None and lit is None and cm is None:
+            if u == "L" or (u is None and p_v and ("liter" in p_v or "litre" in p_v)):
+                lit, p_l = val, p_v
+            elif u == "CM" or (u is None and p_v and p_v.endswith("_cm")):
+                cm, p_cm = val, p_v
+            else:
+                out["_source_level_unknown"][side] = val
+        if lit is not None:
+            out[f"source_level_{side}_l"] = lit
+            src[f"source_level_{side}_l"] = p_l
+        if cm is not None:
+            out[f"source_level_{side}_cm"] = cm
+            src[f"source_level_{side}_cm"] = p_cm
+    note, p_n = first("note")
+    if not _empty(note):
+        out["transfer_note"] = str(note).strip()[:255]
+        src["transfer_note"] = p_n
+    else:  # bon de transfert joint comme pièce dans la section Ponction
+        items, paths = proofs({"request": sec})
+        if items:
+            out["transfer_note"] = ", ".join(items)[:255]
+            src["transfer_note"] = ", ".join(p.replace("request", base, 1) for p in paths)
+    return out
+
+
 # ── Extraction canonique ───────────────────────────────────────────────────────────────────────────────────
 def extract(m) -> dict:
     raw = m.raw_payload or {}
@@ -320,6 +411,7 @@ def extract(m) -> dict:
         "delivery_note_number": take("delivery_note", lambda v: text(v, 128)),
         "vehicle_or_truck_reference": take("vehicle", lambda v: text(v, 128)),
         "operations_count": len(ops),
+        **extract_ponction(docs, src),
         "field_sources": src,
         "_has_request": has_request,
         "_has_operation": has_operation,
@@ -349,16 +441,20 @@ def qualify(c: dict, now=None) -> dict:
     if c.get("operations_count", 0) > 1:
         alert("PLUSIEURS_OPERATIONS", f"{c['operations_count']} opérations ENOC pour cette demande : la plus récente est utilisée.")
 
-    def result(classification, state, reason, recon="NON_REQUIS"):
-        return {"type_family": fam, "business_classification": classification, "execution_state": state,
-                "stock_impact": False, "consumption_impact": False, "reason": reason, "missing_conditions": missing,
-                "alerts": alerts, "blocking": any(a["blocking"] for a in alerts), "reconciliation_status": recon,
-                "qualification_version": QUALIFICATION_VERSION}
+    def result(classification, state, reason, recon="NON_REQUIS", **extra):
+        out = {"type_family": fam, "business_classification": classification, "execution_state": state,
+               "stock_impact": False, "consumption_impact": False, "reason": reason, "missing_conditions": missing,
+               "alerts": alerts, "blocking": any(a["blocking"] for a in alerts), "reconciliation_status": recon,
+               "qualification_version": QUALIFICATION_VERSION, "transfer_id": None, "transfer_status": "NON_APPLICABLE",
+               "source_variation_l": None, "control_gap_l": None, "fuel_manager_alert": "AUCUNE"}
+        out.update(extra)
+        return out
 
     if status in REJECTED_STATUSES:
-        return result("REJETEE", "REJETEE", f"Demande ENOC au statut « {c.get('raw_status')} » : aucun impact stock.")
+        extra = {"transfer_status": "REJETE", "transfer_id": transfer_id_for(c.get("enoc_reference"))} if fam == "PONCTION" else {}
+        return result("REJETEE", "REJETEE", f"Demande ENOC au statut « {c.get('raw_status')} » : aucun impact stock.", **extra)
     if fam == "PONCTION":
-        return result("PONCTION_A_QUALIFIER", "NATURE_A_QUALIFIER", REASON_PONCTION)
+        return qualify_ponction(c, status, alerts, missing, alert, result)
 
     closed = status in CLOSED_STATUSES or (not c.get("_has_request") and c.get("_has_operation"))
     if status and not closed and status not in OPEN_STATUSES | APPROVED_STATUSES:
@@ -431,18 +527,92 @@ def qualify(c: dict, now=None) -> dict:
     return result("LIVRAISON_A_CONFIRMER", state, f"Truck terminé mais incomplet : {why}.")
 
 
+def qualify_ponction(c: dict, status: str, alerts: list, missing: list, alert, result) -> dict:
+    """
+    Ponction (règle validée) : site_id principal = DESTINATAIRE, « Site source » = SOURCE, volume comptable =
+    quantité APPROUVÉE, date = date de validation. Double écriture liée par transfer_id (somme des impacts = 0)
+    seulement si toutes les conditions sont réunies ; sinon TRANSFERT_A_COMPLETER, aucune écriture stock.
+    """
+    cfg = ponction_settings()
+    ref = c.get("enoc_reference")
+    tid = transfer_id_for(ref)
+    src_site = c.get("_source_site_resolved", c.get("ponction_source_site_id"))
+    dst_site = c.get("_site_resolved", c.get("site_id"))
+    qty = c.get("approved_quantity_l")
+    if not c.get("_ponction_section"):
+        missing.append("section Ponction absente de la demande ENOC")
+    if status not in cfg["statuses"]:
+        missing.append(f"statut ENOC validé (actuel : {c.get('raw_status') or 'aucun'})")
+    if not c.get("ponction_source_site_id"):
+        missing.append("site source")
+    elif not src_site:
+        missing.append(f"site source « {c['ponction_source_site_id']} » inconnu de Gestion des sites")
+    if not c.get("site_id"):
+        missing.append("site destinataire (site_id de la demande)")
+    elif not dst_site:
+        missing.append(f"site destinataire « {c['site_id']} » inconnu de Gestion des sites")
+    if src_site and dst_site and str(src_site).upper() == str(dst_site).upper():
+        alert("PONCTION_MEME_SITE", "Site source = site destinataire : transfert impossible.", blocking=True)
+    if qty is None or qty <= 0:
+        missing.append("quantité approuvée > 0 L")
+    if not c.get("approved_at"):
+        missing.append("date de validation")
+    if c.get("source_level_before_l") is None and c.get("source_level_before_cm") is None:
+        missing.append("niveau cuve avant (site source)")
+    if c.get("source_level_after_l") is None and c.get("source_level_after_cm") is None:
+        missing.append("niveau cuve après (site source)")
+    if not c.get("transfer_note"):
+        missing.append("bon de transfert")
+    if not c.get("validator_name"):
+        missing.append("validation manager")
+    for side, v in (c.get("_source_level_unknown") or {}).items():
+        alert("UNITE_NIVEAU_SOURCE_INCONNUE", f"Niveau source {('avant' if side == 'before' else 'après')} {v} sans unité reconnue.")
+
+    # Contrôle des niveaux (jamais comptable : le volume approuvé fait foi)
+    variation = gap = None
+    fm = "AUCUNE"
+    b, a = c.get("source_level_before_l"), c.get("source_level_after_l")
+    if b is not None and a is not None and qty is not None:
+        variation = a - b
+        gap = abs(variation + qty)
+        threshold = max(cfg["gap_min_l"], cfg["gap_pct"] / Decimal("100") * qty)
+        if gap > threshold:
+            alert("ECART_NIVEAU_PONCTION_A_CONTROLER",
+                  f"Variation source {variation} L pour {qty} L approuvés : écart de contrôle {gap} L > seuil {threshold} L "
+                  "(max(20 L ; 10 %)). Volume approuvé comptabilisé tel quel ; contrôle Fuel Manager requis.")
+            fm = "EN_ATTENTE"
+    elif (c.get("source_level_before_cm") is not None or c.get("source_level_after_cm") is not None) and qty is not None:
+        alert("NIVEAU_SOURCE_EN_CM", "Niveaux du site source en cm : variation en litres non calculée (contrôle manuel).")
+
+    extra = {"transfer_id": tid, "source_variation_l": variation, "control_gap_l": gap, "fuel_manager_alert": fm}
+    blocking = any(x["blocking"] for x in alerts)
+    if missing or blocking or not tid:
+        why = ", ".join(missing + [x["message"] for x in alerts if x["blocking"]])
+        return result("PONCTION_A_COMPLETER", "TRANSFERT_A_COMPLETER", f"Transfert à compléter — manquant : {why}.",
+                      transfer_status="TRANSFERT_A_COMPLETER", **extra)
+    out = result("PONCTION_COMPTABILISEE", "ELIGIBLE_STOCK_REEL",
+                 f"Ponction validée : −{qty} L au site source {src_site}, +{qty} L au site destinataire {dst_site} "
+                 f"(quantité approuvée, {tid}).", transfer_status="COMPTABILISE", **extra)
+    out["stock_impact"] = out["consumption_impact"] = True
+    return out
+
+
 CANONICAL_FIELDS = ("enoc_request_id", "enoc_reference", "site_id", "site_name", "country", "zone", "raw_movement_type",
                     "raw_status", "requested_quantity_l", "approved_quantity_l", "actual_quantity_l", "quantity_unit",
                     "planned_at", "actual_operation_at", "requested_at", "approved_at", "closed_at", "tank_level_before_l",
                     "tank_level_after_l", "tank_level_before_cm", "tank_level_after_cm", "generator_hourmeter_before_h",
                     "generator_hourmeter_after_h", "technician_name", "validator_name", "closer_name", "comment",
                     "proof_count", "proof_urls_or_ids", "supplier_name", "delivery_note_number",
-                    "vehicle_or_truck_reference", "operations_count", "field_sources")
+                    "vehicle_or_truck_reference", "operations_count", "ponction_source_site_id", "source_level_before_l",
+                    "source_level_after_l", "source_level_before_cm", "source_level_after_cm", "transfer_note", "field_sources")
 # Valeurs qui, si elles changent à la source, invalident un rapprochement déjà fait.
 FINGERPRINT_FIELDS = ("site_id", "raw_movement_type", "raw_status", "actual_quantity_l", "quantity_unit", "actual_operation_at",
-                      "tank_level_before_l", "tank_level_after_l", "proof_count", "supplier_name", "delivery_note_number")
+                      "tank_level_before_l", "tank_level_after_l", "proof_count", "supplier_name", "delivery_note_number",
+                      "approved_quantity_l", "approved_at", "validator_name", "ponction_source_site_id", "source_level_before_l",
+                      "source_level_after_l", "source_level_before_cm", "source_level_after_cm", "transfer_note")
 QUALIF_FIELDS = ("type_family", "business_classification", "execution_state", "stock_impact", "consumption_impact",
-                 "reason", "missing_conditions", "alerts", "blocking", "qualification_version")
+                 "reason", "missing_conditions", "alerts", "blocking", "qualification_version", "transfer_id",
+                 "transfer_status", "source_variation_l", "control_gap_l", "fuel_manager_alert")
 
 
 def fingerprint(c: dict) -> str:
@@ -464,12 +634,17 @@ def sync_qualified(movements=None, user=None) -> dict:
         for m in qs:
             stats["lus"] += 1
             c = extract(m)
+            c["_site_resolved"] = resolver.resolve(c["site_id"]) if c["site_id"] else None
+            c["_source_site_resolved"] = resolver.resolve(c["ponction_source_site_id"]) if c["ponction_source_site_id"] else None
             q_vals = qualify(c, now)
             fp = fingerprint(c)
             values = {k: c[k] for k in CANONICAL_FIELDS}
-            values.update(site_id_resolved=resolver.resolve(c["site_id"]) if c["site_id"] else None, source_fingerprint=fp,
-                          synced_at=m.synced_at)
+            values.update(site_id_resolved=c["_site_resolved"], ponction_source_site_resolved=c["_source_site_resolved"],
+                          source_fingerprint=fp, synced_at=m.synced_at)
             q = existing.get(m.pk)
+            if q is not None and q.fuel_manager_alert == "TRAITEE" and q_vals.get("fuel_manager_alert") == "EN_ATTENTE" \
+                    and q.source_fingerprint == fp:
+                q_vals["fuel_manager_alert"] = "TRAITEE"  # alerte déjà traitée par le Fuel Manager, source inchangée
             if q is not None and q.reconciliation_status in ("RAPPROCHE", "CERTIFIE", "REJETE"):
                 if q.source_fingerprint == fp:
                     # Rapprochement humain conservé : seule la partie source est rafraîchie.
@@ -550,9 +725,22 @@ def reconcile(q, user, decision: str, reason: str, evidence: str | None = None):
         new_recon = "CERTIFIE" if q.delivery_note_number else "RAPPROCHE"
         old = (q.execution_state, q.reconciliation_status)
         q.execution_state, q.reconciliation_status, q.stock_impact, q.consumption_impact = "ELIGIBLE_STOCK_REEL", new_recon, True, True
+    elif decision == "acquitter":
+        if q.fuel_manager_alert != "EN_ATTENTE":
+            raise ReconciliationError("Aucune alerte Fuel Manager en attente sur ce mouvement.")
+        q.fuel_manager_alert = "TRAITEE"
+        q.fuel_manager_reviewed_by = user if (user and getattr(user, "is_authenticated", False)) else None
+        q.fuel_manager_reviewed_at = timezone.now()
+        q.fuel_manager_comment = reason
+        q.save()
+        R.log_correction("ENOC_MOVEMENT", q.pk, "VALIDATE", reason, site_id=q.site_id_resolved, field="fuel_manager_alert",
+                         old="EN_ATTENTE", new="TRAITEE", user=user)
+        return q
     elif decision == "rejeter":
         old = (q.execution_state, q.reconciliation_status)
         q.execution_state, q.reconciliation_status, q.stock_impact, q.consumption_impact = "REJETEE", "REJETE", False, False
+        if q.transfer_status != "NON_APPLICABLE":
+            q.transfer_status = "REJETE"
     else:
         raise ReconciliationError("Décision inconnue (rapprocher | rejeter).")
     q.reconciled_by = user if (user and getattr(user, "is_authenticated", False)) else None

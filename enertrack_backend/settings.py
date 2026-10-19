@@ -324,6 +324,11 @@ ENOC_MONGO_PORT     = int(os.getenv("ENOC_MONGO_PORT", "27017"))
 ENOC_MONGO_USERNAME = os.getenv("ENOC_MONGO_USERNAME", "")
 ENOC_MONGO_PASSWORD = os.getenv("ENOC_MONGO_PASSWORD", "")
 ENOC_MONGO_DB_NAME  = os.getenv("ENOC_MONGO_DB_NAME", "")
+# Ponction ENOC (règle validée) : statuts comptabilisables et seuil d'alerte Fuel Manager
+# écart de contrôle > max(FUEL_PONCTION_GAP_MIN_L ; FUEL_PONCTION_GAP_PCT % de la quantité approuvée)
+FUEL_PONCTION_ACCEPTED_STATUSES = [x.strip() for x in os.getenv("FUEL_PONCTION_ACCEPTED_STATUSES", "validated,validee,validée").split(",") if x.strip()]
+FUEL_PONCTION_GAP_MIN_L = float(os.getenv("FUEL_PONCTION_GAP_MIN_L", "20"))
+FUEL_PONCTION_GAP_PCT = float(os.getenv("FUEL_PONCTION_GAP_PCT", "10"))
 # Lien vers une demande ENOC dans l'interface ENOC (optionnel), ex. https://enoc.example/fuel/requests/{reference}
 ENOC_REQUEST_URL_TEMPLATE = os.getenv("ENOC_REQUEST_URL_TEMPLATE", "")
 

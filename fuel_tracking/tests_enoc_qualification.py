@@ -18,6 +18,7 @@ from fuel_tracking.management.commands.sync_enoc_fuel_movements import clean_pay
 from fuel_tracking.models import FuelEnocMovement, FuelEnocQualifiedMovement as Q, FuelMovement, FuelRegistryCorrection
 from fuel_tracking.services import enoc_canonical as C
 from fuel_tracking.services import stock_enoc as E
+from fuel_tracking.services import stock_work_queue as W
 
 
 class EnocBase(TestCase):
@@ -66,10 +67,10 @@ class QualificationRulesTests(EnocBase):
         q_open = self.q(self.mk("TC-3", status="validated", operation=False))
         self.assertEqual((q_open.business_classification, q_open.execution_state, q_open.stock_impact), ("DEMANDE_CARTE_TOTAL", "APPROUVEE", False))
 
-    def test_ponction_is_nature_to_qualify(self):
+    def test_ponction_without_section_is_transfer_to_complete(self):
         q = self.q(self.mk("PO-1", typ="PONCTION"))
-        self.assertEqual((q.execution_state, q.reason, q.stock_impact, q.consumption_impact),
-                         ("NATURE_A_QUALIFIER", "Signification métier de Ponction non validée", False, False))
+        self.assertEqual((q.execution_state, q.transfer_status, q.stock_impact), ("TRANSFERT_A_COMPLETER", "TRANSFERT_A_COMPLETER", False))
+        self.assertIn("section Ponction absente de la demande ENOC", q.missing_conditions)
         with self.assertRaises(C.ReconciliationError):
             C.reconcile(q, None, "rapprocher", "test", "relevé")
 
@@ -252,7 +253,8 @@ class EnocApiAndAuditTests(EnocBase):
         r = self.client.get("/api/fuel-tracking/stock/enoc/mouvements/").json()
         self.assertEqual(r["pagination"]["total"], 3)
         t = r["totaux"]
-        self.assertEqual((t["demandes"]["count"], t["declares"]["count"], t["eligibles"]["count"], t["certifies"]["count"]), (1, 1, 0, 0))
+        self.assertEqual((t["demandes"]["count"], t["declares"]["count"], t["eligibles"]["count"], t["certifies"]["count"],
+                          t["transferts_a_completer"]["count"]), (1, 1, 0, 0, 1))
         self.assertEqual(self.client.get("/api/fuel-tracking/stock/enoc/mouvements/?type_brut=PONCTION").json()["pagination"]["total"], 1)
         self.assertEqual(self.client.get("/api/fuel-tracking/stock/enoc/mouvements/?impact=OUI").json()["pagination"]["total"], 0)
         self.assertEqual(self.client.get("/api/fuel-tracking/stock/enoc/mouvements/?preuve=AVEC").json()["pagination"]["total"], 2)
@@ -335,3 +337,149 @@ class StockBalanceTests(EnocBase):
         self.assertEqual(r.status_code, 200, r.content)
         self.assertIn("references", r.json())
         self.assertEqual(r.json()["conso_reelle_l"], 200.0)
+
+
+
+class PonctionTransferTests(EnocBase):
+    """Règle Ponction validée : site_id = DESTINATAIRE, « Site source » = SOURCE, volume = quantité approuvée,
+    double écriture liée par transfer_id (somme = 0), sinon TRANSFERT_A_COMPLETER sans aucune écriture."""
+
+    def setUp(self):
+        super().setUp()
+        Site.objects.create(site_id="DKR_0002", name="SOURCE")
+
+    def mkp(self, code, status="validated", source="DKR_0002", approved=100, before=500, after=400, note="BT-001",
+            validator="Fuel Manager", unit="L", drop=()):
+        ponction = {"source_site_id": source, "level_before": before, "level_before_unit": unit, "level_after": after,
+                    "level_after_unit": unit, "transfer_note_number": note}
+        for k in drop:
+            ponction.pop(k, None)
+        action = {"validated_at": (self.when - timedelta(hours=5)).isoformat(), **({"validated_by": validator} if validator else {})}
+        return self.mk(code, typ="PONCTION", status=status, operation=False,
+                       req_extra={"approved_quantity_liters": approved, "ponction": ponction, "action": action})
+
+    def legs(self, ref):
+        return {mv.movement_direction: mv for mv in FuelMovement.objects.filter(transfer_id=f"ENOC-PONCTION-{ref}")}
+
+    def test_valid_complete_coherent_two_linked_movements_sum_zero(self):
+        m = self.mkp("PO-10")
+        E.sync_enoc_to_registry()
+        q = Q.objects.get(enoc_movement=m)
+        self.assertEqual((q.transfer_status, q.execution_state, q.stock_impact, q.transfer_id),
+                         ("COMPTABILISE", "ELIGIBLE_STOCK_REEL", True, "ENOC-PONCTION-PO-10"))
+        legs = self.legs("PO-10")
+        self.assertEqual(set(legs), {"OUT", "IN"})
+        self.assertEqual(sum(float(mv.impact_stock_l) for mv in legs.values()), 0.0)
+        self.assertEqual((float(q.source_variation_l), float(q.control_gap_l), q.fuel_manager_alert), (-100.0, 0.0, "AUCUNE"))
+        self.assertTrue(all(mv.retained_in_stock and mv.movement_type == "TRANSFERT_INTERSITE" for mv in legs.values()))
+        self.assertEqual(legs["IN"].movement_datetime, q.approved_at)  # date de validation ENOC, jamais la date prévue
+        req_row = FuelMovement.objects.get(source_event_id="PO-10")
+        self.assertFalse(req_row.retained_in_stock)  # la demande n'est pas une 3e écriture
+
+    def test_source_debited_and_request_site_credited(self):
+        self.mkp("PO-11")
+        E.sync_enoc_to_registry()
+        legs = self.legs("PO-11")
+        self.assertEqual((legs["OUT"].site_id, float(legs["OUT"].impact_stock_l), legs["OUT"].counterpart_site_id),
+                         ("DKR_0002", -100.0, "DKR_0001"))  # « Site source » débité
+        self.assertEqual((legs["IN"].site_id, float(legs["IN"].impact_stock_l), legs["IN"].counterpart_site_id),
+                         ("DKR_0001", 100.0, "DKR_0002"))  # site_id principal de la demande crédité
+
+    def test_level_gap_keeps_approved_volume_and_raises_fuel_manager_alert(self):
+        m = self.mkp("PO-12", before=95, after=90)
+        E.sync_enoc_to_registry()
+        q = Q.objects.get(enoc_movement=m)
+        legs = self.legs("PO-12")
+        self.assertEqual((float(legs["OUT"].impact_stock_l), float(legs["IN"].impact_stock_l)), (-100.0, 100.0))  # jamais 5 L
+        self.assertEqual((float(q.source_variation_l), float(q.control_gap_l), q.fuel_manager_alert), (-5.0, 95.0, "EN_ATTENTE"))
+        self.assertIn("ECART_NIVEAU_PONCTION_A_CONTROLER", [a["code"] for a in q.alerts])
+        items = W.build("ponctions_fuel_manager")
+        self.assertEqual(items[0]["ref"]["enoc_id"], q.pk)
+        with self.assertRaises(C.ReconciliationError):
+            C.reconcile(q, None, "acquitter", "")
+        C.reconcile(q, None, "acquitter", "Écart expliqué : cuve source remplie le même jour")
+        q.refresh_from_db()
+        self.assertEqual(q.fuel_manager_alert, "TRAITEE")
+        C.sync_qualified([m])  # source inchangée : l'alerte traitée le reste
+        q.refresh_from_db()
+        self.assertEqual(q.fuel_manager_alert, "TRAITEE")
+        self.assertEqual(W.build("ponctions_fuel_manager"), [])
+
+    def test_gap_threshold_is_configurable(self):
+        from django.test import override_settings
+
+        with override_settings(FUEL_PONCTION_GAP_MIN_L=200, FUEL_PONCTION_GAP_PCT=10):
+            q = self.q(self.mkp("PO-13", before=95, after=90))
+        self.assertEqual(q.fuel_manager_alert, "AUCUNE")
+
+    def assert_no_write(self, ref, missing):
+        E.sync_enoc_to_registry()
+        q = Q.objects.get(enoc_reference=ref)
+        self.assertEqual((q.transfer_status, q.execution_state, q.stock_impact), ("TRANSFERT_A_COMPLETER", "TRANSFERT_A_COMPLETER", False))
+        self.assertTrue(any(missing in x for x in q.missing_conditions), q.missing_conditions)
+        self.assertEqual(self.legs(ref), {})
+
+    def test_without_source_site_no_write(self):
+        self.mkp("PO-20", source=None)
+        self.assert_no_write("PO-20", "site source")
+
+    def test_without_approved_quantity_no_write(self):
+        self.mkp("PO-21", approved=None)
+        self.assert_no_write("PO-21", "quantité approuvée")
+
+    def test_not_validated_no_write(self):
+        self.mkp("PO-22", status="pending")
+        self.assert_no_write("PO-22", "statut ENOC validé")
+
+    def test_without_transfer_note_no_write(self):
+        self.mkp("PO-23", note=None)
+        self.assert_no_write("PO-23", "bon de transfert")
+
+    def test_without_source_levels_or_manager_no_write(self):
+        self.mkp("PO-24", drop=("level_after",))
+        self.assert_no_write("PO-24", "niveau cuve après")
+        self.mkp("PO-25", validator=None)
+        self.assert_no_write("PO-25", "validation manager")
+
+    def test_global_stock_never_unbalanced(self):
+        from fuel_tracking.services.stock_enoc import check_transfer_balance
+
+        m1 = self.mkp("PO-30")
+        self.mkp("PO-31", before=95, after=90)
+        self.mkp("PO-32", note=None)
+        E.sync_enoc_to_registry()
+        self.assertEqual(check_transfer_balance(), [])
+        retained = FuelMovement.objects.filter(transfer_id__isnull=False, retained_in_stock=True)
+        self.assertEqual(sum(float(x.impact_stock_l) for x in retained), 0.0)
+        # La Ponction devient incomplète à la source : ses deux écritures sont neutralisées ensemble (tracé)
+        raw = dict(m1.raw_payload)
+        raw["request"] = {**raw["request"], "ponction": {**raw["request"]["ponction"], "transfer_note_number": None}}
+        m1.raw_payload = raw
+        m1.save()
+        E.sync_enoc_to_registry()
+        legs = self.legs("PO-30")
+        self.assertEqual({d: mv.retained_in_stock for d, mv in legs.items()}, {"OUT": False, "IN": False})
+        self.assertEqual(check_transfer_balance(), [])
+
+    def test_stock_balance_counts_transfer_at_both_sites(self):
+        from fuel_tracking.services.stock_balance import site_balance
+
+        self.mkp("PO-40")
+        E.sync_enoc_to_registry()
+        for site, comp in (("DKR_0002", "transferts_sortie"), ("DKR_0001", "transferts_entree")):
+            b = site_balance(site, (timezone.now() - timedelta(days=30)).date(), timezone.localdate(), with_reference=False)
+            self.assertEqual(b["composantes_l"][comp], 100.0)
+
+    def test_api_ponction_filters(self):
+        self.mkp("PO-50")
+        self.mkp("PO-51", before=95, after=90)
+        self.mkp("PO-52", note=None)
+        E.sync_enoc_to_registry()
+        c = APIClient()
+        c.force_authenticate(get_user_model().objects.create_user("an3", "an3@x.sn", "p", role="analyst"))
+        url = "/api/fuel-tracking/stock/enoc/mouvements/?ponction="
+        counts = {k: c.get(url + k).json()["pagination"]["total"] for k in ("avec_ecart", "a_completer", "comptabilisees", "attente_fm")}
+        self.assertEqual(counts, {"avec_ecart": 1, "a_completer": 1, "comptabilisees": 2, "attente_fm": 1})
+        row = c.get(url + "avec_ecart").json()["data"][0]
+        self.assertEqual((row["site_source"], row["site_destinataire"], row["impact_source_l"], row["impact_destinataire_l"]),
+                         ("DKR_0002", "DKR_0001", -100.0, 100.0))

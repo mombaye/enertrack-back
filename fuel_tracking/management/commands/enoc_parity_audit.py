@@ -206,6 +206,50 @@ class Command(BaseCommand):
         w("**Champs du contrat canonique jamais trouvés dans les données ENOC reçues** : "
           + (", ".join(missing) if missing else "aucun") + ".\n")
 
+        # 4 bis. Ponction (règle validée : site_id = destinataire, « Site source » = source, volume approuvé)
+        from fuel_tracking.services.stock_enoc import check_transfer_balance
+
+        ponc = [(m, c) for m, c in extracted if C.type_family(c["raw_movement_type"]) == "PONCTION"]
+        pn = len(ponc) or 1
+        w(f"\n## 4 bis. Ponctions ({len(ponc)})\n\n")
+        keys = Counter()
+        sections = 0
+        for m, c in ponc:
+            sec, base = C.ponction_section(C._docs(m.raw_payload or {}))
+            if sec:
+                sections += 1
+                keys.update(f"{base}.{k}" for k, v in sec.items() if not C._empty(v))
+        w(f"Section Ponction présente : {sections}/{len(ponc)} ({100 * sections / pn:.0f} %).\n\n")
+        w("| Clé brute de la section Ponction | Présence |\n|---|---|\n")
+        for k, v in keys.most_common():
+            w(f"| {k} | {v}/{len(ponc)} |\n")
+        cond = [("site source", lambda c: bool(c["ponction_source_site_id"])),
+                ("site destinataire (site_id)", lambda c: bool(c["site_id"])),
+                ("quantité approuvée > 0", lambda c: bool(c["approved_quantity_l"] and c["approved_quantity_l"] > 0)),
+                ("date de validation", lambda c: bool(c["approved_at"])),
+                ("niveau source avant", lambda c: c["source_level_before_l"] is not None or c["source_level_before_cm"] is not None),
+                ("niveau source après", lambda c: c["source_level_after_l"] is not None or c["source_level_after_cm"] is not None),
+                ("bon de transfert", lambda c: bool(c["transfer_note"])),
+                ("validation manager", lambda c: bool(c["validator_name"]))]
+        w("\n| Condition de comptabilisation | Présence | Chemin brut constaté |\n|---|---|---|\n")
+        src_key = {"site source": "ponction_source_site", "niveau source avant": "source_level_before_l",
+                   "niveau source après": "source_level_after_l", "bon de transfert": "transfer_note",
+                   "date de validation": "approved_at", "validation manager": "validator", "quantité approuvée > 0": "approved",
+                   "site destinataire (site_id)": "site_id"}
+        for label, fn in cond:
+            ok = sum(1 for _, c in ponc if fn(c))
+            paths = Counter(c["field_sources"].get(src_key[label]) for _, c in ponc if fn(c))
+            w(f"| {label} | {ok}/{len(ponc)} ({100 * ok / pn:.0f} %) | {', '.join(f'{p} ({k})' for p, k in paths.most_common(2) if p) or '—'} |\n")
+        st = Counter((m.raw_payload or {}).get("status") or C.extract(m)["raw_status"] for m, _ in ponc)
+        w(f"\nStatuts bruts des Ponctions : {dict(st)} — seuls {sorted(C.ponction_settings()['statuses'])} sont comptabilisables "
+          "(FUEL_PONCTION_ACCEPTED_STATUSES).\n")
+        stored_p = [q for q in stored.values() if q.type_family == "PONCTION"]
+        w(f"Statut de transfert : {dict(Counter(q.transfer_status for q in stored_p))} ; alerte Fuel Manager : "
+          f"{dict(Counter(q.fuel_manager_alert for q in stored_p))}.\n")
+        bad = check_transfer_balance()
+        w(f"Contrôle global des transferts (somme des impacts par transfer_id = 0, 2 écritures) : "
+          f"{'OK' if not bad else f'{len(bad)} anomalie(s) : ' + str(bad[:10])}.\n")
+
         # 5. Comparaison directe MongoDB
         if mongo:
             w("\n## 5. Comparaison directe avec MongoDB ENOC (lecture seule)\n\n")

@@ -28,7 +28,9 @@ TOTALS = {
                  Q(execution_state__in=DECLARED_STATES) & ~Q(business_classification="DEMANDE_CARTE_TOTAL")),
     "eligibles": ("Éligibles stock réel (rapprochés)", Q(execution_state="ELIGIBLE_STOCK_REEL", reconciliation_status="RAPPROCHE")),
     "certifies": ("Certifiés (rapprochés + preuve fournisseur)", Q(execution_state="ELIGIBLE_STOCK_REEL", reconciliation_status="CERTIFIE")),
-    "a_qualifier": ("Nature à qualifier (Ponction, type inconnu)", Q(execution_state="NATURE_A_QUALIFIER")),
+    "transferts": ("Ponctions comptabilisées (transferts inter-sites, volume approuvé)", Q(transfer_status="COMPTABILISE")),
+    "transferts_a_completer": ("Ponctions à compléter (aucune écriture)", Q(transfer_status="TRANSFERT_A_COMPLETER")),
+    "a_qualifier": ("Nature à qualifier (type inconnu)", Q(execution_state="NATURE_A_QUALIFIER")),
     "rejetes": ("Rejetés", Q(execution_state="REJETEE")),
 }
 
@@ -64,6 +66,19 @@ def row(q) -> dict:
         "rapproche_par": getattr(q.reconciled_by, "username", None), "rapproche_le": q.reconciled_at,
         "motif_rapprochement": q.reconciliation_reason, "element_rapprochement": q.reconciliation_evidence,
         "synchronise_le": q.synced_at,
+        # Ponction : site_id principal = destinataire, « Site source » = source ; volume = quantité approuvée
+        "transfer_id": q.transfer_id, "statut_transfert": q.transfer_status,
+        "site_source": q.ponction_source_site_resolved or q.ponction_source_site_id,
+        "site_source_connu": q.ponction_source_site_resolved is not None,
+        "site_destinataire": (q.site_id_resolved or q.site_id) if q.type_family == "PONCTION" else None,
+        "niveau_source_avant_l": _f(q.source_level_before_l), "niveau_source_apres_l": _f(q.source_level_after_l),
+        "niveau_source_avant_cm": _f(q.source_level_before_cm), "niveau_source_apres_cm": _f(q.source_level_after_cm),
+        "variation_source_l": _f(q.source_variation_l), "ecart_controle_l": _f(q.control_gap_l),
+        "impact_source_l": -_f(q.approved_quantity_l) if q.transfer_status == "COMPTABILISE" and q.approved_quantity_l else None,
+        "impact_destinataire_l": _f(q.approved_quantity_l) if q.transfer_status == "COMPTABILISE" else None,
+        "bon_transfert": q.transfer_note, "alerte_fuel_manager": q.fuel_manager_alert,
+        "fm_traite_par": getattr(q.fuel_manager_reviewed_by, "username", None), "fm_traite_le": q.fuel_manager_reviewed_at,
+        "fm_commentaire": q.fuel_manager_comment,
     }
 
 
@@ -77,7 +92,7 @@ def _date(v):
 def filtered(params):
     from fuel_tracking.models import FuelEnocQualifiedMovement as M
 
-    qs = M.objects.select_related("reconciled_by")
+    qs = M.objects.select_related("reconciled_by", "fuel_manager_reviewed_by")
     p = params
     if p.get("type_brut"):
         v = p["type_brut"]
@@ -94,6 +109,17 @@ def filtered(params):
         qs = qs.filter(proof_count__gt=0)
     elif p.get("preuve") == "SANS":
         qs = qs.filter(proof_count=0)
+    ponction = p.get("ponction")
+    if ponction:
+        qs = qs.filter(type_family="PONCTION")
+        if ponction == "avec_ecart":
+            qs = qs.filter(fuel_manager_alert__in=["EN_ATTENTE", "TRAITEE"])
+        elif ponction == "a_completer":
+            qs = qs.filter(transfer_status="TRANSFERT_A_COMPLETER")
+        elif ponction == "comptabilisees":
+            qs = qs.filter(transfer_status="COMPTABILISE")
+        elif ponction == "attente_fm":
+            qs = qs.filter(fuel_manager_alert="EN_ATTENTE")
     if p.get("a_rapprocher") in ("1", "true"):
         qs = qs.filter(execution_state="A_RAPPROCHER")
     if p.get("anomalie"):
@@ -126,9 +152,11 @@ class EnocMovementListView(APIView):
         totals = {}
         for key, (label, cond) in TOTALS.items():
             sub = qs.filter(cond)
-            agg = sub.aggregate(s=Sum("actual_quantity_l"))
+            field = "approved_quantity_l" if key.startswith("transferts") else "actual_quantity_l"  # Ponction : volume approuvé
+            agg = sub.aggregate(s=Sum(field))
             totals[key] = {"label": label, "count": sub.count(), "quantite_reelle_l": _f(agg["s"]),
-                           "sans_quantite": sub.filter(actual_quantity_l__isnull=True).count()}
+                           "sans_quantite": sub.filter(**{f"{field}__isnull": True}).count(),
+                           "base": "quantité approuvée" if field == "approved_quantity_l" else "quantité réelle"}
         page, limit = _page(request, default=25, maximum=100)
         total = qs.count()
         start = (page - 1) * limit
@@ -147,7 +175,9 @@ class EnocMovementListView(APIView):
                          "regles": [
                              "Type brut ENOC ≠ impact stock : aucun mouvement n'entre automatiquement dans le stock réel.",
                              "Carte Total / Truck terminés, avec site, quantité réelle > 0 en L, date réelle et preuve → À RAPPROCHER.",
-                             "Ponction : nature à qualifier (signification métier non validée), aucun impact.",
+                             "Ponction validée et complète : −quantité approuvée au « Site source », +quantité approuvée au site de la "
+                             "demande, deux écritures liées (transfer_id, somme = 0), datées à la validation ENOC ; sinon à compléter, aucune écriture.",
+                             "Écart de niveau source > max(20 L ; 10 %) : alerte Fuel Manager, le volume approuvé reste comptabilisé.",
                              "ÉLIGIBLE STOCK RÉEL uniquement après rapprochement tracé (relevé terrain / stock cohérent, preuve fournisseur si disponible).",
                              "Une valeur absente reste vide (jamais 0).",
                          ]})
@@ -160,7 +190,7 @@ class EnocMovementDetailView(APIView):
         from fuel_tracking.models import FuelEnocQualifiedMovement as M, FuelRegistryCorrection
         from fuel_tracking.services.enoc_canonical import reconciliation_context
 
-        q = M.objects.select_related("enoc_movement", "reconciled_by").filter(pk=pk).first()
+        q = M.objects.select_related("enoc_movement", "reconciled_by", "fuel_manager_reviewed_by").filter(pk=pk).first()
         if q is None:
             return Response({"detail": "Mouvement introuvable."}, status=404)
         raw = q.enoc_movement.raw_payload or {}
