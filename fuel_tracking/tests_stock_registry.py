@@ -566,7 +566,7 @@ class EnocRegistryTests(TestCase):
     def mk(self, code, status="done", operation=True, op_type="AJOUT", **raw_extra):
         op = {"request_code": code, "quantity_added_liters": 150, "operation_type": op_type, **raw_extra} if operation else None
         raw = {"source_id": code, "status": status, "site_id": "dkr_0001", "quantity_added_liters": op and op["quantity_added_liters"],
-               "request": {"request_code": code}, "operation": op}
+               "request": {"request_code": code, "status": status}, "operation": op}
         return FuelEnocMovement.objects.create(
             source_id=code, request_code=code, status=status, site_id="dkr_0001", operation_type=op_type, operation_date=self.when,
             created_at_source=self.when - timedelta(hours=2), level_before=Decimal("20"), level_before_unit="cm",
@@ -591,8 +591,9 @@ class EnocRegistryTests(TestCase):
                          [(2, True), (1, False)])
         E.sync_enoc_to_registry()
         mv = FuelMovement.objects.get(source_event_id="REQ-1")
+        # La configuration donne le SENS du type ; elle ne donne jamais d'impact stock (rapprochement obligatoire).
         self.assertEqual((mv.source_category, mv.movement_type, mv.supplier, float(mv.quantity_l), mv.retained_in_stock),
-                         ("LIVRAISON_CONFIRMEE", "DELIVERY_EYDON", "EYDON", 150.0, True))
+                         ("LIVRAISON_CONFIRMEE", "DELIVERY_EYDON", "EYDON", 150.0, False))
         self.assertIn("version 2", mv.mapping_rule)
         self.assertTrue(FuelRegistryCorrection.objects.filter(entity="MOVEMENT", field="source_category").exists())
         with self.assertRaises(ValueError):

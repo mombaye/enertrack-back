@@ -145,9 +145,10 @@ class FuelEnocMovement(models.Model):
     operation_type = models.CharField(max_length=32, null=True, blank=True, db_index=True)
     operation_date = models.DateTimeField(null=True, blank=True, db_index=True)
 
-    requested_quantity_liters = models.DecimalField(max_digits=18, decimal_places=3, default=0)
-    approved_quantity_liters = models.DecimalField(max_digits=18, decimal_places=3, default=0)
-    quantity_added_liters = models.DecimalField(max_digits=18, decimal_places=3, default=0)
+    # NULL = absent à la source (jamais 0 par défaut).
+    requested_quantity_liters = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
+    approved_quantity_liters = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
+    quantity_added_liters = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
 
     level_before = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
     level_before_unit = models.CharField(max_length=16, null=True, blank=True)
@@ -158,9 +159,9 @@ class FuelEnocMovement(models.Model):
     hour_meter_before = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
     hour_meter_after = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
 
-    monthly_target_liters = models.DecimalField(max_digits=18, decimal_places=3, default=0)
-    monthly_total_after_liters = models.DecimalField(max_digits=18, decimal_places=3, default=0)
-    target_percent_after = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    monthly_target_liters = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
+    monthly_total_after_liters = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
+    target_percent_after = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     target_status = models.CharField(max_length=32, null=True, blank=True)
     is_target_exceeded = models.BooleanField(default=False)
 
@@ -1436,3 +1437,108 @@ class FuelEnocTypeMapping(models.Model):
     class Meta:
         db_table = "fuel_enoc_type_mapping"
         ordering = ["raw_value", "-version"]
+
+
+class FuelEnocQualifiedMovement(models.Model):
+    """
+    Contrat canonique d'un mouvement Fuel & GE ENOC dans eGrid + qualification métier + rapprochement.
+
+    Trois couches séparées :
+      - donnée brute : FuelEnocMovement.raw_payload (documents Mongo fuel_requests / fuel_operations, jamais modifiés) ;
+      - extraction canonique (champs ci-dessous, field_sources = chemin brut de chaque valeur) ;
+      - qualification eGrid (type brut ≠ impact stock) et rapprochement (seule voie vers ÉLIGIBLE_STOCK_RÉEL).
+    Une valeur absente reste NULL.
+    """
+
+    class TypeFamily(models.TextChoices):
+        TOTAL_CARD = "TOTAL_CARD", "Carte Total"
+        PONCTION = "PONCTION", "Ponction"
+        TRUCK = "TRUCK", "Truck"
+        AUTRE = "AUTRE", "Autre type (conservé sans interprétation)"
+
+    class ExecutionState(models.TextChoices):
+        DEMANDE = "DEMANDE", "Demande"
+        APPROUVEE = "APPROUVEE", "Approuvée"
+        TERMINEE = "TERMINEE", "Terminée (incomplète)"
+        QUANTITE_REELLE_MANQUANTE = "QUANTITE_REELLE_MANQUANTE", "Quantité réelle manquante"
+        PREUVE_MANQUANTE = "PREUVE_MANQUANTE", "Preuve manquante"
+        A_RAPPROCHER = "A_RAPPROCHER", "À rapprocher"
+        ELIGIBLE_STOCK_REEL = "ELIGIBLE_STOCK_REEL", "Éligible stock réel"
+        REJETEE = "REJETEE", "Rejetée"
+        NATURE_A_QUALIFIER = "NATURE_A_QUALIFIER", "Nature à qualifier"
+
+    class Reconciliation(models.TextChoices):
+        NON_REQUIS = "NON_REQUIS", "Non requis (aucun impact stock possible en l'état)"
+        A_RAPPROCHER = "A_RAPPROCHER", "À rapprocher"
+        RAPPROCHE = "RAPPROCHE", "Rapproché (stock / relevé terrain cohérent)"
+        CERTIFIE = "CERTIFIE", "Certifié (rapproché + preuve fournisseur)"
+        REJETE = "REJETE", "Rejeté au rapprochement"
+
+    enoc_movement = models.OneToOneField(FuelEnocMovement, on_delete=models.PROTECT, related_name="qualified",
+                                         help_text="raw_payload_reference : donnée brute ENOC conservée telle quelle.")
+    enoc_request_id = models.CharField(max_length=128, null=True, blank=True)
+    enoc_reference = models.CharField(max_length=128, null=True, blank=True, db_index=True)
+    site_id = models.CharField(max_length=128, null=True, blank=True, help_text="site_id brut ENOC")
+    site_id_resolved = models.CharField(max_length=64, null=True, blank=True, db_index=True)
+    site_name = models.CharField(max_length=255, null=True, blank=True)
+    country = models.CharField(max_length=64, null=True, blank=True)
+    zone = models.CharField(max_length=128, null=True, blank=True, db_index=True)
+    raw_movement_type = models.CharField(max_length=128, null=True, blank=True, db_index=True)
+    raw_status = models.CharField(max_length=64, null=True, blank=True, db_index=True)
+    requested_quantity_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    approved_quantity_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    actual_quantity_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    quantity_unit = models.CharField(max_length=16, null=True, blank=True)
+    planned_at = models.DateTimeField(null=True, blank=True, help_text="Date prévue de ravitaillement (demande).")
+    actual_operation_at = models.DateTimeField(null=True, blank=True, db_index=True, help_text="Date réelle (opération).")
+    requested_at = models.DateTimeField(null=True, blank=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+    closed_at = models.DateTimeField(null=True, blank=True)
+    tank_level_before_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    tank_level_after_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    tank_level_before_cm = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    tank_level_after_cm = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    generator_hourmeter_before_h = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    generator_hourmeter_after_h = models.DecimalField(max_digits=14, decimal_places=2, null=True, blank=True)
+    technician_name = models.CharField(max_length=255, null=True, blank=True)
+    validator_name = models.CharField(max_length=255, null=True, blank=True)
+    closer_name = models.CharField(max_length=255, null=True, blank=True)
+    comment = models.TextField(null=True, blank=True)
+    proof_count = models.PositiveIntegerField(default=0)
+    proof_urls_or_ids = models.JSONField(default=list, blank=True)
+    supplier_name = models.CharField(max_length=255, null=True, blank=True)
+    delivery_note_number = models.CharField(max_length=128, null=True, blank=True)
+    vehicle_or_truck_reference = models.CharField(max_length=128, null=True, blank=True)
+    operations_count = models.PositiveIntegerField(default=0, help_text="Nombre d'opérations ENOC liées à la demande.")
+    field_sources = models.JSONField(default=dict, blank=True, help_text="Champ canonique → chemin brut ENOC utilisé.")
+    source_fingerprint = models.CharField(max_length=64, blank=True, default="")
+    synced_at = models.DateTimeField(null=True, blank=True)
+
+    # Qualification eGrid (axe B — indépendant du type brut)
+    type_family = models.CharField(max_length=16, choices=TypeFamily.choices, db_index=True)
+    business_classification = models.CharField(max_length=48, db_index=True)
+    execution_state = models.CharField(max_length=32, choices=ExecutionState.choices, db_index=True)
+    stock_impact = models.BooleanField(default=False, db_index=True, help_text="Entre dans le stock réel (ÉLIGIBLE_STOCK_RÉEL seulement).")
+    consumption_impact = models.BooleanField(default=False)
+    reason = models.TextField(blank=True, default="")
+    missing_conditions = models.JSONField(default=list, blank=True)
+    alerts = models.JSONField(default=list, blank=True)
+    blocking = models.BooleanField(default=False)
+    qualification_version = models.CharField(max_length=32, default="enoc-q-v1")
+    qualified_at = models.DateTimeField(null=True, blank=True)
+
+    # Rapprochement (seule voie vers l'éligibilité au stock réel)
+    reconciliation_status = models.CharField(max_length=16, choices=Reconciliation.choices, default=Reconciliation.NON_REQUIS,
+                                             db_index=True)
+    reconciled_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    reconciled_at = models.DateTimeField(null=True, blank=True)
+    reconciliation_reason = models.TextField(null=True, blank=True)
+    reconciliation_evidence = models.TextField(null=True, blank=True)
+
+    created_at = models.DateTimeField(default=timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "fuel_enoc_movement_qualified"
+        ordering = ["-actual_operation_at", "-requested_at"]
+        indexes = [models.Index(fields=["site_id_resolved", "actual_operation_at"])]

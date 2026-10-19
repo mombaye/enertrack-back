@@ -124,6 +124,40 @@ def classify(m, supplier: str | None, has_operation: bool, mappings: dict) -> tu
 STATUS_MAP = {"done": "CLOSED", "rejected": "REJECTED", "pending": "DECLARED", "validated": "DECLARED"}
 
 
+QUALIFIED_CATEGORY = {
+    "DEMANDE_CARTE_TOTAL": "DEMANDE_LIVRAISON", "RAVITAILLEMENT_DECLARE_AVEC_PREUVE": "CARTE_TOTAL",
+    "RAVITAILLEMENT_DECLARE_INCOMPLET": "CARTE_TOTAL", "LIVRAISON_A_CONFIRMER": "LIVRAISON_DECLAREE",
+    "LIVRAISON_DECLAREE_A_RAPPROCHER": "LIVRAISON_DECLAREE", "PONCTION_A_QUALIFIER": "INCONNU", "TYPE_NON_RECONNU": "INCONNU",
+}
+
+
+def _apply_qualification(fields: dict, q) -> dict:
+    """Le registre suit la qualification canonique : impact stock = ÉLIGIBLE_STOCK_RÉEL seulement (jamais le type brut)."""
+    if q is None:
+        fields["retained_in_stock"] = False
+        return fields
+    eligible = q.execution_state == "ELIGIBLE_STOCK_REEL"
+    fields["retained_in_stock"] = bool(q.stock_impact and eligible)
+    if eligible:
+        fields["source_category"], fields["movement_type"] = "LIVRAISON_CONFIRMEE", "DELIVERY"
+    elif q.business_classification == "REJETEE":
+        fields["status"] = "REJECTED"
+    elif q.execution_state in ("DEMANDE", "APPROUVEE"):
+        fields["source_category"], fields["movement_type"] = "DEMANDE_LIVRAISON", None
+    elif q.type_family in ("PONCTION", "AUTRE") and fields["source_category"] not in ("INCONNU", "DEMANDE_LIVRAISON"):
+        pass  # sens configuré par l'administrateur (classification versionnée) conservé ; impact stock toujours NON
+    else:
+        fields["source_category"] = QUALIFIED_CATEGORY.get(q.business_classification, fields["source_category"])
+        fields["movement_type"] = "DELIVERY_TOTAL_CARD" if fields["source_category"] == "CARTE_TOTAL" else None
+    fields["quantity_l"] = q.actual_quantity_l
+    fields["mapping_rule"] = f"{fields['mapping_rule']} · {q.execution_state} : {q.reason}"[:255]
+    fields["proof_reference"] = ", ".join(q.proof_urls_or_ids or [])[:512] or fields.get("proof_reference")
+    keep_unknown = q.type_family in ("PONCTION", "AUTRE")  # seuls ces types restent « à classifier »
+    fields["alerts"] = [a for a in fields["alerts"] if keep_unknown or a["code"] != "ENOC_TYPE_UNKNOWN"] + \
+        [{"code": f"ENOC_{q.execution_state}", "message": q.reason}]
+    return fields
+
+
 def _movement_fields(m, mappings: dict | None = None) -> dict:
     raw = m.raw_payload or {}
     supplier = first_value(raw, SUPPLIER_KEYS)
@@ -192,13 +226,15 @@ TRACKED_MOVEMENT_FIELDS = ("site_id", "movement_type", "movement_datetime", "req
                            "source_category", "mapping_rule", "retained_in_stock", "raw_operation_type")
 
 
-def sync_enoc_to_registry(since=None, user=None) -> dict:
+def sync_enoc_to_registry(since=None, user=None, only_ids=None) -> dict:
     """Projette FuelEnocMovement dans le registre (mouvements + relevés). Idempotent."""
     from fuel_tracking.models import FuelEnocMovement, FuelImportBatch, FuelImportRow, FuelMovement, FuelStockObservation
 
     qs = FuelEnocMovement.objects.all().order_by("operation_date", "id")
     if since is not None:
         qs = qs.filter(updated_at__gte=since)
+    if only_ids is not None:
+        qs = qs.filter(pk__in=list(only_ids))
     resolver = R.SiteResolver()
     movements = list(qs)
     site_ids = {resolver.resolve(m.site_id) for m in movements} - {None}
@@ -219,6 +255,11 @@ def sync_enoc_to_registry(since=None, user=None) -> dict:
                                                    status="PROCESSING")
         return batch
 
+    from fuel_tracking.models import FuelEnocQualifiedMovement
+    from fuel_tracking.services.enoc_canonical import sync_qualified
+
+    stats["qualification"] = sync_qualified(movements)
+    qualified = {q.enoc_movement_id: q for q in FuelEnocQualifiedMovement.objects.filter(enoc_movement_id__in=[m.pk for m in movements])}
     with transaction.atomic():
         for m in movements:
             site_id = resolver.resolve(m.site_id)
@@ -227,7 +268,7 @@ def sync_enoc_to_registry(since=None, user=None) -> dict:
             if site_id is None:
                 stats["site_inconnu"] += 1
                 messages.append({"code": "UNKNOWN_SITE", "message": f"Site ENOC « {m.site_id} » absent de Gestion des sites."})
-            fields = _movement_fields(m, mappings)
+            fields = _apply_qualification(_movement_fields(m, mappings), qualified.get(m.pk))
             stats["categories"][fields["source_category"]] = stats["categories"].get(fields["source_category"], 0) + 1
             if site_id:
                 fields["site_id"] = site_id

@@ -76,11 +76,17 @@ def fetch_fuel_movements() -> list[dict]:
     try:
         db = client[settings.ENOC_MONGO_DB_NAME]
 
-        operations_by_code: dict[str, dict] = {}
+        # Toutes les opérations d'une demande sont conservées (raw_payload["operations"]) ; « operation » = la plus
+        # récente. Avant : une seule opération gardée par request_code, les autres étaient écrasées.
+        ops_list_by_code: dict[str, list[dict]] = {}
         for op in db.fuel_operations.find():
             code = op.get("request_code")
             if code:
-                operations_by_code[code] = op
+                ops_list_by_code.setdefault(code, []).append(op)
+        operations_by_code: dict[str, dict] = {
+            code: max(ops, key=lambda o: str(o.get("operation_date") or o.get("created_at") or ""))
+            for code, ops in ops_list_by_code.items()
+        }
 
         movements: list[dict] = []
         seen_codes: set[str] = set()
@@ -136,6 +142,7 @@ def fetch_fuel_movements() -> list[dict]:
                 "ge_context": None,
                 "request": _jsonable(req),
                 "operation": _jsonable(op) if op else None,
+                "operations": [_jsonable(o) for o in ops_list_by_code.get(code, [])],
             })
 
         # Opérations sans demande correspondante dans fuel_requests (ex: PONCTION directe)
@@ -187,6 +194,7 @@ def fetch_fuel_movements() -> list[dict]:
                 "ge_context": None,
                 "request": None,
                 "operation": _jsonable(op),
+                "operations": [_jsonable(o) for o in ops_list_by_code.get(code, [])],
             })
 
         return movements

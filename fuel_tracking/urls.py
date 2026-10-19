@@ -9,6 +9,7 @@ from fuel_tracking.views import (
     FuelConsommationListView,
     FuelStockListView,
 )
+from fuel_tracking.views_enoc import EnocMovementDetailView, EnocMovementListView, EnocMovementReconcileView, StockSiteBalanceView
 from fuel_tracking.views_stock import (
     EnergyAuditView,
     EnocTypesView,
@@ -53,6 +54,10 @@ urlpatterns = [
     path("stock/registre/", StockRegistryView.as_view(), name="fuel-stock-registre"),
     path("stock/a-traiter/", StockWorkQueueView.as_view(), name="fuel-stock-a-traiter"),
     path("stock/enoc/types/", EnocTypesView.as_view(), name="fuel-stock-enoc-types"),
+    path("stock/enoc/mouvements/", EnocMovementListView.as_view(), name="fuel-stock-enoc-movements"),
+    path("stock/registre/<str:site_id>/bilan/", StockSiteBalanceView.as_view(), name="fuel-stock-site-balance"),
+    path("stock/enoc/mouvements/<int:pk>/", EnocMovementDetailView.as_view(), name="fuel-stock-enoc-movement"),
+    path("stock/enoc/mouvements/<int:pk>/rapprocher/", EnocMovementReconcileView.as_view(), name="fuel-stock-enoc-reconcile"),
     path("stock/modeles-cuves/", TankModelListView.as_view(), name="fuel-stock-modeles-cuves"),
     path("stock/audit-profil-energetique/", EnergyAuditView.as_view(), name="fuel-stock-audit-profil"),
     path("stock/registre/<str:site_id>/", StockRegistrySiteView.as_view(), name="fuel-stock-registre-site"),

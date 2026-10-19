@@ -126,9 +126,9 @@ def clean_payload(item: dict) -> dict:
         "operation_type": item.get("operation_type"),
         "operation_date": parse_dt(item.get("operation_date")),
 
-        "requested_quantity_liters": to_decimal(item.get("requested_quantity_liters"), Decimal("0")),
-        "approved_quantity_liters": to_decimal(item.get("approved_quantity_liters"), Decimal("0")),
-        "quantity_added_liters": to_decimal(item.get("quantity_added_liters"), Decimal("0")),
+        "requested_quantity_liters": to_decimal(item.get("requested_quantity_liters")),  # absent → NULL (jamais 0)
+        "approved_quantity_liters": to_decimal(item.get("approved_quantity_liters")),  # absent → NULL (jamais 0)
+        "quantity_added_liters": to_decimal(item.get("quantity_added_liters")),  # absent → NULL (jamais 0)
 
         "level_before": to_decimal(item.get("level_before")),
         "level_before_unit": item.get("level_before_unit"),
@@ -138,9 +138,9 @@ def clean_payload(item: dict) -> dict:
         "hour_meter_before": to_decimal(item.get("hour_meter_before")),
         "hour_meter_after": to_decimal(item.get("hour_meter_after")),
 
-        "monthly_target_liters": to_decimal(item.get("monthly_target_liters"), Decimal("0")),
-        "monthly_total_after_liters": to_decimal(item.get("monthly_total_after_liters"), Decimal("0")),
-        "target_percent_after": to_decimal(item.get("target_percent_after"), Decimal("0")),
+        "monthly_target_liters": to_decimal(item.get("monthly_target_liters")),  # absent → NULL (jamais 0)
+        "monthly_total_after_liters": to_decimal(item.get("monthly_total_after_liters")),  # absent → NULL (jamais 0)
+        "target_percent_after": to_decimal(item.get("target_percent_after")),  # absent → NULL (jamais 0)
         "target_status": item.get("target_status"),
         "is_target_exceeded": to_bool(item.get("is_target_exceeded")),
 

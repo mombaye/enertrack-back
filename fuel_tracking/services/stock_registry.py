@@ -452,7 +452,7 @@ def _rank(o: dict, prio: tuple) -> int:
     return min((prio.index(k) for k in keys if k in prio), default=len(prio))
 
 
-def fuel_stock_retained(site_ids=None, now=None) -> dict[str, dict]:
+def fuel_stock_retained(site_ids=None, now=None, as_of=None) -> dict[str, dict]:
     """
     Stock retenu par site : site identifié, cuve site VALIDÉE, litres natifs ou conversion validée, date connue,
     capacité contrôlée, statut AUTO_VALIDÉ ou VALIDÉ_MANUELLEMENT. Le jour le plus récent est retenu ; entre
@@ -465,6 +465,8 @@ def fuel_stock_retained(site_ids=None, now=None) -> dict[str, dict]:
     qs = Obs.objects.exclude(source_type__in=("SNOWFLAKE", "CLOSING"))
     if site_ids is not None:
         qs = qs.filter(site_id__in=list(site_ids))
+    if as_of is not None:  # stock retenu à une date passée (bilan stock)
+        qs = qs.filter(observation_datetime__lte=as_of)
     fields = ("id", "site_id", "tank_id", "source_type", "observation_datetime", "level_raw", "level_value", "level_unit",
               "level_liters", "conversion_method", "conversion_status", "validation_status", "validation_reason",
               "capacity_l", "proof_reference", "validated_by_id", "volume_geometric_l", "volume_calibrated_l",
@@ -613,8 +615,11 @@ def validate_movement(mv, user, reason: str, validate: bool = True):
     new = "VALIDATED" if validate else "REJECTED"
     if validate and (mv.quantity_l is None or mv.movement_type is None):
         raise ValueError("Mouvement sans quantité réalisée ou sans type : validation impossible.")
-    if validate and mv.source_category in ("DEMANDE_LIVRAISON", "CARTE_TOTAL", "INCONNU"):
-        raise ValueError("Une demande, une carte Total ou un type inconnu n'est jamais un mouvement réel : classifier d'abord le type ENOC.")
+    if validate and mv.source_category in ("DEMANDE_LIVRAISON", "CARTE_TOTAL", "INCONNU", "LIVRAISON_DECLAREE"):
+        raise ValueError("Une demande, une carte Total, une livraison déclarée ou un type inconnu n'est jamais un mouvement réel "
+                         "sans rapprochement : utiliser le rapprochement ENOC.")
+    if validate and mv.source_type == "ENOC" and not mv.retained_in_stock:
+        raise ValueError("Mouvement ENOC non éligible au stock réel : le rapprochement ENOC est la seule voie de validation.")
     log_correction("MOVEMENT", mv.pk, "VALIDATE" if validate else "REJECT", reason, site_id=mv.site_id,
                    field="status", old=mv.status, new=new, user=user)
     mv.status = new

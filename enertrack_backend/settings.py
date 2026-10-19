@@ -324,6 +324,8 @@ ENOC_MONGO_PORT     = int(os.getenv("ENOC_MONGO_PORT", "27017"))
 ENOC_MONGO_USERNAME = os.getenv("ENOC_MONGO_USERNAME", "")
 ENOC_MONGO_PASSWORD = os.getenv("ENOC_MONGO_PASSWORD", "")
 ENOC_MONGO_DB_NAME  = os.getenv("ENOC_MONGO_DB_NAME", "")
+# Lien vers une demande ENOC dans l'interface ENOC (optionnel), ex. https://enoc.example/fuel/requests/{reference}
+ENOC_REQUEST_URL_TEMPLATE = os.getenv("ENOC_REQUEST_URL_TEMPLATE", "")
 
 # Registre stock carburant (Suivis Stock) — répertoire partagé monté (voir docker-compose.yml) :
 #   incoming/{loliforce,scss,closing,modeles_cuves}, processing, accepted, rejected, archive.

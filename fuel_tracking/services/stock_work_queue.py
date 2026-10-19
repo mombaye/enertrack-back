@@ -24,6 +24,8 @@ CATEGORIES = [
     ("releves_depassement", "Relevés dépassant la capacité", "Volume au-dessus de la capacité (+ 5 %) ou niveau au-dessus de la hauteur utile."),
     ("conflits_gardiennage", "Conflits Loliforce / SCSS", "Deux relevés à moins de 48 h dont l'écart dépasse max(100 L ; 10 % capacité)."),
     ("gardiennage_a_configurer", "Gardiennage à configurer", "Relevés de gardiennage d'un site sans périmètre configuré ou d'un autre prestataire."),
+    ("mouvements_enoc_a_rapprocher", "Mouvements ENOC à rapprocher", "Carte Total / Truck terminés avec quantité, date et preuve : "
+     "aucun impact stock tant qu'ils ne sont pas rapprochés d'un relevé terrain ou d'un stock cohérent."),
     ("mouvements_enoc_inconnus", "Mouvements ENOC non classifiés", "Type d'opération ENOC absent de la configuration (valeur brute visible)."),
     ("mouvements_sans_preuve", "Mouvements sans preuve", "Livraisons / appoints sans photo ni pièce justificative."),
     ("sites_sans_releve_recent", "Sites sans relevé récent", f"Dernier relevé de plus de {STALE_DAYS} jours."),
@@ -141,6 +143,21 @@ def build(category: str) -> list[dict]:
         return _grouped_obs(Obs.objects.filter(validation_status="PENDING"), {"STOCK_CONFLICT"})
     if category == "gardiennage_a_configurer":
         return _grouped_obs(Obs.objects.filter(validation_status="PENDING"), {"NOT_CONFIGURED", "PROVIDER_MISMATCH"})
+    if category == "mouvements_enoc_a_rapprocher":
+        from fuel_tracking.models import FuelEnocQualifiedMovement
+
+        out = []
+        for q in FuelEnocQualifiedMovement.objects.filter(execution_state="A_RAPPROCHER").order_by("-actual_operation_at"):
+            out.append({
+                "site_id": q.site_id_resolved or q.site_id or "—", "date": q.actual_operation_at, "source": "ENOC",
+                "anomalie": f"{q.raw_movement_type} déclaré, non rapproché",
+                "valeur_brute": f"réf. {q.enoc_reference}, {_f(q.actual_quantity_l)} {q.quantity_unit or ''}, {q.proof_count} preuve(s)",
+                "attendu": "relevé terrain ou stock cohérent (et bon fournisseur si disponible)", "regle": q.reason,
+                "action": "Rapprocher avec un relevé terrain / stock, ou rejeter (motif obligatoire)", "action_type": "RECONCILE_ENOC",
+                "ref": {"enoc_id": q.pk}, "count": 1,
+                "message": f"{q.site_id_resolved or q.site_id} — {q.raw_movement_type} {q.enoc_reference} à rapprocher.",
+            })
+        return out
     if category == "mouvements_enoc_inconnus":
         out = []
         for m in FuelMovement.objects.filter(source_type="ENOC", source_category="INCONNU").order_by("-movement_datetime"):
