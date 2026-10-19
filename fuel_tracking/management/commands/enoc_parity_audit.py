@@ -95,6 +95,23 @@ class Command(BaseCommand):
           f"avec opération : {sum(1 for _, c in extracted if c['_has_operation'])}, opérations multiples : "
           f"{sum(1 for _, c in extracted if c['operations_count'] > 1)}.\n\n")
 
+        # 1 bis. Répartition (qualification en base si synchronisée, sinon calculée à la volée — mêmes règles)
+        from fuel_tracking.models import FuelEnocQualifiedMovement
+
+        stored = {q.enoc_movement_id: q for q in FuelEnocQualifiedMovement.objects.all()}
+        quals = []
+        for m, c in extracted:
+            q = stored.get(m.pk)
+            quals.append((c["raw_movement_type"] or "(vide)", q.execution_state if q else C.qualify(c)["execution_state"],
+                          q.business_classification if q else C.qualify(c)["business_classification"], bool(q and q.stock_impact),
+                          q.reconciliation_status if q else "NON_SYNCHRONISE"))
+        w("### Répartition des mouvements\n\n")
+        for title, idx in (("Par type brut ENOC", 0), ("Par état d'exécution / preuve (qualification eGrid)", 1),
+                           ("Par classification métier", 2), ("Par statut de rapprochement", 4)):
+            w(f"**{title}** : " + ", ".join(f"{k} = {v}" for k, v in Counter(x[idx] for x in quals).most_common()) + "\n\n")
+        w(f"**Éligibles au stock réel** : {sum(1 for x in quals if x[3])} — **à rapprocher** : "
+          f"{sum(1 for x in quals if x[1] == 'A_RAPPROCHER')} (qualification en base pour {len(stored)} / {len(extracted)} mouvements).\n\n")
+
         # 2. Matrice
         w("## 2. Matrice de parité (toutes les demandes)\n\n")
         w("| Champ ENOC (chemin brut constaté) | Champ eGrid | Règle de transformation | Taux de présence | Écart constaté |\n|---|---|---|---|---|\n")

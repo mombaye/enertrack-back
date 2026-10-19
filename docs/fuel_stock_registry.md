@@ -308,3 +308,43 @@ L'onglet est organisé en 3 vues : **Stock des sites** (par défaut), **À trait
   (stock connu, puis action requise, puis sans relevé ; défaut inchangé = tri par site).
 - « Mouvements sans preuve » exclut les demandes de livraison et les cartes Total (jamais des livraisons).
 - « Plusieurs cuves à identifier » : une ligne par site.
+
+## ENOC → eGrid : contrat canonique, qualification, rapprochement
+
+**Connecteur** (inchangé dans son principe) : lecture seule MongoDB ENOC `fuel_requests` + `fuel_operations`
+(`enoc_mongo_service.fetch_fuel_movements`, tâche toutes les 5 min) → `FuelEnocMovement` (documents bruts complets dans
+`raw_payload.request` / `raw_payload.operation` / `raw_payload.operations`). Corrigé : quantités absentes → NULL (avant 0) ;
+toutes les opérations d'une demande conservées (avant : une seule).
+
+**Contrat canonique** `fuel_enoc_movement_qualified` (`FuelEnocQualifiedMovement`) : référence, site, type et statut bruts,
+quantités demandée / approuvée / réelle + unité, dates prévue / réelle / demande / approbation / clôture, niveaux avant / après
+en L et en cm, compteurs GE, technicien, valideur, clôture, commentaire, preuves (nombre + URL / identifiants), fournisseur,
+bon de livraison, camion, `field_sources` (chemin brut de chaque valeur). La quantité réelle et la date réelle ne viennent
+QUE de l'opération ENOC.
+
+**Qualification** (`services/enoc_canonical.py`, version `enoc-q-v1`) — type brut ≠ impact stock :
+
+| Type | Règle |
+|---|---|
+| Carte Total ouverte / approuvée / sans quantité réelle | DEMANDE_CARTE_TOTAL, aucun impact |
+| Carte Total terminée + site + quantité > 0 en L + date réelle + preuve, sans incohérence bloquante | RAVITAILLEMENT_DECLARE_AVEC_PREUVE, **À_RAPPROCHER** (« Ravitaillement ENOC déclaré et justifié ; rapprochement stock requis ») |
+| Ponction | NATURE_A_QUALIFIER (« Signification métier de Ponction non validée »), aucun impact |
+| Truck incomplet | LIVRAISON_A_CONFIRMER, aucun impact |
+| Truck terminé complet avec preuve | LIVRAISON_DECLAREE_A_RAPPROCHER, **À_RAPPROCHER** |
+| Autre type | conservé sans interprétation (NATURE_A_QUALIFIER s'il est terminé) |
+| Statut rejeté | REJETEE |
+
+Incohérences bloquantes : quantité négative, date réelle future, niveau après < niveau avant (en L) pour un ravitaillement.
+
+**Rapprochement** (seule voie vers ÉLIGIBLE_STOCK_RÉEL) : `POST stock/enoc/mouvements/<id>/rapprocher/` (admin, manager),
+motif + élément de rapprochement obligatoires ; CERTIFIÉ si bon de livraison, sinon RAPPROCHÉ. Si la source ENOC change
+après rapprochement, le rapprochement est annulé (tracé). Le registre (`fuel_movement.retained_in_stock`) suit l'éligibilité ;
+la validation manuelle d'un mouvement ENOC non éligible est refusée.
+
+**Bilan stock réel** (`services/stock_balance.py`, `GET stock/registre/<site>/bilan/?debut=&fin=`) : formule inchangée,
+bornes = stock retenu au début et à la fin ; seuls les mouvements éligibles comptent ; tout mouvement exécuté dont l'impact
+n'est pas établi (ENOC à rapprocher / incomplet / à qualifier, historique sans quantité) → résultat NULL. Niveaux :
+NON_CALCULABLE, INCOHERENT, CALCULE_NON_CERTIFIE, CERTIFIE. CPH et Snowflake affichés à côté, jamais fusionnés.
+
+**Audit de parité** : `python manage.py enoc_parity_audit [--limit 20] [--mongo] [--out fichier.md]` (lecture seule).
+Lien vers ENOC optionnel : variable `ENOC_REQUEST_URL_TEMPLATE` (ex. `https://…/fuel/requests/{reference}`).
