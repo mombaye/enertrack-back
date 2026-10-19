@@ -90,8 +90,17 @@ REASON_PONCTION = "Signification métier de Ponction non validée"
 
 
 # ── Lecture brute ──────────────────────────────────────────────────────────────────────────────────────────
+def is_legacy_rest(raw: dict) -> bool:
+    """Ligne enregistrée par l'ancien connecteur API REST ENOC (GET /fuel/integrations/enertrack/operations) :
+    raw_payload = l'élément REST lui-même (pas de documents Mongo request / operation séparés)."""
+    raw = raw or {}
+    return bool(raw) and "request" not in raw and "operation" not in raw
+
+
 def _docs(raw: dict) -> dict[str, dict]:
     raw = raw or {}
+    if is_legacy_rest(raw):
+        return {"rest": raw, "request": {}, "operation": {}, "flat": {}}
     req = raw.get("request") if isinstance(raw.get("request"), dict) else None
     op = raw.get("operation") if isinstance(raw.get("operation"), dict) else None
     flat = {k: v for k, v in raw.items() if k not in ("request", "operation", "operations")}
@@ -113,7 +122,8 @@ def _empty(v) -> bool:
 
 def pick(docs: dict[str, dict], field: str) -> tuple[object | None, str | None]:
     """(valeur, chemin brut) du premier champ candidat non vide, dans l'ordre des documents autorisés."""
-    for name in FIELD_ORDER.get(field, ORDER_OP_FIRST):
+    order = ("rest",) if docs.get("rest") else FIELD_ORDER.get(field, ORDER_OP_FIRST)
+    for name in order:
         doc = docs.get(name) or {}
         for key in K[field]:
             v = _get(doc, key)
@@ -197,7 +207,7 @@ def proofs(docs: dict[str, dict]) -> tuple[list[str], list[str]]:
                 if isinstance(v, dict):
                     walk(v, path)
 
-    for name in ("request", "operation"):
+    for name in ("rest", "request", "operation"):
         walk(docs.get(name) or {}, name)
     uniq = list(dict.fromkeys(found))
     return uniq, paths
@@ -233,12 +243,17 @@ def extract(m) -> dict:
         s = str(v).strip()
         return s[:n] if s else None
 
-    has_request = bool(docs["request"])
-    has_operation = bool(docs["operation"])
+    legacy = bool(docs.get("rest"))
+    status_doc = "rest" if legacy else "request"
+    has_request = bool(docs["request"]) or legacy
+    # API REST historique (endpoint « operations ») : opération exécutée si quantité ou date d'opération présente.
+    has_operation = bool(docs["operation"]) or (legacy and any(not _empty(docs["rest"].get(k))
+                                                               for k in ("quantity_added_liters", "operation_date")))
     raw_type = take("type", lambda v: text(v, 128))
-    raw_status = text(docs["request"].get("status"), 64) if has_request and not _empty(docs["request"].get("status")) else None
+    sv = docs[status_doc].get("status")
+    raw_status = text(sv, 64) if has_request and not _empty(sv) else None
     if raw_status:
-        src["raw_status"] = "request.status"
+        src["raw_status"] = f"{status_doc}.status"
     actual = take("actual", num)
     unit = take("unit", lambda v: unit_of(v) or text(v, 16))
     if actual is not None and unit is None and src.get("actual", "").endswith(("_liters", "_litres")):
@@ -308,6 +323,7 @@ def extract(m) -> dict:
         "field_sources": src,
         "_has_request": has_request,
         "_has_operation": has_operation,
+        "_legacy_rest": legacy,
         "_level_unknown_unit": {s: levels[s][2] for s in ("before", "after") if levels[s][2] is not None},
     }
 
@@ -323,6 +339,9 @@ def qualify(c: dict, now=None) -> dict:
     def alert(code, msg, blocking=False):
         alerts.append({"code": code, "message": msg, "blocking": blocking})
 
+    if c.get("_legacy_rest"):
+        alert("SOURCE_API_REST_HISTORIQUE", "Ligne issue de l'ancienne API REST ENOC (absente de la source Mongo actuelle) : "
+                                            "élément REST brut utilisé, à confirmer avec ENOC.")
     if not c.get("_has_request") and c.get("_has_operation"):
         alert("OPERATION_SANS_DEMANDE", "Opération ENOC sans demande liée : statut brut absent, exécution déduite de l'opération.")
     for side, v in (c.get("_level_unknown_unit") or {}).items():

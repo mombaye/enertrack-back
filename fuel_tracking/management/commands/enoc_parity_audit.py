@@ -91,7 +91,8 @@ class Command(BaseCommand):
           "(4) registre stock (`fuel_movement`, impact stock = ÉLIGIBLE_STOCK_RÉEL seulement).\n")
         w("- Corrections apportées au connecteur : quantités absentes → NULL (avant : 0) ; toutes les opérations d'une demande "
           "conservées (avant : une seule, les autres écrasées).\n\n")
-        w(f"Mouvements ENOC en base : **{len(movements)}** — avec demande : {sum(1 for _, c in extracted if c['_has_request'])}, "
+        w(f"Mouvements ENOC en base : **{len(movements)}** — dont issus de l'ancienne API REST (absents du format Mongo actuel) : "
+          f"{sum(1 for _, c in extracted if c.get('_legacy_rest'))} ; avec demande : {sum(1 for _, c in extracted if c['_has_request'])}, "
           f"avec opération : {sum(1 for _, c in extracted if c['_has_operation'])}, opérations multiples : "
           f"{sum(1 for _, c in extracted if c['operations_count'] > 1)}.\n\n")
 
@@ -183,14 +184,14 @@ class Command(BaseCommand):
         # 4. Inventaire des champs bruts
         w("\n## 4. Champs bruts ENOC : utilisés / ignorés\n\n")
         used = {k.split(".")[0] for keys in C.K.values() for k in keys} | {"status"}
-        seen = {"request": Counter(), "operation": Counter()}
+        seen = {"request": Counter(), "operation": Counter(), "rest": Counter()}
         for m, _ in extracted:
-            raw = m.raw_payload or {}
-            for name in ("request", "operation"):
-                doc = raw.get(name)
+            docs = C._docs(m.raw_payload or {})
+            for name in seen:
+                doc = docs.get(name)
                 if isinstance(doc, dict):
                     seen[name].update(k for k, v in doc.items() if not C._empty(v))
-        for name in ("request", "operation"):
+        for name in [n for n in ("request", "operation", "rest") if seen[n]]:
             w(f"**{name}** — clés renseignées (présence) : \n\n| Clé brute | Présence | Exploitée par eGrid |\n|---|---|---|\n")
             for k, v in seen[name].most_common():
                 status = "oui" if (k in used or C.PROOF_KEY_RE.search(k)) else (

@@ -183,6 +183,27 @@ class CanonicalExtractionTests(EnocBase):
             R.validate_movement(mv, None, "forçage")
 
 
+class LegacyRestPayloadTests(EnocBase):
+    """Lignes de l'ancien connecteur API REST : raw_payload = élément REST (pas de request / operation)."""
+
+    def rest(self, code, status="done", typ="TOTAL_CARD", qty=150, **extra):
+        item = {"source_id": code, "request_code": code, "status": status, "site_id": "DKR_0001", "operation_type": typ,
+                "operation_date": self.when.isoformat(), "requested_quantity_liters": 200, "approved_quantity_liters": 180,
+                **({"quantity_added_liters": qty} if qty is not None else {}), **extra}
+        return FuelEnocMovement.objects.create(**clean_payload(item))
+
+    def test_legacy_done_with_quantity_and_photo_is_to_reconcile(self):
+        q = self.q(self.rest("REST-1", photos=["https://enoc/p/9.jpg"]))
+        self.assertEqual((q.raw_status, float(q.actual_quantity_l), q.quantity_unit, q.execution_state),
+                         ("done", 150.0, "L", "A_RAPPROCHER"))
+        self.assertIn("SOURCE_API_REST_HISTORIQUE", [a["code"] for a in q.alerts])
+        self.assertEqual(q.field_sources["raw_status"], "rest.status")
+
+    def test_legacy_without_proof_and_open_status(self):
+        self.assertEqual(self.q(self.rest("REST-2")).execution_state, "PREUVE_MANQUANTE")
+        self.assertEqual(self.q(self.rest("REST-3", status="pending", qty=None, operation_date=None)).execution_state, "DEMANDE")
+
+
 class ConnectorParityTests(TestCase):
     def test_all_operations_kept_and_empty_quantities_null(self):
         from fuel_tracking.services import enoc_mongo_service as S
