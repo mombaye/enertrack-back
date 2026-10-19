@@ -91,14 +91,21 @@ REASON_PONCTION = "Signification métier de Ponction non validée"
 PONC = {
     "source_site": ("source_site_id", "site_source_id", "site_source", "source_site", "from_site_id", "site_id_source",
                     "origin_site_id", "site_origine", "source"),
-    "lvl_before": ("source_level_before", "level_before_source", "niveau_avant_source", "level_before", "niveau_avant"),
-    "lvl_before_unit": ("source_level_before_unit", "level_before_source_unit", "level_before_unit", "unit", "unite"),
-    "lvl_after": ("source_level_after", "level_after_source", "niveau_apres_source", "level_after", "niveau_apres"),
-    "lvl_after_unit": ("source_level_after_unit", "level_after_source_unit", "level_after_unit", "unit", "unite"),
-    "lvl_before_l": ("source_level_before_liters", "source_level_before_l", "level_before_liters", "level_before_l"),
-    "lvl_after_l": ("source_level_after_liters", "source_level_after_l", "level_after_liters", "level_after_l"),
-    "lvl_before_cm": ("source_level_before_cm", "level_before_cm"),
-    "lvl_after_cm": ("source_level_after_cm", "level_after_cm"),
+    # Clés réelles ENOC (audit prod 10/2026) : level_before_ponction[_l|_cm], level_after_ponction[_l|_cm], level_unit
+    "lvl_before": ("level_before_ponction", "source_level_before", "level_before_source", "niveau_avant_source",
+                   "level_before", "niveau_avant"),
+    "lvl_before_unit": ("level_unit", "source_level_before_unit", "level_before_source_unit", "level_before_unit",
+                        "unit", "unite"),
+    "lvl_after": ("level_after_ponction", "source_level_after", "level_after_source", "niveau_apres_source",
+                  "level_after", "niveau_apres"),
+    "lvl_after_unit": ("level_unit", "source_level_after_unit", "level_after_source_unit", "level_after_unit",
+                       "unit", "unite"),
+    "lvl_before_l": ("level_before_ponction_l", "level_before_ponction_liters", "source_level_before_liters",
+                     "source_level_before_l", "level_before_liters", "level_before_l"),
+    "lvl_after_l": ("level_after_ponction_l", "level_after_ponction_liters", "source_level_after_liters",
+                    "source_level_after_l", "level_after_liters", "level_after_l"),
+    "lvl_before_cm": ("level_before_ponction_cm", "source_level_before_cm", "level_before_cm"),
+    "lvl_after_cm": ("level_after_ponction_cm", "source_level_after_cm", "level_after_cm"),
     "note": ("transfer_note_number", "transfer_note", "bon_transfert", "bon_de_transfert", "transfer_slip_number",
              "transfer_slip", "numero_bon", "bon_number", "reference_bon", "bon"),
 }
@@ -111,7 +118,8 @@ def ponction_settings() -> dict:
     statuses = getattr(settings, "FUEL_PONCTION_ACCEPTED_STATUSES", None) or PONCTION_OK_STATUSES_DEFAULT
     return {"statuses": {str(x).strip().lower() for x in statuses},
             "gap_min_l": Decimal(str(getattr(settings, "FUEL_PONCTION_GAP_MIN_L", 20))),
-            "gap_pct": Decimal(str(getattr(settings, "FUEL_PONCTION_GAP_PCT", 10)))}
+            "gap_pct": Decimal(str(getattr(settings, "FUEL_PONCTION_GAP_PCT", 10))),
+            "require_transfer_note": bool(getattr(settings, "FUEL_PONCTION_REQUIRE_TRANSFER_NOTE", True))}
 
 
 def transfer_id_for(reference: str | None) -> str | None:
@@ -253,28 +261,37 @@ def type_family(raw_type: str | None) -> str:
     return "AUTRE"
 
 
-def ponction_section(docs: dict[str, dict]) -> tuple[dict, str | None]:
-    """Section « Ponction » brute (opération, puis demande, puis élément REST historique)."""
+def ponction_sections(docs: dict[str, dict]) -> list[tuple[dict, str]]:
+    """Sections « Ponction » brutes, par priorité : opération, demande, élément REST historique.
+    ENOC répartit les champs (ex. niveau avant dans la demande, niveau après dans l'opération)."""
+    out = []
     for name in ("operation", "request", "rest"):
         v = (docs.get(name) or {}).get("ponction")
         if isinstance(v, dict) and v:
-            return v, f"{name}.ponction"
-    return {}, None
+            out.append((v, f"{name}.ponction"))
+    return out
+
+
+def ponction_section(docs: dict[str, dict]) -> tuple[dict, str | None]:
+    """Première section « Ponction » brute (compatibilité)."""
+    secs = ponction_sections(docs)
+    return secs[0] if secs else ({}, None)
 
 
 def extract_ponction(docs: dict[str, dict], src: dict) -> dict:
-    sec, base = ponction_section(docs)
+    secs = ponction_sections(docs)
     out = {"ponction_source_site_id": None, "source_level_before_l": None, "source_level_after_l": None,
-           "source_level_before_cm": None, "source_level_after_cm": None, "transfer_note": None, "_ponction_section": bool(sec),
+           "source_level_before_cm": None, "source_level_after_cm": None, "transfer_note": None, "_ponction_section": bool(secs),
            "_source_level_unknown": {}}
-    if not sec:
+    if not secs:
         return out
 
     def first(field):
-        for k in PONC[field]:
-            v = sec.get(k)
-            if not _empty(v):
-                return v, f"{base}.{k}"
+        for sec, base in secs:
+            for k in PONC[field]:
+                v = sec.get(k)
+                if not _empty(v):
+                    return v, f"{base}.{k}"
         return None, None
 
     v, path = first("source_site")
@@ -308,10 +325,12 @@ def extract_ponction(docs: dict[str, dict], src: dict) -> dict:
         out["transfer_note"] = str(note).strip()[:255]
         src["transfer_note"] = p_n
     else:  # bon de transfert joint comme pièce dans la section Ponction
-        items, paths = proofs({"request": sec})
-        if items:
-            out["transfer_note"] = ", ".join(items)[:255]
-            src["transfer_note"] = ", ".join(p.replace("request", base, 1) for p in paths)
+        for sec, base in secs:
+            items, paths = proofs({"request": sec})
+            if items:
+                out["transfer_note"] = ", ".join(items)[:255]
+                src["transfer_note"] = ", ".join(p.replace("request", base, 1) for p in paths)
+                break
     return out
 
 
@@ -561,7 +580,7 @@ def qualify_ponction(c: dict, status: str, alerts: list, missing: list, alert, r
         missing.append("niveau cuve avant (site source)")
     if c.get("source_level_after_l") is None and c.get("source_level_after_cm") is None:
         missing.append("niveau cuve après (site source)")
-    if not c.get("transfer_note"):
+    if not c.get("transfer_note") and cfg["require_transfer_note"]:
         missing.append("bon de transfert")
     if not c.get("validator_name"):
         missing.append("validation manager")

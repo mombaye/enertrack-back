@@ -215,9 +215,10 @@ class Command(BaseCommand):
         keys = Counter()
         sections = 0
         for m, c in ponc:
-            sec, base = C.ponction_section(C._docs(m.raw_payload or {}))
-            if sec:
+            secs = C.ponction_sections(C._docs(m.raw_payload or {}))
+            if secs:
                 sections += 1
+            for sec, base in secs:
                 keys.update(f"{base}.{k}" for k, v in sec.items() if not C._empty(v))
         w(f"Section Ponction présente : {sections}/{len(ponc)} ({100 * sections / pn:.0f} %).\n\n")
         w("| Clé brute de la section Ponction | Présence |\n|---|---|\n")
@@ -238,8 +239,22 @@ class Command(BaseCommand):
                    "site destinataire (site_id)": "site_id"}
         for label, fn in cond:
             ok = sum(1 for _, c in ponc if fn(c))
-            paths = Counter(c["field_sources"].get(src_key[label]) for _, c in ponc if fn(c))
+            k = src_key[label]
+            paths = Counter(c["field_sources"].get(k) or c["field_sources"].get(k[:-2] + "_cm" if k.endswith("_l") else k)
+                            for _, c in ponc if fn(c))
             w(f"| {label} | {ok}/{len(ponc)} ({100 * ok / pn:.0f} %) | {', '.join(f'{p} ({k})' for p, k in paths.most_common(2) if p) or '—'} |\n")
+        # Simulation (lecture seule) : Ponctions comptabilisables selon les options métier encore ouvertes
+        def _st(m, c):
+            return str((m.raw_payload or {}).get("status") or c.get("raw_status") or "").strip().lower()
+        base_ok = [(m, c) for m, c in ponc if all(fn(c) for label, fn in cond if label != "bon de transfert")]
+        acc = C.ponction_settings()["statuses"]
+        w("\n| Simulation (aucune écriture) | Ponctions comptabilisables |\n|---|---|\n")
+        for label, sts, need_note in (("Règle actuelle (statuts acceptés + bon de transfert)", acc, True),
+                                      ("Statuts acceptés, bon de transfert non exigé", acc, False),
+                                      ("Statuts acceptés + « done », bon exigé", acc | {"done"}, True),
+                                      ("Statuts acceptés + « done », bon non exigé", acc | {"done"}, False)):
+            n = sum(1 for m, c in base_ok if _st(m, c) in sts and (c["transfer_note"] or not need_note))
+            w(f"| {label} | {n}/{len(ponc)} |\n")
         st = Counter((m.raw_payload or {}).get("status") or C.extract(m)["raw_status"] for m, _ in ponc)
         w(f"\nStatuts bruts des Ponctions : {dict(st)} — seuls {sorted(C.ponction_settings()['statuses'])} sont comptabilisables "
           "(FUEL_PONCTION_ACCEPTED_STATUSES).\n")

@@ -9,7 +9,7 @@ from unittest import mock
 
 from django.contrib.auth import get_user_model
 from django.core.management import call_command
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -483,3 +483,41 @@ class PonctionTransferTests(EnocBase):
         row = c.get(url + "avec_ecart").json()["data"][0]
         self.assertEqual((row["site_source"], row["site_destinataire"], row["impact_source_l"], row["impact_destinataire_l"]),
                          ("DKR_0002", "DKR_0001", -100.0, 100.0))
+
+    def mk_real(self, code, req_ponction, op_ponction=None):
+        """Forme réelle ENOC (audit prod) : niveaux *_ponction_[l|cm] répartis entre demande et opération, pas de bon."""
+        action = {"validated_at": (self.when - timedelta(hours=5)).isoformat(), "validated_by": "Fuel Manager"}
+        return self.mk(code, typ="PONCTION", status="validated", operation=op_ponction is not None,
+                       req_extra={"approved_quantity_liters": 100, "ponction": req_ponction, "action": action},
+                       op_extra={"ponction": op_ponction} if op_ponction is not None else None)
+
+    def test_real_enoc_keys_levels_read_across_request_and_operation(self):
+        m = self.mk_real("PO-60", {"source_site_id": "DKR_0002", "source_site_name": "SOURCE", "level_unit": "L",
+                                   "level_before_ponction_l": 500},
+                         {"source_site_id": "DKR_0002", "level_unit": "L", "level_after_ponction_l": 400})
+        q = self.q(m)
+        self.assertEqual((float(q.source_level_before_l), float(q.source_level_after_l)), (500.0, 400.0))
+        self.assertEqual(q.field_sources["source_level_before_l"], "request.ponction.level_before_ponction_l")
+        self.assertEqual(q.field_sources["source_level_after_l"], "operation.ponction.level_after_ponction_l")
+        # sans bon de transfert (absent d'ENOC) : seul ce champ manque, aucune écriture
+        self.assertEqual(q.transfer_status, "TRANSFERT_A_COMPLETER")
+        self.assertIn("bon de transfert", q.reason)
+        self.assertNotIn("niveau cuve", q.reason)
+        E.sync_enoc_to_registry()
+        self.assertEqual(self.legs("PO-60"), {})
+
+    def test_generic_level_with_level_unit_cm(self):
+        m = self.mk_real("PO-61", {"source_site_id": "DKR_0002", "level_unit": "cm", "level_before_ponction": 80,
+                                   "level_after_ponction": 60})
+        q = self.q(m)
+        self.assertEqual((float(q.source_level_before_cm), float(q.source_level_after_cm)), (80.0, 60.0))
+        self.assertIsNone(q.source_variation_l)  # cm : pas de variation en litres inventée
+        self.assertIn("NIVEAU_SOURCE_EN_CM", [a["code"] for a in q.alerts])
+
+    @override_settings(FUEL_PONCTION_REQUIRE_TRANSFER_NOTE=False)
+    def test_transfer_note_optional_when_configured(self):
+        self.mk_real("PO-62", {"source_site_id": "DKR_0002", "level_unit": "L", "level_before_ponction_l": 500,
+                               "level_after_ponction_l": 400})
+        E.sync_enoc_to_registry()
+        legs = self.legs("PO-62")
+        self.assertEqual({k: float(v.impact_stock_l) for k, v in legs.items()}, {"OUT": -100.0, "IN": 100.0})

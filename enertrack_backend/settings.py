@@ -329,6 +329,8 @@ ENOC_MONGO_DB_NAME  = os.getenv("ENOC_MONGO_DB_NAME", "")
 FUEL_PONCTION_ACCEPTED_STATUSES = [x.strip() for x in os.getenv("FUEL_PONCTION_ACCEPTED_STATUSES", "validated,validee,validée").split(",") if x.strip()]
 FUEL_PONCTION_GAP_MIN_L = float(os.getenv("FUEL_PONCTION_GAP_MIN_L", "20"))
 FUEL_PONCTION_GAP_PCT = float(os.getenv("FUEL_PONCTION_GAP_PCT", "10"))
+# Bon de transfert exigé (règle Steve). ENOC ne le fournit pas encore : false seulement après accord métier.
+FUEL_PONCTION_REQUIRE_TRANSFER_NOTE = os.getenv("FUEL_PONCTION_REQUIRE_TRANSFER_NOTE", "true").strip().lower() not in ("0", "false", "non", "no")
 # Lien vers une demande ENOC dans l'interface ENOC (optionnel), ex. https://enoc.example/fuel/requests/{reference}
 ENOC_REQUEST_URL_TEMPLATE = os.getenv("ENOC_REQUEST_URL_TEMPLATE", "")
 
