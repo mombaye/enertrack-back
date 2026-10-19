@@ -211,6 +211,10 @@ def assess_closing_tank(spec: TC.TankSpec, declared_capacity, multi: bool) -> tu
         return "PROPOSEE", f"Forme et cotes reconnues (géométrie {full:.0f} L) mais capacité absente : à confirmer."
     gap = (full - declared_capacity) / declared_capacity
     if abs(gap) <= 0.05:
+        if is_derived_capacity(declared_capacity, full):
+            # La capacité du Closing est recalculée depuis les cotes (fonds plats) : ce n'est pas une preuve de plaque.
+            return "VALIDEE", (f"Closing : forme + cotes reconnues (géométrie {full:.0f} L). Capacité du fichier "
+                               f"{declared_capacity:.0f} L = calcul depuis les cotes, pas une capacité de plaque : plaque à confirmer.")
         return "VALIDEE", (f"Closing : forme + cotes reconnues, capacité déclarée {declared_capacity:.0f} L cohérente avec la "
                            f"géométrie {full:.0f} L (écart {gap * 100:+.1f} %).")
     return "PROPOSEE", f"Capacité déclarée {declared_capacity:.0f} L ≠ géométrie {full:.0f} L ({gap * 100:+.1f} %) : à confirmer."
@@ -324,6 +328,11 @@ def evaluate_site_tanks(user=None, dry_run=False) -> dict:
             changes["validation_status"] = (t.validation_status, status)
         if m is not None and t.tank_model_id is None and t.model_match_status in ("NONE", None):
             changes["tank_model"] = (None, m.tank_model_id)
+        if not changes and t.source_type == "CLOSING" and status == t.validation_status and why and why != t.validation_reason:
+            # Même statut, motif reformulé (règle inchangée) : on met à jour le libellé sans nouvelle entrée de statut.
+            stats["motifs_mis_a_jour"] = stats.get("motifs_mis_a_jour", 0) + 1
+            if not dry_run:
+                FuelTankMaster.objects.filter(pk=t.pk).update(validation_reason=why)
         if changes:
             stats["changements"] += 1
             if not dry_run:

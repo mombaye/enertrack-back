@@ -269,6 +269,7 @@ class TankLibraryAndAssignmentTests(TmpRootMixin, TestCase):
         self.assertEqual((t1.validation_status, t1.model_match_status, t1.tank_model.tank_model_id), ("VALIDEE", "PROPOSED", "SEN-TDB-03"))
         self.assertIsNone(t1.capacity_plate_l)  # capacité recalculée par le Closing ≠ plaque ; plaque du modèle non utilisée (proposition)
         self.assertEqual((float(t1.dimension_1_cm), float(t1.dimension_3_cm), t1.bottom_profile), (124.0, 162.0, "plat"))
+        self.assertIn("pas une capacité de plaque", t1.validation_reason)  # capacité Closing recalculée : jamais présentée comme plaque
         self.assertEqual(FuelTankMaster.objects.get(site_id="DKR_0002").validation_status, "PROPOSEE")
         self.assertEqual(FuelTankMaster.objects.get(site_id="DKR_0003").validation_status, "A_CONFIRMER")
         self.assertFalse(FuelTankMaster.objects.filter(site_id="DKR_0004").exists())
@@ -788,6 +789,20 @@ class AuditAndApiTests(TmpRootMixin, TestCase):
         self.client.force_authenticate(self.analyst)
         self.assertEqual(self.client.post("/api/fuel-tracking/stock/enoc/types/", {"raw_value": "X", "category": "AJOUT", "reason": "x"}, format="json").status_code, 403)
         self.assertEqual(self.client.get("/api/fuel-tracking/stock/audit-profil-energetique/").status_code, 200)
+
+    def test_audit_command_runs_every_section_read_only(self):
+        from django.core.management import call_command
+        tank("DKR_0001")
+        P.process_bytes(xlsx({"K": [HEAD, guard_row("DKR_0001", cm=10)]}), "a.xlsx", "LOLIFORCE", origin="UPLOAD")
+        before = (FuelStockObservation.objects.count(), FuelRegistryCorrection.objects.count(), FuelTankMaster.objects.count())
+        out = io.StringIO()
+        call_command("fuel_stock_audit", stdout=out)
+        text = out.getvalue()
+        self.assertNotIn("Section en erreur", text)
+        for title in ("1. Bibliothèque", "4. Stock retenu", "9. Cas de bout en bout"):
+            self.assertIn(title, text)
+        self.assertEqual(before, (FuelStockObservation.objects.count(), FuelRegistryCorrection.objects.count(),
+                                  FuelTankMaster.objects.count()))  # lecture seule
 
     def test_guard_scope_command_reevaluates(self):
         from django.core.management import call_command
