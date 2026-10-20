@@ -340,6 +340,8 @@ def _movement(m):
         "raw_operation_type": m.raw_operation_type, "source_category": m.source_category, "mapping_rule": m.mapping_rule,
         "retained_in_stock": m.retained_in_stock, "movement_direction": m.movement_direction,
         "impact_stock_l": _f(m.impact_stock_l), "transfer_id": m.transfer_id,
+        "integration_status": m.integration_status, "quality_status": m.quality_status,
+        "quality_missing": m.quality_missing or [], "date_source_used": m.date_source_used,
     }
 
 

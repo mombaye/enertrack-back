@@ -9,7 +9,7 @@ from unittest import mock
 
 from django.contrib.auth import get_user_model
 from django.core.management import call_command
-from django.test import TestCase, override_settings
+from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -50,40 +50,72 @@ class EnocBase(TestCase):
 
 
 class QualificationRulesTests(EnocBase):
-    def test_total_card_done_with_quantity_date_photo_is_to_reconcile_never_stock(self):
+    def test_total_card_validated_with_quantity_and_date_is_integrated(self):
         m = self.mk("TC-1")
         q = self.q(m)
         self.assertEqual((q.type_family, q.business_classification, q.execution_state, q.reconciliation_status),
-                         ("TOTAL_CARD", "RAVITAILLEMENT_DECLARE_AVEC_PREUVE", "A_RAPPROCHER", "A_RAPPROCHER"))
-        self.assertEqual(q.reason, C.REASON_TC_OK)
-        self.assertFalse(q.stock_impact or q.consumption_impact)
+                         ("TOTAL_CARD", "CARTE_TOTAL_INTEGREE", "ELIGIBLE_STOCK_REEL", "A_RAPPROCHER"))
+        self.assertEqual((q.integration_status, q.quality_status, q.date_source_used, float(q.integrated_quantity_l)),
+                         ("INTEGRE", "COMPLET", "DATE_REELLE", 200.0))
+        self.assertEqual(q.accounting_at, q.actual_operation_at)
+        self.assertIn("écart non calculable (niveaux en cm)", q.quality_missing)  # 40 cm → 80 cm : pas de litres inventés
+        self.assertTrue(q.stock_impact)
         E.sync_enoc_to_registry()
         mv = FuelMovement.objects.get(source_event_id="TC-1")
-        self.assertFalse(mv.retained_in_stock)  # aucune écriture automatique en stock réel
+        self.assertEqual((mv.retained_in_stock, mv.movement_type, float(mv.impact_stock_l), mv.integration_status,
+                          mv.quality_status, mv.date_source_used), (True, "DELIVERY_TOTAL_CARD", 200.0, "INTEGRE", "COMPLET", "DATE_REELLE"))
 
     def test_total_card_without_actual_quantity_no_impact(self):
         q = self.q(self.mk("TC-2", qty=None))
-        self.assertEqual((q.business_classification, q.execution_state, q.stock_impact), ("DEMANDE_CARTE_TOTAL", "QUANTITE_REELLE_MANQUANTE", False))
+        self.assertEqual((q.execution_state, q.stock_impact, q.integration_status, q.non_integration_cause, q.quality_status),
+                         ("QUANTITE_REELLE_MANQUANTE", False, "NON_INTEGRABLE", "QUANTITE_ABSENTE", "DONNEES_MINIMALES_MANQUANTES"))
+        self.assertIsNone(q.integrated_quantity_l)
         q_open = self.q(self.mk("TC-3", status="validated", operation=False))
-        self.assertEqual((q_open.business_classification, q_open.execution_state, q_open.stock_impact), ("DEMANDE_CARTE_TOTAL", "APPROUVEE", False))
+        self.assertEqual((q_open.business_classification, q_open.execution_state, q_open.non_integration_cause),
+                         ("DEMANDE_CARTE_TOTAL", "APPROUVEE", "DEMANDE_NON_EXECUTEE"))
 
-    def test_ponction_without_section_is_transfer_to_complete(self):
+    def test_total_card_with_validation_date_only_uses_it(self):
+        q = self.q(self.mk("TC-13", op_extra={"operation_date": None}))
+        self.assertEqual((q.integration_status, q.date_source_used), ("INTEGRE", "DATE_VALIDATION"))
+        self.assertEqual(q.accounting_at, q.approved_at)
+        self.assertIsNone(q.actual_operation_at)  # jamais inventée
+
+    def test_no_date_at_all_not_integrable(self):
+        q = self.q(self.mk("TC-14", op_extra={"operation_date": None}, req_extra={"action": {"validated_by": "FM"}}))
+        self.assertEqual((q.integration_status, q.non_integration_cause, q.date_source_used, q.accounting_at),
+                         ("NON_INTEGRABLE", "DATE_ABSENTE", "AUCUNE_DATE", None))
+
+    def test_truck_requires_real_date(self):
+        q = self.q(self.mk("TR-6", typ="TRUCK", op_extra={"operation_date": None}))
+        self.assertEqual((q.integration_status, q.non_integration_cause), ("NON_INTEGRABLE", "DATE_ABSENTE"))
+        self.assertIn("date réelle", q.missing_conditions)
+
+    def test_ponction_without_section_is_not_integrable(self):
         q = self.q(self.mk("PO-1", typ="PONCTION"))
-        self.assertEqual((q.execution_state, q.transfer_status, q.stock_impact), ("TRANSFERT_A_COMPLETER", "TRANSFERT_A_COMPLETER", False))
-        self.assertIn("section Ponction absente de la demande ENOC", q.missing_conditions)
+        self.assertEqual((q.execution_state, q.transfer_status, q.stock_impact, q.non_integration_cause, q.quality_status),
+                         ("TRANSFERT_A_COMPLETER", "TRANSFERT_A_COMPLETER", False, "SITE_SOURCE_ABSENT", "DONNEES_MINIMALES_MANQUANTES"))
+        self.assertIn("site source", q.missing_conditions)
         with self.assertRaises(C.ReconciliationError):
             C.reconcile(q, None, "rapprocher", "test", "relevé")
 
-    def test_truck_incomplete_no_impact(self):
+    def test_truck_without_photo_integrated_with_quality_flag(self):
         q = self.q(self.mk("TR-1", typ="TRUCK", photos=()))
-        self.assertEqual((q.business_classification, q.execution_state, q.stock_impact), ("LIVRAISON_A_CONFIRMER", "PREUVE_MANQUANTE", False))
+        self.assertEqual((q.business_classification, q.integration_status, q.quality_status, q.stock_impact),
+                         ("LIVRAISON_TRUCK_INTEGREE", "INTEGRE", "PREUVE_MANQUANTE", True))
         q2 = self.q(self.mk("TR-2", typ="TRUCK", status="pending", operation=False))
-        self.assertEqual((q2.business_classification, q2.execution_state), ("LIVRAISON_A_CONFIRMER", "DEMANDE"))
+        self.assertEqual((q2.execution_state, q2.integration_status, q2.non_integration_cause), ("DEMANDE", "NON_INTEGRABLE", "STATUT_NON_VALIDE"))
 
-    def test_truck_complete_with_proof_is_declared_to_reconcile_not_certified(self):
+    def test_truck_without_levels_integrated_niveaux_manquants(self):
+        q = self.q(self.mk("TR-7", typ="TRUCK", req_extra={"level_before": None, "level_before_unit": None},
+                           op_extra={"level_after": None, "level_after_unit": None, "hour_meter_after": None}))
+        self.assertEqual((q.integration_status, q.quality_status), ("INTEGRE", "NIVEAUX_MANQUANTS"))
+        self.assertEqual(q.quality_missing, ["niveau avant", "niveau après", "compteur après"])
+        self.assertIsNone(q.tank_level_before_l)  # NULL conservé, jamais 0
+
+    def test_truck_complete_is_integrated_not_certified(self):
         q = self.q(self.mk("TR-3", typ="TRUCK", op_extra={"supplier": "EYDON", "delivery_note_number": "BL-77", "truck_number": "DK-1234-A"}))
         self.assertEqual((q.business_classification, q.execution_state, q.stock_impact, q.reconciliation_status),
-                         ("LIVRAISON_DECLAREE_A_RAPPROCHER", "A_RAPPROCHER", False, "A_RAPPROCHER"))
+                         ("LIVRAISON_TRUCK_INTEGREE", "ELIGIBLE_STOCK_REEL", True, "A_RAPPROCHER"))
         self.assertEqual((q.supplier_name, q.delivery_note_number, q.vehicle_or_truck_reference), ("EYDON", "BL-77", "DK-1234-A"))
 
     def test_missing_quantity_stays_null(self):
@@ -93,30 +125,30 @@ class QualificationRulesTests(EnocBase):
         self.assertEqual((q.actual_quantity_l, q.approved_quantity_l, q.quantity_unit), (None, None, None))
         self.assertEqual(Decimal(q.requested_quantity_l), Decimal("300")) if q.requested_quantity_l is not None else None
 
-    def test_missing_proof_not_eligible(self):
+    def test_missing_proof_does_not_block(self):
         q = self.q(self.mk("TC-5", photos=()))
-        self.assertEqual((q.execution_state, q.proof_count), ("PREUVE_MANQUANTE", 0))
-        self.assertIn("preuve / photo", q.missing_conditions)
-        with self.assertRaises(C.ReconciliationError):
-            C.reconcile(q, None, "rapprocher", "motif", "relevé")
+        self.assertEqual((q.integration_status, q.quality_status, q.proof_count), ("INTEGRE", "PREUVE_MANQUANTE", 0))
+        self.assertIn("photo / preuve", q.quality_missing)
 
     def test_open_request_not_eligible(self):
         q = self.q(self.mk("TC-6", status="pending", operation=False))
         self.assertEqual((q.execution_state, q.stock_impact, q.actual_quantity_l), ("DEMANDE", False, None))
 
-    def test_missing_site_not_eligible(self):
+    def test_missing_site_not_integrable(self):
         q = self.q(self.mk("TC-7", site=None))
-        self.assertEqual(q.execution_state, "TERMINEE")
-        self.assertIn("site_id", q.missing_conditions)
-        self.assertFalse(q.stock_impact)
+        self.assertEqual((q.execution_state, q.integration_status, q.non_integration_cause, q.stock_impact),
+                         ("TERMINEE", "NON_INTEGRABLE", "SITE_NON_IDENTIFIE", False))
+        self.assertIn("site identifié", q.missing_conditions)
 
-    def test_rejected_and_blocking_incoherence(self):
-        self.assertEqual(self.q(self.mk("TC-8", status="rejected")).execution_state, "REJETEE")
+    def test_rejected_level_gap_and_blocking_incoherence(self):
+        q0 = self.q(self.mk("TC-8", status="rejected"))
+        self.assertEqual((q0.execution_state, q0.non_integration_cause), ("REJETEE", "REJETEE"))
         q = self.q(self.mk("TC-9", req_extra={"level_before": 900, "level_before_unit": "L"},
                            op_extra={"level_after": 500, "level_after_unit": "L"}))
-        self.assertTrue(q.blocking)
-        self.assertEqual(q.execution_state, "TERMINEE")
-        self.assertIn("NIVEAU_APRES_INFERIEUR", [a["code"] for a in q.alerts])
+        self.assertEqual((q.integration_status, q.quality_status, q.blocking), ("INTEGRE", "ECART_NIVEAU", False))  # non bloquant
+        self.assertIn("ECART_NIVEAU", [a["code"] for a in q.alerts])
+        q2 = self.q(self.mk("TC-15", op_extra={"operation_date": (timezone.now() + timedelta(days=5)).isoformat()}))
+        self.assertEqual((q2.integration_status, q2.non_integration_cause, q2.blocking), ("NON_INTEGRABLE", "INCOHERENCE_BLOQUANTE", True))
 
     def test_unknown_type_kept_without_guess(self):
         q = self.q(self.mk("XX-1", typ="LAVAGE"))
@@ -149,24 +181,30 @@ class CanonicalExtractionTests(EnocBase):
         user = get_user_model().objects.create_user("admin1", "admin1@x.sn", "p", role="admin")
         m = self.mk("TC-12")
         q = self.q(m)
+        self.assertEqual((q.execution_state, q.reconciliation_status), ("ELIGIBLE_STOCK_REEL", "A_RAPPROCHER"))  # intégré d'office
         with self.assertRaises(C.ReconciliationError):
             C.reconcile(q, user, "rapprocher", "ok", "")  # élément de rapprochement obligatoire
         C.reconcile(q, user, "rapprocher", "Relevé Loliforce du lendemain cohérent", "Loliforce 02/10 : +200 L")
         q.refresh_from_db()
         self.assertEqual((q.execution_state, q.reconciliation_status, q.stock_impact, q.reconciled_by_id),
                          ("ELIGIBLE_STOCK_REEL", "RAPPROCHE", True, user.pk))
-        E.sync_enoc_to_registry()
-        self.assertTrue(FuelMovement.objects.get(source_event_id="TC-12").retained_in_stock)
         C.sync_qualified([m])  # source inchangée : rapprochement conservé
         q.refresh_from_db()
-        self.assertEqual(q.execution_state, "ELIGIBLE_STOCK_REEL")
+        self.assertEqual(q.reconciliation_status, "RAPPROCHE")
+        C.reconcile(q, user, "rejeter", "Doublon de la livraison TC-11")
+        C.sync_qualified([m])
+        q.refresh_from_db()
+        self.assertEqual((q.execution_state, q.integration_status, q.stock_impact), ("REJETEE", "NON_INTEGRABLE", False))  # décision humaine
+        E.sync_enoc_to_registry()
+        self.assertFalse(FuelMovement.objects.get(source_event_id="TC-12").retained_in_stock)
         raw = dict(m.raw_payload)
         raw["operation"] = {**raw["operation"], "quantity_added_liters": 260}
         m.raw_payload = raw
         m.save()
         C.sync_qualified([m])
         q.refresh_from_db()
-        self.assertEqual((q.execution_state, q.stock_impact, q.reconciled_by_id), ("A_RAPPROCHER", False, None))
+        self.assertEqual((q.reconciliation_status, q.integration_status, q.stock_impact, q.reconciled_by_id),
+                         ("A_RAPPROCHER", "INTEGRE", True, None))  # source modifiée : décision à reprendre
         self.assertTrue(FuelRegistryCorrection.objects.filter(entity="ENOC_MOVEMENT", field="reconciliation_status").exists())
 
     def test_certified_when_delivery_note(self):
@@ -177,12 +215,11 @@ class CanonicalExtractionTests(EnocBase):
     def test_manual_validation_of_non_eligible_enoc_movement_refused(self):
         from fuel_tracking.services import stock_registry as R
 
-        self.mk("TR-5", typ="TRUCK")
+        self.mk("TR-5", typ="TRUCK", qty=None)
         E.sync_enoc_to_registry()
         mv = FuelMovement.objects.get(source_event_id="TR-5")
         with self.assertRaises(ValueError):
             R.validate_movement(mv, None, "forçage")
-
 
 class LegacyRestPayloadTests(EnocBase):
     """Lignes de l'ancien connecteur API REST : raw_payload = élément REST (pas de request / operation)."""
@@ -193,17 +230,19 @@ class LegacyRestPayloadTests(EnocBase):
                 **({"quantity_added_liters": qty} if qty is not None else {}), **extra}
         return FuelEnocMovement.objects.create(**clean_payload(item))
 
-    def test_legacy_done_with_quantity_and_photo_is_to_reconcile(self):
+    def test_legacy_done_with_quantity_is_integrated(self):
         q = self.q(self.rest("REST-1", photos=["https://enoc/p/9.jpg"]))
-        self.assertEqual((q.raw_status, float(q.actual_quantity_l), q.quantity_unit, q.execution_state),
-                         ("done", 150.0, "L", "A_RAPPROCHER"))
+        self.assertEqual((q.raw_status, float(q.actual_quantity_l), q.quantity_unit, q.integration_status, q.quality_status),
+                         ("done", 150.0, "L", "INTEGRE", "NIVEAUX_MANQUANTS"))
         self.assertIn("SOURCE_API_REST_HISTORIQUE", [a["code"] for a in q.alerts])
         self.assertEqual(q.field_sources["raw_status"], "rest.status")
 
-    def test_legacy_without_proof_and_open_status(self):
-        self.assertEqual(self.q(self.rest("REST-2")).execution_state, "PREUVE_MANQUANTE")
-        self.assertEqual(self.q(self.rest("REST-3", status="pending", qty=None, operation_date=None)).execution_state, "DEMANDE")
-
+    def test_legacy_without_status_not_verifiable_and_open_status(self):
+        q = self.q(self.rest("REST-2", status=None))
+        self.assertEqual((q.integration_status, q.non_integration_cause, q.stock_impact),
+                         ("HISTORIQUE_NON_VERIFIABLE", "HISTORIQUE_SANS_STATUT", False))
+        q3 = self.q(self.rest("REST-3", status="pending", qty=None, operation_date=None))
+        self.assertEqual((q3.execution_state, q3.integration_status), ("DEMANDE", "NON_INTEGRABLE"))
 
 class ConnectorParityTests(TestCase):
     def test_all_operations_kept_and_empty_quantities_null(self):
@@ -253,22 +292,42 @@ class EnocApiAndAuditTests(EnocBase):
         r = self.client.get("/api/fuel-tracking/stock/enoc/mouvements/").json()
         self.assertEqual(r["pagination"]["total"], 3)
         t = r["totaux"]
-        self.assertEqual((t["demandes"]["count"], t["declares"]["count"], t["eligibles"]["count"], t["certifies"]["count"],
+        self.assertEqual((t["integres"]["count"], t["demandes"]["count"], t["eligibles"]["count"], t["certifies"]["count"],
                           t["transferts_a_completer"]["count"]), (1, 1, 0, 0, 1))
         self.assertEqual(self.client.get("/api/fuel-tracking/stock/enoc/mouvements/?type_brut=PONCTION").json()["pagination"]["total"], 1)
-        self.assertEqual(self.client.get("/api/fuel-tracking/stock/enoc/mouvements/?impact=OUI").json()["pagination"]["total"], 0)
+        self.assertEqual(self.client.get("/api/fuel-tracking/stock/enoc/mouvements/?impact=OUI").json()["pagination"]["total"], 1)
+        self.assertEqual(self.client.get("/api/fuel-tracking/stock/enoc/mouvements/?integration=INTEGRE").json()["pagination"]["total"], 1)
+        self.assertEqual(self.client.get("/api/fuel-tracking/stock/enoc/mouvements/?cause=SITE_SOURCE_ABSENT").json()["pagination"]["total"], 1)
         self.assertEqual(self.client.get("/api/fuel-tracking/stock/enoc/mouvements/?preuve=AVEC").json()["pagination"]["total"], 2)
         q = Q.objects.get(enoc_reference="TC-20")
+        row = self.client.get(f"/api/fuel-tracking/stock/enoc/mouvements/{q.pk}/").json()
+        self.assertEqual((row["statut_integration"], row["qualite"], row["date_source"], row["quantite_integree_l"]),
+                         ("INTEGRE", "COMPLET", "DATE_REELLE", 200.0))
         self.assertEqual(self.client.post(f"/api/fuel-tracking/stock/enoc/mouvements/{q.pk}/rapprocher/",
                                           {"decision": "rapprocher", "reason": "ok", "evidence": "relevé"}, format="json").status_code, 403)
         self.client.force_authenticate(self.admin)
         r = self.client.post(f"/api/fuel-tracking/stock/enoc/mouvements/{q.pk}/rapprocher/",
                              {"decision": "rapprocher", "reason": "Relevé terrain cohérent", "evidence": "Loliforce +200 L"}, format="json")
         self.assertEqual(r.status_code, 200, r.content)
-        self.assertEqual((r.json()["etat"], r.json()["impact_stock"]), ("ELIGIBLE_STOCK_REEL", True))
+        self.assertEqual((r.json()["etat"], r.json()["impact_stock"], r.json()["rapprochement"]), ("ELIGIBLE_STOCK_REEL", True, "RAPPROCHE"))
         d = self.client.get(f"/api/fuel-tracking/stock/enoc/mouvements/{q.pk}/").json()
         self.assertIn("contexte_rapprochement", d)
         self.assertIn("brut", d)
+
+    def test_integration_report_command(self):
+        self.mk("TC-22")
+        self.mk("TR-22", typ="TRUCK", photos=())
+        self.mk("TC-23", qty=None)
+        E.sync_enoc_to_registry()
+        out = StringIO()
+        call_command("sync_stock_registry_enoc", "--rapport", stdout=out)
+        import json
+        rep = json.loads(out.getvalue())
+        self.assertEqual((rep["carte_total_integrees"]["nombre"], rep["truck_integres"]["nombre"], rep["ponctions_integrees"]["nombre"]),
+                         (1, 1, 0))
+        self.assertEqual((rep["integres_complets"]["nombre"], rep["integres_preuve_manquante"]["nombre"]), (1, 1))
+        self.assertEqual(rep["truck_integres"]["litres"], 200.0)
+        self.assertTrue(any(k.startswith("QUANTITE_ABSENTE") for k in rep["non_integrables_par_cause"]))
 
     def test_parity_audit_command(self):
         for i in range(3):
@@ -309,15 +368,15 @@ class StockBalanceTests(EnocBase):
         b = self.balance()
         self.assertEqual((b["conso_reelle_l"], b["certification"]), (200.0, "CERTIFIE"))
 
-    def test_movement_to_reconcile_makes_balance_null_then_eligible_counts(self):
-        m = self.mk("TC-40", qty=400)
-        q = self.q(m)
+    def test_integrated_counts_and_non_integrable_execution_makes_balance_null(self):
+        self.q(self.mk("TC-40", qty=400))
+        b = self.balance()
+        self.assertEqual((b["conso_reelle_l"], b["composantes_l"]["livraisons"], b["certification"]), (600.0, 400.0, "CALCULE_NON_CERTIFIE"))
+        self.assertEqual(b["mouvements_comptes"][0]["date_source"], "DATE_REELLE")
+        self.q(self.mk("TC-42", qty=None))  # exécuté sans quantité : impact inconnu
         b = self.balance()
         self.assertIsNone(b["conso_reelle_l"])  # composante inconnue → NULL, jamais 0
         self.assertEqual((b["certification"], len(b["mouvements_inconnus"])), ("NON_CALCULABLE", 1))
-        C.reconcile(q, None, "rapprocher", "Relevé Loliforce cohérent", "Loliforce J-1")
-        b = self.balance()
-        self.assertEqual((b["conso_reelle_l"], b["composantes_l"]["livraisons"], b["certification"]), (600.0, 400.0, "CALCULE_NON_CERTIFIE"))
 
     def test_demand_never_counted_and_missing_initial_stock_null(self):
         self.mk("TC-41", status="pending", operation=False)
@@ -349,12 +408,13 @@ class PonctionTransferTests(EnocBase):
         Site.objects.create(site_id="DKR_0002", name="SOURCE")
 
     def mkp(self, code, status="validated", source="DKR_0002", approved=100, before=500, after=400, note="BT-001",
-            validator="Fuel Manager", unit="L", drop=()):
+            validator="Fuel Manager", unit="L", drop=(), validated_at=True):
         ponction = {"source_site_id": source, "level_before": before, "level_before_unit": unit, "level_after": after,
                     "level_after_unit": unit, "transfer_note_number": note}
         for k in drop:
             ponction.pop(k, None)
-        action = {"validated_at": (self.when - timedelta(hours=5)).isoformat(), **({"validated_by": validator} if validator else {})}
+        action = {**({"validated_at": (self.when - timedelta(hours=5)).isoformat()} if validated_at else {}),
+                  **({"validated_by": validator} if validator else {})}
         return self.mk(code, typ="PONCTION", status=status, operation=False,
                        req_extra={"approved_quantity_liters": approved, "ponction": ponction, "action": action})
 
@@ -431,29 +491,44 @@ class PonctionTransferTests(EnocBase):
         self.mkp("PO-22", status="pending")
         self.assert_no_write("PO-22", "statut ENOC validé")
 
-    def test_without_transfer_note_no_write(self):
+    def test_without_transfer_note_still_integrated(self):
         self.mkp("PO-23", note=None)
-        self.assert_no_write("PO-23", "bon de transfert")
+        E.sync_enoc_to_registry()
+        q = Q.objects.get(enoc_reference="PO-23")
+        self.assertEqual((q.transfer_status, q.integration_status, q.quality_status), ("COMPTABILISE", "INTEGRE", "COMPLET"))
+        self.assertIn("bon de transfert", q.quality_missing)  # information de qualité, non bloquante
+        self.assertEqual(set(self.legs("PO-23")), {"OUT", "IN"})
 
-    def test_without_source_levels_or_manager_no_write(self):
+    def test_without_validation_date_no_write(self):
+        self.mkp("PO-26", validated_at=None)
+        self.assert_no_write("PO-26", "date de validation")
+
+    def test_partial_levels_or_no_manager_integrated_with_quality(self):
         self.mkp("PO-24", drop=("level_after",))
-        self.assert_no_write("PO-24", "niveau cuve après")
         self.mkp("PO-25", validator=None)
-        self.assert_no_write("PO-25", "validation manager")
+        E.sync_enoc_to_registry()
+        q24, q25 = Q.objects.get(enoc_reference="PO-24"), Q.objects.get(enoc_reference="PO-25")
+        self.assertEqual((q24.integration_status, q24.quality_status, q24.source_variation_l), ("INTEGRE", "CONTROLE_PARTIEL", None))
+        self.assertIn("niveau source après", q24.quality_missing)
+        self.assertEqual((q25.integration_status, q25.quality_status), ("INTEGRE", "COMPLET"))
+        self.assertIn("valideur", q25.quality_missing)
+        legs = self.legs("PO-24")
+        self.assertEqual((legs["OUT"].quality_status, legs["OUT"].date_source_used), ("CONTROLE_PARTIEL", "DATE_VALIDATION"))
 
     def test_global_stock_never_unbalanced(self):
         from fuel_tracking.services.stock_enoc import check_transfer_balance
 
         m1 = self.mkp("PO-30")
         self.mkp("PO-31", before=95, after=90)
-        self.mkp("PO-32", note=None)
+        self.mkp("PO-32", source=None)
         E.sync_enoc_to_registry()
         self.assertEqual(check_transfer_balance(), [])
         retained = FuelMovement.objects.filter(transfer_id__isnull=False, retained_in_stock=True)
+        self.assertEqual(retained.count(), 4)
         self.assertEqual(sum(float(x.impact_stock_l) for x in retained), 0.0)
-        # La Ponction devient incomplète à la source : ses deux écritures sont neutralisées ensemble (tracé)
+        # La Ponction perd son site source à la source : ses deux écritures sont neutralisées ensemble (tracé)
         raw = dict(m1.raw_payload)
-        raw["request"] = {**raw["request"], "ponction": {**raw["request"]["ponction"], "transfer_note_number": None}}
+        raw["request"] = {**raw["request"], "ponction": {**raw["request"]["ponction"], "source_site_id": None}}
         m1.raw_payload = raw
         m1.save()
         E.sync_enoc_to_registry()
@@ -473,7 +548,7 @@ class PonctionTransferTests(EnocBase):
     def test_api_ponction_filters(self):
         self.mkp("PO-50")
         self.mkp("PO-51", before=95, after=90)
-        self.mkp("PO-52", note=None)
+        self.mkp("PO-52", source=None)
         E.sync_enoc_to_registry()
         c = APIClient()
         c.force_authenticate(get_user_model().objects.create_user("an3", "an3@x.sn", "p", role="analyst"))
@@ -481,8 +556,8 @@ class PonctionTransferTests(EnocBase):
         counts = {k: c.get(url + k).json()["pagination"]["total"] for k in ("avec_ecart", "a_completer", "comptabilisees", "attente_fm")}
         self.assertEqual(counts, {"avec_ecart": 1, "a_completer": 1, "comptabilisees": 2, "attente_fm": 1})
         row = c.get(url + "avec_ecart").json()["data"][0]
-        self.assertEqual((row["site_source"], row["site_destinataire"], row["impact_source_l"], row["impact_destinataire_l"]),
-                         ("DKR_0002", "DKR_0001", -100.0, 100.0))
+        self.assertEqual((row["site_source"], row["site_destinataire"], row["impact_source_l"], row["impact_destinataire_l"],
+                          row["qualite"]), ("DKR_0002", "DKR_0001", -100.0, 100.0, "ECART_NIVEAU"))
 
     def mk_real(self, code, req_ponction, op_ponction=None):
         """Forme réelle ENOC (audit prod) : niveaux *_ponction_[l|cm] répartis entre demande et opération, pas de bon."""
@@ -499,12 +574,11 @@ class PonctionTransferTests(EnocBase):
         self.assertEqual((float(q.source_level_before_l), float(q.source_level_after_l)), (500.0, 400.0))
         self.assertEqual(q.field_sources["source_level_before_l"], "request.ponction.level_before_ponction_l")
         self.assertEqual(q.field_sources["source_level_after_l"], "operation.ponction.level_after_ponction_l")
-        # sans bon de transfert (absent d'ENOC) : seul ce champ manque, aucune écriture
-        self.assertEqual(q.transfer_status, "TRANSFERT_A_COMPLETER")
-        self.assertIn("bon de transfert", q.reason)
-        self.assertNotIn("niveau cuve", q.reason)
+        # sans bon de transfert (absent d'ENOC) : intégré, qualité COMPLET, date réelle d'opération prioritaire
+        self.assertEqual((q.transfer_status, q.quality_status, q.date_source_used), ("COMPTABILISE", "COMPLET", "DATE_REELLE"))
         E.sync_enoc_to_registry()
-        self.assertEqual(self.legs("PO-60"), {})
+        legs = self.legs("PO-60")
+        self.assertEqual(legs["IN"].movement_datetime, q.actual_operation_at)
 
     def test_generic_level_with_level_unit_cm(self):
         m = self.mk_real("PO-61", {"source_site_id": "DKR_0002", "level_unit": "cm", "level_before_ponction": 80,
@@ -514,10 +588,8 @@ class PonctionTransferTests(EnocBase):
         self.assertIsNone(q.source_variation_l)  # cm : pas de variation en litres inventée
         self.assertIn("NIVEAU_SOURCE_EN_CM", [a["code"] for a in q.alerts])
 
-    @override_settings(FUEL_PONCTION_REQUIRE_TRANSFER_NOTE=False)
-    def test_transfer_note_optional_when_configured(self):
-        self.mk_real("PO-62", {"source_site_id": "DKR_0002", "level_unit": "L", "level_before_ponction_l": 500,
-                               "level_after_ponction_l": 400})
+    def test_done_status_counts_as_validated(self):
+        self.mkp("PO-62", status="done")
         E.sync_enoc_to_registry()
-        legs = self.legs("PO-62")
-        self.assertEqual({k: float(v.impact_stock_l) for k, v in legs.items()}, {"OUT": -100.0, "IN": 100.0})
+        self.assertEqual({k: float(v.impact_stock_l) for k, v in self.legs("PO-62").items()}, {"OUT": -100.0, "IN": 100.0})
+

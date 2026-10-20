@@ -27,7 +27,7 @@ from django.db import transaction
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 
-QUALIFICATION_VERSION = "enoc-q-v1"
+QUALIFICATION_VERSION = "enoc-q-v2"
 
 # ── Champs bruts candidats (premier trouvé : opération, puis demande, puis payload aplati du connecteur) ─────
 K = {
@@ -109,17 +109,17 @@ PONC = {
     "note": ("transfer_note_number", "transfer_note", "bon_transfert", "bon_de_transfert", "transfer_slip_number",
              "transfer_slip", "numero_bon", "bon_number", "reference_bon", "bon"),
 }
-PONCTION_OK_STATUSES_DEFAULT = ("validated", "validee", "validée")
+PONCTION_OK_STATUSES_DEFAULT = ("validated", "validee", "validée", "done")
 
 
 def ponction_settings() -> dict:
     from django.conf import settings
 
-    statuses = getattr(settings, "FUEL_PONCTION_ACCEPTED_STATUSES", None) or PONCTION_OK_STATUSES_DEFAULT
+    statuses = (getattr(settings, "FUEL_PONCTION_ACCEPTED_STATUSES", None) or getattr(settings, "FUEL_ENOC_VALIDATED_STATUSES", None)
+                or PONCTION_OK_STATUSES_DEFAULT)
     return {"statuses": {str(x).strip().lower() for x in statuses},
             "gap_min_l": Decimal(str(getattr(settings, "FUEL_PONCTION_GAP_MIN_L", 20))),
-            "gap_pct": Decimal(str(getattr(settings, "FUEL_PONCTION_GAP_PCT", 10))),
-            "require_transfer_note": bool(getattr(settings, "FUEL_PONCTION_REQUIRE_TRANSFER_NOTE", True))}
+            "gap_pct": Decimal(str(getattr(settings, "FUEL_PONCTION_GAP_PCT", 10)))}
 
 
 def transfer_id_for(reference: str | None) -> str | None:
@@ -465,92 +465,182 @@ def qualify(c: dict, now=None) -> dict:
                "stock_impact": False, "consumption_impact": False, "reason": reason, "missing_conditions": missing,
                "alerts": alerts, "blocking": any(a["blocking"] for a in alerts), "reconciliation_status": recon,
                "qualification_version": QUALIFICATION_VERSION, "transfer_id": None, "transfer_status": "NON_APPLICABLE",
-               "source_variation_l": None, "control_gap_l": None, "fuel_manager_alert": "AUCUNE"}
+               "source_variation_l": None, "control_gap_l": None, "fuel_manager_alert": "AUCUNE",
+               "integration_status": "NON_INTEGRABLE", "non_integration_cause": None, "quality_status": None,
+               "quality_missing": [], "accounting_at": None, "date_source_used": "AUCUNE_DATE", "integrated_quantity_l": None}
         out.update(extra)
         return out
 
     if status in REJECTED_STATUSES:
         extra = {"transfer_status": "REJETE", "transfer_id": transfer_id_for(c.get("enoc_reference"))} if fam == "PONCTION" else {}
-        return result("REJETEE", "REJETEE", f"Demande ENOC au statut « {c.get('raw_status')} » : aucun impact stock.", **extra)
+        return result("REJETEE", "REJETEE", f"Demande ENOC au statut « {c.get('raw_status')} » : aucun impact stock.",
+                      non_integration_cause="REJETEE", **extra)
     if fam == "PONCTION":
         return qualify_ponction(c, status, alerts, missing, alert, result)
-
-    closed = status in CLOSED_STATUSES or (not c.get("_has_request") and c.get("_has_operation"))
-    if status and not closed and status not in OPEN_STATUSES | APPROVED_STATUSES:
-        alert("STATUT_INCONNU", f"Statut ENOC « {c.get('raw_status')} » non reconnu : traité comme non terminé.")
-    open_state = "APPROUVEE" if status in APPROVED_STATUSES else "DEMANDE"
     if fam == "AUTRE":
         label = c.get("raw_movement_type") or "(vide)"
-        if not closed:
-            return result("TYPE_NON_RECONNU", open_state, f"Demande ENOC de type « {label} » non reconnu : demande, aucun impact stock.")
-        return result("TYPE_NON_RECONNU", "NATURE_A_QUALIFIER", f"Type ENOC « {label} » conservé sans interprétation : nature à qualifier.")
-    if not closed:
-        if fam == "TOTAL_CARD":
-            return result("DEMANDE_CARTE_TOTAL", open_state, "Carte Total non terminée : demande, aucun impact stock ni consommation.")
-        return result("LIVRAISON_A_CONFIRMER", open_state, "Truck non terminé : livraison à confirmer, aucun impact stock.")
+        closed = status in CLOSED_STATUSES or (not c.get("_has_request") and c.get("_has_operation"))
+        state = "NATURE_A_QUALIFIER" if closed else ("APPROUVEE" if status in APPROVED_STATUSES else "DEMANDE")
+        return result("TYPE_NON_RECONNU", state, f"Type ENOC « {label} » conservé sans interprétation : non intégré.",
+                      non_integration_cause="TYPE_NON_RECONNU")
+    return qualify_delivery(c, fam, status, now, alerts, missing, alert, result)
 
+
+# ── Intégration eGrid sur données minimales (ajustement validé : exploiter l'historique ENOC) ────────────────
+CAUSE_LABEL = {
+    "REJETEE": "Demande rejetée dans ENOC",
+    "HISTORIQUE_SANS_STATUT": "Historique ENOC (ancienne API) sans statut : validation non vérifiable",
+    "STATUT_NON_VALIDE": "Statut ENOC non validé (en attente / inconnu)",
+    "TYPE_NON_RECONNU": "Type ENOC non reconnu",
+    "DEMANDE_NON_EXECUTEE": "Demande validée sans opération réalisée (pas de quantité réelle)",
+    "SITE_NON_IDENTIFIE": "Site absent ou inconnu de Gestion des sites",
+    "SITE_SOURCE_ABSENT": "Site source de la Ponction absent ou inconnu",
+    "QUANTITE_ABSENTE": "Quantité absente ou ≤ 0",
+    "UNITE_NON_LITRE": "Unité de quantité non confirmée en litres",
+    "DATE_ABSENTE": "Date requise absente",
+    "INCOHERENCE_BLOQUANTE": "Incohérence bloquante (quantité négative, date future, même site…)",
+}
+CAUSE_ORDER = tuple(CAUSE_LABEL)
+
+
+def integration_settings() -> dict:
+    from django.conf import settings
+
+    statuses = getattr(settings, "FUEL_ENOC_VALIDATED_STATUSES", None) or ("validated", "validee", "validée", "done")
+    return {"statuses": {str(x).strip().lower() for x in statuses},
+            "gap_min_l": Decimal(str(getattr(settings, "FUEL_PONCTION_GAP_MIN_L", 20))),
+            "gap_pct": Decimal(str(getattr(settings, "FUEL_PONCTION_GAP_PCT", 10)))}
+
+
+def accounting_date(c: dict) -> tuple[object | None, str]:
+    """Date comptable : 1) date réelle d'opération, 2) date de validation, 3) aucune (jamais inventée)."""
+    if c.get("actual_operation_at"):
+        return c["actual_operation_at"], "DATE_REELLE"
+    if c.get("approved_at"):
+        return c["approved_at"], "DATE_VALIDATION"
+    return None, "AUCUNE_DATE"
+
+
+def _integration(fam, causes: list[str], legacy_no_status: bool) -> dict:
+    if not causes:
+        return {"integration_status": "INTEGRE", "non_integration_cause": None}
+    if legacy_no_status:
+        return {"integration_status": "HISTORIQUE_NON_VERIFIABLE", "non_integration_cause": "HISTORIQUE_SANS_STATUT"}
+    first = min(causes, key=CAUSE_ORDER.index)
+    return {"integration_status": "NON_INTEGRABLE", "non_integration_cause": first}
+
+
+def qualify_delivery(c: dict, fam: str, status: str, now, alerts: list, missing: list, alert, result) -> dict:
+    """
+    TRUCK / CARTE TOTAL — intégré au stock si : statut validé (validated / done), site identifié,
+    quantité réelle > 0 L, date (Truck : date réelle ; Carte Total : date réelle sinon date de validation).
+    Niveaux, photo et compteur ne bloquent pas : ils produisent un statut de qualité.
+    """
+    cfg = integration_settings()
+    legacy_no_status = bool(c.get("_legacy_rest")) and not status
+    causes: list[str] = []
+
+    def need(cause, label):
+        causes.append(cause)
+        missing.append(label)
+
+    if legacy_no_status:
+        need("HISTORIQUE_SANS_STATUT", "statut ENOC (historique sans statut)")
+    elif status not in cfg["statuses"]:
+        need("STATUT_NON_VALIDE", f"statut validé (actuel : {c.get('raw_status') or 'aucun'})")
+    if not c.get("site_id") or not c.get("_site_resolved", c.get("site_id")):
+        need("SITE_NON_IDENTIFIE", "site identifié" + (f" (« {c['site_id']} » inconnu)" if c.get("site_id") else ""))
     qty = c.get("actual_quantity_l")
-    if not c.get("site_id"):
-        missing.append("site_id")
-    if qty is None or qty <= 0:
-        missing.append("quantité réelle > 0")
-    if c.get("quantity_unit") != "L":
-        missing.append("unité = L")
-    if not c.get("actual_operation_at"):
-        missing.append("date réelle")
-    if not c.get("proof_count"):
-        missing.append("preuve / photo")
-
+    if not c.get("_has_operation"):
+        need("DEMANDE_NON_EXECUTEE", "opération réalisée (quantité réellement introduite)")
+    elif qty is None or qty <= 0:
+        need("QUANTITE_ABSENTE", "quantité réelle > 0 L")
+    elif c.get("quantity_unit") != "L":
+        need("UNITE_NON_LITRE", "unité = L")
+    when, date_src = accounting_date(c)
+    if fam == "TRUCK" and not c.get("actual_operation_at"):
+        need("DATE_ABSENTE", "date réelle")
+        when, date_src = (c.get("approved_at"), "DATE_VALIDATION") if c.get("approved_at") else (None, "AUCUNE_DATE")
+    elif when is None:
+        need("DATE_ABSENTE", "date (réelle ou de validation)")
     if qty is not None and qty < 0:
         alert("QUANTITE_NEGATIVE", f"Quantité réelle négative ({qty}).", blocking=True)
-    when = c.get("actual_operation_at")
     if when and when > now + timedelta(days=1):
-        alert("DATE_FUTURE", f"Date réelle dans le futur ({when:%d/%m/%Y}).", blocking=True)
-    b, a = c.get("tank_level_before_l"), c.get("tank_level_after_l")
-    if b is not None and a is not None and qty is not None and qty > 0:
-        if a < b:
-            alert("NIVEAU_APRES_INFERIEUR", f"Niveau après ({a} L) < niveau avant ({b} L) pour un ravitaillement.", blocking=True)
-        else:
-            gap = abs((a - b) - qty)
-            tol = max(Decimal("100"), Decimal("0.10") * qty)
-            if gap > tol:
-                alert("ECART_NIVEAU_QUANTITE", f"Hausse de niveau {a - b} L ≠ quantité réelle {qty} L (écart {gap} L > {tol} L) : à examiner au rapprochement.")
+        alert("DATE_FUTURE", f"Date dans le futur ({when:%d/%m/%Y}).", blocking=True)
+    if any(a["blocking"] for a in alerts):
+        causes.append("INCOHERENCE_BLOQUANTE")
     appr = c.get("approved_quantity_l")
     if appr and qty and qty > appr * Decimal("1.2"):
         alert("QUANTITE_SUP_APPROUVEE", f"Quantité réelle {qty} L > 120 % de la quantité approuvée ({appr} L).")
-    blocking = any(x["blocking"] for x in alerts)
 
-    if "quantité réelle > 0" in missing:
-        state = "QUANTITE_REELLE_MANQUANTE"
-    elif "preuve / photo" in missing:
-        state = "PREUVE_MANQUANTE"
-    elif missing or blocking:
-        state = "TERMINEE"
+    # Qualité (jamais bloquante)
+    qmiss = []
+    has_b = c.get("tank_level_before_l") is not None or c.get("tank_level_before_cm") is not None
+    has_a = c.get("tank_level_after_l") is not None or c.get("tank_level_after_cm") is not None
+    if not has_b:
+        qmiss.append("niveau avant")
+    if not has_a:
+        qmiss.append("niveau après")
+    if not c.get("proof_count"):
+        qmiss.append("photo / preuve")
+    if c.get("generator_hourmeter_before_h") is None:
+        qmiss.append("compteur avant")
+    if c.get("generator_hourmeter_after_h") is None:
+        qmiss.append("compteur après")
+    gap_flag = False
+    b, a = c.get("tank_level_before_l"), c.get("tank_level_after_l")
+    if b is not None and a is not None and qty is not None and qty > 0:
+        gap = abs((a - b) - qty)
+        tol = max(cfg["gap_min_l"], cfg["gap_pct"] / Decimal("100") * qty)
+        if a < b:
+            gap_flag = True
+            alert("ECART_NIVEAU", f"Niveau après ({a} L) < niveau avant ({b} L) pour un ravitaillement de {qty} L : à contrôler.")
+        elif gap > tol:
+            gap_flag = True
+            alert("ECART_NIVEAU", f"Hausse de niveau {a - b} L ≠ quantité {qty} L (écart {gap} L > {tol} L) : à contrôler.")
+    elif has_b and has_a:
+        qmiss.append("écart non calculable (niveaux en cm)")
+    minimal = any(x not in ("STATUT_NON_VALIDE", "HISTORIQUE_SANS_STATUT", "DEMANDE_NON_EXECUTEE") for x in causes)
+    if minimal or "DEMANDE_NON_EXECUTEE" in causes:
+        quality = "DONNEES_MINIMALES_MANQUANTES"
+    elif gap_flag:
+        quality = "ECART_NIVEAU"
+    elif not (has_b and has_a):
+        quality = "NIVEAUX_MANQUANTS"
+    elif not c.get("proof_count"):
+        quality = "PREUVE_MANQUANTE"
     else:
-        state = "A_RAPPROCHER"
-
-    if fam == "TOTAL_CARD":
-        if state == "QUANTITE_REELLE_MANQUANTE":
-            return result("DEMANDE_CARTE_TOTAL", state, "Carte Total sans quantité réelle : demande, aucun impact stock ni consommation.")
-        if state == "A_RAPPROCHER":
-            return result("RAVITAILLEMENT_DECLARE_AVEC_PREUVE", state, REASON_TC_OK, recon="A_RAPPROCHER")
-        why = "Non éligible : " + ", ".join(missing + [x["message"] for x in alerts if x["blocking"]])
-        return result("RAVITAILLEMENT_DECLARE_INCOMPLET", state, f"Carte Total terminée. {why}.")
-    # TRUCK
-    if state == "A_RAPPROCHER":
-        extra = [lbl for lbl, key in (("fournisseur", "supplier_name"), ("bon de livraison", "delivery_note_number"),
-                                       ("référence camion", "vehicle_or_truck_reference")) if not c.get(key)]
-        reason = REASON_TRUCK_OK + (f" (à compléter si possible : {', '.join(extra)})" if extra else "")
-        return result("LIVRAISON_DECLAREE_A_RAPPROCHER", state, reason, recon="A_RAPPROCHER")
+        quality = "COMPLET"
+    integ = _integration(fam, causes, legacy_no_status)
+    extra = dict(integ, quality_status=quality, quality_missing=qmiss, accounting_at=when, date_source_used=date_src,
+                 integrated_quantity_l=qty if integ["integration_status"] == "INTEGRE" else None)
+    label = "Carte Total" if fam == "TOTAL_CARD" else "Truck"
+    if integ["integration_status"] == "INTEGRE":
+        src = "date réelle" if date_src == "DATE_REELLE" else "date de validation"
+        out = result("CARTE_TOTAL_INTEGREE" if fam == "TOTAL_CARD" else "LIVRAISON_TRUCK_INTEGREE", "ELIGIBLE_STOCK_REEL",
+                     f"{label} intégré : +{qty} L ({src}), qualité {quality}"
+                     + (f" — manquant (non bloquant) : {', '.join(qmiss)}" if qmiss else "") + ".",
+                     recon="A_RAPPROCHER", **extra)
+        out["stock_impact"] = out["consumption_impact"] = True
+        return out
     why = ", ".join(missing + [x["message"] for x in alerts if x["blocking"]])
-    return result("LIVRAISON_A_CONFIRMER", state, f"Truck terminé mais incomplet : {why}.")
+    if "DEMANDE_NON_EXECUTEE" in causes or "STATUT_NON_VALIDE" in causes and not c.get("_has_operation"):
+        state = "APPROUVEE" if status in APPROVED_STATUSES else "DEMANDE"
+    elif "QUANTITE_ABSENTE" in causes:
+        state = "QUANTITE_REELLE_MANQUANTE"
+    else:
+        state = "TERMINEE"
+    cls = ("DEMANDE_CARTE_TOTAL" if fam == "TOTAL_CARD" else "LIVRAISON_A_CONFIRMER") if state in ("DEMANDE", "APPROUVEE") \
+        else ("RAVITAILLEMENT_DECLARE_INCOMPLET" if fam == "TOTAL_CARD" else "LIVRAISON_A_CONFIRMER")
+    return result(cls, state, f"{label} non intégré — {CAUSE_LABEL[integ['non_integration_cause']]} : {why}.", **extra)
 
 
 def qualify_ponction(c: dict, status: str, alerts: list, missing: list, alert, result) -> dict:
     """
-    Ponction (règle validée) : site_id principal = DESTINATAIRE, « Site source » = SOURCE, volume comptable =
-    quantité APPROUVÉE, date = date de validation. Double écriture liée par transfer_id (somme des impacts = 0)
-    seulement si toutes les conditions sont réunies ; sinon TRANSFERT_A_COMPLETER, aucune écriture stock.
+    Ponction : site_id principal = DESTINATAIRE, « Site source » = SOURCE, volume comptable = quantité APPROUVÉE.
+    Transfert créé (double écriture liée par transfer_id, somme = 0) si : statut validé, site source, site
+    destinataire, quantité approuvée > 0, date de validation. Niveaux, bon de transfert, compteur et photos
+    ne bloquent pas : statut de qualité COMPLET / CONTROLE_PARTIEL / ECART_NIVEAU.
     """
     cfg = ponction_settings()
     ref = c.get("enoc_reference")
@@ -558,40 +648,54 @@ def qualify_ponction(c: dict, status: str, alerts: list, missing: list, alert, r
     src_site = c.get("_source_site_resolved", c.get("ponction_source_site_id"))
     dst_site = c.get("_site_resolved", c.get("site_id"))
     qty = c.get("approved_quantity_l")
-    if not c.get("_ponction_section"):
-        missing.append("section Ponction absente de la demande ENOC")
-    if status not in cfg["statuses"]:
-        missing.append(f"statut ENOC validé (actuel : {c.get('raw_status') or 'aucun'})")
+    legacy_no_status = bool(c.get("_legacy_rest")) and not status
+    causes: list[str] = []
+
+    def need(cause, label):
+        causes.append(cause)
+        missing.append(label)
+
+    if legacy_no_status:
+        need("HISTORIQUE_SANS_STATUT", "statut ENOC (historique sans statut)")
+    elif status not in cfg["statuses"]:
+        need("STATUT_NON_VALIDE", f"statut ENOC validé (actuel : {c.get('raw_status') or 'aucun'})")
     if not c.get("ponction_source_site_id"):
-        missing.append("site source")
+        need("SITE_SOURCE_ABSENT", "site source")
     elif not src_site:
-        missing.append(f"site source « {c['ponction_source_site_id']} » inconnu de Gestion des sites")
+        need("SITE_SOURCE_ABSENT", f"site source « {c['ponction_source_site_id']} » inconnu de Gestion des sites")
     if not c.get("site_id"):
-        missing.append("site destinataire (site_id de la demande)")
+        need("SITE_NON_IDENTIFIE", "site destinataire (site_id de la demande)")
     elif not dst_site:
-        missing.append(f"site destinataire « {c['site_id']} » inconnu de Gestion des sites")
+        need("SITE_NON_IDENTIFIE", f"site destinataire « {c['site_id']} » inconnu de Gestion des sites")
     if src_site and dst_site and str(src_site).upper() == str(dst_site).upper():
         alert("PONCTION_MEME_SITE", "Site source = site destinataire : transfert impossible.", blocking=True)
+        causes.append("INCOHERENCE_BLOQUANTE")
     if qty is None or qty <= 0:
-        missing.append("quantité approuvée > 0 L")
+        need("QUANTITE_ABSENTE", "quantité approuvée > 0 L")
     if not c.get("approved_at"):
-        missing.append("date de validation")
-    if c.get("source_level_before_l") is None and c.get("source_level_before_cm") is None:
-        missing.append("niveau cuve avant (site source)")
-    if c.get("source_level_after_l") is None and c.get("source_level_after_cm") is None:
-        missing.append("niveau cuve après (site source)")
-    if not c.get("transfer_note") and cfg["require_transfer_note"]:
-        missing.append("bon de transfert")
-    if not c.get("validator_name"):
-        missing.append("validation manager")
+        need("DATE_ABSENTE", "date de validation")
+    if not tid:
+        need("INCOHERENCE_BLOQUANTE", "référence ENOC (transfer_id)")
+    when, date_src = accounting_date(c)
     for side, v in (c.get("_source_level_unknown") or {}).items():
         alert("UNITE_NIVEAU_SOURCE_INCONNUE", f"Niveau source {('avant' if side == 'before' else 'après')} {v} sans unité reconnue.")
 
-    # Contrôle des niveaux (jamais comptable : le volume approuvé fait foi)
+    # Qualité (jamais bloquante) — le volume approuvé fait foi
+    qmiss = []
+    has_b = c.get("source_level_before_l") is not None or c.get("source_level_before_cm") is not None
+    has_a = c.get("source_level_after_l") is not None or c.get("source_level_after_cm") is not None
+    if not has_b:
+        qmiss.append("niveau source avant")
+    if not has_a:
+        qmiss.append("niveau source après")
+    if not c.get("transfer_note"):
+        qmiss.append("bon de transfert")
+    if not c.get("validator_name"):
+        qmiss.append("valideur")
     variation = gap = None
     fm = "AUCUNE"
     b, a = c.get("source_level_before_l"), c.get("source_level_after_l")
-    if b is not None and a is not None and qty is not None:
+    if b is not None and a is not None and qty is not None and qty > 0:
         variation = a - b
         gap = abs(variation + qty)
         threshold = max(cfg["gap_min_l"], cfg["gap_pct"] / Decimal("100") * qty)
@@ -600,18 +704,32 @@ def qualify_ponction(c: dict, status: str, alerts: list, missing: list, alert, r
                   f"Variation source {variation} L pour {qty} L approuvés : écart de contrôle {gap} L > seuil {threshold} L "
                   "(max(20 L ; 10 %)). Volume approuvé comptabilisé tel quel ; contrôle Fuel Manager requis.")
             fm = "EN_ATTENTE"
-    elif (c.get("source_level_before_cm") is not None or c.get("source_level_after_cm") is not None) and qty is not None:
+    elif has_b and has_a:
+        qmiss.append("écart non calculable (niveaux en cm)")
         alert("NIVEAU_SOURCE_EN_CM", "Niveaux du site source en cm : variation en litres non calculée (contrôle manuel).")
-
-    extra = {"transfer_id": tid, "source_variation_l": variation, "control_gap_l": gap, "fuel_manager_alert": fm}
-    blocking = any(x["blocking"] for x in alerts)
-    if missing or blocking or not tid:
+    minimal = any(x in ("SITE_SOURCE_ABSENT", "SITE_NON_IDENTIFIE", "QUANTITE_ABSENTE", "DATE_ABSENTE") for x in causes)
+    if minimal:
+        quality = "DONNEES_MINIMALES_MANQUANTES"
+    elif fm == "EN_ATTENTE":
+        quality = "ECART_NIVEAU"
+    elif has_b and has_a:
+        quality = "COMPLET"
+    else:
+        quality = "CONTROLE_PARTIEL"
+    integ = _integration("PONCTION", causes, legacy_no_status)
+    extra = dict(integ, transfer_id=tid, source_variation_l=variation, control_gap_l=gap, fuel_manager_alert=fm,
+                 quality_status=quality, quality_missing=qmiss, accounting_at=when, date_source_used=date_src,
+                 integrated_quantity_l=qty if integ["integration_status"] == "INTEGRE" else None)
+    if integ["integration_status"] != "INTEGRE":
         why = ", ".join(missing + [x["message"] for x in alerts if x["blocking"]])
-        return result("PONCTION_A_COMPLETER", "TRANSFERT_A_COMPLETER", f"Transfert à compléter — manquant : {why}.",
+        return result("PONCTION_A_COMPLETER", "TRANSFERT_A_COMPLETER",
+                      f"Transfert non intégré — {CAUSE_LABEL[integ['non_integration_cause']]} : {why}.",
                       transfer_status="TRANSFERT_A_COMPLETER", **extra)
     out = result("PONCTION_COMPTABILISEE", "ELIGIBLE_STOCK_REEL",
-                 f"Ponction validée : −{qty} L au site source {src_site}, +{qty} L au site destinataire {dst_site} "
-                 f"(quantité approuvée, {tid}).", transfer_status="COMPTABILISE", **extra)
+                 f"Ponction intégrée : −{qty} L au site source {src_site}, +{qty} L au site destinataire {dst_site} "
+                 f"(quantité approuvée, {tid}), qualité {quality}"
+                 + (f" — manquant (non bloquant) : {', '.join(qmiss)}" if qmiss else "") + ".",
+                 transfer_status="COMPTABILISE", **extra)
     out["stock_impact"] = out["consumption_impact"] = True
     return out
 
@@ -631,7 +749,9 @@ FINGERPRINT_FIELDS = ("site_id", "raw_movement_type", "raw_status", "actual_quan
                       "source_level_after_l", "source_level_before_cm", "source_level_after_cm", "transfer_note")
 QUALIF_FIELDS = ("type_family", "business_classification", "execution_state", "stock_impact", "consumption_impact",
                  "reason", "missing_conditions", "alerts", "blocking", "qualification_version", "transfer_id",
-                 "transfer_status", "source_variation_l", "control_gap_l", "fuel_manager_alert")
+                 "transfer_status", "source_variation_l", "control_gap_l", "fuel_manager_alert", "integration_status",
+                 "non_integration_cause", "quality_status", "quality_missing", "accounting_at", "date_source_used",
+                 "integrated_quantity_l")
 
 
 def fingerprint(c: dict) -> str:
@@ -666,9 +786,16 @@ def sync_qualified(movements=None, user=None) -> dict:
                 q_vals["fuel_manager_alert"] = "TRAITEE"  # alerte déjà traitée par le Fuel Manager, source inchangée
             if q is not None and q.reconciliation_status in ("RAPPROCHE", "CERTIFIE", "REJETE"):
                 if q.source_fingerprint == fp:
-                    # Rapprochement humain conservé : seule la partie source est rafraîchie.
-                    q_vals = {k: getattr(q, k) for k in QUALIF_FIELDS}
+                    # Décision humaine conservée (source inchangée) : elle prime sur la qualification automatique.
                     q_vals["reconciliation_status"] = q.reconciliation_status
+                    if q.reconciliation_status == "REJETE":
+                        q_vals.update(execution_state="REJETEE", stock_impact=False, consumption_impact=False,
+                                      integration_status="NON_INTEGRABLE", non_integration_cause="REJETEE",
+                                      integrated_quantity_l=None)
+                        if q_vals.get("transfer_status") != "NON_APPLICABLE":
+                            q_vals["transfer_status"] = "REJETE"
+                    else:
+                        q_vals.update(execution_state="ELIGIBLE_STOCK_REEL", stock_impact=True, consumption_impact=True)
                 else:
                     R.log_correction("ENOC_MOVEMENT", q.pk, "SYSTEM", "Donnée ENOC modifiée après rapprochement : à rapprocher de nouveau",
                                      site_id=values["site_id_resolved"], field="reconciliation_status",
@@ -702,7 +829,7 @@ def _differs(a, b) -> bool:
     return a != b
 
 
-# ── Rapprochement (seule voie vers ÉLIGIBLE_STOCK_RÉEL) ─────────────────────────────────────────────────────
+# ── Rapprochement (certification d'un mouvement intégré, ou rejet humain) ─────────────────────────────────────────────────────
 class ReconciliationError(ValueError):
     pass
 
@@ -728,15 +855,16 @@ def _f(v):
 
 
 def reconcile(q, user, decision: str, reason: str, evidence: str | None = None):
-    """decision : « rapprocher » (→ ÉLIGIBLE_STOCK_RÉEL, certifié si bon de livraison) ou « rejeter »."""
+    """decision : « rapprocher » (mouvement intégré → RAPPROCHE, CERTIFIE si bon de livraison), « rejeter » (retire
+    du stock), « acquitter » (alerte Fuel Manager)."""
     from fuel_tracking.services import stock_registry as R
 
     reason = (reason or "").strip()
     if not reason:
         raise ReconciliationError("Motif obligatoire.")
     if decision == "rapprocher":
-        if q.execution_state != "A_RAPPROCHER":
-            raise ReconciliationError(f"Mouvement au statut {q.execution_state} : seul un mouvement À_RAPPROCHER peut être rapproché.")
+        if q.integration_status != "INTEGRE" or q.reconciliation_status != "A_RAPPROCHER":
+            raise ReconciliationError("Seul un mouvement intégré non encore rapproché peut être rapproché (certification).")
         if q.blocking:
             raise ReconciliationError("Alerte bloquante présente : rapprochement impossible.")
         if not (evidence or "").strip():
@@ -758,6 +886,7 @@ def reconcile(q, user, decision: str, reason: str, evidence: str | None = None):
     elif decision == "rejeter":
         old = (q.execution_state, q.reconciliation_status)
         q.execution_state, q.reconciliation_status, q.stock_impact, q.consumption_impact = "REJETEE", "REJETE", False, False
+        q.integration_status, q.non_integration_cause, q.integrated_quantity_l = "NON_INTEGRABLE", "REJETEE", None
         if q.transfer_status != "NON_APPLICABLE":
             q.transfer_status = "REJETE"
     else:
@@ -770,3 +899,39 @@ def reconcile(q, user, decision: str, reason: str, evidence: str | None = None):
     R.log_correction("ENOC_MOVEMENT", q.pk, "VALIDATE" if decision == "rapprocher" else "REJECT", reason, site_id=q.site_id_resolved,
                      field="execution_state/reconciliation", old=old, new=(q.execution_state, q.reconciliation_status), user=user)
     return q
+
+
+# ── Volumes d'intégration eGrid (retour attendu après déploiement) ─────────────────────────────────────────
+def integration_report() -> dict:
+    """Volumes calculés sur la qualification en base (lecture seule)."""
+    from django.db.models import Count, Sum
+
+    from fuel_tracking.models import FuelEnocQualifiedMovement as Q
+
+    def vol(qs):
+        a = qs.aggregate(n=Count("id"), l=Sum("integrated_quantity_l"))
+        return {"nombre": a["n"], "litres": float(a["l"]) if a["l"] is not None else None}
+
+    integ = Q.objects.filter(integration_status="INTEGRE")
+    fam = {"PONCTION": "ponctions_integrees", "TRUCK": "truck_integres", "TOTAL_CARD": "carte_total_integrees"}
+    out = {key: vol(integ.filter(type_family=f)) for f, key in fam.items()}
+    out["integres_total"] = vol(integ)
+    out["integres_complets"] = vol(integ.filter(quality_status="COMPLET"))
+    out["integres_niveaux_manquants"] = vol(integ.filter(quality_status__in=("NIVEAUX_MANQUANTS", "CONTROLE_PARTIEL")))
+    out["integres_ecart_niveau"] = vol(integ.filter(quality_status="ECART_NIVEAU"))
+    out["integres_preuve_manquante"] = vol(integ.filter(quality_status="PREUVE_MANQUANTE"))
+    out["integres_ecart_non_calculable_cm"] = integ.filter(quality_missing__icontains="niveaux en cm").count()
+    out["integres_par_qualite_et_type"] = {
+        f"{r['type_family']}:{r['quality_status']}": r["n"]
+        for r in integ.values("type_family", "quality_status").annotate(n=Count("id")).order_by("type_family", "quality_status")}
+    out["integres_par_source_de_date"] = {r["date_source_used"]: r["n"] for r in integ.values("date_source_used").annotate(n=Count("id"))}
+    rest = Q.objects.exclude(integration_status="INTEGRE")
+    out["non_integrables_par_cause"] = {
+        f"{r['non_integration_cause'] or 'AUTRE'} ({CAUSE_LABEL.get(r['non_integration_cause'] or '', 'autre')})": r["n"]
+        for r in rest.values("non_integration_cause").annotate(n=Count("id")).order_by("-n")}
+    out["non_integrables_par_type_et_cause"] = {
+        f"{r['type_family']}:{r['non_integration_cause'] or 'AUTRE'}": r["n"]
+        for r in rest.values("type_family", "non_integration_cause").annotate(n=Count("id")).order_by("type_family", "-n")}
+    out["historiques_non_verifiables"] = Q.objects.filter(integration_status="HISTORIQUE_NON_VERIFIABLE").count()
+    out["total_mouvements"] = Q.objects.count()
+    return out

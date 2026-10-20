@@ -4,7 +4,7 @@ Mouvements Fuel & GE ENOC qualifiés (contrat canonique + qualification + rappro
 
   GET  stock/enoc/mouvements/                   liste paginée, filtres, totaux SÉPARÉS (jamais mélangés)
   GET  stock/enoc/mouvements/<id>/              détail : canonique, sources des champs, brut ENOC, contexte de rapprochement
-  POST stock/enoc/mouvements/<id>/rapprocher/   {decision: rapprocher | rejeter, reason, evidence} (admin, manager)
+  POST stock/enoc/mouvements/<id>/rapprocher/   {decision: rapprocher | rejeter | acquitter, reason, evidence} (admin, manager)
 """
 from __future__ import annotations
 
@@ -17,19 +17,24 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from fuel_tracking.services.enoc_canonical import CAUSE_LABEL
 from fuel_tracking.views_cph import VALIDATOR_ROLES, IsCphValidator
 
 DEMAND_STATES = ("DEMANDE", "APPROUVEE")
-DECLARED_STATES = ("A_RAPPROCHER", "TERMINEE", "PREUVE_MANQUANTE")
+DECLARED_STATES = ("A_RAPPROCHER", "TERMINEE", "PREUVE_MANQUANTE", "QUANTITE_REELLE_MANQUANTE")
 TOTALS = {
-    "demandes": ("Demandes (non exécutées ou sans quantité réelle)",
+    "integres": ("Intégrés au stock eGrid (Truck / Carte Total : quantité réelle)",
+                 Q(integration_status="INTEGRE") & ~Q(type_family="PONCTION")),
+    "demandes": ("Demandes (non exécutées)",
                  Q(execution_state__in=DEMAND_STATES) | Q(business_classification="DEMANDE_CARTE_TOTAL")),
-    "declares": ("Ravitaillements / livraisons déclarés (non rapprochés)",
-                 Q(execution_state__in=DECLARED_STATES) & ~Q(business_classification="DEMANDE_CARTE_TOTAL")),
-    "eligibles": ("Éligibles stock réel (rapprochés)", Q(execution_state="ELIGIBLE_STOCK_REEL", reconciliation_status="RAPPROCHE")),
+    "declares": ("Exécutés non intégrables (donnée minimale absente)",
+                 Q(execution_state__in=DECLARED_STATES, integration_status="NON_INTEGRABLE")
+                 & ~Q(business_classification="DEMANDE_CARTE_TOTAL")),
+    "historiques": ("Historiques non vérifiables (ancienne API sans statut)", Q(integration_status="HISTORIQUE_NON_VERIFIABLE")),
+    "eligibles": ("Intégrés et rapprochés", Q(execution_state="ELIGIBLE_STOCK_REEL", reconciliation_status="RAPPROCHE")),
     "certifies": ("Certifiés (rapprochés + preuve fournisseur)", Q(execution_state="ELIGIBLE_STOCK_REEL", reconciliation_status="CERTIFIE")),
-    "transferts": ("Ponctions comptabilisées (transferts inter-sites, volume approuvé)", Q(transfer_status="COMPTABILISE")),
-    "transferts_a_completer": ("Ponctions à compléter (aucune écriture)", Q(transfer_status="TRANSFERT_A_COMPLETER")),
+    "transferts": ("Ponctions intégrées (transferts inter-sites, volume approuvé)", Q(transfer_status="COMPTABILISE")),
+    "transferts_a_completer": ("Ponctions non intégrables (aucune écriture)", Q(transfer_status="TRANSFERT_A_COMPLETER")),
     "a_qualifier": ("Nature à qualifier (type inconnu)", Q(execution_state="NATURE_A_QUALIFIER")),
     "rejetes": ("Rejetés", Q(execution_state="REJETEE")),
 }
@@ -79,6 +84,12 @@ def row(q) -> dict:
         "bon_transfert": q.transfer_note, "alerte_fuel_manager": q.fuel_manager_alert,
         "fm_traite_par": getattr(q.fuel_manager_reviewed_by, "username", None), "fm_traite_le": q.fuel_manager_reviewed_at,
         "fm_commentaire": q.fuel_manager_comment,
+        # Intégration eGrid sur données minimales + qualité (non bloquante)
+        "statut_integration": q.integration_status, "cause_non_integration": q.non_integration_cause,
+        "cause_non_integration_libelle": CAUSE_LABEL.get(q.non_integration_cause or ""),
+        "qualite": q.quality_status, "qualite_manquant": q.quality_missing,
+        "date_comptable": q.accounting_at, "date_source": q.date_source_used,
+        "quantite_integree_l": _f(q.integrated_quantity_l),
     }
 
 
@@ -121,7 +132,13 @@ def filtered(params):
         elif ponction == "attente_fm":
             qs = qs.filter(fuel_manager_alert="EN_ATTENTE")
     if p.get("a_rapprocher") in ("1", "true"):
-        qs = qs.filter(execution_state="A_RAPPROCHER")
+        qs = qs.filter(integration_status="INTEGRE", reconciliation_status="A_RAPPROCHER")
+    if p.get("integration"):
+        qs = qs.filter(integration_status=p["integration"])
+    if p.get("qualite"):
+        qs = qs.filter(quality_status=p["qualite"])
+    if p.get("cause"):
+        qs = qs.filter(non_integration_cause=p["cause"])
     if p.get("anomalie"):
         code = p["anomalie"]
         ids = [x.pk for x in qs.only("id", "alerts") if (any(a.get("code") == code for a in (x.alerts or [])) if code != "1" else bool(x.alerts))]
@@ -169,17 +186,22 @@ class EnocMovementListView(APIView):
             "anomalies": sorted({a.get("code") for al in M.objects.values_list("alerts", flat=True) for a in (al or []) if a.get("code")}),
             "zones": sorted({v for v in M.objects.values_list("zone", flat=True) if v}),
             "pays": sorted({v for v in M.objects.values_list("country", flat=True) if v}),
+            "integrations": [{"key": k, "label": lbl} for k, lbl in M.IntegrationStatus.choices],
+            "qualites": sorted({v for v in M.objects.values_list("quality_status", flat=True) if v}),
+            "causes": [{"key": k, "label": CAUSE_LABEL[k]} for k in CAUSE_LABEL
+                       if M.objects.filter(non_integration_cause=k).exists()],
         }
         return Response({"data": data, "pagination": _pagination(page, limit, total), "totaux": totals, "facettes": facets,
                          "can_validate": getattr(request.user, "role", None) in VALIDATOR_ROLES,
                          "regles": [
-                             "Type brut ENOC ≠ impact stock : aucun mouvement n'entre automatiquement dans le stock réel.",
-                             "Carte Total / Truck terminés, avec site, quantité réelle > 0 en L, date réelle et preuve → À RAPPROCHER.",
-                             "Ponction validée et complète : −quantité approuvée au « Site source », +quantité approuvée au site de la "
-                             "demande, deux écritures liées (transfer_id, somme = 0), datées à la validation ENOC ; sinon à compléter, aucune écriture.",
-                             "Écart de niveau source > max(20 L ; 10 %) : alerte Fuel Manager, le volume approuvé reste comptabilisé.",
-                             "ÉLIGIBLE STOCK RÉEL uniquement après rapprochement tracé (relevé terrain / stock cohérent, preuve fournisseur si disponible).",
-                             "Une valeur absente reste vide (jamais 0).",
+                             "Truck validé : intégré si site identifié, quantité réellement introduite > 0 L et date réelle.",
+                             "Carte Total validée : intégrée si site identifié, quantité déclarée > 0 L et date (réelle, sinon validation).",
+                             "Ponction validée : intégrée si site source, site destinataire, quantité approuvée > 0 L et date de validation ; "
+                             "−approuvé au site source, +approuvé au site de la demande, transfer_id commun, somme = 0.",
+                             "Niveaux, photo, bon et compteur ne bloquent pas : ils donnent le niveau de qualité (COMPLET, NIVEAUX_MANQUANTS, "
+                             "PREUVE_MANQUANTE, CONTROLE_PARTIEL, ECART_NIVEAU).",
+                             "Date comptable : date réelle, sinon date de validation, sinon aucune (non intégrable dans un bilan).",
+                             "Une valeur absente reste vide (jamais 0) ; rien n'est inventé.",
                          ]})
 
 

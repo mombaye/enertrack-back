@@ -20,7 +20,6 @@ from decimal import Decimal
 from django.utils import timezone
 
 D0 = Decimal("0")
-UNKNOWN_ENOC_STATES = ("A_RAPPROCHER", "TERMINEE", "PREUVE_MANQUANTE", "QUANTITE_REELLE_MANQUANTE", "NATURE_A_QUALIFIER")
 SIGN = {"DELIVERY": "livraisons", "DELIVERY_EYDON": "livraisons", "DELIVERY_TOTAL_CARD": "livraisons", "ADD": "livraisons",
         "TRANSFER_IN": "transferts_entree", "TRANSFER_OUT": "transferts_sortie", "WITHDRAWAL": "transferts_sortie",
         "THEFT": "vols", "DRAIN": "vidanges"}
@@ -54,38 +53,47 @@ def site_balance(site_id: str, start: date, end: date, with_reference=True) -> d
 
     comps = {"livraisons": D0, "transferts_entree": D0, "transferts_sortie": D0, "vols": D0, "vidanges": D0}
     counted, unknown = [], []
-    # ENOC : seul ÉLIGIBLE_STOCK_RÉEL compte ; un mouvement exécuté non encore qualifié rend le bilan inconnu.
-    # Ponction : comptée via ses deux écritures de transfert (registre ci-dessous), datée à la validation ENOC ;
-    # une Ponction validée mais incomplète (TRANSFERT_A_COMPLETER) rend le bilan inconnu aux DEUX sites.
+    # ENOC : seuls les mouvements INTÉGRÉS comptent, à leur date comptable (réelle, sinon validation) ;
+    # un mouvement exécuté non intégrable dans la période rend le bilan inconnu (jamais 0).
+    # Ponction intégrée : comptée via ses deux écritures de transfert ; non intégrée : inconnue aux DEUX sites.
     from django.db.models import Q as DQ
 
     from fuel_tracking.services.enoc_canonical import OPEN_STATUSES
 
     for q in FuelEnocQualifiedMovement.objects.filter(DQ(site_id_resolved=site_id) | DQ(ponction_source_site_resolved=site_id)):
-        if q.type_family == "PONCTION":
-            when = q.approved_at or q.actual_operation_at
-            if when is None or not (t0 < when <= t1):
+        if q.integration_status == "INTEGRE":
+            if q.type_family == "PONCTION":
+                continue  # comptée via ses deux écritures de transfert (registre ci-dessous)
+            when = q.accounting_at
+            if q.site_id_resolved != site_id or when is None or not (t0 < when <= t1) or q.integrated_quantity_l is None:
                 continue
-            if q.transfer_status == "TRANSFERT_A_COMPLETER" and (q.raw_status or "").lower() not in OPEN_STATUSES:
-                unknown.append({"source": "ENOC", "ref": q.enoc_reference, "date": when, "type": "PONCTION",
-                                "etat": q.execution_state, "motif": q.reason})
+            comps["livraisons"] += q.integrated_quantity_l
+            counted.append({"source": "ENOC", "ref": q.enoc_reference, "date": when, "type": q.raw_movement_type,
+                            "quantite_l": _f(q.integrated_quantity_l), "composante": "livraisons",
+                            "certification": q.reconciliation_status, "qualite": q.quality_status,
+                            "date_source": q.date_source_used})
             continue
-        if q.site_id_resolved != site_id or q.actual_operation_at is None or not (t0 < q.actual_operation_at <= t1):
+        # Non intégré : impact inconnu seulement s'il a été exécuté (quantité / opération) et daté dans la période ;
+        # une simple demande (jamais exécutée) n'a pas d'impact stock.
+        if q.execution_state in ("REJETEE", "DEMANDE", "APPROUVEE"):
             continue
-        if q.execution_state == "ELIGIBLE_STOCK_REEL" and q.actual_quantity_l is not None:
-            comps["livraisons"] += q.actual_quantity_l
-            counted.append({"source": "ENOC", "ref": q.enoc_reference, "date": q.actual_operation_at, "type": q.raw_movement_type,
-                            "quantite_l": _f(q.actual_quantity_l), "composante": "livraisons", "certification": q.reconciliation_status})
-        elif q.execution_state in UNKNOWN_ENOC_STATES:
-            unknown.append({"source": "ENOC", "ref": q.enoc_reference, "date": q.actual_operation_at, "type": q.raw_movement_type,
-                            "etat": q.execution_state, "motif": q.reason})
+        if q.type_family == "PONCTION" and (q.raw_status or "").lower() in OPEN_STATUSES:
+            continue
+        when = q.accounting_at or q.actual_operation_at
+        if when is None or not (t0 < when <= t1):
+            continue
+        if q.type_family != "PONCTION" and q.site_id_resolved != site_id:
+            continue
+        unknown.append({"source": "ENOC", "ref": q.enoc_reference, "date": when, "type": q.raw_movement_type,
+                        "etat": q.integration_status, "motif": q.reason})
     # Transferts inter-sites ENOC (Ponction comptabilisée) : écriture signée du site (−source / +destinataire).
     for mv in FuelMovement.objects.filter(site_id=site_id, source_type="ENOC", movement_type="TRANSFERT_INTERSITE", retained_in_stock=True,
                                           movement_datetime__gt=t0, movement_datetime__lte=t1):
         comp = "transferts_entree" if mv.movement_direction == "IN" else "transferts_sortie"
         comps[comp] += abs(mv.impact_stock_l or D0)
         counted.append({"source": "ENOC", "ref": mv.transfer_id, "date": mv.movement_datetime, "type": f"TRANSFERT_INTERSITE {mv.movement_direction}",
-                        "quantite_l": _f(mv.impact_stock_l), "composante": comp, "certification": "CERTIFIE"})
+                        "quantite_l": _f(mv.impact_stock_l), "composante": comp, "certification": "INTEGRE",
+                        "qualite": mv.quality_status, "date_source": mv.date_source_used})
     # Autres mouvements du registre (historique refueling, saisies) : retenus et validés seulement.
     for mv in FuelMovement.objects.filter(site_id=site_id, movement_datetime__gt=t0, movement_datetime__lte=t1).exclude(source_type="ENOC"):
         comp = SIGN.get(mv.movement_type or "")

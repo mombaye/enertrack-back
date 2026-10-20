@@ -110,8 +110,8 @@ class Command(BaseCommand):
         for title, idx in (("Par type brut ENOC", 0), ("Par état d'exécution / preuve (qualification eGrid)", 1),
                            ("Par classification métier", 2), ("Par statut de rapprochement", 4)):
             w(f"**{title}** : " + ", ".join(f"{k} = {v}" for k, v in Counter(x[idx] for x in quals).most_common()) + "\n\n")
-        w(f"**Éligibles au stock réel** : {sum(1 for x in quals if x[3])} — **à rapprocher** : "
-          f"{sum(1 for x in quals if x[1] == 'A_RAPPROCHER')} (qualification en base pour {len(stored)} / {len(extracted)} mouvements).\n\n")
+        w(f"**Intégrés au stock eGrid** : {sum(1 for x in quals if x[3])} (qualification en base pour {len(stored)} / "
+          f"{len(extracted)} mouvements).\n\n")
 
         # 2. Matrice
         w("## 2. Matrice de parité (toutes les demandes)\n\n")
@@ -243,18 +243,6 @@ class Command(BaseCommand):
             paths = Counter(c["field_sources"].get(k) or c["field_sources"].get(k[:-2] + "_cm" if k.endswith("_l") else k)
                             for _, c in ponc if fn(c))
             w(f"| {label} | {ok}/{len(ponc)} ({100 * ok / pn:.0f} %) | {', '.join(f'{p} ({k})' for p, k in paths.most_common(2) if p) or '—'} |\n")
-        # Simulation (lecture seule) : Ponctions comptabilisables selon les options métier encore ouvertes
-        def _st(m, c):
-            return str((m.raw_payload or {}).get("status") or c.get("raw_status") or "").strip().lower()
-        base_ok = [(m, c) for m, c in ponc if all(fn(c) for label, fn in cond if label != "bon de transfert")]
-        acc = C.ponction_settings()["statuses"]
-        w("\n| Simulation (aucune écriture) | Ponctions comptabilisables |\n|---|---|\n")
-        for label, sts, need_note in (("Règle actuelle (statuts acceptés + bon de transfert)", acc, True),
-                                      ("Statuts acceptés, bon de transfert non exigé", acc, False),
-                                      ("Statuts acceptés + « done », bon exigé", acc | {"done"}, True),
-                                      ("Statuts acceptés + « done », bon non exigé", acc | {"done"}, False)):
-            n = sum(1 for m, c in base_ok if _st(m, c) in sts and (c["transfer_note"] or not need_note))
-            w(f"| {label} | {n}/{len(ponc)} |\n")
         st = Counter((m.raw_payload or {}).get("status") or C.extract(m)["raw_status"] for m, _ in ponc)
         w(f"\nStatuts bruts des Ponctions : {dict(st)} — seuls {sorted(C.ponction_settings()['statuses'])} sont comptabilisables "
           "(FUEL_PONCTION_ACCEPTED_STATUSES).\n")
@@ -264,6 +252,19 @@ class Command(BaseCommand):
         bad = check_transfer_balance()
         w(f"Contrôle global des transferts (somme des impacts par transfer_id = 0, 2 écritures) : "
           f"{'OK' if not bad else f'{len(bad)} anomalie(s) : ' + str(bad[:10])}.\n")
+
+        # 4 ter. Volumes d'intégration eGrid (données minimales)
+        rep = C.integration_report()
+        w("\n## 4 ter. Intégration eGrid (données minimales ; qualité non bloquante)\n\n| Indicateur | Nombre | Litres |\n|---|---|---|\n")
+        for key, label in (("ponctions_integrees", "Ponctions intégrées"), ("truck_integres", "Truck intégrés"),
+                           ("carte_total_integrees", "Carte Total intégrées"), ("integres_complets", "Intégrés complets"),
+                           ("integres_niveaux_manquants", "Intégrés avec niveaux manquants"),
+                           ("integres_ecart_niveau", "Intégrés avec écart de niveau"),
+                           ("integres_preuve_manquante", "Intégrés avec preuve manquante")):
+            v = rep[key]
+            w(f"| {label} | {v['nombre']} | {v['litres'] if v['litres'] is not None else '—'} |\n")
+        w("\n**Non intégrables par cause** : " + ", ".join(f"{k} = {v}" for k, v in rep["non_integrables_par_cause"].items()) + "\n\n")
+        w(f"**Source de la date comptable (intégrés)** : {rep['integres_par_source_de_date']}\n")
 
         # 5. Comparaison directe MongoDB
         if mongo:

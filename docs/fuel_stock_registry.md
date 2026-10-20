@@ -363,4 +363,32 @@ Lien vers ENOC optionnel : variable `ENOC_REQUEST_URL_TEMPLATE` (ex. `https://�
 - Contrôle d'équilibre : `services/stock_enoc.py::check_transfer_balance()` (somme des impacts par `transfer_id` = 0 exactement), repris dans `enoc_parity_audit` section 4 bis.
 - Bilan stock : `transferts_entree` / `transferts_sortie` ; une Ponction incomplète touchant le site rend le bilan NON_CALCULABLE aux deux sites.
 - API : `GET stock/enoc/?ponction=avec_ecart|a_completer|comptabilisees|attente_fm`.
-- Champs réels ENOC (audit prod 10/2026) : section `ponction` dans la demande, l'opération et/ou l'élément REST (lues dans cet ordre, champ par champ) ; `source_site_id`, `level_before_ponction[_l|_cm]`, `level_after_ponction[_l|_cm]`, `level_unit`. Aucun bon de transfert dans ENOC : `FUEL_PONCTION_REQUIRE_TRANSFER_NOTE` (défaut `true`, règle Steve) ; `false` uniquement après accord métier. Niveaux en cm : pas de variation en litres (alerte `NIVEAU_SOURCE_EN_CM`, contrôle manuel). `enoc_parity_audit` section 4 bis donne une simulation (lecture seule) par option.
+- Champs réels ENOC (audit prod 10/2026) : section `ponction` dans la demande, l'opération et/ou l'élément REST (lues dans cet ordre, champ par champ) ; `source_site_id`, `level_before_ponction[_l|_cm]`, `level_after_ponction[_l|_cm]`, `level_unit`. Aucun bon de transfert dans ENOC : information de qualité, non bloquante (voir « Intégration eGrid sur données minimales »). Niveaux en cm : pas de variation en litres (alerte `NIVEAU_SOURCE_EN_CM`, contrôle manuel). `enoc_parity_audit` section 4 bis donne une simulation (lecture seule) par option.
+
+## Intégration eGrid sur données minimales (ajustement 10/2026 — exploiter l'historique ENOC)
+
+Les champs ENOC n'étaient pas obligatoires historiquement : un mouvement est intégré dès que ses données comptables
+minimales sont présentes ; niveaux, photo, bon et compteur ne bloquent jamais, ils fixent le **niveau de qualité**.
+Rien n'est inventé : une valeur absente reste NULL (jamais 0). Qualification `enoc-q-v2`, migration `0047_enoc_minimal_integration` (ajouts uniquement).
+
+| Type | Conditions d'intégration | Volume | Qualité |
+|---|---|---|---|
+| Ponction | statut validé, site source, site destinataire, quantité approuvée > 0, date de validation | ± approuvé (2 écritures, `transfer_id`, somme = 0) | COMPLET / CONTROLE_PARTIEL / ECART_NIVEAU / DONNEES_MINIMALES_MANQUANTES |
+| Truck | statut validé, site identifié, quantité réellement introduite > 0 L, date réelle | + réel | COMPLET / NIVEAUX_MANQUANTS / PREUVE_MANQUANTE / ECART_NIVEAU / DONNEES_MINIMALES_MANQUANTES |
+| Carte Total | statut validé, site identifié, quantité déclarée > 0 L, date (réelle sinon validation) | + réel | idem Truck |
+
+- Statut « Validée » : `FUEL_ENOC_VALIDATED_STATUSES` (défaut `validated,validee,validée,done` — `done` = validé puis exécuté ;
+  workflow ENOC pending → validated → done). `FUEL_PONCTION_ACCEPTED_STATUSES` peut le restreindre pour les Ponctions.
+- Date comptable (`accounting_at`, `date_source_used`) : DATE_REELLE, sinon DATE_VALIDATION, sinon AUCUNE_DATE (non intégrable dans un bilan).
+- Écart de niveau : seuil `max(FUEL_PONCTION_GAP_MIN_L ; FUEL_PONCTION_GAP_PCT %)` (20 L ; 10 %) pour les trois types ; niveaux en cm :
+  présents mais écart non calculé (« écart non calculable (niveaux en cm) » dans les champs de qualité).
+- Statut d'intégration : INTEGRE / NON_INTEGRABLE (cause : `non_integration_cause`) / HISTORIQUE_NON_VERIFIABLE (ancienne API REST sans statut).
+- Rapprochement : n'est plus la condition d'intégration ; il certifie un mouvement intégré (RAPPROCHE / CERTIFIE) ou le rejette (retiré du stock).
+  Une décision humaine est conservée tant que la source ENOC ne change pas.
+- Bilan stock : seuls les intégrés comptent (à leur date comptable) ; un mouvement exécuté non intégrable dans la période rend le bilan NULL.
+- Registre : `fuel_movement.integration_status`, `quality_status`, `quality_missing`, `date_source_used`, `impact_stock_l` ; l'historique
+  d'un site sépare Intégrés / Non intégrables / Historiques non vérifiables / Autres sources.
+- Volumes de retour : `python manage.py sync_stock_registry_enoc --rapport` (lecture seule) ; aussi inclus dans la sortie de
+  `sync_stock_registry_enoc` (`integration_egrid`) et dans `enoc_parity_audit` (section 4 ter).
+- API : `GET stock/enoc/mouvements/?integration=…&qualite=…&cause=…` ; champs `statut_integration`, `cause_non_integration(_libelle)`,
+  `qualite`, `qualite_manquant`, `date_comptable`, `date_source`, `quantite_integree_l` ; total `integres`, `historiques`.

@@ -128,7 +128,19 @@ QUALIFIED_CATEGORY = {
     "DEMANDE_CARTE_TOTAL": "DEMANDE_LIVRAISON", "RAVITAILLEMENT_DECLARE_AVEC_PREUVE": "CARTE_TOTAL",
     "RAVITAILLEMENT_DECLARE_INCOMPLET": "CARTE_TOTAL", "LIVRAISON_A_CONFIRMER": "LIVRAISON_DECLAREE",
     "LIVRAISON_DECLAREE_A_RAPPROCHER": "LIVRAISON_DECLAREE", "PONCTION_A_QUALIFIER": "INCONNU", "TYPE_NON_RECONNU": "INCONNU",
+    "CARTE_TOTAL_INTEGREE": "CARTE_TOTAL", "LIVRAISON_TRUCK_INTEGREE": "LIVRAISON_CONFIRMEE",
 }
+QUALITY_FIELDS = ("integration_status", "quality_status", "quality_missing", "date_source_used")
+
+
+def _quality_alerts(q) -> list[dict]:
+    out = []
+    if q.quality_status and q.quality_status != "COMPLET":
+        detail = ", ".join(q.quality_missing or []) or q.quality_status
+        out.append({"code": f"QUALITE_{q.quality_status}", "message": f"Qualité {q.quality_status} : {detail} (non bloquant)."})
+    out += [{"code": a["code"], "message": a["message"]} for a in (q.alerts or [])
+            if a.get("code") in ("ECART_NIVEAU", "ECART_NIVEAU_PONCTION_A_CONTROLER", "QUANTITE_SUP_APPROUVEE", "NIVEAU_SOURCE_EN_CM")]
+    return out
 
 
 def _apply_qualification(fields: dict, q) -> dict:
@@ -138,6 +150,12 @@ def _apply_qualification(fields: dict, q) -> dict:
         return fields
     eligible = q.execution_state == "ELIGIBLE_STOCK_REEL"
     fields["retained_in_stock"] = bool(q.stock_impact and eligible)
+    for f in QUALITY_FIELDS:
+        fields[f] = getattr(q, f)
+    if q.accounting_at:
+        fields["movement_datetime"] = q.accounting_at
+    fields["impact_stock_l"] = None
+    fields["alerts"] = [a for a in fields["alerts"] if a["code"] != "TOTAL_CARD"]
     if q.type_family == "PONCTION":
         # La demande Ponction reste une ligne d'information : l'impact stock est porté par les 2 écritures transfer_id.
         fields["retained_in_stock"], fields["movement_type"] = False, None
@@ -149,9 +167,11 @@ def _apply_qualification(fields: dict, q) -> dict:
         fields["counterpart_site_id"] = q.ponction_source_site_resolved or q.ponction_source_site_id
         fields["mapping_rule"] = f"{q.transfer_id or ''} · {q.execution_state} : {q.reason}"[:255]
         fields["alerts"] = [a for a in fields["alerts"] if a["code"] != "ENOC_TYPE_UNKNOWN"] + \
-            [{"code": f"ENOC_{q.execution_state}", "message": q.reason}]
+            [{"code": f"ENOC_{q.execution_state}", "message": q.reason}] + _quality_alerts(q)
         return fields
-    if eligible:
+    if eligible and q.type_family == "TOTAL_CARD":
+        fields["source_category"], fields["movement_type"] = "CARTE_TOTAL", "DELIVERY_TOTAL_CARD"
+    elif eligible:
         fields["source_category"], fields["movement_type"] = "LIVRAISON_CONFIRMEE", "DELIVERY"
     elif q.business_classification == "REJETEE":
         fields["status"] = "REJECTED"
@@ -163,11 +183,13 @@ def _apply_qualification(fields: dict, q) -> dict:
         fields["source_category"] = QUALIFIED_CATEGORY.get(q.business_classification, fields["source_category"])
         fields["movement_type"] = "DELIVERY_TOTAL_CARD" if fields["source_category"] == "CARTE_TOTAL" else None
     fields["quantity_l"] = q.actual_quantity_l
+    if fields["retained_in_stock"] and q.integrated_quantity_l is not None:
+        fields["impact_stock_l"] = q.integrated_quantity_l
     fields["mapping_rule"] = f"{fields['mapping_rule']} · {q.execution_state} : {q.reason}"[:255]
     fields["proof_reference"] = ", ".join(q.proof_urls_or_ids or [])[:512] or fields.get("proof_reference")
     keep_unknown = q.type_family == "AUTRE"  # seul un type non reconnu reste « à classifier »
     fields["alerts"] = [a for a in fields["alerts"] if keep_unknown or a["code"] != "ENOC_TYPE_UNKNOWN"] + \
-        [{"code": f"ENOC_{q.execution_state}", "message": q.reason}]
+        [{"code": f"ENOC_{q.execution_state}", "message": q.reason}] + _quality_alerts(q)
     return fields
 
 
@@ -215,6 +237,7 @@ def _movement_fields(m, mappings: dict | None = None) -> dict:
         source_status=src_status, status=STATUS_MAP.get(src_status or "", "DECLARED"), alerts=alerts,
         comment=(m.comment or None), counterpart_site_id=_counterpart(m),
         raw_operation_type=raw_key(m)[:128], source_category=category, mapping_rule=rule[:255], retained_in_stock=retained,
+        impact_stock_l=None, integration_status=None, quality_status=None, quality_missing=[], date_source_used=None,
     )
 
 
@@ -236,7 +259,8 @@ def _raw_level(v, unit) -> str | None:
 
 TRACKED_MOVEMENT_FIELDS = ("site_id", "movement_type", "movement_datetime", "requested_quantity_l", "quantity_l",
                            "supplier", "ticket_reference", "delivery_note", "proof_reference", "source_status", "status",
-                           "source_category", "mapping_rule", "retained_in_stock", "raw_operation_type")
+                           "source_category", "mapping_rule", "retained_in_stock", "raw_operation_type", "impact_stock_l",
+                           "integration_status", "quality_status", "quality_missing", "date_source_used")
 
 
 def sync_enoc_to_registry(since=None, user=None, only_ids=None) -> dict:
@@ -384,7 +408,8 @@ def sync_enoc_to_registry(since=None, user=None, only_ids=None) -> dict:
 
 
 TRANSFER_TRACKED = ("site_id", "counterpart_site_id", "quantity_l", "impact_stock_l", "movement_datetime", "retained_in_stock",
-                    "status", "proof_reference", "source_user", "alerts")
+                    "status", "proof_reference", "source_user", "alerts", "integration_status", "quality_status",
+                    "quality_missing", "date_source_used")
 
 
 def _sync_transfer(q, get_batch, stats) -> bool:
@@ -401,16 +426,19 @@ def _sync_transfer(q, get_batch, stats) -> bool:
     changed = False
     if q.transfer_status == "COMPTABILISE" and q.approved_quantity_l and q.ponction_source_site_resolved and q.site_id_resolved:
         qty = q.approved_quantity_l
-        fm = [a for a in (q.alerts or []) if a.get("code") == "ECART_NIVEAU_PONCTION_A_CONTROLER"]
+        fm = _quality_alerts(q)
         legs = {"OUT": (q.ponction_source_site_resolved, -qty, q.site_id_resolved),
                 "IN": (q.site_id_resolved, qty, q.ponction_source_site_resolved)}
         for direction, (site, impact, counterpart) in legs.items():
             values = dict(site_id=site, counterpart_site_id=counterpart, movement_type="TRANSFERT_INTERSITE", movement_direction=direction,
-                          quantity_l=qty, impact_stock_l=impact, transfer_id=q.transfer_id, movement_datetime=q.approved_at,
+                          quantity_l=qty, impact_stock_l=impact, transfer_id=q.transfer_id,
+                          movement_datetime=q.accounting_at or q.approved_at, integration_status="INTEGRE",
+                          quality_status=q.quality_status, quality_missing=q.quality_missing or [],
+                          date_source_used=q.date_source_used,
                           retained_in_stock=True, status="CLOSED", source_status=q.raw_status, source_category="TRANSFERT_INTERSITE",
                           raw_operation_type=q.raw_movement_type, proof_reference=(q.transfer_note or "")[:512] or None,
-                          source_user=q.validator_name, alerts=[{"code": a["code"], "message": a["message"]} for a in fm],
-                          mapping_rule=f"Ponction validée {q.transfer_id} : quantité approuvée, date de validation ENOC"[:255],
+                          source_user=q.validator_name, alerts=fm,
+                          mapping_rule=f"Ponction {q.transfer_id} : quantité approuvée, {q.date_source_used}"[:255],
                           comment=f"Réf. ENOC {q.enoc_reference}")
             mv = existing.get(direction)
             if mv is None:
@@ -436,6 +464,7 @@ def _sync_transfer(q, get_batch, stats) -> bool:
                              site_id=mv.site_id, field="retained_in_stock", old=True, new=False, author_label="ENOC")
             mv.retained_in_stock = False
             mv.status = "REJECTED" if q.transfer_status == "REJETE" else "DECLARED"
+            mv.integration_status = q.integration_status
             mv.save()
             stats["transferts_neutralises"] = stats.get("transferts_neutralises", 0) + 1
             changed = True

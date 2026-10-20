@@ -1378,6 +1378,12 @@ class FuelMovement(models.Model):
                                          help_text="Impact signé sur le stock du site (+ entrée, − sortie).")
     transfer_id = models.CharField(max_length=160, null=True, blank=True, db_index=True,
                                    help_text="Identifiant commun des deux écritures d'un transfert (somme des impacts = 0).")
+    integration_status = models.CharField(max_length=28, null=True, blank=True, db_index=True,
+                                          help_text="ENOC : INTEGRE / NON_INTEGRABLE / HISTORIQUE_NON_VERIFIABLE.")
+    quality_status = models.CharField(max_length=32, null=True, blank=True, db_index=True)
+    quality_missing = models.JSONField(default=list, blank=True)
+    date_source_used = models.CharField(max_length=16, null=True, blank=True,
+                                        help_text="DATE_REELLE / DATE_VALIDATION / AUCUNE_DATE (provenance de movement_datetime).")
     comment = models.TextField(null=True, blank=True)
     validated_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
     validated_at = models.DateTimeField(null=True, blank=True)
@@ -1485,6 +1491,16 @@ class FuelEnocQualifiedMovement(models.Model):
         EN_ATTENTE = "EN_ATTENTE", "En attente Fuel Manager"
         TRAITEE = "TRAITEE", "Traitée par le Fuel Manager"
 
+    class IntegrationStatus(models.TextChoices):
+        INTEGRE = "INTEGRE", "Intégré au stock eGrid"
+        NON_INTEGRABLE = "NON_INTEGRABLE", "Non intégrable (donnée minimale absente)"
+        HISTORIQUE_NON_VERIFIABLE = "HISTORIQUE_NON_VERIFIABLE", "Historique non vérifiable"
+
+    class DateSource(models.TextChoices):
+        DATE_REELLE = "DATE_REELLE", "Date réelle d'opération"
+        DATE_VALIDATION = "DATE_VALIDATION", "Date de validation"
+        AUCUNE_DATE = "AUCUNE_DATE", "Aucune date"
+
     class Reconciliation(models.TextChoices):
         NON_REQUIS = "NON_REQUIS", "Non requis (aucun impact stock possible en l'état)"
         A_RAPPROCHER = "A_RAPPROCHER", "À rapprocher"
@@ -1551,6 +1567,18 @@ class FuelEnocQualifiedMovement(models.Model):
     fuel_manager_reviewed_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
     fuel_manager_reviewed_at = models.DateTimeField(null=True, blank=True)
     fuel_manager_comment = models.TextField(null=True, blank=True)
+
+    # Intégration eGrid sur données minimales : niveaux / photo / bon / compteur = qualité, jamais bloquants
+    integration_status = models.CharField(max_length=28, choices=IntegrationStatus.choices, default=IntegrationStatus.NON_INTEGRABLE,
+                                          db_index=True)
+    non_integration_cause = models.CharField(max_length=32, null=True, blank=True, db_index=True)
+    quality_status = models.CharField(max_length=32, null=True, blank=True, db_index=True)
+    quality_missing = models.JSONField(default=list, blank=True, help_text="Données de contrôle absentes (non bloquantes).")
+    accounting_at = models.DateTimeField(null=True, blank=True, db_index=True,
+                                         help_text="Date comptable : date réelle, sinon date de validation, sinon NULL.")
+    date_source_used = models.CharField(max_length=16, choices=DateSource.choices, default=DateSource.AUCUNE_DATE)
+    integrated_quantity_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True,
+                                                help_text="Volume intégré (Ponction : approuvé ; Truck / Carte Total : réel).")
 
     # Qualification eGrid (axe B — indépendant du type brut)
     type_family = models.CharField(max_length=16, choices=TypeFamily.choices, db_index=True)
