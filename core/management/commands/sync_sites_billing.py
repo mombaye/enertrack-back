@@ -29,7 +29,7 @@ class Command(BaseCommand):
         parser.add_argument("--csv", default=None, help="Liste complète des contrats non rattachés (cause, sites, factures)")
 
     def handle(self, *args, site, dry_run, csv, **opts):
-        from billing.models import ContractSiteLink
+        from billing.models import ContractSiteLink, SonatelInvoice
 
         qs = Site.objects.all()
         if site:
@@ -56,6 +56,20 @@ class Command(BaseCommand):
                     if k in total:
                         total[k] += v
             if not dry_run and not site:
+                # Liens contrat → site déjà en base (import de liens, ancienne version) : factures sans site rattachées
+                # au site du lien (jamais une facture déjà rattachée ailleurs).
+                # Une fiche de Gestion des sites qui porte ce contrat pour un AUTRE site fait foi : lien ignoré (signalé).
+                claimed: dict[str, set[int]] = {}
+                for pk, raw in Site.objects.exclude(contract_number__isnull=True).exclude(contract_number="").values_list("pk", "contract_number"):
+                    for c in site_contracts(type("S", (), {"contract_number": raw})()):
+                        claimed.setdefault(contract_key(c), set()).add(pk)
+                total["factures_rattachees_par_lien"] = 0
+                for num, site_pk in ContractSiteLink.objects.values_list("numero_compte_contrat", "site_id"):
+                    owners = claimed.get(contract_key(num))
+                    if owners and site_pk not in owners:
+                        continue
+                    total["factures_rattachees_par_lien"] += SonatelInvoice.objects.filter(
+                        numero_compte_contrat=num, site__isnull=True).update(site_id=site_pk)
                 total["certifications_relancees"] += refresh_unknown_certifications()
             if dry_run:
                 transaction.set_rollback(True)
@@ -75,7 +89,13 @@ class Command(BaseCommand):
                 k = contract_key(c)
                 if k:
                     by_key.setdefault(k, set()).add(sid)
-        links = {contract_key(c): sid for c, sid in ContractSiteLink.objects.values_list("numero_compte_contrat", "site__site_id")}
+        links: dict[str, list[str]] = {}
+        for c, sid in ContractSiteLink.objects.values_list("numero_compte_contrat", "site__site_id"):
+            links.setdefault(contract_key(c), []).append(f"{c!r}→{sid}")
+        raw_by_key: dict[str, list[str]] = {}
+        for sid, raw in Site.objects.exclude(contract_number__isnull=True).exclude(contract_number="").values_list("site_id", "contract_number"):
+            for c in site_contracts(type("S", (), {"contract_number": raw})()):
+                raw_by_key.setdefault(contract_key(c), []).append(f"{sid} (fiche : {raw!r})")
         rows = (SonatelInvoice.objects.filter(site__isnull=True).values("numero_compte_contrat")
                 .annotate(n=Count("id"), payees=Count("id", filter=Q(payment_status="PAID"))).order_by("-n"))
         causes: dict[str, list] = {"CONTRAT_AMBIGU": [], "CONTRAT_ABSENT_GESTION_SITES": [], "CONTRAT_LIE_NON_RATTACHE": []}
@@ -88,18 +108,22 @@ class Command(BaseCommand):
                 cause = "CONTRAT_LIE_NON_RATTACHE"
             else:
                 cause = "CONTRAT_ABSENT_GESTION_SITES"
-            causes[cause].append((r["numero_compte_contrat"], r["n"], r["payees"], ", ".join(sites) or links.get(k) or ""))
+            detail = ", ".join(sites)
+            if cause == "CONTRAT_LIE_NON_RATTACHE":
+                detail = (f"facture : {r['numero_compte_contrat']!r} ; fiches : {', '.join(raw_by_key.get(k, [])) or '—'} ; "
+                          f"liens : {', '.join(links.get(k, [])) or '—'}")
+            causes[cause].append((r["numero_compte_contrat"], r["n"], r["payees"], detail))
         total_inv = sum(x[1] for v in causes.values() for x in v)
         total_paid = sum(x[2] for v in causes.values() for x in v)
         w(self.style.MIGRATE_HEADING(f"\nFactures encore sans site : {total_inv} (dont {total_paid} payées)"))
         labels = {"CONTRAT_AMBIGU": "contrat saisi sur plusieurs fiches de Gestion des sites (à corriger sur la fiche)",
                   "CONTRAT_ABSENT_GESTION_SITES": "contrat absent de toutes les fiches de Gestion des sites",
-                  "CONTRAT_LIE_NON_RATTACHE": "contrat connu mais factures non rattachées (relancer cette commande)"}
+                  "CONTRAT_LIE_NON_RATTACHE": "contrat présent sur une fiche ou un lien mais factures non rattachées (détail du format ci-dessous)"}
         for cause, items in causes.items():
             w(f"  {cause} — {labels[cause]} : {len(items)} contrat(s), {sum(x[1] for x in items)} facture(s), "
               f"{sum(x[2] for x in items)} payée(s)")
             for c, n, p, sids in items[:10]:
-                w(f"     {c} : {n} facture(s), {p} payée(s){(' — sites : ' + sids) if sids else ''}")
+                w(f"     {c} : {n} facture(s), {p} payée(s){(' — ' + sids) if sids else ''}")
         out_scope = (SonatelInvoice.objects.filter(site__isnull=False)
                      .exclude(site__invoice_payment__iexact="Aktivco", site__grid_fee=True)
                      .values("site__site_id", "site__invoice_payment", "site__grid_fee")

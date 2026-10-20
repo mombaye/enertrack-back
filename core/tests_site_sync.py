@@ -107,3 +107,23 @@ class SiteSyncRelinkTests(TestCase):
         self.assertIn("Factures encore sans site : 1 (dont 1 payées)", text)
         self.assertIn("CONTRAT_ABSENT_GESTION_SITES", text)
         self.assertIn("DKR_0001 : paiement « Sonatel »", text)  # rattachée mais hors périmètre Suivi facturation
+
+    def test_existing_link_relinks_unlinked_invoices_and_details_conflicts(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        a = Site.objects.create(site_id="DKR_0001", name="A")
+        # lien ancien (sans signal à l'époque) : facture restée sans site
+        ContractSiteLink.objects.bulk_create([ContractSiteLink(numero_compte_contrat="22005301879", site=a)])
+        SonatelInvoice.objects.create(batch=self.batch, numero_compte_contrat="022004880840", numero_facture="F3")
+        b = Site.objects.create(site_id="DKR_0002", name="B")
+        ContractSiteLink.objects.bulk_create([ContractSiteLink(numero_compte_contrat="022004880840", site=b)])
+        Site.objects.filter(pk=a.pk).update(contract_number="22004880840")  # la fiche A revendique ce contrat
+        out = StringIO()
+        call_command("sync_sites_billing", stdout=out)
+        text = out.getvalue()
+        self.assertEqual(SonatelInvoice.objects.get(pk=self.invoice.pk).site_id, a.pk)
+        self.assertIsNone(SonatelInvoice.objects.get(numero_facture="F3").site_id)  # conflit fiche A / lien B : non tranché
+        self.assertIn("liens : '022004880840'→DKR_0002", text)
+        self.assertIn("fiches : DKR_0001 (fiche : '22004880840')", text)
