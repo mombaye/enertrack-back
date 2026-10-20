@@ -10,7 +10,8 @@ class CoreConfig(AppConfig):
         from django.db.models.signals import post_save, pre_save
 
         from .models import Site
-        from .site_sync import on_site_post_save, on_site_pre_save
+        from .site_sync import on_contract_link_post_save, on_site_post_save, on_site_pre_save
 
         pre_save.connect(on_site_pre_save, sender=Site, dispatch_uid="core_site_scope")
         post_save.connect(on_site_post_save, sender=Site, dispatch_uid="core_site_contracts")
+        post_save.connect(on_contract_link_post_save, sender="billing.ContractSiteLink", dispatch_uid="core_contract_link_invoices")
