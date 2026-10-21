@@ -1299,6 +1299,10 @@ class FuelStockObservation(models.Model):
     source_user = models.CharField(max_length=255, null=True, blank=True)
     source_reference = models.CharField(max_length=255, null=True, blank=True)
     guard_scope_status = models.CharField(max_length=24, null=True, blank=True, help_text="IN_SCOPE, NOT_CONFIGURED, PROVIDER_MISMATCH (sources gardiennage).")
+    source_provenance = models.CharField(max_length=32, null=True, blank=True, help_text="ENOC : provenance du statut brut.")
+    business_status = models.CharField(max_length=28, null=True, blank=True, db_index=True, help_text="ENOC : statut métier eGrid.")
+    status_mapping_rule = models.CharField(max_length=255, null=True, blank=True)
+    eligible_for_stock = models.BooleanField(null=True, blank=True, help_text="ENOC : statut éligible au stock (NULL hors ENOC).")
     comment = models.TextField(null=True, blank=True)
     proof_reference = models.CharField(max_length=512, null=True, blank=True)
     validation_status = models.CharField(max_length=16, choices=ValidationStatus.choices, default=ValidationStatus.PENDING, db_index=True)
@@ -1384,6 +1388,10 @@ class FuelMovement(models.Model):
     quality_missing = models.JSONField(default=list, blank=True)
     date_source_used = models.CharField(max_length=16, null=True, blank=True,
                                         help_text="DATE_REELLE / DATE_VALIDATION / AUCUNE_DATE (provenance de movement_datetime).")
+    source_provenance = models.CharField(max_length=32, null=True, blank=True, help_text="ENOC : provenance du statut brut.")
+    business_status = models.CharField(max_length=28, null=True, blank=True, db_index=True, help_text="ENOC : statut métier eGrid.")
+    status_mapping_rule = models.CharField(max_length=255, null=True, blank=True)
+    eligible_for_stock = models.BooleanField(null=True, blank=True, help_text="ENOC : statut éligible au stock (NULL hors ENOC).")
     comment = models.TextField(null=True, blank=True)
     validated_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
     validated_at = models.DateTimeField(null=True, blank=True)
@@ -1568,6 +1576,13 @@ class FuelEnocQualifiedMovement(models.Model):
     fuel_manager_reviewed_at = models.DateTimeField(null=True, blank=True)
     fuel_manager_comment = models.TextField(null=True, blank=True)
 
+    # Mapping figé du statut ENOC (enoc_canonical.map_status) : brut → statut métier eGrid, règle tracée
+    source_provenance = models.CharField(max_length=32, null=True, blank=True, db_index=True,
+                                         help_text="ENOC_MONGO / ENOC_OPERATION_SANS_DEMANDE / API_REST_HISTORIQUE")
+    business_status = models.CharField(max_length=28, null=True, blank=True, db_index=True)
+    status_mapping_rule = models.CharField(max_length=255, null=True, blank=True)
+    eligible_for_stock = models.BooleanField(default=False, db_index=True)
+
     # Intégration eGrid sur données minimales : niveaux / photo / bon / compteur = qualité, jamais bloquants
     integration_status = models.CharField(max_length=28, choices=IntegrationStatus.choices, default=IntegrationStatus.NON_INTEGRABLE,
                                           db_index=True)
@@ -1608,3 +1623,105 @@ class FuelEnocQualifiedMovement(models.Model):
         db_table = "fuel_enoc_movement_qualified"
         ordering = ["-actual_operation_at", "-requested_at"]
         indexes = [models.Index(fields=["site_id_resolved", "actual_operation_at"])]
+
+
+class FuelStockBalance(models.Model):
+    """
+    Bilan stock au grain site + période EXACTE (jamais limité au mois civil) :
+        conso_reelle = stock_initial + livraisons_externes + carte_total + transferts_entrants + rajouts
+                       − transferts_sortants − retraits − vols − vidanges − stock_final
+    NULL reste NULL (stock manquant → conso NULL). Jamais « certifié » automatiquement : la certification est
+    une action explicite du Fuel Manager (FuelStockBalanceCertification, historique non modifiable).
+    """
+
+    class Statut(models.TextChoices):
+        PRET_A_CERTIFIER = "PRET_A_CERTIFIER", "Prêt à certifier"
+        PRET_A_CERTIFIER_AVEC_RESERVE = "PRET_A_CERTIFIER_AVEC_RESERVE", "Prêt à certifier avec réserve"
+        DONNEES_STOCK_INCOMPLETES = "DONNEES_STOCK_INCOMPLETES", "Données stock incomplètes"
+        MOUVEMENTS_A_CONTROLER = "MOUVEMENTS_A_CONTROLER", "Mouvements à contrôler"
+        HISTORIQUE_NON_VERIFIABLE = "HISTORIQUE_NON_VERIFIABLE", "Historique non vérifiable"
+
+    class Niveau(models.TextChoices):
+        NON_CERTIFIE = "NON_CERTIFIE", "Non certifié"
+        CERTIFIE = "CERTIFIE", "Certifié (Fuel Manager)"
+        CERTIFIE_AVEC_RESERVE = "CERTIFIE_AVEC_RESERVE", "Certifié avec réserve (Fuel Manager)"
+        A_RECERTIFIER = "A_RECERTIFIER", "À recertifier (données modifiées depuis la certification)"
+
+    country = models.CharField(max_length=8, null=True, blank=True, db_index=True)
+    site_id = models.CharField(max_length=64, db_index=True)
+    site_name = models.CharField(max_length=255, null=True, blank=True)
+    zone = models.CharField(max_length=64, null=True, blank=True, db_index=True)
+    typologie = models.CharField(max_length=255, null=True, blank=True, help_text="Typologie technique existante (installée).")
+    profil_energetique = models.CharField(max_length=64, null=True, blank=True)
+    observation_start = models.DateTimeField(db_index=True)
+    observation_end = models.DateTimeField(db_index=True)
+
+    stock_initial_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    source_stock_initial = models.CharField(max_length=32, null=True, blank=True)
+    date_stock_initial = models.DateTimeField(null=True, blank=True)
+    stock_initial_detail = models.JSONField(default=dict, blank=True)
+    stock_final_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    source_stock_final = models.CharField(max_length=32, null=True, blank=True)
+    date_stock_final = models.DateTimeField(null=True, blank=True)
+    stock_final_detail = models.JSONField(default=dict, blank=True)
+
+    truck_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    carte_total_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    transferts_entrants_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    transferts_sortants_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    vols_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    vidanges_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    retraits_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    rajouts_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    livraisons_externes_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True,
+                                                help_text="Truck / Eydon et autres livraisons externes (hors Carte Total).")
+    consommation_reelle_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    conso_journaliere_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True,
+                                              help_text="Consommation réelle / jours entre les deux relevés (référence commande).")
+
+    statut_bilan = models.CharField(max_length=32, choices=Statut.choices, db_index=True)
+    niveau_certification = models.CharField(max_length=24, choices=Niveau.choices, default=Niveau.NON_CERTIFIE, db_index=True)
+    motifs = models.JSONField(default=list, blank=True)
+    alertes = models.JSONField(default=list, blank=True)
+    candidats = models.JSONField(default=dict, blank=True, help_text="Relevés stock candidats (initial / final) et motif de sélection.")
+    mouvements = models.JSONField(default=list, blank=True, help_text="Mouvements constitutifs retenus.")
+    mouvements_exclus = models.JSONField(default=list, blank=True, help_text="Mouvements exclus ou à contrôler (avec motif).")
+    periode_effective_debut = models.DateTimeField(null=True, blank=True)
+    periode_effective_fin = models.DateTimeField(null=True, blank=True)
+    fingerprint = models.CharField(max_length=64, blank=True, default="")
+    calculated_at = models.DateTimeField(default=timezone.now)
+    rule_version = models.CharField(max_length=32, default="bilan-v1")
+
+    class Meta:
+        db_table = "fuel_stock_balance"
+        constraints = [models.UniqueConstraint(fields=["site_id", "observation_start", "observation_end"], name="uniq_fuel_stock_balance_period")]
+        indexes = [models.Index(fields=["observation_start", "observation_end", "statut_bilan"])]
+
+
+class FuelStockBalanceCertification(models.Model):
+    """Historique NON MODIFIABLE des certifications Fuel Manager (création seulement)."""
+
+    class Action(models.TextChoices):
+        CERTIFIE = "CERTIFIE", "Certifier"
+        CERTIFIE_AVEC_RESERVE = "CERTIFIE_AVEC_RESERVE", "Certifier avec réserve"
+
+    balance = models.ForeignKey(FuelStockBalance, on_delete=models.PROTECT, related_name="certifications")
+    action = models.CharField(max_length=24, choices=Action.choices)
+    comment = models.TextField(blank=True, default="")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, on_delete=models.PROTECT, related_name="+")
+    user_label = models.CharField(max_length=255, blank=True, default="")
+    created_at = models.DateTimeField(default=timezone.now)
+    fingerprint = models.CharField(max_length=64, help_text="Empreinte du bilan certifié (détecte une modification ultérieure).")
+    snapshot = models.JSONField(default=dict, help_text="Valeurs du bilan au moment de la certification.")
+
+    class Meta:
+        db_table = "fuel_stock_balance_certification"
+        ordering = ["-created_at", "-id"]
+
+    def save(self, *args, **kwargs):
+        if self.pk is not None:
+            raise ValueError("Historique de certification non modifiable.")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValueError("Historique de certification non modifiable.")

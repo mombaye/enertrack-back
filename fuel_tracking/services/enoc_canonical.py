@@ -109,16 +109,12 @@ PONC = {
     "note": ("transfer_note_number", "transfer_note", "bon_transfert", "bon_de_transfert", "transfer_slip_number",
              "transfer_slip", "numero_bon", "bon_number", "reference_bon", "bon"),
 }
-PONCTION_OK_STATUSES_DEFAULT = ("validated", "validee", "validée", "done")
 
 
 def ponction_settings() -> dict:
     from django.conf import settings
 
-    statuses = (getattr(settings, "FUEL_PONCTION_ACCEPTED_STATUSES", None) or getattr(settings, "FUEL_ENOC_VALIDATED_STATUSES", None)
-                or PONCTION_OK_STATUSES_DEFAULT)
-    return {"statuses": {str(x).strip().lower() for x in statuses},
-            "gap_min_l": Decimal(str(getattr(settings, "FUEL_PONCTION_GAP_MIN_L", 20))),
+    return {"gap_min_l": Decimal(str(getattr(settings, "FUEL_PONCTION_GAP_MIN_L", 20))),
             "gap_pct": Decimal(str(getattr(settings, "FUEL_PONCTION_GAP_PCT", 10)))}
 
 
@@ -460,8 +456,10 @@ def qualify(c: dict, now=None) -> dict:
     if c.get("operations_count", 0) > 1:
         alert("PLUSIEURS_OPERATIONS", f"{c['operations_count']} opérations ENOC pour cette demande : la plus récente est utilisée.")
 
+    st = c["_status_map"] = map_status(c)
+
     def result(classification, state, reason, recon="NON_REQUIS", **extra):
-        out = {"type_family": fam, "business_classification": classification, "execution_state": state,
+        out = {**st, "type_family": fam, "business_classification": classification, "execution_state": state,
                "stock_impact": False, "consumption_impact": False, "reason": reason, "missing_conditions": missing,
                "alerts": alerts, "blocking": any(a["blocking"] for a in alerts), "reconciliation_status": recon,
                "qualification_version": QUALIFICATION_VERSION, "transfer_id": None, "transfer_status": "NON_APPLICABLE",
@@ -489,8 +487,8 @@ def qualify(c: dict, now=None) -> dict:
 # ── Intégration eGrid sur données minimales (ajustement validé : exploiter l'historique ENOC) ────────────────
 CAUSE_LABEL = {
     "REJETEE": "Demande rejetée dans ENOC",
-    "HISTORIQUE_SANS_STATUT": "Historique ENOC (ancienne API) sans statut : validation non vérifiable",
-    "STATUT_NON_VALIDE": "Statut ENOC non validé (en attente / inconnu)",
+    "HISTORIQUE_SANS_STATUT": "Historique ENOC (ancien connecteur) : statut non vérifiable",
+    "STATUT_NON_VALIDE": "Statut ENOC non validé (en attente / inconnu / « done » sans validation tracée)",
     "TYPE_NON_RECONNU": "Type ENOC non reconnu",
     "DEMANDE_NON_EXECUTEE": "Demande validée sans opération réalisée (pas de quantité réelle)",
     "SITE_NON_IDENTIFIE": "Site absent ou inconnu de Gestion des sites",
@@ -503,11 +501,71 @@ CAUSE_LABEL = {
 CAUSE_ORDER = tuple(CAUSE_LABEL)
 
 
+# ── Mapping figé des statuts ENOC (traçable, configurable) ────────────────────────────────────────────────
+STATUS_MAPPING_VERSION = "enoc-status-v1"
+BUSINESS_STATUS_LABEL = {
+    "VALIDEE_EXECUTABLE": "Validée (exécutable)",
+    "VALIDEE_EXECUTEE": "Validée puis exécutée",
+    "HISTORIQUE_NON_VERIFIABLE": "Historique non vérifiable (ancien connecteur)",
+    "REJETEE": "Rejetée",
+    "EN_ATTENTE": "En attente de validation",
+    "STATUT_NON_VERIFIABLE": "Statut absent / inconnu / non vérifiable",
+}
+
+
+def status_settings() -> dict:
+    from django.conf import settings
+
+    validated = getattr(settings, "FUEL_ENOC_VALIDATED_STATUSES", None) or ("validated", "validee", "validée")
+    return {"validated": {str(x).strip().lower() for x in validated} - {"done"},
+            "done_is_executed": bool(getattr(settings, "FUEL_ENOC_DONE_IS_EXECUTED", True)),
+            "done_requires_validation": bool(getattr(settings, "FUEL_ENOC_DONE_REQUIRES_VALIDATION", True))}
+
+
+def map_status(c: dict) -> dict:
+    """
+    Statut brut ENOC → statut métier eGrid (règle tracée) :
+      validated (ENOC actuel)                         → VALIDEE_EXECUTABLE   éligible
+      done (ENOC actuel), validation tracée           → VALIDEE_EXECUTEE     éligible (FUEL_ENOC_DONE_IS_EXECUTED)
+      tout statut issu de l'ancien connecteur REST    → HISTORIQUE_NON_VERIFIABLE (rejected → REJETEE)
+      rejected                                        → REJETEE
+      pending / open…                                 → EN_ATTENTE
+      absent / inconnu / done sans validation tracée  → STATUT_NON_VERIFIABLE
+    """
+    cfg = status_settings()
+    raw = (c.get("raw_status") or "").strip().lower()
+    if c.get("_legacy_rest"):
+        prov = "API_REST_HISTORIQUE"
+    elif not c.get("_has_request"):
+        prov = "ENOC_OPERATION_SANS_DEMANDE"
+    else:
+        prov = "ENOC_MONGO"
+
+    def out(business, rule):
+        return {"source_provenance": prov, "business_status": business, "eligible_for_stock":
+                business in ("VALIDEE_EXECUTABLE", "VALIDEE_EXECUTEE"), "status_mapping_rule": f"{STATUS_MAPPING_VERSION} : {rule}"[:255]}
+
+    if raw in REJECTED_STATUSES:
+        return out("REJETEE", f"« {raw} » → REJETEE")
+    if prov == "API_REST_HISTORIQUE":
+        return out("HISTORIQUE_NON_VERIFIABLE", f"« {raw or 'aucun'} » créé par l'ancien connecteur REST : non vérifiable dans ENOC actuel")
+    if raw in cfg["validated"]:
+        return out("VALIDEE_EXECUTABLE", f"« {raw} » ENOC → VALIDEE_EXECUTABLE")
+    if raw == "done":
+        if not cfg["done_is_executed"]:
+            return out("STATUT_NON_VERIFIABLE", "« done » non retenu comme exécution validée (FUEL_ENOC_DONE_IS_EXECUTED=false)")
+        if cfg["done_requires_validation"] and not (c.get("approved_at") or c.get("validator_name")):
+            return out("STATUT_NON_VERIFIABLE", "« done » ENOC sans trace de validation (date ou valideur) : non vérifiable")
+        return out("VALIDEE_EXECUTEE", "« done » ENOC avec validation tracée → étape exécutée après validation")
+    if raw in OPEN_STATUSES:
+        return out("EN_ATTENTE", f"« {raw} » → EN_ATTENTE")
+    return out("STATUT_NON_VERIFIABLE", f"statut « {raw or 'absent'} » inconnu ou absent")
+
+
 def integration_settings() -> dict:
     from django.conf import settings
 
-    statuses = getattr(settings, "FUEL_ENOC_VALIDATED_STATUSES", None) or ("validated", "validee", "validée", "done")
-    return {"statuses": {str(x).strip().lower() for x in statuses},
+    return {
             "gap_min_l": Decimal(str(getattr(settings, "FUEL_PONCTION_GAP_MIN_L", 20))),
             "gap_pct": Decimal(str(getattr(settings, "FUEL_PONCTION_GAP_PCT", 10)))}
 
@@ -521,10 +579,10 @@ def accounting_date(c: dict) -> tuple[object | None, str]:
     return None, "AUCUNE_DATE"
 
 
-def _integration(fam, causes: list[str], legacy_no_status: bool) -> dict:
+def _integration(fam, causes: list[str], hnv: bool) -> dict:
     if not causes:
         return {"integration_status": "INTEGRE", "non_integration_cause": None}
-    if legacy_no_status:
+    if hnv:
         return {"integration_status": "HISTORIQUE_NON_VERIFIABLE", "non_integration_cause": "HISTORIQUE_SANS_STATUT"}
     first = min(causes, key=CAUSE_ORDER.index)
     return {"integration_status": "NON_INTEGRABLE", "non_integration_cause": first}
@@ -537,7 +595,8 @@ def qualify_delivery(c: dict, fam: str, status: str, now, alerts: list, missing:
     Niveaux, photo et compteur ne bloquent pas : ils produisent un statut de qualité.
     """
     cfg = integration_settings()
-    legacy_no_status = bool(c.get("_legacy_rest")) and not status
+    st = c.get("_status_map") or map_status(c)
+    legacy_no_status = st["business_status"] == "HISTORIQUE_NON_VERIFIABLE"
     causes: list[str] = []
 
     def need(cause, label):
@@ -545,9 +604,9 @@ def qualify_delivery(c: dict, fam: str, status: str, now, alerts: list, missing:
         missing.append(label)
 
     if legacy_no_status:
-        need("HISTORIQUE_SANS_STATUT", "statut ENOC (historique sans statut)")
-    elif status not in cfg["statuses"]:
-        need("STATUT_NON_VALIDE", f"statut validé (actuel : {c.get('raw_status') or 'aucun'})")
+        need("HISTORIQUE_SANS_STATUT", f"statut vérifiable (historique ancien connecteur, « {c.get('raw_status') or 'aucun'} »)")
+    elif not st["eligible_for_stock"]:
+        need("STATUT_NON_VALIDE", f"statut validé (actuel : {c.get('raw_status') or 'aucun'} → {st['business_status']})")
     if not c.get("site_id") or not c.get("_site_resolved", c.get("site_id")):
         need("SITE_NON_IDENTIFIE", "site identifié" + (f" (« {c['site_id']} » inconnu)" if c.get("site_id") else ""))
     qty = c.get("actual_quantity_l")
@@ -648,7 +707,8 @@ def qualify_ponction(c: dict, status: str, alerts: list, missing: list, alert, r
     src_site = c.get("_source_site_resolved", c.get("ponction_source_site_id"))
     dst_site = c.get("_site_resolved", c.get("site_id"))
     qty = c.get("approved_quantity_l")
-    legacy_no_status = bool(c.get("_legacy_rest")) and not status
+    st = c.get("_status_map") or map_status(c)
+    legacy_no_status = st["business_status"] == "HISTORIQUE_NON_VERIFIABLE"
     causes: list[str] = []
 
     def need(cause, label):
@@ -656,9 +716,9 @@ def qualify_ponction(c: dict, status: str, alerts: list, missing: list, alert, r
         missing.append(label)
 
     if legacy_no_status:
-        need("HISTORIQUE_SANS_STATUT", "statut ENOC (historique sans statut)")
-    elif status not in cfg["statuses"]:
-        need("STATUT_NON_VALIDE", f"statut ENOC validé (actuel : {c.get('raw_status') or 'aucun'})")
+        need("HISTORIQUE_SANS_STATUT", f"statut vérifiable (historique ancien connecteur, « {c.get('raw_status') or 'aucun'} »)")
+    elif not st["eligible_for_stock"]:
+        need("STATUT_NON_VALIDE", f"statut ENOC validé (actuel : {c.get('raw_status') or 'aucun'} → {st['business_status']})")
     if not c.get("ponction_source_site_id"):
         need("SITE_SOURCE_ABSENT", "site source")
     elif not src_site:
@@ -751,7 +811,7 @@ QUALIF_FIELDS = ("type_family", "business_classification", "execution_state", "s
                  "reason", "missing_conditions", "alerts", "blocking", "qualification_version", "transfer_id",
                  "transfer_status", "source_variation_l", "control_gap_l", "fuel_manager_alert", "integration_status",
                  "non_integration_cause", "quality_status", "quality_missing", "accounting_at", "date_source_used",
-                 "integrated_quantity_l")
+                 "integrated_quantity_l", "source_provenance", "business_status", "status_mapping_rule", "eligible_for_stock")
 
 
 def fingerprint(c: dict) -> str:
@@ -933,5 +993,16 @@ def integration_report() -> dict:
         f"{r['type_family']}:{r['non_integration_cause'] or 'AUTRE'}": r["n"]
         for r in rest.values("type_family", "non_integration_cause").annotate(n=Count("id")).order_by("type_family", "-n")}
     out["historiques_non_verifiables"] = Q.objects.filter(integration_status="HISTORIQUE_NON_VERIFIABLE").count()
+    # Détail par statut (mapping figé) : validated / done ENOC vérifié / done historique exclu / autres
+    def by_status(qs):
+        return {f"{r['raw_status'] or '(aucun)'} → {r['business_status'] or '?'} [{r['source_provenance'] or '?'}]": r["n"]
+                for r in qs.values("raw_status", "business_status", "source_provenance").annotate(n=Count("id")).order_by("-n")}
+    out["integres_par_statut"] = {
+        "validated": integ.filter(business_status="VALIDEE_EXECUTABLE").count(),
+        "done_enoc_verifie": integ.filter(business_status="VALIDEE_EXECUTEE").count(),
+        "autres": integ.exclude(business_status__in=("VALIDEE_EXECUTABLE", "VALIDEE_EXECUTEE")).count(),
+    }
+    out["done_historique_exclu"] = Q.objects.filter(business_status="HISTORIQUE_NON_VERIFIABLE", raw_status__iexact="done").count()
+    out["statuts_detail"] = by_status(Q.objects.all())
     out["total_mouvements"] = Q.objects.count()
     return out

@@ -130,7 +130,8 @@ QUALIFIED_CATEGORY = {
     "LIVRAISON_DECLAREE_A_RAPPROCHER": "LIVRAISON_DECLAREE", "PONCTION_A_QUALIFIER": "INCONNU", "TYPE_NON_RECONNU": "INCONNU",
     "CARTE_TOTAL_INTEGREE": "CARTE_TOTAL", "LIVRAISON_TRUCK_INTEGREE": "LIVRAISON_CONFIRMEE",
 }
-QUALITY_FIELDS = ("integration_status", "quality_status", "quality_missing", "date_source_used")
+QUALITY_FIELDS = ("integration_status", "quality_status", "quality_missing", "date_source_used", "source_provenance",
+                  "business_status", "status_mapping_rule", "eligible_for_stock")
 
 
 def _quality_alerts(q) -> list[dict]:
@@ -238,6 +239,7 @@ def _movement_fields(m, mappings: dict | None = None) -> dict:
         comment=(m.comment or None), counterpart_site_id=_counterpart(m),
         raw_operation_type=raw_key(m)[:128], source_category=category, mapping_rule=rule[:255], retained_in_stock=retained,
         impact_stock_l=None, integration_status=None, quality_status=None, quality_missing=[], date_source_used=None,
+        source_provenance=None, business_status=None, status_mapping_rule=None, eligible_for_stock=None,
     )
 
 
@@ -260,7 +262,8 @@ def _raw_level(v, unit) -> str | None:
 TRACKED_MOVEMENT_FIELDS = ("site_id", "movement_type", "movement_datetime", "requested_quantity_l", "quantity_l",
                            "supplier", "ticket_reference", "delivery_note", "proof_reference", "source_status", "status",
                            "source_category", "mapping_rule", "retained_in_stock", "raw_operation_type", "impact_stock_l",
-                           "integration_status", "quality_status", "quality_missing", "date_source_used")
+                           "integration_status", "quality_status", "quality_missing", "date_source_used", "business_status",
+                           "eligible_for_stock")
 
 
 def sync_enoc_to_registry(since=None, user=None, only_ids=None) -> dict:
@@ -366,7 +369,14 @@ def sync_enoc_to_registry(since=None, user=None, only_ids=None) -> dict:
                     proof_reference=fields["proof_reference"], extra_messages=extra, review_flags=flags,
                 )
                 new, _msgs = R.build_observation(inp, tanks.get(site_id, []), None)
+                qm = qualified.get(m.pk)
+                status_vals = {f: getattr(qm, f) if qm else None
+                               for f in ("source_provenance", "business_status", "status_mapping_rule", "eligible_for_stock")}
+                for f, v in status_vals.items():
+                    setattr(new, f, v)
                 old = existing_obs.get(event_id)
+                if old is not None and any(getattr(old, f) != v for f, v in status_vals.items()):
+                    type(old).objects.filter(pk=old.pk).update(**status_vals)
                 if old is None:
                     new.batch = get_batch()
                     new.import_row = row or _row(get_batch(), m, site_id, fields["alerts"])
@@ -409,7 +419,7 @@ def sync_enoc_to_registry(since=None, user=None, only_ids=None) -> dict:
 
 TRANSFER_TRACKED = ("site_id", "counterpart_site_id", "quantity_l", "impact_stock_l", "movement_datetime", "retained_in_stock",
                     "status", "proof_reference", "source_user", "alerts", "integration_status", "quality_status",
-                    "quality_missing", "date_source_used")
+                    "quality_missing", "date_source_used", "business_status", "eligible_for_stock")
 
 
 def _sync_transfer(q, get_batch, stats) -> bool:
@@ -434,7 +444,9 @@ def _sync_transfer(q, get_batch, stats) -> bool:
                           quantity_l=qty, impact_stock_l=impact, transfer_id=q.transfer_id,
                           movement_datetime=q.accounting_at or q.approved_at, integration_status="INTEGRE",
                           quality_status=q.quality_status, quality_missing=q.quality_missing or [],
-                          date_source_used=q.date_source_used,
+                          date_source_used=q.date_source_used, source_provenance=q.source_provenance,
+                          business_status=q.business_status, status_mapping_rule=q.status_mapping_rule,
+                          eligible_for_stock=q.eligible_for_stock,
                           retained_in_stock=True, status="CLOSED", source_status=q.raw_status, source_category="TRANSFERT_INTERSITE",
                           raw_operation_type=q.raw_movement_type, proof_reference=(q.transfer_note or "")[:512] or None,
                           source_user=q.validator_name, alerts=fm,

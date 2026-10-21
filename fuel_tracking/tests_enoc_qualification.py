@@ -230,19 +230,49 @@ class LegacyRestPayloadTests(EnocBase):
                 **({"quantity_added_liters": qty} if qty is not None else {}), **extra}
         return FuelEnocMovement.objects.create(**clean_payload(item))
 
-    def test_legacy_done_with_quantity_is_integrated(self):
+    def test_legacy_done_is_historical_not_verifiable(self):
         q = self.q(self.rest("REST-1", photos=["https://enoc/p/9.jpg"]))
-        self.assertEqual((q.raw_status, float(q.actual_quantity_l), q.quantity_unit, q.integration_status, q.quality_status),
-                         ("done", 150.0, "L", "INTEGRE", "NIVEAUX_MANQUANTS"))
+        self.assertEqual((q.raw_status, float(q.actual_quantity_l), q.quantity_unit), ("done", 150.0, "L"))
+        self.assertEqual((q.source_provenance, q.business_status, q.eligible_for_stock, q.integration_status),
+                         ("API_REST_HISTORIQUE", "HISTORIQUE_NON_VERIFIABLE", False, "HISTORIQUE_NON_VERIFIABLE"))
+        self.assertIn("ancien connecteur", q.status_mapping_rule)
         self.assertIn("SOURCE_API_REST_HISTORIQUE", [a["code"] for a in q.alerts])
         self.assertEqual(q.field_sources["raw_status"], "rest.status")
 
-    def test_legacy_without_status_not_verifiable_and_open_status(self):
+    def test_legacy_without_status_or_open_is_historical_and_rejected_stays_rejected(self):
         q = self.q(self.rest("REST-2", status=None))
         self.assertEqual((q.integration_status, q.non_integration_cause, q.stock_impact),
                          ("HISTORIQUE_NON_VERIFIABLE", "HISTORIQUE_SANS_STATUT", False))
         q3 = self.q(self.rest("REST-3", status="pending", qty=None, operation_date=None))
-        self.assertEqual((q3.execution_state, q3.integration_status), ("DEMANDE", "NON_INTEGRABLE"))
+        self.assertEqual(q3.business_status, "HISTORIQUE_NON_VERIFIABLE")
+        self.assertEqual(self.q(self.rest("REST-4", status="rejected")).business_status, "REJETEE")
+
+
+class StatusMappingTests(EnocBase):
+    """Mapping figé : validated → VALIDEE_EXECUTABLE ; done ENOC (validation tracée) → VALIDEE_EXECUTEE ; sinon non éligible."""
+
+    def test_validated_and_done_with_validation_trace_are_eligible(self):
+        q1 = self.q(self.mk("SM-1", status="validated"))
+        q2 = self.q(self.mk("SM-2", status="done"))
+        self.assertEqual((q1.business_status, q1.eligible_for_stock, q1.source_provenance), ("VALIDEE_EXECUTABLE", True, "ENOC_MONGO"))
+        self.assertEqual((q2.business_status, q2.eligible_for_stock, q2.integration_status), ("VALIDEE_EXECUTEE", True, "INTEGRE"))
+        E.sync_enoc_to_registry()
+        mv = FuelMovement.objects.get(source_event_id="SM-2")
+        self.assertEqual((mv.source_status, mv.business_status, mv.eligible_for_stock), ("done", "VALIDEE_EXECUTEE", True))
+        self.assertIn("enoc-status-v1", mv.status_mapping_rule)
+
+    def test_done_without_validation_trace_not_verifiable(self):
+        q = self.q(self.mk("SM-3", status="done", req_extra={"action": {}}))
+        self.assertEqual((q.business_status, q.eligible_for_stock, q.integration_status), ("STATUT_NON_VERIFIABLE", False, "NON_INTEGRABLE"))
+
+    def test_done_mapping_is_configurable(self):
+        from django.test import override_settings
+
+        with override_settings(FUEL_ENOC_DONE_IS_EXECUTED=False):
+            q = self.q(self.mk("SM-4", status="done"))
+        self.assertEqual((q.business_status, q.stock_impact), ("STATUT_NON_VERIFIABLE", False))
+        q0 = self.q(self.mk("SM-5", status=""))
+        self.assertEqual(q0.business_status, "STATUT_NON_VERIFIABLE")
 
 class ConnectorParityTests(TestCase):
     def test_all_operations_kept_and_empty_quantities_null(self):

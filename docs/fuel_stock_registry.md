@@ -392,3 +392,50 @@ Rien n'est inventé : une valeur absente reste NULL (jamais 0). Qualification `e
   `sync_stock_registry_enoc` (`integration_egrid`) et dans `enoc_parity_audit` (section 4 ter).
 - API : `GET stock/enoc/mouvements/?integration=…&qualite=…&cause=…` ; champs `statut_integration`, `cause_non_integration(_libelle)`,
   `qualite`, `qualite_manquant`, `date_comptable`, `date_source`, `quantite_integree_l` ; total `integres`, `historiques`.
+
+## Mapping figé des statuts ENOC (`enoc_canonical.map_status`, version `enoc-status-v1`)
+
+| Statut brut | Provenance | Statut métier eGrid | Éligible stock |
+|---|---|---|---|
+| `validated` (`FUEL_ENOC_VALIDATED_STATUSES`) | ENOC actuel (Mongo) | VALIDEE_EXECUTABLE | Oui (sous conditions) |
+| `done` avec validation tracée (date ou valideur) | ENOC actuel (Mongo) | VALIDEE_EXECUTEE | Oui (sous conditions) |
+| `done` sans validation tracée, ou `FUEL_ENOC_DONE_IS_EXECUTED=false` | ENOC actuel | STATUT_NON_VERIFIABLE | Non |
+| tout statut (sauf `rejected`) | ancien connecteur REST | HISTORIQUE_NON_VERIFIABLE | Non |
+| `rejected` | toutes | REJETEE | Non |
+| `pending` / ouvert | ENOC actuel | EN_ATTENTE | Non |
+| absent / inconnu | toutes | STATUT_NON_VERIFIABLE | Non |
+
+Conservés dans `fuel_enoc_movement_qualified`, `fuel_movement` et `fuel_stock_observation` : `raw_status` (`source_status`
+dans le registre), `source_provenance`, `business_status`, `status_mapping_rule`, `eligible_for_stock`.
+Variables : `FUEL_ENOC_VALIDATED_STATUSES` (défaut `validated,validee,validée`), `FUEL_ENOC_DONE_IS_EXECUTED` (défaut `true`),
+`FUEL_ENOC_DONE_REQUIRES_VALIDATION` (défaut `true`). Détail réel : `sync_stock_registry_enoc --rapport`
+(`integres_par_statut`, `done_historique_exclu`, `statuts_detail`).
+
+## Bilan de stock par site et période exacte (`services/stock_period_balance.py`, migration `0049`)
+
+Grain `country + site_id + observation_start + observation_end` (jamais limité au mois civil), table `fuel_stock_balance`.
+
+    consommation_reelle_l = stock_initial_l + livraisons_externes_l + carte_total_l + transferts_entrants_l + rajouts_l
+                            − transferts_sortants_l − retraits_l − vols_l − vidanges_l − stock_final_l
+
+- Truck / Eydon (et autres livraisons externes) → `livraisons_externes_l` (dont `truck_l`) ; Carte Total → `carte_total_l` ;
+  Ponction → transferts (impact net nul au niveau pays, réel au niveau site). NULL reste NULL.
+- Stocks : relevés VALIDÉS en base, litres natifs ou conversion cm → L par une cuve validée (mesure brute, unité, modèle, méthode
+  et règle conservés ; sinon `CONVERSION_CUVE_MANQUANTE`, aucun litre). Priorité : 1. closing mensuel validé, 2. gardiennage validé
+  (Loliforce / SCSS), 3. relevé ENOC qualifié (statut éligible), 4. autre source marquée. Relevé dans la période préféré, puis
+  priorité, puis proximité de la borne (fenêtre `FUEL_BALANCE_STOCK_WINDOW_H`, défaut 72 h). Candidats et motif de sélection
+  conservés ; écart > max(100 L ; 10 % capacité) entre sources → alerte `ECART_STOCK_CANDIDATS`.
+- Mouvements comptés entre les deux relevés retenus (fenêtre effective, dans la période) : ENOC intégrés (date comptable),
+  écritures de Ponction, mouvements validés des fichiers. Historique non vérifiable : exclu (listé).
+- Statuts : PRET_A_CERTIFIER, PRET_A_CERTIFIER_AVEC_RESERVE (qualité non complète, source de stock moins fiable, alerte),
+  DONNEES_STOCK_INCOMPLETES (stock manquant → conso NULL), MOUVEMENTS_A_CONTROLER (mouvement exécuté non intégrable → conso NULL,
+  conso négative, Ponction en attente Fuel Manager), HISTORIQUE_NON_VERIFIABLE (seulement de l'historique non vérifiable).
+- Certification : jamais automatique. Action Fuel Manager (`certifier` sur PRET_A_CERTIFIER, `certifier_avec_reserve` avec
+  commentaire obligatoire) ; `fuel_stock_balance_certification` non modifiable (utilisateur, date, commentaire, valeurs certifiées).
+  Recalcul avec valeurs différentes → `A_RECERTIFIER`.
+- Commande (préparation, sans génération) : stock final retenu, fraîcheur (`fraicheur_stock_final_h`), `conso_journaliere_l`, alertes.
+- Commande : `python manage.py compute_stock_balances --debut 2026-10-01 --fin 2026-10-31 [--site X] [--exemples]`.
+- API : `stock/bilans/` (liste paginée + filtres pays, zone, site, typologie, statut, certification, stock initial/final
+  présent/absent, source, à contrôler), `stock/bilans/periodes/`, `stock/bilans/calculer/`, `stock/bilans/<id>/`,
+  `stock/bilans/<id>/certifier/`, `stock/bilans/rapprochement/` (réel / instrumentée Snowflake / théorique CPH ; aucun écart si
+  la consommation réelle est NULL).

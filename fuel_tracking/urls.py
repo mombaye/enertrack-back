@@ -9,6 +9,8 @@ from fuel_tracking.views import (
     FuelConsommationListView,
     FuelStockListView,
 )
+from fuel_tracking.views_balance import (StockBalanceCertifyView, StockBalanceComputeView, StockBalanceDetailView,
+                                         StockBalanceListView, StockBalancePeriodsView, StockBalanceReconciliationView)
 from fuel_tracking.views_enoc import EnocMovementDetailView, EnocMovementListView, EnocMovementReconcileView, StockSiteBalanceView
 from fuel_tracking.views_stock import (
     EnergyAuditView,
@@ -56,6 +58,12 @@ urlpatterns = [
     path("stock/enoc/types/", EnocTypesView.as_view(), name="fuel-stock-enoc-types"),
     path("stock/enoc/mouvements/", EnocMovementListView.as_view(), name="fuel-stock-enoc-movements"),
     path("stock/registre/<str:site_id>/bilan/", StockSiteBalanceView.as_view(), name="fuel-stock-site-balance"),
+    path("stock/bilans/", StockBalanceListView.as_view(), name="fuel-stock-balances"),
+    path("stock/bilans/periodes/", StockBalancePeriodsView.as_view(), name="fuel-stock-balance-periods"),
+    path("stock/bilans/calculer/", StockBalanceComputeView.as_view(), name="fuel-stock-balance-compute"),
+    path("stock/bilans/rapprochement/", StockBalanceReconciliationView.as_view(), name="fuel-stock-balance-reconciliation"),
+    path("stock/bilans/<int:pk>/", StockBalanceDetailView.as_view(), name="fuel-stock-balance"),
+    path("stock/bilans/<int:pk>/certifier/", StockBalanceCertifyView.as_view(), name="fuel-stock-balance-certify"),
     path("stock/enoc/mouvements/<int:pk>/", EnocMovementDetailView.as_view(), name="fuel-stock-enoc-movement"),
     path("stock/enoc/mouvements/<int:pk>/rapprocher/", EnocMovementReconcileView.as_view(), name="fuel-stock-enoc-reconcile"),
     path("stock/modeles-cuves/", TankModelListView.as_view(), name="fuel-stock-modeles-cuves"),

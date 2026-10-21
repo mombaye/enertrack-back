@@ -244,8 +244,8 @@ class Command(BaseCommand):
                             for _, c in ponc if fn(c))
             w(f"| {label} | {ok}/{len(ponc)} ({100 * ok / pn:.0f} %) | {', '.join(f'{p} ({k})' for p, k in paths.most_common(2) if p) or '—'} |\n")
         st = Counter((m.raw_payload or {}).get("status") or C.extract(m)["raw_status"] for m, _ in ponc)
-        w(f"\nStatuts bruts des Ponctions : {dict(st)} — seuls {sorted(C.ponction_settings()['statuses'])} sont comptabilisables "
-          "(FUEL_PONCTION_ACCEPTED_STATUSES).\n")
+        w(f"\nStatuts bruts des Ponctions : {dict(st)} ; statut métier eGrid : "
+          f"{dict(Counter(C.map_status(c)['business_status'] for _, c in ponc))} (mapping {C.STATUS_MAPPING_VERSION}).\n")
         stored_p = [q for q in stored.values() if q.type_family == "PONCTION"]
         w(f"Statut de transfert : {dict(Counter(q.transfer_status for q in stored_p))} ; alerte Fuel Manager : "
           f"{dict(Counter(q.fuel_manager_alert for q in stored_p))}.\n")

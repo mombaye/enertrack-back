@@ -326,10 +326,12 @@ ENOC_MONGO_PASSWORD = os.getenv("ENOC_MONGO_PASSWORD", "")
 ENOC_MONGO_DB_NAME  = os.getenv("ENOC_MONGO_DB_NAME", "")
 # Ponction ENOC (règle validée) : statuts comptabilisables et seuil d'alerte Fuel Manager
 # écart de contrôle > max(FUEL_PONCTION_GAP_MIN_L ; FUEL_PONCTION_GAP_PCT % de la quantité approuvée)
-# Statuts ENOC « Validée » pour l'intégration eGrid (Ponction, Truck, Carte Total). « done » = demande validée puis
-# exécutée (workflow ENOC pending → validated → done) ; les quantités réelles n'existent qu'après exécution.
-FUEL_ENOC_VALIDATED_STATUSES = [x.strip() for x in os.getenv("FUEL_ENOC_VALIDATED_STATUSES", "validated,validee,validée,done").split(",") if x.strip()]
-FUEL_PONCTION_ACCEPTED_STATUSES = [x.strip() for x in os.getenv("FUEL_PONCTION_ACCEPTED_STATUSES", "").split(",") if x.strip()] or FUEL_ENOC_VALIDATED_STATUSES
+# Mapping figé des statuts ENOC (fuel_tracking/services/enoc_canonical.py::map_status, docs/fuel_stock_registry.md) :
+#   validated (ENOC actuel) → VALIDEE_EXECUTABLE ; done (ENOC actuel, validation tracée) → VALIDEE_EXECUTEE ;
+#   tout statut de l'ancien connecteur REST → HISTORIQUE_NON_VERIFIABLE ; rejected → REJETEE ; absent / inconnu → STATUT_NON_VERIFIABLE.
+FUEL_ENOC_VALIDATED_STATUSES = [x.strip() for x in os.getenv("FUEL_ENOC_VALIDATED_STATUSES", "validated,validee,validée").split(",") if x.strip()]
+FUEL_ENOC_DONE_IS_EXECUTED = os.getenv("FUEL_ENOC_DONE_IS_EXECUTED", "true").strip().lower() not in ("0", "false", "non", "no")
+FUEL_ENOC_DONE_REQUIRES_VALIDATION = os.getenv("FUEL_ENOC_DONE_REQUIRES_VALIDATION", "true").strip().lower() not in ("0", "false", "non", "no")
 FUEL_PONCTION_GAP_MIN_L = float(os.getenv("FUEL_PONCTION_GAP_MIN_L", "20"))
 FUEL_PONCTION_GAP_PCT = float(os.getenv("FUEL_PONCTION_GAP_PCT", "10"))
 # Lien vers une demande ENOC dans l'interface ENOC (optionnel), ex. https://enoc.example/fuel/requests/{reference}
