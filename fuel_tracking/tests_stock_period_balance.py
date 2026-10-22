@@ -229,7 +229,7 @@ class TankPlateDiagnosticTests(BalanceBase):
         a = FuelTankMaster.objects.create(site_id="DKR_0001", tank_id="1", validation_status="VALIDEE", shape_family="h-circ",
                                           dimension_1_cm=157, dimension_2_cm=80, dimension_3_cm=268, capacity_plate_l=1350)
         b = FuelTankMaster.objects.create(site_id="DKR_0002", tank_id="1", validation_status="VALIDEE", shape_family="h-circ",
-                                          dimension_1_cm=157, dimension_3_cm=268, capacity_plate_l=1500, capacity_l=5188)
+                                          dimension_1_cm=157, dimension_3_cm=268, capacity_plate_l=None, capacity_l=5188)
         for t in (a, b):
             self.obs(None, self.start, site=t.site_id, level_unit="CM", level_value=50, level_liters=None,
                      conversion_status="GEOMETRIC_ONLY", validation_status="PENDING")
@@ -239,6 +239,6 @@ class TankPlateDiagnosticTests(BalanceBase):
         self.assertIn("Cuves validées à plaque incohérente (relevés bloqués) : 2", text)
         self.assertIn("DKR_0001 cuve 1 h-circ 157.0/80.0/268.0 cm, plaque 1350.0 L", text)
         self.assertIn("→ DIAMETRE_EN_COTE_2", text)  # D = 80 cm : ≈ 1 347 L
-        self.assertIn("→ PLAQUE_ERRONEE", text)       # cotes cohérentes avec la capacité déclarée
+        self.assertIn("→ PLAQUE_ABSENTE", text)       # capacité Closing recalculée depuis les cotes : ne confirme rien
         a.refresh_from_db()
         self.assertEqual(float(a.dimension_1_cm), 157.0)  # lecture seule

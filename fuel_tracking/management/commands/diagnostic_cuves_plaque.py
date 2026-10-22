@@ -78,12 +78,14 @@ class Command(BaseCommand):
             cur = res[0]
             ok = [r for r in res[1:] if r[3] is not None and abs(r[3]) <= TOL]
             src_cap = _f(t.capacity_l)
-            cap_ok = bool(src_cap and cur[2] and abs(src_cap - cur[2]) / cur[2] <= TOL)
-            if ok:
-                best = min(ok, key=lambda r: abs(r[3]))
-                verdict = best[0]
-            elif cap_ok:
-                verdict = "PLAQUE_ERRONEE"  # la capacité déclarée par la source colle aux cotes : la plaque est fausse
+            if not plate:
+                # Pas de plaque : volume géométrique conservé comme valeur technique (jamais retenu automatiquement).
+                # La capacité « source » du Closing est recalculée depuis les cotes : elle ne confirme rien.
+                verdict = "PLAQUE_ABSENTE"
+            elif ok:
+                verdict = min(ok, key=lambda r: abs(r[3]))[0]
+            elif cur[3] is not None and abs(cur[3]) <= 0.15:
+                verdict = "ECART_LEGER_5_15_PCT"
             else:
                 verdict = "A_RELEVER_SUR_SITE"
             best_counter[verdict] += 1
@@ -101,8 +103,9 @@ class Command(BaseCommand):
         w(f"Cuves validées à plaque incohérente (relevés bloqués) : {len(tanks)} — relevés bloqués : {sum(r['releves_bloques'] for r in rows)}")
         w("Rapport géométrie actuelle / plaque : " + ", ".join(f"{k} = {v}" for k, v in ratio_counter.most_common()))
         w("Hypothèse qui rend la cuve cohérente (± 5 %) :")
-        labels.update({"PLAQUE_ERRONEE": "cotes cohérentes avec la capacité déclarée par la source : capacité de plaque probablement fausse",
-                       "A_RELEVER_SUR_SITE": "aucune hypothèse ne colle : cotes et plaque à relever sur site"})
+        labels.update({"PLAQUE_ABSENTE": "aucune capacité de plaque : volume géométrique seulement (plaque à relever, ou règle métier à décider)",
+                       "ECART_LEGER_5_15_PCT": "plaque présente, écart 5 à 15 % : cotes approximatives ou fonds bombés",
+                       "A_RELEVER_SUR_SITE": "plaque présente, aucune hypothèse ne colle : cotes et plaque à relever sur site"})
         for k, v in best_counter.most_common():
             w(f"  {k:<26} {v:>4}  {labels.get(k, '')}")
         w("\nExemples :")
