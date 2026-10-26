@@ -471,6 +471,39 @@ class MvpImportTests(TmpRootMixin, BalanceBase):
         self.assertEqual(c["unite_detectee"], "cm + litres")
         self.assertEqual(FuelImportBatch.objects.count(), 0)  # rien n'est importé
 
+    def test_closing_stock_preview_reads_blocks_and_checks_coherence(self):
+        from fuel_tracking.services.stock_file_analysis import analyze
+
+        head = ["Id du site", "Date de relevé initiale", "Qtité laissée à la date du relevé", "Qtité totale livrée",
+                "Qté rajoutée ou retirée de la cuve par les techniciens d' un site à l' autre", "Qté volée",
+                "Qté vidangée (fuel de mauvaise qualité)", "Date de relevé finale", "Qtité laissée à la date du relevé",
+                "Qtité cons considéréé (l)", "Test date", "Date de relevé", "Qtité laissée à la date du relevé"]
+        d1, d2 = datetime(2026, 8, 1), datetime(2026, 8, 31)
+        rows = [["Synthèse"], head,
+                ["DKR_0001", d1, 500, 200, 0, 0, 0, d2, 300, 400, None, d2, 999],      # 500 + 200 − 300 = 400 : cohérent
+                ["DKR_0002", d1, 800, 0, 0, 0, 0, d2, 600, 500, None, d2, 999],        # 200 calculés vs 500 : incohérent
+                ["DKR_0003", d1, None, 0, 0, 0, 0, d2, 100, None, None, d2, 999]]      # stock initial absent : jamais 0
+        res = analyze(xlsx({"Synthese conso fuel": rows}), "closing_aout.xlsx", "CLOSING")
+        cs = res["closing_stocks"]
+        self.assertEqual((cs["sites_lus"], cs["stock_initial_present"], cs["stock_final_present"], cs["sites_avec_les_deux_stocks_et_dates"]), (3, 2, 3, 2))
+        self.assertEqual((cs["controle_coherence"]["sites_verifies"], cs["controle_coherence"]["formule_coherente"]), (2, 1))
+        self.assertEqual((cs["dates_initiales"], cs["dates_finales"]), (["2026-08-01", "2026-08-01"], ["2026-08-31", "2026-08-31"]))
+        self.assertEqual(cs["stock_final_l"]["max"], 600.0)  # le stock final est lu dans le bloc FINAL, pas la valeur de la colonne répétée (999)
+        self.assertEqual(FuelImportBatch.objects.count(), 0)
+
+    def test_guard_analysis_ignores_empty_template_rows_and_flags_odd_dates(self):
+        from fuel_tracking.services.stock_file_analysis import analyze
+
+        rows = [guard_row("DKR_0001", cm=10, d=datetime(2026, 10, 3)), guard_row("DKR_0001", cm=None, l=None, d=None),
+                guard_row("DKR_0001", cm=12, d=datetime(2016, 10, 1)), guard_row("DKR_0001", cm=14, d=datetime(2027, 6, 14))]
+        res = analyze(xlsx({"KOLDA": [["SEMAINE 40"], [], HEAD] + rows}), "loli.xlsx", "LOLIFORCE")
+        c = res["controle_lignes"]
+        self.assertEqual((c["lignes_modele_vides_ignorees"], c["lignes_lues"], c["lignes_rejetees"]), (1, 3, 2))
+        self.assertEqual(c["periode_detectee"], ["2026-10-03", "2026-10-03"])
+        self.assertEqual(c["dates_invraisemblables"], ["2016-10-01", "2027-06-14"])
+        self.assertEqual(c["gardiennage_declare"], {"LOLIFORCE": 3})
+        self.assertEqual(res["periode_detectee"], ["2026-10-03", "2026-10-03"])
+
     def test_validation_sites_table_covers_profiles_read_only(self):
         self.stocks(500, 300)
         self.tc("TR-V1", 200, self.base + timedelta(days=10), typ="TRUCK")

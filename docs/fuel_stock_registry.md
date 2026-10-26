@@ -518,3 +518,11 @@ Paramètre `ALLOW_GEOMETRIC_TANK_ESTIMATION_WITH_RESERVE` (variable d'environnem
 validée sans plaque mais aux dimensions cohérentes produit une estimation, uniquement « estimation avec réserve » (« Volume calculé à partir des
 dimensions de cuve, plaque non confirmée »), jamais certifiable automatiquement. Après changement : `reestimate_stock_observations` puis
 `compute_stock_balances`.
+
+## Analyse des vrais fichiers (octobre 2026) — constats
+- **Closing** (`Esco Senegal - Synthèse Conso Fuel Aout 2026`, .xlsb) : la feuille « Synthese conso fuel » contient, par site, le stock initial et final
+  (colonnes « Qtité laissée à la date du relevé », en-têtes répétés : bloc initial puis bloc final), les mouvements de la période (livré, rajouts/retraits,
+  volé, vidangé) et la conso du Closing. L'import actuel n'en lit que les colonnes de cuves. L'analyse en donne désormais un aperçu par blocs avec un
+  contrôle de cohérence automatique (`closing_stocks`) ; l'import des stocks du Closing n'est activé qu'après validation de cet aperçu.
+- **Loliforce** : lignes de modèle pré-remplies (site seul, sans date ni niveau) ignorées et comptées à part (plus de faux rejets) ; dates invraisemblables
+  signalées séparément ; la colonne « Site gardé par » indique le prestataire réel (`gardiennage_declare`).

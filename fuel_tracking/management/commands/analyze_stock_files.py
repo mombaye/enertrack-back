@@ -70,8 +70,28 @@ class Command(BaseCommand):
         w(f"  Période       : {r.get('periode_detectee')} · lignes de données : {r.get('lignes_total')}")
         cov = r["couverture_sites"]
         w(f"  Sites         : {cov['distincts']} distincts, {cov['reconnus']} reconnus, {cov['inconnus']} non reconnus")
+        cs = r.get("closing_stocks")
+        if cs:
+            w("  Stocks du Closing (aperçu, non importé) :")
+            if not cs.get("en_tete_trouve"):
+                w("    en-tête « id du site / date de relevé initiale » introuvable")
+            else:
+                w(f"    sites lus {cs['sites_lus']} (reconnus {cs['sites_reconnus']}) · stock initial {cs['stock_initial_present']} · stock final {cs['stock_final_present']} · les deux + dates {cs['sites_avec_les_deux_stocks_et_dates']}")
+                w(f"    dates initiales {cs['dates_initiales']} · dates finales {cs['dates_finales']}")
+                w(f"    stock initial (L) {cs['stock_initial_l']} · stock final (L) {cs['stock_final_l']} · livré (L) {cs['livre_l']}")
+                cc = cs["controle_coherence"]
+                w(f"    contrôle : {cc['formule_coherente']}/{cc['sites_verifies']} sites cohérents avec la conso du Closing — {cc['formule']}")
+                for x in cc["exemples_ecarts"]:
+                    w(f"      écart {x}")
+                w(f"    colonnes utilisées : {cs['colonnes_utilisees']}")
         c = r.get("controle_lignes")
         if c:
+            if c.get("gardiennage_declare"):
+                w(f"  Gardiennage déclaré dans le fichier : {c['gardiennage_declare']} (colonne « Site gardé par »)")
+            if c.get("lignes_modele_vides_ignorees"):
+                w(f"  Lignes de modèle vides ignorées (ni date ni niveau) : {c['lignes_modele_vides_ignorees']}")
+            if c.get("dates_invraisemblables"):
+                w(f"  Dates invraisemblables (rejetées) : {c['dates_invraisemblables']}")
             w(f"  Unité         : {c['unite_detectee']} — relevés en litres {c['releves_en_litres']}, en cm {c['releves_en_cm']}, lignes avec deux unités {c['lignes_avec_deux_unites']}")
             w(f"  Contrôle      : {c['lignes_lues']} lues, {c['lignes_acceptees']} acceptées, {c['lignes_rejetees']} rejetées — motifs {c['motifs_rejet']}")
             if c["sites_non_reconnus_detail"]:
@@ -83,5 +103,10 @@ class Command(BaseCommand):
               + (f" — IGNORÉE : {s['ignoree'][:80]}" if s.get("ignoree") else ""))
             if s["colonnes_mappees"]:
                 w("      mapping : " + " ; ".join(f"{k} → {v}" for k, v in s["colonnes_mappees"].items()))
-            if s["colonnes_non_reconnues"]:
-                w("      non reconnues : " + " ; ".join(s["colonnes_non_reconnues"]))
+            nr = s["colonnes_non_reconnues"]
+            if nr:
+                w(f"      non reconnues ({len(nr)}) : " + " ; ".join(nr[:12]) + (" …" if len(nr) > 12 else ""))
+            elif not s["colonnes_mappees"] and s.get("colonnes"):
+                w("      colonnes : " + " ; ".join(map(str, s["colonnes"][:15])) + (" …" if len(s["colonnes"]) > 15 else ""))
+            if s.get("dates_invraisemblables"):
+                w(f"      dates invraisemblables : {s['dates_invraisemblables']}")

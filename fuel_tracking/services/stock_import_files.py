@@ -291,6 +291,9 @@ def process_guard_file(batch, file_bytes: bytes, file_name: str) -> dict:
     touched_sites = set()
 
     for sheet, n, raw, rec in rows:
+        if rec.get("cm") in (None, "") and rec.get("l") in (None, "") and rec.get("date") in (None, ""):
+            stats["lignes_modele_vides_ignorees"] = stats.get("lignes_modele_vides_ignorees", 0) + 1  # modèle pré-rempli : ni date ni niveau
+            continue
         messages: list[dict] = []
         if rec.get("site_id"):
             site_raw = str(rec.get("site_id")).strip()
