@@ -534,3 +534,12 @@ Lecture par blocs de la feuille « Synthese conso fuel » : sur 3 329 sites, 3 2
 une formule incohérente rend le stock « à valider ». Les mouvements du Closing (totaux sans date) ne sont pas importés : ils viennent d'ENOC.
 Contrôle de bout en bout : `python manage.py compare_closing_balances --lot <id> [--limite N] [--csv f.csv]` (lecture seule) compare le bilan eGrid de
 chaque site, sur sa propre période, à la consommation du Closing et mesure la couverture des entrées ENOC par rapport au « livré » du Closing.
+
+## Contrôle croisé Closing / ENOC (migration `0053`, `source_context`)
+Recette sur 300 sites du Closing d'août 2026 : le moteur concorde avec la consommation du Closing sur 182 des 221 sites comparables (médiane d'écart 0 L),
+mais 86 des 116 sites avec livraison au Closing ont moins d'entrées dans eGrid (ENOC) : des livraisons réelles n'y figurent pas. Un bilan à stocks Closing
+et sans ces livraisons était « prêt à certifier » avec une consommation fausse par défaut. Garde-fou : les stocks du Closing portent les totaux de période
+du Closing (`source_context`) ; quand les deux stocks retenus viennent de la même ligne de Closing, les mouvements nets d'eGrid sont comparés à ceux du
+Closing (±5 % ou 20 L). Entrées eGrid inférieures → `NON_CALCULABLE`, cause `ENTREES_NON_RETROUVEES` (jamais une consommation fausse présentée comme
+estimée) ; supérieures → alerte majeure (au mieux estimation avec réserve). La décision « quelle source fait foi pour les livraisons d'une période de
+Closing » reste à prendre (Closing ou ENOC).

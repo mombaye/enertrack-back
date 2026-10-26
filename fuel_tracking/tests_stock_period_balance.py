@@ -1,6 +1,7 @@
 """MVP Suivi Carburant : bilan par site et période exacte, fraîcheur, estimations avec réserve, score, imports, qualité."""
 import json
 from datetime import datetime, time, timedelta
+from datetime import timezone as dt_tz
 from decimal import Decimal
 from io import StringIO
 from unittest import mock
@@ -519,6 +520,20 @@ class MvpImportTests(TmpRootMixin, BalanceBase):
         again = P.relaunch(b, "test idempotence")
         self.assertEqual(Obs.objects.filter(source_type="CLOSING").count(), n)
         self.assertEqual(again.summary["stocks_closing"]["doublons"], 4)
+
+    def test_closing_period_totals_cross_check_blocks_false_certification(self):
+        P.process_bytes(self.closing_file(), "closing_aout.xlsx", "CLOSING", origin="UPLOAD")
+        start, end = datetime(2026, 8, 1, tzinfo=dt_tz.utc), datetime(2026, 8, 31, 23, 59, 59, tzinfo=dt_tz.utc)
+        # Le Closing compte 200 L livrés ; aucune livraison dans ENOC : consommation NON calculée (pas de 300 L « certifiés » à tort)
+        r = SB.compute_balances(start, end, site_ids=["DKR_0001"], persist=False)[0]
+        self.assertEqual((r["statut_bilan"], r["cause_principale"], r["consommation_reelle_l"]), ("NON_CALCULABLE", "ENTREES_NON_RETROUVEES", None))
+        self.assertTrue(any("non retrouvée" in m for m in r["motifs"]))
+        # La livraison est retrouvée dans ENOC : la consommation (400 L) concorde avec le Closing
+        self.tc("TC-CL1", 200, datetime(2026, 8, 15, tzinfo=dt_tz.utc), typ="TRUCK",
+                req_extra={"level_before": 100, "level_before_unit": "L"}, op_extra={"level_after": 300, "level_after_unit": "L"})
+        r = SB.compute_balances(start, end, site_ids=["DKR_0001"], persist=False)[0]
+        self.assertEqual((float(r["consommation_reelle_l"]), r["statut_bilan"]), (400.0, "PRET_A_CERTIFIER"))
+        self.assertEqual(r["stock_initial_detail"]["reference_closing"]["ecart_l"], 0.0)
 
     def test_compare_closing_balances_end_to_end(self):
         from tempfile import NamedTemporaryFile

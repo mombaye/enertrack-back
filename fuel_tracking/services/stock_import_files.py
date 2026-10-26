@@ -634,7 +634,7 @@ def _process_closing_stocks(batch, file_bytes: bytes, file_name: str, resolver) 
         data, _diag = closing_stock_rows(rows)
     site_ids = {resolver.resolve(r["site"]) for r in data} - {None}
     tanks = R.site_tanks(site_ids)
-    existing = set(Obs.objects.filter(source_type="CLOSING", site_id__in=site_ids).values_list("source_event_id", flat=True))
+    existing = dict(Obs.objects.filter(source_type="CLOSING", site_id__in=site_ids).values_list("source_event_id", "pk"))
     for r in data:
         site_id = resolver.resolve(r["site"])
         if site_id is None:
@@ -651,10 +651,14 @@ def _process_closing_stocks(batch, file_bytes: bytes, file_name: str, resolver) 
                 stats["sans_carburant_ignores"] += 1  # site sans GE : pas de carburant, ce n'est pas un 0 L mesuré
                 continue
             event_id = "CL:" + fingerprint("CLOSING", site_id, d, kind, value)
+            context = {"type": "closing_periode", "periode": [r["date_initiale"].isoformat(), r["date_finale"].isoformat()],
+                       "livre_l": r["livre_l"], "rajout_retrait_l": r["rajout_retrait_l"], "vole_l": r["vole_l"], "vidange_l": r["vidange_l"],
+                       "conso_closing_l": _ref, "formule_coherente": coherent}
             if event_id in existing:
+                Obs.objects.filter(pk=existing[event_id]).update(source_context=context)  # complète le contexte d'un stock déjà importé
                 stats["doublons"] += 1
                 continue
-            existing.add(event_id)
+            existing[event_id] = None
             flags = []
             if coherent is False:
                 flags.append(R.flag("CLOSING_FORMULE_INCOHERENTE", f"Formule du Closing incohérente pour ce site (calcul {_calc:.0f} L ≠ consommation "
@@ -667,6 +671,7 @@ def _process_closing_stocks(batch, file_bytes: bytes, file_name: str, resolver) 
                 comment=f"Stock {kind} du Closing mensuel (qtité laissée à la date du relevé).", review_flags=flags)
             obs, _msgs = R.build_observation(inp, [], None)  # litres natifs : pas de conversion de cuve
             obs.tank_id = SITE_TOTAL
+            obs.source_context = context
             blocking = {"CAPACITY_NOT_VALIDATED", "NO_VALIDATED_TANK", "MULTI_TANK_WITHOUT_ID"}
             if obs.validation_status == Obs.ValidationStatus.PENDING and not flags and set(obs.issue_codes or []) <= blocking:
                 obs.validation_status = Obs.ValidationStatus.VALIDATED

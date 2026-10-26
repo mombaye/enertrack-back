@@ -1313,6 +1313,8 @@ class FuelStockObservation(models.Model):
                                            help_text="Litres ESTIMÉS (cuve géométrique sans plaque / cuve proposée) : jamais level_liters.")
     estimation_mode = models.CharField(max_length=40, null=True, blank=True)
     estimation_detail = models.JSONField(default=dict, blank=True, help_text="Cuve, statut, modèle, score, dimensions, formule et version.")
+    source_context = models.JSONField(default=dict, blank=True,
+                                      help_text="Contexte fourni par la source (ex. totaux de période du Closing : livré, rajouts/retraits, volé, vidangé, conso).")
     potential_duplicate_of = models.IntegerField(null=True, blank=True, db_index=True,
                                                  help_text="Relevé de priorité supérieure aux valeurs équivalentes (même site, jour et cuve) : DOUBLON_POTENTIEL.")
     source_provenance = models.CharField(max_length=32, null=True, blank=True, help_text="ENOC : provenance du statut brut.")

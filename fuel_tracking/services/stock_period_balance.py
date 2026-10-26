@@ -128,7 +128,7 @@ def _candidate(o: dict, boundary, final: bool, c: dict) -> dict:
         "methode_conversion": o["conversion_method"], "modele_cuve": o.get("tank_model_ref"),
         "regle_conversion": o.get("conversion_rule"), "cuve": o.get("tank_id"),
         "confiance": "FAIBLE" if est else (o.get("confidence") or ("MOYENNE" if o["source_type"] == "ENOC" else "HAUTE" if certifiable else "FAIBLE")),
-        "detail_estimation": o.get("estimation_detail") if est else None,
+        "detail_estimation": o.get("estimation_detail") if est else None, "contexte_source": o.get("source_context") or None,
         "certifiable": certifiable, "dans_periode": tier in ("EXACT",) or (tier == "POSTERIEUR" and not final),
         "ecart_borne_h": round(abs((t - boundary).total_seconds()) / 3600, 1),
         "utilisable": reason is None, "motif_rejet": reason,
@@ -213,7 +213,7 @@ def compute_balances(start, end, site_ids=None, persist=True) -> list[dict]:
     for o in obs_qs.values("id", "site_id", "tank_id", "source_type", "observation_datetime", "level_raw", "level_value", "level_unit",
                            "level_cm", "level_liters", "conversion_method", "conversion_status", "conversion_rule", "tank_model_ref",
                            "validation_status", "eligible_for_stock", "business_status", "reading_quality_status", "confidence",
-                           "estimated_liters", "estimation_mode", "estimation_detail"):
+                           "estimated_liters", "estimation_mode", "estimation_detail", "source_context"):
         obs_by_site[o["site_id"]].append(o)
     enoc_by_site = defaultdict(list)
     for q in enoc_qs:
@@ -332,6 +332,16 @@ def _movements(site_id, enoc, movements, t0, t1, end, c, unbalanced):  # noqa: C
     return comps, counted, excluded, after_final, st, sorted(defect_kinds)
 
 
+def _closing_reference(ini, fin) -> dict | None:
+    """Totaux de période du Closing, si les deux stocks retenus viennent de la même ligne de Closing (même période)."""
+    if not (ini and fin) or ini.get("source") != "CLOSING" or fin.get("source") != "CLOSING":
+        return None
+    a, b = ini.get("contexte_source") or {}, fin.get("contexte_source") or {}
+    if a.get("type") == "closing_periode" and a.get("periode") and a.get("periode") == b.get("periode"):
+        return a
+    return None
+
+
 def ponctions_globales(start, end) -> dict:
     """Ponctions de la période, sur les mouvements eux-mêmes (indépendant des fenêtres de stock de chaque site) :
     entrées − sorties doit valoir 0 (chaque transfert a deux écritures liées de somme nulle)."""
@@ -425,6 +435,27 @@ def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, pro
     if site is None:
         cause = "SITE_NON_RECONNU"
         motifs.insert(0, "Site absent de Gestion des sites : bilan non calculable.")
+
+    # Contrôle croisé : quand les DEUX stocks viennent du même Closing, ses totaux de période (livré, rajouts/retraits, volé, vidangé) disent
+    # ce qui est réellement entré / sorti. Des entrées eGrid (ENOC) inférieures = livraison(s) non retrouvée(s) → consommation fausse par défaut.
+    closing_ref = _closing_reference(ini, fin)
+    if closing_ref:
+        eg = (comps["livraisons_externes_l"] + comps["carte_total_l"] + comps["transferts_entrants_l"] + comps["rajouts_l"]
+              - comps["transferts_sortants_l"] - comps["retraits_l"] - comps["vols_l"] - comps["vidanges_l"])
+        cl = Decimal(str(closing_ref.get("livre_l") or 0)) + Decimal(str(closing_ref.get("rajout_retrait_l") or 0)) \
+            - Decimal(str(closing_ref.get("vole_l") or 0)) - Decimal(str(closing_ref.get("vidange_l") or 0))
+        gap, tol = eg - cl, max(Decimal(20), Decimal("0.05") * abs(cl))
+        ref_out = {"mouvements_nets_egrid_l": _f(eg), "mouvements_nets_closing_l": _f(cl), "ecart_l": _f(gap),
+                   "conso_closing_l": closing_ref.get("conso_closing_l")}
+        for x in (ini, fin):
+            x["reference_closing"] = ref_out
+        if gap < -tol:
+            cause = cause or "ENTREES_NON_RETROUVEES"
+            motifs.append(f"Le Closing compte {_f(cl):.0f} L d'entrées nettes sur la période, eGrid (ENOC) seulement {_f(eg):.0f} L : "
+                          f"livraison(s) non retrouvée(s) dans ENOC ({_f(-gap):.0f} L) — consommation non calculée (conso du Closing : "
+                          f"{closing_ref.get('conso_closing_l') if closing_ref.get('conso_closing_l') is None else round(closing_ref['conso_closing_l'])} L).")
+        elif gap > tol:
+            major.append(f"Entrées eGrid (ENOC) supérieures de {_f(gap):.0f} L à celles du Closing ({_f(cl):.0f} L) : livraison non confirmée au Closing ?")
 
     conso = None
     can = ini and fin and not cause
