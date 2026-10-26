@@ -252,6 +252,8 @@ class MvpBalanceTests(BalanceBase):
         self.assertEqual((float(dst["consommation_reelle_l"]), float(src["consommation_reelle_l"])), (300.0, 100.0))
         self.assertEqual((float(dst["impact_ponctions_l"]), float(src["impact_ponctions_l"])), (100.0, -100.0))
         self.assertEqual(sum(float(r["impact_ponctions_l"]) for r in rows.values()), 0.0)  # impact pays nul
+        g = SB.ponctions_globales(self.start, self.end)
+        self.assertEqual((g["entrantes_l"], g["sortantes_l"], g["impact_global_l"]), (100.0, 100.0, 0.0))  # indépendant des fenêtres de stock
         self.assertEqual((float(dst["entrees_externes_nettes_l"]), float(dst["volume_transfere_l"])), (0.0, 0.0))  # pas un achat
         # écriture déséquilibrée : bilan non calculable
         FuelMovement.objects.filter(transfer_id="ENOC-PONCTION-PO-B1", movement_direction="IN").update(impact_stock_l=Decimal("90"))
@@ -317,6 +319,14 @@ class MvpBalanceTests(BalanceBase):
         r = self.compute()["DKR_0001"]
         b.refresh_from_db()
         self.assertEqual((float(r["consommation_reelle_l"]), b.niveau_certification, b.certifications.count()), (250.0, "A_RECERTIFIER", 1))
+
+    def test_identical_stocks_without_movement_flagged(self):
+        self.stocks(400, 400)
+        r = self.compute()["DKR_0001"]
+        self.assertEqual(float(r["consommation_reelle_l"]), 0.0)
+        self.assertEqual(r["statut_bilan"], "ESTIMATION_AVEC_RESERVE")
+        self.assertTrue(any("identiques" in a for a in r["alertes"]))
+        self.assertLess(r["score_confiance"], 100)
 
     def test_site_not_recognised(self):
         self.stocks(500, 300, site="GHOST_1")

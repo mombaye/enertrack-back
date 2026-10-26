@@ -133,7 +133,8 @@ class StockBalanceListView(APIView):
             "livraisons_truck_eydon_l": z(vol["truck"]), "ravitaillements_carte_total_l": z(vol["carte"]),
             "entrees_externes_nettes_l": z(vol["truck"]) + z(vol["carte"]),
             "ponctions_entrantes_l": z(vol["ent"]), "ponctions_sortantes_l": z(vol["sor"]), "volume_transfere_entre_sites_l": z(vol["sor"]),
-            "impact_global_ponctions_l": round(z(vol["ent"]) - z(vol["sor"]), 3), "volume_brut_integre_l": z(vol["brut"]),
+            "impact_global_ponctions_l": __import__("fuel_tracking.services.stock_period_balance", fromlist=["x"]).ponctions_globales(start, end)["impact_global_l"] if start and end else 0.0,
+            "volume_brut_integre_l": z(vol["brut"]),
             "note": "Les Ponctions sont des transferts internes : elles ne sont ni des achats ni une entrée nette de carburant ; "
                     "leur impact global (pays) est nul.",
         }

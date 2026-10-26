@@ -332,6 +332,20 @@ def _movements(site_id, enoc, movements, t0, t1, end, c, unbalanced):  # noqa: C
     return comps, counted, excluded, after_final, st, sorted(defect_kinds)
 
 
+def ponctions_globales(start, end) -> dict:
+    """Ponctions de la période, sur les mouvements eux-mêmes (indépendant des fenêtres de stock de chaque site) :
+    entrées − sorties doit valoir 0 (chaque transfert a deux écritures liées de somme nulle)."""
+    from django.db.models import Sum
+
+    from fuel_tracking.models import FuelMovement
+
+    qs = FuelMovement.objects.filter(retained_in_stock=True, movement_datetime__range=(start, end),
+                                     movement_type__in=("TRANSFERT_INTERSITE_SORTANT", "TRANSFERT_INTERSITE_ENTRANT"))
+    ent = qs.filter(movement_type="TRANSFERT_INTERSITE_ENTRANT").aggregate(v=Sum("impact_stock_l"))["v"] or D0
+    sor = qs.filter(movement_type="TRANSFERT_INTERSITE_SORTANT").aggregate(v=Sum("impact_stock_l"))["v"] or D0
+    return {"entrantes_l": float(abs(ent)), "sortantes_l": float(abs(sor)), "impact_global_l": round(float(ent + sor), 3)}
+
+
 def _score(c, ini, fin, st, major_alerts, has_movement_defects) -> tuple[int, list[dict]]:
     w = c["weights"]
     present = [x for x in (ini, fin) if x]
@@ -404,6 +418,8 @@ def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, pro
         reserves.append(f"{st['defects']} mouvement(s) intégré(s) avec contrôles manquants ({', '.join(defect_kinds)}).")
     if any("ECART_STOCK_CANDIDATS" in a for a in alerts):
         major.append("Écart important entre relevés candidats.")
+    if ini and fin and ini["litres"] == fin["litres"] and not any(comps[k] for k in ("livraisons_externes_l", "carte_total_l", "transferts_entrants_l", "rajouts_l")):
+        major.append("Stock initial et final identiques sans aucun mouvement : consommation nulle suspecte (relevé reporté ou capteur figé ?).")
     if site is None:
         cause = "SITE_NON_RECONNU"
         motifs.insert(0, "Site absent de Gestion des sites : bilan non calculable.")

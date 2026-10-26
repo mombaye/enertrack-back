@@ -69,7 +69,9 @@ class Command(BaseCommand):
                "cuves_proposees_utilisees": len(tanks_used["PROPOSEE"]),
                "volumes": {k: float(sum((r[k] or 0) for r in rows)) for k in ("livraisons_externes_l", "carte_total_l", "entrees_externes_nettes_l",
                                                                               "transferts_entrants_l", "transferts_sortants_l", "volume_brut_integre_l")}}
-        out["volumes"]["impact_global_ponctions_l"] = round(out["volumes"]["transferts_entrants_l"] - out["volumes"]["transferts_sortants_l"], 3)
+        from fuel_tracking.services.stock_period_balance import ponctions_globales
+
+        out["volumes"]["impact_global_ponctions_l"] = ponctions_globales(start, end)["impact_global_l"]  # sur les mouvements : doit valoir 0
         if exemples:
             def pick(status):
                 return next((r for r in rows if r["statut_bilan"] == status), None)
