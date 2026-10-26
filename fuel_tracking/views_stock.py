@@ -546,6 +546,7 @@ def _batch(b):
         "rows_pending": b.rows_pending, "rows_duplicate": b.rows_duplicate, "summary": b.summary,
         "received_at": b.received_at, "processed_at": b.processed_at,
         "received_by": getattr(b.received_by, "username", None),
+        "declared_period_start": b.declared_period_start, "declared_period_end": b.declared_period_end, "mapping_version": b.mapping_version,
     }
 
 

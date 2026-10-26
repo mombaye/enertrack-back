@@ -96,6 +96,38 @@ def _finalize_counts(batch):
     )
 
 
+MAPPING_VERSIONS = {"LOLIFORCE": "gardiennage-v1", "SCSS": "gardiennage-v1", "CLOSING": "closing-v1",
+                    "HISTORICAL_REFUELING": "refueling-v1", "TANK_MODELS": "tank-models-v1"}
+
+
+def _declare_period(batch):
+    """Période déclarée du lot (première / dernière date d'événement des lignes) et version du mapping appliqué."""
+    from django.db.models import Max, Min
+
+    agg = batch.rows.exclude(event_datetime__isnull=True).aggregate(a=Min("event_datetime"), b=Max("event_datetime"))
+    batch.declared_period_start = agg["a"].date() if agg["a"] else None
+    batch.declared_period_end = agg["b"].date() if agg["b"] else None
+    batch.mapping_version = MAPPING_VERSIONS.get(batch.source_type)
+
+
+def report_csv(batch) -> str:
+    """Rapport complet du lot (toutes les lignes, avec statut et motifs de rejet) — téléchargeable depuis l'interface."""
+    import io
+
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";")
+    w.writerow(["lot", "source", "fichier", "empreinte", "mapping", "periode_declaree", "importe_par", "importe_le", "statut_lot"])
+    w.writerow([batch.pk, batch.source_type, batch.file_name, batch.file_hash, batch.mapping_version or "",
+                f"{batch.declared_period_start or ''} → {batch.declared_period_end or ''}",
+                getattr(batch.received_by, "username", "") or batch.origin, batch.received_at.isoformat(), batch.status])
+    w.writerow([])
+    w.writerow(["feuille", "ligne", "site_brut", "site", "statut", "codes", "messages"])
+    for r in batch.rows.order_by("sheet_name", "row_number").iterator():
+        w.writerow([r.sheet_name, r.row_number, r.site_id_raw, r.site_id_resolved, r.validation_status,
+                    ",".join(m.get("code", "") for m in r.messages or []), " | ".join(m.get("message", "") for m in r.messages or [])])
+    return buf.getvalue()
+
+
 def _decide_status(batch) -> tuple[str, str]:
     from fuel_tracking.models import FuelImportBatch as B
 
@@ -159,6 +191,7 @@ def process_bytes(data: bytes, file_name: str, source_type: str, *, origin: str 
         with transaction.atomic():
             stats = F.PROCESSORS[source_type](batch, data, file_name)
             _finalize_counts(batch)
+            _declare_period(batch)
             batch.status, batch.status_message = _decide_status(batch)
             batch.summary = stats
     except Exception as exc:  # échec technique : le lot reste tracé, le fichier va dans rejected/

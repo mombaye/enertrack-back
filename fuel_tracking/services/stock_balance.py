@@ -87,7 +87,7 @@ def site_balance(site_id: str, start: date, end: date, with_reference=True) -> d
         unknown.append({"source": "ENOC", "ref": q.enoc_reference, "date": when, "type": q.raw_movement_type,
                         "etat": q.integration_status, "motif": q.reason})
     # Transferts inter-sites ENOC (Ponction comptabilisée) : écriture signée du site (−source / +destinataire).
-    for mv in FuelMovement.objects.filter(site_id=site_id, source_type="ENOC", movement_type="TRANSFERT_INTERSITE", retained_in_stock=True,
+    for mv in FuelMovement.objects.filter(site_id=site_id, source_type="ENOC", movement_type__in=("TRANSFERT_INTERSITE_SORTANT", "TRANSFERT_INTERSITE_ENTRANT"), retained_in_stock=True,
                                           movement_datetime__gt=t0, movement_datetime__lte=t1):
         comp = "transferts_entree" if mv.movement_direction == "IN" else "transferts_sortie"
         comps[comp] += abs(mv.impact_stock_l or D0)

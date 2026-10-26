@@ -440,7 +440,7 @@ def _sync_transfer(q, get_batch, stats) -> bool:
         legs = {"OUT": (q.ponction_source_site_resolved, -qty, q.site_id_resolved),
                 "IN": (q.site_id_resolved, qty, q.ponction_source_site_resolved)}
         for direction, (site, impact, counterpart) in legs.items():
-            values = dict(site_id=site, counterpart_site_id=counterpart, movement_type="TRANSFERT_INTERSITE", movement_direction=direction,
+            values = dict(site_id=site, counterpart_site_id=counterpart, movement_type=("TRANSFERT_INTERSITE_SORTANT" if direction == "OUT" else "TRANSFERT_INTERSITE_ENTRANT"), movement_direction=direction,
                           quantity_l=qty, impact_stock_l=impact, transfer_id=q.transfer_id,
                           movement_datetime=q.accounting_at or q.approved_at, integration_status="INTEGRE",
                           quality_status=q.quality_status, quality_missing=q.quality_missing or [],

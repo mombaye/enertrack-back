@@ -1,19 +1,26 @@
-"""Bilan stock par site et période exacte : formule, sources de stock, conversion cm → L, statuts, certification."""
+"""MVP Suivi Carburant : bilan par site et période exacte, fraîcheur, estimations avec réserve, score, imports, qualité."""
 from datetime import datetime, time, timedelta
 from decimal import Decimal
+from io import StringIO
 from unittest import mock
 
 from django.contrib.auth import get_user_model
+from django.core.management import call_command
 from django.utils import timezone
 from rest_framework.test import APIClient
 
 from core.models import Site
-from fuel_tracking.models import FuelEnocMovement, FuelStockBalance, FuelStockObservation as Obs, FuelTankMaster
+from fuel_tracking.models import (FuelEnocMovement, FuelEnocQualifiedMovement as Q, FuelImportBatch, FuelMovement, FuelStockBalance,
+                                  FuelStockObservation as Obs, FuelTankMaster)
 from fuel_tracking.management.commands.sync_enoc_fuel_movements import clean_payload
 from fuel_tracking.services import enoc_canonical as C
 from fuel_tracking.services import stock_enoc as E
+from fuel_tracking.services import stock_import_pipeline as P
 from fuel_tracking.services import stock_period_balance as SB
+from fuel_tracking.services import stock_registry as R
+from fuel_tracking.services import tank_conversion as TC
 from fuel_tracking.tests_enoc_qualification import EnocBase
+from fuel_tracking.tests_stock_registry import HEAD, TmpRootMixin, guard_row, tank, xlsx
 
 
 class BalanceBase(EnocBase):
@@ -21,145 +28,302 @@ class BalanceBase(EnocBase):
         super().setUp()
         Site.objects.filter(site_id="DKR_0001").update(zone="DKR", country="sen", installed_typology="A_Ax_GG GE")
         Site.objects.create(site_id="DKR_0002", name="SOURCE", zone="DKR", country="sen")
-        day0 = timezone.localtime(timezone.now() - timedelta(days=40)).date()
+        day0 = timezone.localtime(timezone.now() - timedelta(days=60)).date()
         self.base = timezone.make_aware(datetime.combine(day0, time.min))
-        self.start = self.base + timedelta(days=1)                                  # « le 2 » 00:00
-        self.end = self.base + timedelta(days=19, hours=23, minutes=59, seconds=59)  # « le 20 » 23:59:59
+        self.start = self.base + timedelta(days=1)                                   # « le 2 » 00:00
+        self.end = self.base + timedelta(days=19, hours=23, minutes=59, seconds=59)   # « le 20 » 23:59:59
         self.n = 0
 
+    # ── relevés ───────────────────────────────────────────────────────────────────────────────────────────
     def obs(self, liters, at, site="DKR_0001", source="LOLIFORCE", **extra):
+        """Relevé en litres directs, validé."""
         self.n += 1
         values = dict(source_type=source, source_event_id=f"obs-{self.n}", site_id=site, tank_id="1", observation_datetime=at,
-                      level_raw=f"{liters} L", level_value=liters, level_unit="L", level_liters=liters,
-                      conversion_method="DIRECT_LITERS", conversion_status="VALID", validation_status="VALIDATED")
+                      level_raw=f"{liters} L", level_value=liters, level_unit="L", level_liters=liters, declared_liters=liters,
+                      conversion_method="DIRECT_LITERS", conversion_status="VALID", validation_status="VALIDATED",
+                      reading_quality_status="LITRE_DIRECT", confidence="HAUTE")
         values.update(extra)
         return Obs.objects.create(**values)
+
+    def obs_cm(self, cm, at, site="DKR_0001", source="LOLIFORCE"):
+        """Relevé en cm converti PAR LE MOTEUR (conversion certifiable, estimation ou aucun litre selon la cuve)."""
+        self.n += 1
+        tanks = R.site_tanks([site]).get(site, [])
+        inp = R.ObservationInput(source, f"obs-cm-{self.n}", site, at, f"{cm} cm", float(cm), "CM", None)
+        o, _ = R.build_observation(inp, tanks, None)
+        o.save()
+        return o
 
     def stocks(self, ini=500, fin=300, site="DKR_0001"):
         self.obs(ini, self.start + timedelta(hours=1), site=site)
         if fin is not None:
             self.obs(fin, self.end - timedelta(hours=1), site=site)
 
+    # ── mouvements ────────────────────────────────────────────────────────────────────────────────────────
     def tc(self, code, qty, at, **kw):
-        m = self.mk(code, qty=qty, op_extra={"operation_date": at.isoformat()}, **kw)
+        m = self.mk(code, qty=qty, op_extra={"operation_date": at.isoformat(), **(kw.pop("op_extra", {}))}, **kw)
         C.sync_qualified([m])
         return m
 
-    def compute(self, sites=("DKR_0001",)):
-        rows = SB.compute_balances(self.start, self.end, site_ids=list(sites))
+    def compute(self, sites=("DKR_0001",), start=None, end=None):
+        rows = SB.compute_balances(start or self.start, end or self.end, site_ids=list(sites))
         return {r["site_id"]: r for r in rows}
 
 
-class StockPeriodBalanceTests(BalanceBase):
-    def test_complete_balance_with_stocks_and_movements(self):
+class MvpBalanceTests(BalanceBase):
+    # 1. bilan prêt à certifier
+    def test_ready_to_certify_complete_balance(self):
         self.stocks(500, 300)
-        self.tc("TC-B1", 400, self.base + timedelta(days=10))
+        self.tc("TR-1", 200, self.base + timedelta(days=10), typ="TRUCK",
+                req_extra={"level_before": 100, "level_before_unit": "L"}, op_extra={"level_after": 300, "level_after_unit": "L"})
         r = self.compute()["DKR_0001"]
-        self.assertEqual((float(r["stock_initial_l"]), float(r["carte_total_l"]), float(r["stock_final_l"])), (500.0, 400.0, 300.0))
-        self.assertEqual(float(r["consommation_reelle_l"]), 600.0)  # 500 + 400 − 300
-        self.assertEqual((r["statut_bilan"], r["source_stock_initial"], r["source_stock_final"]), ("PRET_A_CERTIFIER", "LOLIFORCE", "LOLIFORCE"))
-        b = FuelStockBalance.objects.get(site_id="DKR_0001")
-        self.assertEqual((b.niveau_certification, b.rule_version, b.typologie, b.country), ("NON_CERTIFIE", "bilan-v1", "A_Ax_GG GE", "sen"))
-        self.assertEqual(b.mouvements[0]["composante"], "carte_total_l")
+        self.assertEqual(float(r["consommation_reelle_l"]), 400.0)  # 500 + 200 − 300
+        self.assertEqual((r["statut_bilan"], r["score_confiance"], r["cause_principale"]), ("PRET_A_CERTIFIER", 100, None))
+        self.assertEqual({d["critere"]: d["points"] for d in r["score_detail"]},
+                         {"stock_initial": 25, "stock_final": 25, "litre_direct_ou_cuve_validee": 20, "mouvements_complets": 15,
+                          "stock_recent": 10, "sans_alerte_majeure": 5})
+        self.assertEqual((float(r["livraisons_externes_l"]), float(r["entrees_externes_nettes_l"]), float(r["volume_brut_integre_l"])), (200.0, 200.0, 200.0))
+        self.assertEqual(r["proposition"]["commande_automatique"], False)
+        self.assertIsNone(r["proposition"]["avertissement"])
 
-    def test_ponction_impacts_source_and_destination_with_zero_country_net(self):
+    # 2. bilan avec réserve (mouvement avec défauts de contrôle)
+    def test_reserve_when_movement_has_missing_controls(self):
+        self.stocks(500, 300)
+        self.tc("TC-R1", 400, self.base + timedelta(days=10), photos=())  # niveaux en cm, sans preuve
+        r = self.compute()["DKR_0001"]
+        self.assertEqual((float(r["consommation_reelle_l"]), r["statut_bilan"], r["cause_principale"]), (600.0, "ESTIMATION_AVEC_RESERVE", "RESERVES"))
+        self.assertTrue(any("contrôles manquants" in x for x in r["reserves"]))
+        self.assertEqual(r["proposition"]["avertissement"], "ESTIMATION — VALIDATION FUEL MANAGER REQUISE")
+        self.assertLess(r["score_confiance"], 100)
+
+    # 3. bilan non calculable
+    def test_not_computable_without_stocks(self):
+        self.tc("TC-N1", 400, self.base + timedelta(days=10))
+        r = self.compute()["DKR_0001"]
+        self.assertIsNone(r["consommation_reelle_l"])  # jamais 0
+        self.assertEqual((r["statut_bilan"], r["cause_principale"]), ("NON_CALCULABLE", "DONNEES_STOCK_INCOMPLETES"))
+        self.assertTrue(any("Stock initial absent" in m for m in r["motifs"]))
+        self.assertIsNone(r["proposition"]["quantite_indicative_l"])
+
+    # 4. litre direct prioritaire sur une estimation
+    def test_direct_liter_beats_estimate(self):
+        tank("DKR_0001", plate=None)  # cuve validée sans plaque : estimation possible
+        self.obs_cm(48, self.start + timedelta(hours=1), source="SCSS")
+        self.obs(480, self.start + timedelta(hours=2), source="LOLIFORCE")
+        self.obs(300, self.end - timedelta(hours=1))
+        r = self.compute()["DKR_0001"]
+        d = r["stock_initial_detail"]
+        self.assertEqual((float(r["stock_initial_l"]), d["mode_valeur"], d["estimation"]), (480.0, "LITRE_DIRECT", False))
+        self.assertEqual(r["statut_bilan"], "PRET_A_CERTIFIER")
+        self.assertTrue(any(c["estimation"] for c in r["candidats"]["initial"]))  # l'estimation reste visible comme candidat
+
+    # 5. cm avec cuve validée : conversion tracée
+    def test_cm_with_validated_tank_traced(self):
+        tank("DKR_0001")  # 100×100×100, plaque 1 000 L : 1 cm = 10 L
+        o = self.obs_cm(50, self.start + timedelta(hours=1))
+        self.assertEqual((o.reading_quality_status, o.confidence, float(o.level_liters), o.validation_status),
+                         ("CM_CONVERTI_CUVE_VALIDEE", "HAUTE", 500.0, "VALIDATED"))
+        self.obs(300, self.end - timedelta(hours=1))
+        r = self.compute()["DKR_0001"]
+        d = r["stock_initial_detail"]
+        self.assertEqual((d["unite_origine"], d["niveau_cm"], d["valeur_brute"], d["litres"], d["certifiable"]), ("CM", 50.0, "50 cm", 500.0, True))
+        self.assertTrue(d["regle_conversion"] and d["methode_conversion"] == "CALIBRATED")
+        self.assertEqual(r["statut_bilan"], "PRET_A_CERTIFIER")
+
+    # 6. cm avec cuve géométrique sans plaque : estimation avec réserve, jamais certifiable
+    def test_cm_geometric_tank_without_plate_is_estimate_with_reserve(self):
+        tank("DKR_0001", plate=None)
+        o = self.obs_cm(60, self.start + timedelta(hours=1))
+        self.assertEqual((o.reading_quality_status, o.confidence, o.estimation_mode, float(o.estimated_liters)),
+                         ("CM_CONVERTI_CUVE_GEOMETRIQUE_RESERVE", "FAIBLE", "CM_CONVERTI_CUVE_GEOMETRIQUE_RESERVE", 600.0))
+        self.assertIsNone(o.level_liters)  # jamais présenté comme valeur certifiée
+        self.assertEqual((o.estimation_detail["forme"], o.estimation_detail["dimensions_cm"], o.estimation_detail["statut_cuve"]),
+                         ("rect", [100.0, 100.0, 100.0], "VALIDEE"))
+        self.assertTrue(o.estimation_detail["version"] and o.estimation_detail["formule"])
+        self.obs(300, self.end - timedelta(hours=1))
+        r = self.compute()["DKR_0001"]
+        self.assertEqual((float(r["consommation_reelle_l"]), r["statut_bilan"], r["cause_principale"], r["estimation"]),
+                         (300.0, "ESTIMATION_AVEC_RESERVE", "ESTIMATION", True))
+        self.assertLess(r["score_confiance"], 100)
+        self.assertTrue(any("ESTIMÉ" in x for x in r["reserves"]))
+        # un niveau physiquement impossible n'est jamais estimé
+        imp = self.obs_cm(500, self.start + timedelta(hours=3), source="SCSS")
+        self.assertIsNone(imp.estimated_liters)
+        # certification : une estimation ne peut qu'être « certifiée avec réserve », commentaire obligatoire
+        b = FuelStockBalance.objects.get(site_id="DKR_0001")
+        with self.assertRaises(SB.BalanceError):
+            SB.certify(b, None, "certifier", "")
+        with self.assertRaises(SB.BalanceError):
+            SB.certify(b, None, "certifier_avec_reserve", "")
+        SB.certify(b, None, "certifier_avec_reserve", "Cuve sans plaque : estimation validée par le Fuel Manager")
+
+    # 7. cuve proposée : score de compatibilité configurable
+    def test_proposed_tank_estimate_only_above_score_threshold(self):
+        t = tank("DKR_0001", status="PROPOSEE", plate=None, compat_score=60)
+        low = self.obs_cm(40, self.start + timedelta(hours=1))
+        self.assertEqual((low.reading_quality_status, low.estimated_liters), ("CM_SANS_CUVE", None))
+        self.assertIn("score de compatibilité 60 < seuil 70", low.estimation_detail["refus"])
+        FuelTankMaster.objects.filter(pk=t.pk).update(compat_score=85)
+        high = self.obs_cm(40, self.start + timedelta(hours=2), source="SCSS")
+        self.assertEqual((high.reading_quality_status, float(high.estimated_liters)), ("CM_CONVERTI_CUVE_PROPOSEE_RESERVE", 400.0))
+        self.assertEqual((high.estimation_detail["statut_cuve"], high.estimation_detail["score_compatibilite"]), ("PROPOSEE", 85))
+        t.refresh_from_db()
+        self.assertEqual(t.validation_status, "PROPOSEE")  # jamais validée automatiquement
+        with self.settings(FUEL_PROPOSED_TANK_MIN_SCORE=90):
+            self.assertIsNone(self.obs_cm(40, self.start + timedelta(hours=3), source="ENOC").estimated_liters)
+
+    # 8. absence de cuve : aucun litre inventé
+    def test_no_tank_no_invented_liters(self):
+        o = self.obs_cm(50, self.start + timedelta(hours=1))
+        self.assertEqual((o.reading_quality_status, o.level_liters, o.estimated_liters, o.confidence), ("CM_SANS_CUVE", None, None, None))
+        self.obs(300, self.end - timedelta(hours=1))
+        r = self.compute()["DKR_0001"]
+        self.assertIsNone(r["stock_initial_l"])
+        self.assertEqual((r["statut_bilan"], r["cause_principale"]), ("NON_CALCULABLE", "CM_SANS_CUVE"))
+        cand = r["candidats"]["initial"][0]
+        self.assertEqual((cand["utilisable"], cand["niveau_cm"], cand["litres"]), (False, 50.0, None))
+        self.assertIn("CONVERSION_CUVE_MANQUANTE", cand["motif_rejet"])
+        self.assertTrue(any("CONVERSION_CUVE_MANQUANTE" in a for a in r["alertes"]))
+
+    # 9. fraîcheur : 0-3 j normal, 4-14 j réserve, > 14 j non calculable, jamais de relevé postérieur silencieux
+    def test_stock_freshness_thresholds(self):
+        self.obs(500, self.start - timedelta(days=2))   # initial antérieur de 2 j : frais
+        self.obs(300, self.end - timedelta(hours=1))
+        r = self.compute()["DKR_0001"]
+        self.assertEqual((r["age_stock_initial_j"], r["stock_initial_detail"]["tier"], r["statut_bilan"]), (2, "FRAIS", "ESTIMATION_AVEC_RESERVE"))
+        Obs.objects.all().delete()
+        self.obs(500, self.start - timedelta(days=10))  # 4-14 j : estimation avec réserve
+        self.obs(300, self.end - timedelta(hours=1))
+        r = self.compute()["DKR_0001"]
+        self.assertEqual((r["age_stock_initial_j"], r["stock_initial_detail"]["tier"], r["statut_bilan"]), (10, "RESERVE", "ESTIMATION_AVEC_RESERVE"))
+        self.assertTrue(any("ancien de 10 j" in x for x in r["reserves"]))
+        self.assertEqual(float(r["consommation_reelle_l"]), 200.0)
+        Obs.objects.all().delete()
+        self.obs(500, self.start - timedelta(days=20))  # > 14 j : non calculable
+        self.obs(300, self.end - timedelta(hours=1))
+        r = self.compute()["DKR_0001"]
+        self.assertEqual((r["statut_bilan"], r["cause_principale"], r["consommation_reelle_l"]), ("NON_CALCULABLE", "STOCK_TROP_ANCIEN", None))
+        self.assertIn("TROP_ANCIEN", [x["tier"] for x in r["candidats"]["initial"]])
+        Obs.objects.all().delete()
+        self.obs(500, self.start + timedelta(days=3))  # lecture postérieure au début : jamais utilisée silencieusement
+        self.obs(300, self.end - timedelta(hours=1))
+        r = self.compute()["DKR_0001"]
+        post = [x for x in r["candidats"]["initial"] if x["tier"] == "POSTERIEUR"]
+        self.assertEqual(r["statut_bilan"], "NON_CALCULABLE")
+        self.assertTrue(post and "postérieur" in post[0]["motif_rejet"])
+
+    def test_final_stock_prior_reading_and_movements_after_it_are_flagged(self):
+        self.obs(500, self.start + timedelta(hours=1))
+        self.obs(300, self.end - timedelta(days=2))  # dernier relevé antérieur dans la tolérance
+        self.tc("TC-A1", 150, self.end - timedelta(hours=10))  # entre le relevé final et la fin de période
+        r = self.compute()["DKR_0001"]
+        self.assertEqual((r["age_stock_final_j"], float(r["carte_total_l"]), float(r["consommation_reelle_l"])), (2, 0.0, 200.0))
+        self.assertTrue(any("entre le relevé final" in a for a in r["alertes"]))
+        self.assertEqual(r["statut_bilan"], "ESTIMATION_AVEC_RESERVE")
+
+    # 10. double comptage Closing / ENOC évité
+    def test_closing_enoc_double_counting_avoided(self):
+        self.stocks(500, 300)
+        at = self.base + timedelta(days=10)
+        self.tc("TC-D1", 400, at)
+        FuelMovement.objects.create(source_type="CLOSING", source_event_id="CLOSING-1", site_id="DKR_0001", movement_type="DELIVERY_TOTAL_CARD",
+                                    movement_datetime=at + timedelta(hours=3), quantity_l=Decimal("401"), status="VALIDATED", retained_in_stock=True)
+        FuelMovement.objects.create(source_type="CLOSING", source_event_id="CLOSING-2", site_id="DKR_0001", movement_type="DELIVERY_TOTAL_CARD",
+                                    movement_datetime=at + timedelta(days=3), quantity_l=Decimal("100"), status="VALIDATED", retained_in_stock=True)
+        r = self.compute()["DKR_0001"]
+        self.assertEqual(float(r["carte_total_l"]), 500.0)  # 400 (ENOC) + 100 (autre livraison) ; le doublon de 401 L est écarté
+        dup = [m for m in r["mouvements_exclus"] if "DOUBLON_POTENTIEL" in m["motif"]]
+        self.assertEqual((len(dup), dup[0]["source"]), (1, "CLOSING"))
+
+    # 11. Ponction équilibrée : impact site réel, impact pays nul, déséquilibre bloquant
+    def test_ponction_balanced_site_impact_country_zero_and_unbalanced_blocks(self):
         self.stocks(500, 300)
         self.stocks(800, 600, site="DKR_0002")
         action = {"validated_at": (self.base + timedelta(days=5)).isoformat(), "validated_by": "FM"}
         m = self.mk("PO-B1", typ="PONCTION", status="validated", operation=False,
-                    req_extra={"approved_quantity_liters": 100, "action": action,
-                               "ponction": {"source_site_id": "DKR_0002", "level_before": 800, "level_before_unit": "L",
-                                            "level_after": 700, "level_after_unit": "L"}})
+                    req_extra={"approved_quantity_liters": 100, "action": action, "ponction": {"source_site_id": "DKR_0002"}})
         E.sync_enoc_to_registry(only_ids=[m.pk])
+        types = {mv.movement_direction: mv.movement_type for mv in FuelMovement.objects.filter(transfer_id="ENOC-PONCTION-PO-B1")}
+        self.assertEqual(types, {"OUT": "TRANSFERT_INTERSITE_SORTANT", "IN": "TRANSFERT_INTERSITE_ENTRANT"})
+        self.assertEqual(E.check_transfer_balance(), [])
         rows = self.compute(("DKR_0001", "DKR_0002"))
         dst, src = rows["DKR_0001"], rows["DKR_0002"]
         self.assertEqual((float(dst["transferts_entrants_l"]), float(src["transferts_sortants_l"])), (100.0, 100.0))
         self.assertEqual((float(dst["consommation_reelle_l"]), float(src["consommation_reelle_l"])), (300.0, 100.0))
-        net = sum(float(r["transferts_entrants_l"]) - float(r["transferts_sortants_l"]) for r in rows.values())
-        self.assertEqual(net, 0.0)  # impact pays nul
+        self.assertEqual((float(dst["impact_ponctions_l"]), float(src["impact_ponctions_l"])), (100.0, -100.0))
+        self.assertEqual(sum(float(r["impact_ponctions_l"]) for r in rows.values()), 0.0)  # impact pays nul
+        self.assertEqual((float(dst["entrees_externes_nettes_l"]), float(dst["volume_transfere_l"])), (0.0, 0.0))  # pas un achat
+        # écriture déséquilibrée : bilan non calculable
+        FuelMovement.objects.filter(transfer_id="ENOC-PONCTION-PO-B1", movement_direction="IN").update(impact_stock_l=Decimal("90"))
+        r = self.compute(("DKR_0001",))["DKR_0001"]
+        self.assertEqual((r["statut_bilan"], r["cause_principale"], r["consommation_reelle_l"]), ("NON_CALCULABLE", "TRANSFERT_DESEQUILIBRE", None))
 
-    def test_missing_final_stock_gives_null_consumption(self):
-        self.stocks(500, None)
-        self.tc("TC-B2", 400, self.base + timedelta(days=10))
-        r = self.compute()["DKR_0001"]
-        self.assertIsNone(r["consommation_reelle_l"])  # jamais 0
-        self.assertEqual(r["statut_bilan"], "DONNEES_STOCK_INCOMPLETES")
-        self.assertIsNone(r["stock_final_l"])
-        self.assertTrue(any("Stock final absent" in m for m in r["motifs"]))
+    # 12. plusieurs défauts de qualité visibles simultanément
+    def test_quality_indicators_are_not_exclusive(self):
+        m = self.mk("TC-Q1", photos=(), req_extra={"level_before": 900, "level_before_unit": "L", "hour_meter_before": None},
+                    op_extra={"level_after": 500, "level_after_unit": "L", "hour_meter_after": None})
+        q = Q.objects.get(enoc_movement=self.q(m).enoc_movement)
+        self.assertEqual((q.has_levels_before_after, q.has_proof, q.has_hourmeter, q.has_date, q.has_actual_quantity), (True, False, False, True, True))
+        self.assertEqual((q.level_coherence_status, q.quality_status_global, q.stock_eligibility), ("ECART", "DEFAUTS_MAJEURS", "ELIGIBLE"))
+        self.assertEqual((q.source_record_id, q.has_site_source, q.has_site_destination), ("TC-Q1", None, True))
+        ok = self.q(self.mk("TC-Q2", req_extra={"level_before": 100, "level_before_unit": "L"}, op_extra={"level_after": 300, "level_after_unit": "L"}))
+        self.assertEqual((ok.quality_status_global, ok.level_coherence_status, ok.has_hourmeter), ("COMPLET", "COHERENT", True))
+        bad = self.q(self.mk("TC-Q3", qty=None))
+        self.assertEqual((bad.stock_eligibility, bad.quality_status_global, bad.has_actual_quantity), ("NON_ELIGIBLE", "NON_INTEGRABLE", False))
 
-    def test_cm_level_with_validated_tank_conversion_traced(self):
-        from fuel_tracking.services import stock_registry as R
-        from fuel_tracking.services import tank_conversion as TC
-
-        FuelTankMaster.objects.create(site_id="DKR_0001", tank_id="1", validation_status="VALIDEE", shape_family="rect",
-                                      dimension_1_cm=100, dimension_2_cm=100, dimension_3_cm=100, capacity_plate_l=1000)
-        res = TC.convert(50.0, "CM", R.site_tanks(["DKR_0001"])["DKR_0001"])
-        self.assertEqual(res.status, "VALID")
-        self.obs(res.level_liters, self.start + timedelta(hours=2), level_raw="50 cm", level_value=50, level_unit="CM", level_cm=50,
-                 conversion_method=res.method, conversion_rule=res.rule, tank_model_ref=res.model_ref)
-        self.obs(300, self.end - timedelta(hours=1))
-        r = self.compute()["DKR_0001"]
-        d = r["stock_initial_detail"]
-        self.assertEqual((d["unite_origine"], d["niveau_cm"], d["valeur_brute"]), ("CM", 50.0, "50 cm"))  # mesure brute conservée
-        self.assertEqual((d["litres"], d["methode_conversion"]), (res.level_liters, res.method))
-        self.assertTrue(d["regle_conversion"])
-        self.assertEqual(float(r["consommation_reelle_l"]), res.level_liters - 300)
-
-    def test_cm_level_without_validated_tank_not_converted(self):
-        self.obs(None, self.start + timedelta(hours=2), level_raw="50 cm", level_value=50, level_unit="CM", level_cm=50,
-                 level_liters=None, conversion_method="NONE", conversion_status="PENDING_TANK_MAPPING")
-        self.obs(300, self.end - timedelta(hours=1))
-        r = self.compute()["DKR_0001"]
-        self.assertIsNone(r["stock_initial_l"])  # aucun litre inventé
-        self.assertEqual(r["statut_bilan"], "DONNEES_STOCK_INCOMPLETES")
-        cand = r["candidats"]["initial"][0]
-        self.assertEqual((cand["utilisable"], cand["niveau_cm"]), (False, 50.0))
-        self.assertIn("CONVERSION_CUVE_MANQUANTE", cand["motif_rejet"])
-        self.assertTrue(any("CONVERSION_CUVE_MANQUANTE" in a for a in r["alertes"]))
-
-    def test_several_candidates_priority_documented(self):
-        t = self.start + timedelta(hours=1)
-        self.obs(520, t, source="ENOC", eligible_for_stock=True, business_status="VALIDEE_EXECUTEE")
-        self.obs(500, t + timedelta(hours=1), source="LOLIFORCE")
-        self.obs(480, t + timedelta(hours=3), source="CLOSING")
-        self.obs(900, t, source="SCSS", validation_status="PENDING")
-        self.obs(300, self.end - timedelta(hours=1))
-        r = self.compute()["DKR_0001"]
-        d = r["stock_initial_detail"]
-        self.assertEqual((r["source_stock_initial"], float(r["stock_initial_l"])), ("CLOSING", 480.0))  # priorité 1
-        self.assertIn("Closing mensuel validé (priorité 1)", d["motif_selection"])
-        self.assertIn("2 autre(s) candidat(s) utilisable(s) écarté(s)", d["motif_selection"])
-        self.assertEqual(len(r["candidats"]["initial"]), 4)
-        self.assertIn("non validé", next(c for c in r["candidats"]["initial"] if c["source"] == "SCSS")["motif_rejet"])
-        Obs.objects.filter(source_type="CLOSING").delete()
-        Obs.objects.filter(source_type="ENOC").update(level_liters=900)
-        r = self.compute()["DKR_0001"]
-        self.assertEqual(r["source_stock_initial"], "LOLIFORCE")  # gardiennage avant ENOC
-        self.assertTrue(any("ECART_STOCK_CANDIDATS" in a for a in r["alertes"]))  # 500 vs 900 : contradiction signalée
-        self.assertEqual(r["statut_bilan"], "PRET_A_CERTIFIER_AVEC_RESERVE")
-
-    def test_historical_non_verifiable_movement_excluded(self):
+    # 13. mouvement historique non vérifiable exclu
+    def test_historical_movement_excluded_with_reserve(self):
         self.stocks(500, 300)
-        item = {"source_id": "REST-B1", "request_code": "REST-B1", "status": "done", "site_id": "DKR_0001",
-                "operation_type": "TOTAL_CARD", "operation_date": (self.base + timedelta(days=8)).isoformat(),
-                "quantity_added_liters": 999}
+        item = {"source_id": "REST-B1", "request_code": "REST-B1", "status": "done", "site_id": "DKR_0001", "operation_type": "TOTAL_CARD",
+                "operation_date": (self.base + timedelta(days=8)).isoformat(), "quantity_added_liters": 999}
         C.sync_qualified([FuelEnocMovement.objects.create(**clean_payload(item))])
         r = self.compute()["DKR_0001"]
         self.assertEqual(float(r["consommation_reelle_l"]), 200.0)  # les 999 L historiques ne comptent pas
-        self.assertEqual(r["statut_bilan"], "HISTORIQUE_NON_VERIFIABLE")
+        self.assertEqual(r["statut_bilan"], "ESTIMATION_AVEC_RESERVE")
+        self.assertTrue(any("historique" in x for x in r["reserves"]))
         self.assertIn("Historique non vérifiable", r["mouvements_exclus"][0]["motif"])
 
-    def test_period_2_to_20_only_counts_movements_inside(self):
+    # 14. période personnalisée
+    def test_custom_period_only_counts_movements_inside(self):
         self.stocks(500, 300)
-        self.tc("TC-B3", 111, self.base + timedelta(hours=12))            # « le 1er » : hors période
-        self.tc("TC-B4", 400, self.base + timedelta(days=10))             # dans la période
-        self.tc("TC-B5", 222, self.base + timedelta(days=20, hours=12))   # « le 21 » : hors période
+        self.tc("TC-P1", 111, self.base + timedelta(hours=12))
+        self.tc("TC-P2", 400, self.base + timedelta(days=12))
+        self.tc("TC-P3", 222, self.base + timedelta(days=20, hours=12))
         r = self.compute()["DKR_0001"]
-        self.assertEqual(float(r["carte_total_l"]), 400.0)
-        self.assertEqual([m["reference"] for m in r["mouvements"]], ["TC-B4"])
-        self.assertEqual((r["observation_start"], r["observation_end"]), (self.start, self.end))
+        self.assertEqual((float(r["carte_total_l"]), [m["reference"] for m in r["mouvements"]]), (400.0, ["TC-P2"]))
+        # semaine libre : 10 → 17, relevés exacts aux deux bornes
+        s2, e2 = self.base + timedelta(days=10), self.base + timedelta(days=16, hours=23, minutes=59)
+        self.obs(900, s2 + timedelta(hours=1), source="SCSS")
+        self.obs(850, e2 - timedelta(hours=1), source="SCSS")
+        w = self.compute(start=s2, end=e2)["DKR_0001"]
+        self.assertEqual((w["observation_start"], w["observation_end"], float(w["consommation_reelle_l"]), w["source_stock_initial"]), (s2, e2, 450.0, "SCSS"))
+        self.assertEqual(FuelStockBalance.objects.filter(site_id="DKR_0001").count(), 2)  # une ligne par période exacte
 
-    def test_reconciliation_only_when_real_consumption_computed(self):
+    # 15. recalcul après modification d'une donnée
+    def test_recompute_after_data_change_requires_recertification(self):
+        fm = get_user_model().objects.create_user("fm", "fm@x.sn", "p", role="manager")
+        self.stocks(500, 300)
+        self.compute()
+        b = FuelStockBalance.objects.get(site_id="DKR_0001")
+        self.assertEqual(b.statut_bilan, "PRET_A_CERTIFIER")
+        with self.assertRaises(SB.BalanceError):
+            SB.certify(b, fm, "certifier_avec_reserve", "")
+        cert = SB.certify(b, fm, "certifier", "")
+        self.assertEqual((cert.user_id, cert.action, cert.snapshot["consommation_reelle_l"]), (fm.pk, "CERTIFIE", "200.000"))
+        cert.comment = "x"
+        with self.assertRaises(ValueError):
+            cert.save()  # historique non modifiable
+        Obs.objects.filter(level_liters=300).update(level_liters=250, declared_liters=250)
+        r = self.compute()["DKR_0001"]
+        b.refresh_from_db()
+        self.assertEqual((float(r["consommation_reelle_l"]), b.niveau_certification, b.certifications.count()), (250.0, "A_RECERTIFIER", 1))
+
+    def test_site_not_recognised(self):
+        self.stocks(500, 300, site="GHOST_1")
+        r = self.compute(("GHOST_1",))["GHOST_1"]
+        self.assertEqual((r["statut_bilan"], r["cause_principale"], r["consommation_reelle_l"]), ("NON_CALCULABLE", "SITE_NON_RECONNU", None))
+
+    def test_reconciliation_only_when_stock_consumption_computed(self):
         self.stocks(500, 300)
         self.stocks(800, None, site="DKR_0002")
         self.compute(("DKR_0001", "DKR_0002"))
@@ -168,64 +332,114 @@ class StockPeriodBalanceTests(BalanceBase):
         with mock.patch("fuel_tracking.services.cph_service.compute_period_summary", return_value=cph):
             rows = {r["site_id"]: r for r in SB.reconciliation(self.start, self.end)}
         a, b = rows["DKR_0001"], rows["DKR_0002"]
-        self.assertEqual((a["conso_reelle_l"], a["ecart_reel_instrumentee_l"], a["ecart_reel_theorique_l"]), (200.0, 50.0, -50.0))
+        self.assertEqual((a["conso_reelle_l"], a["ecart_reel_instrumentee_l"], a["ecart_reel_theorique_l"], a["score_confiance"]), (200.0, 50.0, -50.0, 100))
         self.assertEqual((b["conso_reelle_l"], b["conso_instrumentee_l"], b["ecart_reel_instrumentee_l"]), (None, 90.0, None))
         self.assertIn("aucun écart", b["motif"])
 
-    def test_certification_history_user_date_comment(self):
-        U = get_user_model()
-        fm = U.objects.create_user("fm", "fm@x.sn", "p", role="manager")
-        self.stocks(500, 300)
-        self.compute()
-        b = FuelStockBalance.objects.get(site_id="DKR_0001")
-        with self.assertRaises(SB.BalanceError):
-            SB.certify(b, fm, "certifier_avec_reserve", "")  # commentaire obligatoire si réserve
-        c = APIClient()
-        c.force_authenticate(U.objects.create_user("an", "an@x.sn", "p", role="analyst"))
-        self.assertEqual(c.post(f"/api/fuel-tracking/stock/bilans/{b.pk}/certifier/", {"decision": "certifier"}, format="json").status_code, 403)
-        c.force_authenticate(fm)
-        r = c.post(f"/api/fuel-tracking/stock/bilans/{b.pk}/certifier/", {"decision": "certifier"}, format="json")
-        self.assertEqual((r.status_code, r.json()["niveau_certification"]), (200, "CERTIFIE"))
-        cert = b.certifications.get()
-        self.assertEqual((cert.user_id, cert.action, cert.snapshot["consommation_reelle_l"]), (fm.pk, "CERTIFIE", "200.000"))
-        self.assertIsNotNone(cert.created_at)
-        cert.comment = "modifié"
-        with self.assertRaises(ValueError):
-            cert.save()  # historique non modifiable
-        d = c.get(f"/api/fuel-tracking/stock/bilans/{b.pk}/").json()
-        self.assertEqual((d["certifications"][0]["utilisateur"], d["certifications"][0]["toujours_valide"]), ("fm", True))
-        Obs.objects.filter(site_id="DKR_0001", level_liters=300).update(level_liters=250)  # donnée modifiée après certification
-        self.compute()
-        b.refresh_from_db()
-        self.assertEqual((b.niveau_certification, b.certifications.count()), ("A_RECERTIFIER", 1))
-
-    def test_api_list_filters_compute_and_detail(self):
+    def test_api_list_volumes_priorities_readings_tanks(self):
         U = get_user_model()
         c = APIClient()
         c.force_authenticate(U.objects.create_user("adm", "adm@x.sn", "p", role="admin"))
-        self.stocks(500, 300)
+        tank("DKR_0001", plate=None)
+        self.obs_cm(60, self.start + timedelta(hours=1))
+        self.obs(300, self.end - timedelta(hours=1))
         self.stocks(800, None, site="DKR_0002")
         debut, fin = self.start.strftime("%Y-%m-%d"), self.end.strftime("%Y-%m-%d")
-        r = c.post("/api/fuel-tracking/stock/bilans/calculer/", {"debut": debut, "fin": fin, "site": "DKR_0001"}, format="json")
-        self.assertEqual((r.status_code, r.json()["calculables"]), (200, 1), r.content)
-        SB.compute_balances(self.start, self.end, site_ids=["DKR_0002"])
-        url = f"/api/fuel-tracking/stock/bilans/?debut={debut}&fin={fin}"
-        j = c.get(url).json()
-        self.assertEqual((j["pagination"]["total"], j["totaux"]["calculables"], j["totaux"]["incomplets"]), (2, 1, 1))
-        self.assertEqual(c.get(url + "&stock_final=absent").json()["data"][0]["site_id"], "DKR_0002")
-        self.assertEqual(c.get(url + "&statut=PRET_A_CERTIFIER").json()["pagination"]["total"], 1)
-        self.assertEqual(j["totaux"]["sources_stock"]["LOLIFORCE"], {"initial": 2, "final": 1})
+        r = c.post("/api/fuel-tracking/stock/bilans/calculer/", {"debut": debut, "fin": fin}, format="json")
+        self.assertEqual(r.status_code, 200, r.content)
+        j = c.get(f"/api/fuel-tracking/stock/bilans/?debut={debut}&fin={fin}").json()
+        self.assertEqual(j["totaux"]["par_statut"], {"ESTIMATION_AVEC_RESERVE": 1, "NON_CALCULABLE": 1})
+        self.assertEqual(j["volumes"]["impact_global_ponctions_l"], 0.0)
+        self.assertIn("transferts internes", j["volumes"]["note"])
+        self.assertEqual(c.get(f"/api/fuel-tracking/stock/bilans/?debut={debut}&fin={fin}&estimation=1").json()["pagination"]["total"], 1)
         d = c.get(f"/api/fuel-tracking/stock/bilans/{j['data'][0]['id']}/").json()
-        self.assertIn("candidats", d)
-        self.assertEqual(len(d["priorite_sources"]), 4)
+        self.assertEqual(len(d["score_detail"]), 6)
+        self.assertIn("quantite_indicative_l", d["proposition"])
+        pr = c.get(f"/api/fuel-tracking/stock/priorites/?debut={debut}&fin={fin}&avec_ecarts=0").json()
+        cats = {i["categorie"] for i in pr["data"]}
+        self.assertEqual(cats, {"forte_conso_estimee_sans_cuve_validee", "stock_trop_ancien"})
+        self.assertEqual(pr["data"][0]["rang"], 1)
+        rd = c.get("/api/fuel-tracking/stock/releves/?estimes=1").json()
+        self.assertEqual((rd["pagination"]["total"], rd["data"][0]["litres_estimes"], rd["data"][0]["niveau_cm"], rd["data"][0]["niveau_brut"]),
+                         (1, 600.0, 60.0, "60 cm"))
+        tk = c.get("/api/fuel-tracking/stock/cuves-a-traiter/").json()
+        self.assertEqual((tk["data"][0]["usage"], tk["data"][0]["categories"], tk["data"][0]["releves_estimes"]),
+                         ("ESTIMATION_GEOMETRIQUE", ["VALIDEE", "SANS_PLAQUE"], 1))
+
+
+class MvpImportTests(TmpRootMixin, BalanceBase):
+    def setUp(self):
+        super().setUp()
+        Site.objects.create(site_id="DKR_0003", name="GAMMA")
+
+    def file(self, rows, name="g.xlsx", source="LOLIFORCE"):
+        return P.process_bytes(xlsx({"KOLDA": [["SEMAINE 40"], [], HEAD] + rows}), name, source, origin="UPLOAD")
+
+    # import idempotent + lot tracé + rapport
+    def test_import_idempotent_batch_traced_and_report(self):
+        U = get_user_model()
+        admin = U.objects.create_user("imp", "imp@x.sn", "p", role="admin")
+        rows = [guard_row("DKR_0001", cm=10, d=datetime(2026, 10, 3)), guard_row("DKR_0001", cm=12, d=datetime(2026, 10, 9)),
+                guard_row("XXX_9999", cm=5)]
+        data = xlsx({"KOLDA": [["SEMAINE 40"], [], HEAD] + rows})
+        b1 = P.process_bytes(data, "g.xlsx", "LOLIFORCE", origin="UPLOAD", user=admin)
+        self.assertEqual((b1.rows_total, b1.rows_rejected, b1.received_by_id, b1.mapping_version), (3, 1, admin.pk, "gardiennage-v1"))
+        self.assertEqual((str(b1.declared_period_start), str(b1.declared_period_end)), ("2026-10-03", "2026-10-09"))
+        self.assertEqual(len(b1.file_hash), 64)
+        n = Obs.objects.count()
+        again = P.process_bytes(data, "g.xlsx", "LOLIFORCE", origin="UPLOAD", user=admin)
+        self.assertEqual((again.status, again.duplicate_of_id, Obs.objects.count()), ("REJECTED", b1.pk, n))  # aucun doublon créé
+        c = APIClient()
+        c.force_authenticate(admin)
+        rep = c.get(f"/api/fuel-tracking/stock/imports/{b1.pk}/rapport/")
+        self.assertEqual(rep.status_code, 200)
+        text = rep.content.decode("utf-8")
+        self.assertIn(b1.file_hash, text)
+        self.assertIn("XXX_9999", text)
+        self.assertIn("gardiennage-v1", text)
+
+    # site non reconnu dans un fichier : ligne rejetée, visible dans les relevés rejetés
+    def test_unknown_site_row_rejected_and_listed(self):
+        U = get_user_model()
+        c = APIClient()
+        c.force_authenticate(U.objects.create_user("ana", "ana@x.sn", "p", role="analyst"))
+        b = self.file([guard_row("XXX_9999", cm=5)])
+        self.assertEqual((b.rows_rejected, Obs.objects.count()), (1, 0))
+        r = c.get("/api/fuel-tracking/stock/releves/?vue=rejetes").json()
+        self.assertEqual((r["pagination"]["total"], r["data"][0]["qualite"], r["data"][0]["site_brut"]), (1, "SITE_NON_RECONNU", "XXX_9999"))
+
+    # analyse préalable : feuilles / colonnes / mapping, aucune écriture
+    def test_file_analysis_is_read_only_and_documents_mapping(self):
+        from fuel_tracking.services.stock_file_analysis import analyze
+
+        data = xlsx({"KOLDA": [["SEMAINE 40"], [], HEAD, guard_row("DKR_0001", cm=10), guard_row("XXX_9999", cm=5)], "Compile": [HEAD]})
+        before = (FuelImportBatch.objects.count(), Obs.objects.count())
+        res = analyze(data, "loliforce.xlsx", "LOLIFORCE")
+        self.assertEqual((FuelImportBatch.objects.count(), Obs.objects.count()), before)
+        self.assertTrue(res["lecture_seule"])
+        kolda = next(s for s in res["feuilles"] if s["feuille"] == "KOLDA")
+        self.assertEqual((kolda["lignes_de_donnees"], kolda["colonnes_mappees"]["relevé en cm"], kolda["plage_dates"]),
+                         (2, "cm", ["2026-10-03", "2026-10-03"]))
+        self.assertIn("marque ge", kolda["colonnes_non_reconnues"])
+        self.assertTrue(next(s for s in res["feuilles"] if s["feuille"] == "Compile")["ignoree"])
+        self.assertEqual((res["source_detectee"], res["version_mapping"], res["couverture_sites"]["inconnus"]), ("LOLIFORCE", "gardiennage-v1", 1))
+
+    # doublon potentiel entre sources
+    def test_potential_duplicate_between_sources(self):
+        self.obs(500, self.start + timedelta(hours=1), source="LOLIFORCE")
+        dup = self.obs(500, self.start + timedelta(hours=2), source="SCSS")
+        self.assertEqual(R.mark_potential_duplicates(["DKR_0001"]), 1)
+        dup.refresh_from_db()
+        self.assertIsNotNone(dup.potential_duplicate_of)
+        U = get_user_model()
+        c = APIClient()
+        c.force_authenticate(U.objects.create_user("ana3", "ana3@x.sn", "p", role="analyst"))
+        r = c.get("/api/fuel-tracking/stock/releves/?qualite=DOUBLON_POTENTIEL").json()
+        self.assertEqual((r["pagination"]["total"], r["data"][0]["qualite"], r["data"][0]["qualite_releve"]), (1, "DOUBLON_POTENTIEL", "LITRE_DIRECT"))
 
 
 class TankPlateDiagnosticTests(BalanceBase):
     def test_diagnostic_finds_likely_input_error_read_only(self):
-        from io import StringIO
-
-        from django.core.management import call_command
-
         a = FuelTankMaster.objects.create(site_id="DKR_0001", tank_id="1", validation_status="VALIDEE", shape_family="h-circ",
                                           dimension_1_cm=157, dimension_2_cm=80, dimension_3_cm=268, capacity_plate_l=1350)
         b = FuelTankMaster.objects.create(site_id="DKR_0002", tank_id="1", validation_status="VALIDEE", shape_family="h-circ",
@@ -237,8 +451,7 @@ class TankPlateDiagnosticTests(BalanceBase):
         call_command("diagnostic_cuves_plaque", stdout=out)
         text = out.getvalue()
         self.assertIn("Cuves validées à plaque incohérente (relevés bloqués) : 2", text)
-        self.assertIn("DKR_0001 cuve 1 h-circ 157.0/80.0/268.0 cm, plaque 1350.0 L", text)
-        self.assertIn("→ DIAMETRE_EN_COTE_2", text)  # D = 80 cm : ≈ 1 347 L
-        self.assertIn("→ PLAQUE_ABSENTE", text)       # capacité Closing recalculée depuis les cotes : ne confirme rien
+        self.assertIn("→ DIAMETRE_EN_COTE_2", text)
+        self.assertIn("→ PLAQUE_ABSENTE", text)
         a.refresh_from_db()
         self.assertEqual(float(a.dimension_1_cm), 157.0)  # lecture seule

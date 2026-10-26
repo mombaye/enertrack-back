@@ -461,7 +461,7 @@ class PonctionTransferTests(EnocBase):
         self.assertEqual(set(legs), {"OUT", "IN"})
         self.assertEqual(sum(float(mv.impact_stock_l) for mv in legs.values()), 0.0)
         self.assertEqual((float(q.source_variation_l), float(q.control_gap_l), q.fuel_manager_alert), (-100.0, 0.0, "AUCUNE"))
-        self.assertTrue(all(mv.retained_in_stock and mv.movement_type == "TRANSFERT_INTERSITE" for mv in legs.values()))
+        self.assertTrue(all(mv.retained_in_stock and mv.movement_type == f"TRANSFERT_INTERSITE_{'SORTANT' if mv.movement_direction == 'OUT' else 'ENTRANT'}" for mv in legs.values()))
         self.assertEqual(legs["IN"].movement_datetime, q.approved_at)  # date de validation ENOC, jamais la date prévue
         req_row = FuelMovement.objects.get(source_event_id="PO-10")
         self.assertFalse(req_row.retained_in_stock)  # la demande n'est pas une 3e écriture

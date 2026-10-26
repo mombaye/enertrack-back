@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import os
 from datetime import timedelta
 
@@ -374,3 +375,18 @@ FUEL_CPH_SFC_MAX_L_KWH = os.environ.get("FUEL_CPH_SFC_MAX_L_KWH", "0.50")
 FUEL_CPH_STALE_AFTER_DAYS = os.environ.get("FUEL_CPH_STALE_AFTER_DAYS", "3")
 FUEL_CPH_MIN_COVERAGE = os.environ.get("FUEL_CPH_MIN_COVERAGE", "0.5")
 FUEL_CPH_MAX_SFC_ALERT_SHARE = os.environ.get("FUEL_CPH_MAX_SFC_ALERT_SHARE", "0.2")
+
+
+# ── Bilan stock MVP (fuel_tracking/services/stock_period_balance.py) ─────────────────────────────────────────
+# Fraîcheur : relevé à 0-3 j de la borne = exploitable ; 4-14 j = estimation avec réserve ; > 14 j = non calculable.
+FUEL_BALANCE_FRESH_STOCK_DAYS = int(os.getenv("FUEL_BALANCE_FRESH_STOCK_DAYS", "3"))
+FUEL_BALANCE_RESERVE_STOCK_DAYS = int(os.getenv("FUEL_BALANCE_RESERVE_STOCK_DAYS", "14"))
+# Score de confiance 0-100 : ≥ READY (sans réserve) = prêt à certifier ; ≥ RESERVE = estimation avec réserve ; sinon non calculable.
+FUEL_BALANCE_SCORE_READY = int(os.getenv("FUEL_BALANCE_SCORE_READY", "80"))
+FUEL_BALANCE_SCORE_RESERVE = int(os.getenv("FUEL_BALANCE_SCORE_RESERVE", "50"))
+# Barème (points) : stock_initial, stock_final, litre_direct_ou_cuve_validee, mouvements_complets, stock_recent, sans_alerte_majeure
+FUEL_BALANCE_SCORE_WEIGHTS = json.loads(os.getenv("FUEL_BALANCE_SCORE_WEIGHTS", "{}") or "{}")
+# Score minimal de compatibilité (0-100) pour estimer des litres avec une cuve PROPOSÉE (jamais validée automatiquement).
+FUEL_PROPOSED_TANK_MIN_SCORE = int(os.getenv("FUEL_PROPOSED_TANK_MIN_SCORE", "70"))
+# Données préparées pour la future recommandation de commande (indicatif, aucune commande automatique).
+FUEL_ORDER_HORIZON_DAYS = int(os.getenv("FUEL_ORDER_HORIZON_DAYS", "30"))

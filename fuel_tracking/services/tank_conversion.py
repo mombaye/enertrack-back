@@ -76,6 +76,7 @@ class TankSpec:
     validated: bool = False
     status: str | None = None
     model_ref: str | None = None
+    compat_score: int | None = None
 
     @classmethod
     def from_model(cls, t) -> "TankSpec":
@@ -97,6 +98,7 @@ class TankSpec:
             calibration_curve=t.calibration_curve, calibration_validated=bool(t.calibration_validated),
             validated=t.validation_status == "VALIDEE" and t.active, status=t.validation_status,
             model_ref=model.tank_model_id if model is not None else None,
+            compat_score=getattr(t, "compat_score", None),
         )
 
     def has_geometry(self) -> bool:
@@ -302,3 +304,84 @@ def convert(level_value: float | None, unit: str | None, site_tanks: list[TankSp
 
 def to_decimal(v) -> Decimal | None:
     return None if v is None else Decimal(str(round(float(v), 3)))
+
+
+
+# ── Estimation (MVP) : jamais une valeur certifiée ────────────────────────────────────────────────────────
+ESTIMATE_VERSION = "estimation-cuve-v1"
+EST_GEOMETRIC = "CM_CONVERTI_CUVE_GEOMETRIQUE_RESERVE"
+EST_PROPOSED = "CM_CONVERTI_CUVE_PROPOSEE_RESERVE"
+PROPOSED_STATUSES = ("PROPOSEE", "A_CONFIRMER")
+
+
+def compat_score(spec: TankSpec, model_found: bool, declared_capacity: float | None) -> int:
+    """
+    Score de compatibilité 0-100 d'une cuve : 0 sans géométrie ; 50 forme + cotes reconnues ; +25 modèle de la
+    bibliothèque unique et compatible ; +25 capacité (plaque ou déclarée, hors capacité recalculée depuis les cotes)
+    cohérente à 5 % (+10 à 15 %) ; plafonné à 40 si la capacité connue s'écarte de plus de 15 % de la géométrie.
+    """
+    full = spec.geometric_capacity_l() if spec.family else None
+    if not full:
+        return 0
+    score = 50 + (25 if model_found else 0)
+    cap = spec.plate_capacity_l or declared_capacity
+    if cap:
+        gap = abs(full - cap) / cap
+        derived = bool(declared_capacity and not spec.plate_capacity_l and abs(declared_capacity - full) / full <= 0.001)
+        if gap > 0.15:
+            score = min(score, 40)
+        elif not derived:
+            score += 25 if gap <= 0.05 else 10
+    return max(0, min(100, score))
+
+
+@dataclass
+class Estimate:
+    liters: float
+    mode: str
+    detail: dict
+
+
+def estimate_cm(level_cm: float | None, tank: TankSpec | None, min_score: int = 70) -> tuple[Estimate | None, str | None]:
+    """
+    Estimation de litres pour un niveau en cm quand la conversion certifiable est impossible :
+      - cuve VALIDÉE, forme + cotes, SANS capacité de plaque  → CM_CONVERTI_CUVE_GEOMETRIQUE_RESERVE ;
+      - cuve PROPOSÉE / À CONFIRMER, score de compatibilité ≥ seuil → CM_CONVERTI_CUVE_PROPOSEE_RESERVE.
+    Refus (aucun litre inventé) : pas de cuve, géométrie absente, plaque incohérente, niveau physiquement impossible.
+    Retourne (estimation, None) ou (None, motif). La cuve n'est JAMAIS marquée validée.
+    """
+    if level_cm is None:
+        return None, "Niveau absent."
+    if tank is None or tank.status == "REJETEE":
+        return None, "CM_SANS_CUVE : aucune cuve exploitable rattachée au relevé."
+    if not tank.family or not tank.has_geometry():
+        return None, "Forme ou cotes de la cuve insuffisantes pour estimer un volume."
+    plate = tank.plate_capacity_l
+    cal = tank.calibration()
+    if plate and cal["coherent"] is False:
+        return None, f"Plaque {plate:.0f} L incohérente avec la géométrie ({cal['gap_pct']:+.1f} %) : aucune estimation."
+    if tank.validated and not plate:
+        mode = EST_GEOMETRIC
+    elif tank.status in PROPOSED_STATUSES:
+        score = tank.compat_score or 0
+        if score < min_score:
+            return None, f"Cuve {tank.status} : score de compatibilité {score} < seuil {min_score}."
+        mode = EST_PROPOSED
+    else:
+        return None, f"Cuve au statut {tank.status} : estimation non autorisée."
+    height = tank.useful_height_cm()
+    if level_cm < 0 or (height is not None and level_cm > height + 0.5):
+        return None, f"Niveau {level_cm:g} cm physiquement impossible (hauteur utile {height:.0f} cm)."
+    try:
+        vol = geometric_volume_l(tank, float(level_cm))
+    except MissingDimensions as e:
+        return None, f"Calcul géométrique impossible : {e}"
+    k = cal["k"] if (plate and cal["coherent"]) else None
+    if k:
+        vol *= k
+    full = tank.geometric_capacity_l()
+    detail = {"version": ESTIMATE_VERSION, "formule": G.GEOMETRIC_FORMULA_VERSION, "cuve": tank.tank_id, "statut_cuve": tank.status,
+              "forme": tank.family, "dimensions_cm": [tank.d1, tank.d2, tank.d3], "fonds": [tank.bottom, tank.top],
+              "modele": tank.model_ref, "score_compatibilite": tank.compat_score, "plaque_l": plate, "volume_plein_geometrique_l": round(full, 1) if full else None,
+              "coefficient_plaque": round(k, 4) if k else None, "niveau_cm": float(level_cm), "confiance": "FAIBLE"}
+    return Estimate(round(vol, 3), mode, detail), None

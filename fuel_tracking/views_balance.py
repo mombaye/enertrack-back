@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from datetime import datetime, time
 
-from django.db.models import Count, Q
+from django.db.models import Count, Q, Sum
 from django.utils import timezone
 from rest_framework.parsers import JSONParser
 from rest_framework.permissions import IsAuthenticated
@@ -55,6 +55,11 @@ def row(b) -> dict:
         "retraits_l": _f(b.retraits_l), "rajouts_l": _f(b.rajouts_l), "livraisons_externes_l": _f(b.livraisons_externes_l),
         "consommation_reelle_l": _f(b.consommation_reelle_l), "conso_journaliere_l": _f(b.conso_journaliere_l),
         "statut_bilan": b.statut_bilan, "niveau_certification": b.niveau_certification, "motifs": b.motifs, "alertes": b.alertes,
+        "cause_principale": b.cause_principale, "score_confiance": b.score_confiance, "reserves": b.reserves, "estimation": b.estimation,
+        "age_stock_initial_j": b.age_stock_initial_j, "age_stock_final_j": b.age_stock_final_j,
+        "entrees_externes_nettes_l": _f(b.entrees_externes_nettes_l), "volume_transfere_l": _f(b.volume_transfere_l),
+        "impact_ponctions_l": _f(b.impact_ponctions_l), "volume_brut_integre_l": _f(b.volume_brut_integre_l),
+        "avertissement": "ESTIMATION — VALIDATION FUEL MANAGER REQUISE" if b.statut_bilan == "ESTIMATION_AVEC_RESERVE" else None,
         "nb_mouvements": len(b.mouvements or []), "nb_a_controler": sum(1 for x in (b.mouvements_exclus or []) if "contrôler" in x.get("motif", "")),
         "fraicheur_stock_final_h": round((b.calculated_at - b.date_stock_final).total_seconds() / 3600, 1) if b.date_stock_final else None,
         "calculated_at": b.calculated_at, "rule_version": b.rule_version,
@@ -90,7 +95,11 @@ def filtered(params):
     if p.get("source"):
         qs = qs.filter(Q(source_stock_initial=p["source"]) | Q(source_stock_final=p["source"]))
     if p.get("a_controler") in ("1", "true"):
-        qs = qs.filter(statut_bilan="MOUVEMENTS_A_CONTROLER")
+        qs = qs.filter(cause_principale__in=("MOUVEMENTS_A_CONTROLER", "TRANSFERT_DESEQUILIBRE"))
+    if p.get("cause"):
+        qs = qs.filter(cause_principale=p["cause"])
+    if p.get("estimation") in ("1", "true"):
+        qs = qs.filter(estimation=True)
     return qs, start, end
 
 
@@ -117,8 +126,19 @@ class StockBalanceListView(APIView):
         for field in ("source_stock_initial", "source_stock_final"):
             for r in period.exclude(**{f"{field}__isnull": True}).values(field).annotate(n=Count("id")):
                 sources.setdefault(r[field], {"initial": 0, "final": 0})["initial" if "initial" in field else "final"] = r["n"]
+        vol = period.aggregate(truck=Sum("livraisons_externes_l"), carte=Sum("carte_total_l"), ent=Sum("transferts_entrants_l"),
+                               sor=Sum("transferts_sortants_l"), brut=Sum("volume_brut_integre_l"))
+        z = lambda v: float(v or 0)  # noqa: E731  (somme d'agrégats : 0 = aucune ligne, jamais une donnée inconnue)
+        volumes = {
+            "livraisons_truck_eydon_l": z(vol["truck"]), "ravitaillements_carte_total_l": z(vol["carte"]),
+            "entrees_externes_nettes_l": z(vol["truck"]) + z(vol["carte"]),
+            "ponctions_entrantes_l": z(vol["ent"]), "ponctions_sortantes_l": z(vol["sor"]), "volume_transfere_entre_sites_l": z(vol["sor"]),
+            "impact_global_ponctions_l": round(z(vol["ent"]) - z(vol["sor"]), 3), "volume_brut_integre_l": z(vol["brut"]),
+            "note": "Les Ponctions sont des transferts internes : elles ne sont ni des achats ni une entrée nette de carburant ; "
+                    "leur impact global (pays) est nul.",
+        }
         return Response({
-            "data": data, "pagination": _pagination(page, limit, total), "periode": {"debut": start, "fin": end},
+            "data": data, "pagination": _pagination(page, limit, total), "periode": {"debut": start, "fin": end}, "volumes": volumes,
             "totaux": {"par_statut": totals, "calculables": period.filter(consommation_reelle_l__isnull=False).count(),
                        "incomplets": period.filter(consommation_reelle_l__isnull=True).count(), "sources_stock": sources,
                        "par_certification": {r["niveau_certification"]: r["n"] for r in period.values("niveau_certification").annotate(n=Count("id"))}},
@@ -129,10 +149,12 @@ class StockBalanceListView(APIView):
                 "pays": sorted({v for v in period.values_list("country", flat=True) if v}),
                 "typologies": sorted({v for v in period.values_list("typologie", flat=True) if v}),
                 "sources": sorted(sources),
+                "causes": sorted({v for v in period.values_list("cause_principale", flat=True) if v}),
             },
             "can_validate": getattr(request.user, "role", None) in VALIDATOR_ROLES,
-            "formule": "conso_reelle = stock_initial + livraisons_externes + carte_total + transferts_entrants + rajouts "
+            "formule": "conso_reelle = stock_initial + livraisons_truck + carte_total + transferts_entrants + rajouts "
                        "− transferts_sortants − retraits − vols − vidanges − stock_final",
+            "seuils": __import__("fuel_tracking.services.stock_period_balance", fromlist=["cfg"]).cfg(),
         })
 
 
@@ -184,12 +206,16 @@ class StockBalanceDetailView(APIView):
         return Response({
             **row(b), "stock_initial_detail": b.stock_initial_detail, "stock_final_detail": b.stock_final_detail,
             "candidats": b.candidats, "mouvements": mvts, "mouvements_exclus": b.mouvements_exclus,
+            "score_detail": b.score_detail, "proposition": b.proposition,
             "periode_effective": {"debut": b.periode_effective_debut, "fin": b.periode_effective_fin},
             "certifications": [{"action": c.action, "commentaire": c.comment, "utilisateur": c.user_label or (c.user.username if c.user_id else None),
                                 "date": c.created_at, "valeurs_certifiees": c.snapshot, "toujours_valide": c.fingerprint == b.fingerprint}
                                for c in b.certifications.select_related("user")],
             "priorite_sources": ["1. Closing mensuel validé", "2. Relevé terrain gardiennage validé (Loliforce / SCSS)",
                                  "3. Relevé ENOC qualifié (statut éligible)", "4. Autre source identifiée (marquée)"],
+            "priorite_valeurs": ["1. Litre directement déclaré", "2. cm converti, cuve validée avec plaque",
+                                 "3. cm estimé, cuve géométrique sans plaque (ESTIMATION)", "4. cm estimé, cuve proposée à forte compatibilité (ESTIMATION)",
+                                 "5. Aucun calcul si aucune cuve exploitable"],
             "can_validate": getattr(request.user, "role", None) in VALIDATOR_ROLES,
         })
 

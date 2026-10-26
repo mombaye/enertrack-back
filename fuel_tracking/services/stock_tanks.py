@@ -302,6 +302,15 @@ def evaluate_site_tanks(user=None, dry_run=False) -> dict:
         counts[t.site_id] = counts.get(t.site_id, 0) + 1
     for t in FuelTankMaster.objects.filter(active=True).select_related("tank_model", "source_batch"):
         stats["evaluees"] += 1
+        # Score de compatibilité (autorise l'estimation d'une cuve proposée au-dessus du seuil) : recalculé pour toutes les cuves.
+        spec0 = TC.TankSpec.from_model(t)
+        m0, _ = propose_model(spec0, models)
+        score = TC.compat_score(spec0, m0 is not None or t.tank_model_id is not None, _num(t.capacity_l))
+        if t.compat_score != score:
+            stats["scores_mis_a_jour"] = stats.get("scores_mis_a_jour", 0) + 1
+            if not dry_run:
+                FuelTankMaster.objects.filter(pk=t.pk).update(compat_score=score)
+                t.compat_score = score
         if t.validated_by_id is not None:
             stats["statuts"][t.validation_status] = stats["statuts"].get(t.validation_status, 0) + 1
             continue

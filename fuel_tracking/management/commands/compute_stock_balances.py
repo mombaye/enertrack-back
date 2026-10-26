@@ -16,9 +16,10 @@ from fuel_tracking.views_balance import parse_bound
 
 
 def _anon(r: dict, i: int) -> dict:
-    keep = ("observation_start", "observation_end", "stock_initial_l", "source_stock_initial", "date_stock_initial", "stock_final_l",
-            "source_stock_final", "date_stock_final", "truck_l", "carte_total_l", "transferts_entrants_l", "transferts_sortants_l",
-            "livraisons_externes_l", "consommation_reelle_l", "statut_bilan", "motifs")
+    keep = ("observation_start", "observation_end", "stock_initial_l", "source_stock_initial", "date_stock_initial", "age_stock_initial_j",
+            "stock_final_l", "source_stock_final", "date_stock_final", "age_stock_final_j", "livraisons_externes_l", "carte_total_l",
+            "transferts_entrants_l", "transferts_sortants_l", "consommation_reelle_l", "statut_bilan", "cause_principale", "score_confiance",
+            "reserves", "motifs")
     return {"site": f"SITE_{i:03d} (zone {r.get('zone') or '—'}, {r.get('typologie') or 'typologie inconnue'})",
             **{k: r.get(k) for k in keep}, "nb_mouvements": len(r.get("mouvements") or [])}
 
@@ -42,18 +43,38 @@ class Command(BaseCommand):
             raise CommandError(str(e)) from e
         calc = [r for r in rows if r["consommation_reelle_l"] is not None]
         sources = Counter()
+        modes = Counter()
+        tanks_used = {"GEOMETRIQUE": set(), "PROPOSEE": set()}
         for r in rows:
             for k in ("source_stock_initial", "source_stock_final"):
                 if r[k]:
                     sources[f"{r[k]} ({'initial' if 'initial' in k else 'final'})"] += 1
-        out = {"periode": f"{start:%d/%m/%Y %H:%M} → {end:%d/%m/%Y %H:%M}", "sites": len(rows), "calculables": len(calc),
-               "incomplets": len(rows) - len(calc), "par_statut": dict(Counter(r["statut_bilan"] for r in rows)),
+            for d in (r["stock_initial_detail"], r["stock_final_detail"]):
+                if d.get("mode_valeur"):
+                    modes[d["mode_valeur"]] += 1
+                det = d.get("detail_estimation") or {}
+                if d.get("estimation") and det.get("cuve") is not None:
+                    tanks_used["GEOMETRIQUE" if d["mode_valeur"].endswith("GEOMETRIQUE_RESERVE") else "PROPOSEE"].add((r["site_id"], det["cuve"]))
+        out = {"periode": f"{start:%d/%m/%Y %H:%M} → {end:%d/%m/%Y %H:%M}", "sites": len(rows),
+               "prets_a_certifier": sum(1 for r in rows if r["statut_bilan"] == "PRET_A_CERTIFIER"),
+               "estimations_avec_reserve": sum(1 for r in rows if r["statut_bilan"] == "ESTIMATION_AVEC_RESERVE"),
+               "non_calculables": sum(1 for r in rows if r["statut_bilan"] == "NON_CALCULABLE"),
+               "causes_principales": dict(Counter(r["cause_principale"] for r in rows if r["statut_bilan"] == "NON_CALCULABLE").most_common()),
+               "reserves_principales": dict(Counter(x.split(" (")[0].split(" :")[0][:60] for r in rows
+                                                    if r["statut_bilan"] == "ESTIMATION_AVEC_RESERVE" for x in r["reserves"]).most_common(8)),
                "stock_initial_present": sum(1 for r in rows if r["stock_initial_l"] is not None),
                "stock_final_present": sum(1 for r in rows if r["stock_final_l"] is not None),
-               "sources_stock_utilisees": dict(sources),
-               "conversion_cuve_manquante": sum(1 for r in rows if any("CONVERSION_CUVE_MANQUANTE" in a for a in r["alertes"]))}
+               "sources_stock_utilisees": dict(sources), "nature_des_valeurs_de_stock": dict(modes),
+               "cuves_geometriques_estimees_utilisees": len(tanks_used["GEOMETRIQUE"]),
+               "cuves_proposees_utilisees": len(tanks_used["PROPOSEE"]),
+               "volumes": {k: float(sum((r[k] or 0) for r in rows)) for k in ("livraisons_externes_l", "carte_total_l", "entrees_externes_nettes_l",
+                                                                              "transferts_entrants_l", "transferts_sortants_l", "volume_brut_integre_l")}}
+        out["volumes"]["impact_global_ponctions_l"] = round(out["volumes"]["transferts_entrants_l"] - out["volumes"]["transferts_sortants_l"], 3)
         if exemples:
-            inc = next((r for r in rows if r["statut_bilan"] == "DONNEES_STOCK_INCOMPLETES"), None)
-            out["exemple_calculable"] = _anon(calc[0], 1) if calc else None
-            out["exemple_incomplet"] = _anon(inc, 2) if inc else None
+            def pick(status):
+                return next((r for r in rows if r["statut_bilan"] == status), None)
+
+            out["exemples"] = {"certifiable": _anon(pick("PRET_A_CERTIFIER"), 1) if pick("PRET_A_CERTIFIER") else None,
+                               "avec_reserve": _anon(pick("ESTIMATION_AVEC_RESERVE"), 2) if pick("ESTIMATION_AVEC_RESERVE") else None,
+                               "non_calculable": _anon(pick("NON_CALCULABLE"), 3) if pick("NON_CALCULABLE") else None}
         self.stdout.write(json.dumps(out, ensure_ascii=False, indent=2, default=str))

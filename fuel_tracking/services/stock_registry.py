@@ -243,6 +243,25 @@ def _gap_tolerance(cap) -> float:
     return max(100.0, 0.10 * float(cap)) if cap else 100.0
 
 
+def proposed_tank_min_score() -> int:
+    return int(getattr(settings, "FUEL_PROPOSED_TANK_MIN_SCORE", 70))
+
+
+def reading_quality(unit, conv, estimate_mode, validation_status) -> tuple[str, str | None]:
+    """(statut qualité du relevé, confiance). Les estimations sont toujours de confiance FAIBLE."""
+    if unit not in ("L", "CM"):
+        return "UNITE_INCONNUE", None
+    if validation_status == "REJECTED" or conv.status == TC.INVALID:
+        return "VALEUR_INVALIDE", None
+    if unit == "L" and conv.level_liters is not None:
+        return "LITRE_DIRECT", "HAUTE" if conv.status == TC.VALID else "MOYENNE"
+    if conv.level_liters is not None and conv.method in (TC.CALIBRATED, TC.TANK_CURVE) and conv.status == TC.VALID:
+        return "CM_CONVERTI_CUVE_VALIDEE", "HAUTE"
+    if estimate_mode:
+        return estimate_mode, "FAIBLE"
+    return "CM_SANS_CUVE", None
+
+
 def build_observation(inp: ObservationInput, tanks: list[TC.TankSpec], guard: tuple[str, str | None] | None):
     """Construit (sans l'enregistrer) l'observation, ses volumes, ses codes d'anomalie et ses messages."""
     from fuel_tracking.models import FuelStockObservation as Obs
@@ -297,6 +316,20 @@ def build_observation(inp: ObservationInput, tanks: list[TC.TankSpec], guard: tu
             codes.append(f["code"])
             reasons.append(f["message"])
 
+    # Estimation MVP (niveau en cm sans conversion certifiable) : litres ESTIMÉS séparés de level_liters, relevé jamais validé
+    est_liters, est_mode, est_detail = None, None, {}
+    if level_cm is not None and conv.level_liters is None and conv.status in (TC.PENDING_TANK_MAPPING, TC.GEOMETRIC_ONLY) \
+            and inp.level_unit == "CM":
+        tank, _problem = TC.select_tank(tanks, inp.tank_id)
+        est, why = TC.estimate_cm(float(level_cm), tank, proposed_tank_min_score())
+        if est is not None:
+            est_liters, est_mode, est_detail = est.liters, est.mode, est.detail
+            messages.append({"code": est.mode, "message": f"Estimation {est.liters:.0f} L (confiance faible, avec réserve) : cuve "
+                                                           f"{est.detail['cuve']} {est.detail['statut_cuve']}, {est.detail['formule']}."})
+        elif why:
+            est_detail = {"refus": why}
+    quality, confidence = reading_quality(inp.level_unit if inp.level_unit in ("L", "CM") else None, conv, est_mode, status)
+
     codes = list(dict.fromkeys(codes))
     if status == Obs.ValidationStatus.VALIDATED:
         reason = "Contrôles automatiques réussis : conversion valide, capacité contrôlée" + (", périmètre de gardiennage conforme." if guard else ".")
@@ -321,6 +354,8 @@ def build_observation(inp: ObservationInput, tanks: list[TC.TankSpec], guard: tu
         guard_scope_status=guard[0] if guard else None, comment=inp.comment,
         proof_reference=(inp.proof_reference or None) and str(inp.proof_reference)[:512],
         validation_status=status, review_flags=flags, issue_codes=codes, validation_reason=reason,
+        reading_quality_status=quality, confidence=confidence, estimated_liters=TC.to_decimal(est_liters),
+        estimation_mode=est_mode, estimation_detail=est_detail,
     )
     return obs, messages
 
@@ -742,18 +777,56 @@ def reconvert_site_observations(site_id: str, user=None) -> int:
         # Le statut de gardiennage et les anomalies comptent aussi : un site qui entre dans un périmètre perd son
         # anomalie « gardiennage non configuré » même si le relevé reste à valider (cuve seulement proposée).
         before = (o.tank_id, _f(o.level_liters), o.conversion_status, o.validation_status, _f(o.volume_geometric_l),
-                  o.guard_scope_status, sorted(set(o.issue_codes or []) - {"STOCK_CONFLICT"}))
+                  o.guard_scope_status, sorted(set(o.issue_codes or []) - {"STOCK_CONFLICT"}), _f(o.estimated_liters), o.reading_quality_status)
         after = (new.tank_id, _f(new.level_liters), new.conversion_status, new.validation_status, _f(new.volume_geometric_l),
-                 new.guard_scope_status, sorted(set(new.issue_codes or []) - {"STOCK_CONFLICT"}))
+                 new.guard_scope_status, sorted(set(new.issue_codes or []) - {"STOCK_CONFLICT"}), _f(new.estimated_liters), new.reading_quality_status)
         if before != after:
             log_correction("OBSERVATION", o.pk, "SYSTEM", "Reconversion après modification du référentiel cuve / gardiennage",
                            site_id=site_id, field="cuve/litres/conversion/statut/géométrique", old=before, new=after, user=user,
                            author_label=None if user else "système")
             for f in ("tank_id", "level_liters", "conversion_method", "conversion_status", "conversion_message", "capacity_l",
                       "validation_status", "validation_reason", "guard_scope_status", "volume_geometric_l", "volume_calibrated_l",
-                      "cm_liters_gap_l", "fill_pct", "conversion_rule", "tank_model_ref", "issue_codes", "review_flags"):
+                      "cm_liters_gap_l", "fill_pct", "conversion_rule", "tank_model_ref", "issue_codes", "review_flags",
+                      "reading_quality_status", "confidence", "estimated_liters", "estimation_mode", "estimation_detail"):
                 setattr(o, f, getattr(new, f))
             o.save()
             n += 1
     apply_guard_conflicts([site_id])
+    mark_potential_duplicates([site_id])
     return n
+
+
+SOURCE_PRIORITY_DUP = {"CLOSING": 1, "LOLIFORCE": 2, "SCSS": 2, "ENOC": 3}
+
+
+def mark_potential_duplicates(site_ids=None) -> int:
+    """
+    DOUBLON_POTENTIEL : relevés de SOURCES différentes, même site / jour / cuve, valeurs équivalentes (± 1 %). Le relevé de
+    priorité la plus haute reste la référence ; les autres pointent vers lui (potential_duplicate_of). Aucune suppression.
+    """
+    from collections import defaultdict
+
+    from fuel_tracking.models import FuelStockObservation as Obs
+
+    qs = Obs.objects.exclude(source_type="SNOWFLAKE").only("id", "site_id", "tank_id", "observation_datetime", "source_type", "level_value",
+                                                           "level_unit", "level_liters", "estimated_liters", "potential_duplicate_of")
+    if site_ids is not None:
+        qs = qs.filter(site_id__in=list(site_ids))
+    groups = defaultdict(list)
+    for o in qs.iterator():
+        groups[(o.site_id, o.observation_datetime.date(), str(o.tank_id or ""))].append(o)
+    changed = 0
+    for items in groups.values():
+        if len(items) < 2 or len({o.source_type for o in items}) < 2:
+            continue
+        items.sort(key=lambda o: (SOURCE_PRIORITY_DUP.get(o.source_type, 4), o.id))
+        ref = items[0]
+        ref_val = _f(ref.level_liters if ref.level_liters is not None else ref.estimated_liters) or _f(ref.level_value)
+        for o in items[1:]:
+            val = _f(o.level_liters if o.level_liters is not None else o.estimated_liters) or _f(o.level_value)
+            same = bool(ref_val and val and abs(val - ref_val) <= 0.01 * max(abs(ref_val), 1)) and o.source_type != ref.source_type
+            target = ref.id if same else None
+            if o.potential_duplicate_of != target:
+                Obs.objects.filter(pk=o.pk).update(potential_duplicate_of=target)
+                changed += 1
+    return changed

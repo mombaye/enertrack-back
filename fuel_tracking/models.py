@@ -1065,6 +1065,9 @@ class FuelImportBatch(models.Model):
     received_at = models.DateTimeField(default=timezone.now)
     processed_at = models.DateTimeField(null=True, blank=True)
     received_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    declared_period_start = models.DateField(null=True, blank=True, help_text="Première date de relevé / d'événement du fichier.")
+    declared_period_end = models.DateField(null=True, blank=True, help_text="Dernière date de relevé / d'événement du fichier.")
+    mapping_version = models.CharField(max_length=64, null=True, blank=True, help_text="Version du mapping de colonnes appliqué (docs/fuel_stock_registry.md).")
 
     class Meta:
         db_table = "fuel_import_batch"
@@ -1192,6 +1195,8 @@ class FuelTankMaster(models.Model):
     capacity_l = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True, help_text="Capacité déclarée par la source (le Closing la recalcule depuis les cotes).")
     capacity_plate_l = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True, help_text="Capacité de plaque (sert au volume calibré).")
     capacity_plate_source = models.CharField(max_length=255, null=True, blank=True)
+    compat_score = models.IntegerField(null=True, blank=True, help_text="Score de compatibilité 0-100 (forme + cotes + modèle + capacité) : "
+                                                                    "autorise l'estimation d'une cuve PROPOSÉE au-dessus du seuil configurable.")
     serial_number = models.CharField(max_length=128, null=True, blank=True)
     number_of_tanks_on_site = models.IntegerField(null=True, blank=True)
     calibration_curve = models.JSONField(null=True, blank=True, help_text="[[niveau_cm, volume_L], …] croissant.")
@@ -1299,6 +1304,17 @@ class FuelStockObservation(models.Model):
     source_user = models.CharField(max_length=255, null=True, blank=True)
     source_reference = models.CharField(max_length=255, null=True, blank=True)
     guard_scope_status = models.CharField(max_length=24, null=True, blank=True, help_text="IN_SCOPE, NOT_CONFIGURED, PROVIDER_MISMATCH (sources gardiennage).")
+    # MVP : qualité du relevé et estimation (jamais présentée comme une valeur certifiée)
+    reading_quality_status = models.CharField(max_length=40, null=True, blank=True, db_index=True,
+                                              help_text="LITRE_DIRECT, CM_CONVERTI_CUVE_VALIDEE, CM_CONVERTI_CUVE_GEOMETRIQUE_RESERVE, "
+                                                        "CM_CONVERTI_CUVE_PROPOSEE_RESERVE, CM_SANS_CUVE, UNITE_INCONNUE, VALEUR_INVALIDE, DOUBLON_POTENTIEL.")
+    confidence = models.CharField(max_length=8, null=True, blank=True, help_text="HAUTE / MOYENNE / FAIBLE.")
+    estimated_liters = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True,
+                                           help_text="Litres ESTIMÉS (cuve géométrique sans plaque / cuve proposée) : jamais level_liters.")
+    estimation_mode = models.CharField(max_length=40, null=True, blank=True)
+    estimation_detail = models.JSONField(default=dict, blank=True, help_text="Cuve, statut, modèle, score, dimensions, formule et version.")
+    potential_duplicate_of = models.IntegerField(null=True, blank=True, db_index=True,
+                                                 help_text="Relevé de priorité supérieure aux valeurs équivalentes (même site, jour et cuve) : DOUBLON_POTENTIEL.")
     source_provenance = models.CharField(max_length=32, null=True, blank=True, help_text="ENOC : provenance du statut brut.")
     business_status = models.CharField(max_length=28, null=True, blank=True, db_index=True, help_text="ENOC : statut métier eGrid.")
     status_mapping_rule = models.CharField(max_length=255, null=True, blank=True)
@@ -1342,7 +1358,9 @@ class FuelMovement(models.Model):
         THEFT = "THEFT", "Vol"
         DRAIN = "DRAIN", "Vidange"
         CORRECTION = "CORRECTION", "Correction"
-        TRANSFERT_INTERSITE = "TRANSFERT_INTERSITE", "Transfert inter-sites (Ponction)"
+        TRANSFERT_INTERSITE = "TRANSFERT_INTERSITE", "Transfert inter-sites (ancien libellé)"
+        TRANSFERT_INTERSITE_SORTANT = "TRANSFERT_INTERSITE_SORTANT", "Transfert inter-sites sortant (Ponction, site source)"
+        TRANSFERT_INTERSITE_ENTRANT = "TRANSFERT_INTERSITE_ENTRANT", "Transfert inter-sites entrant (Ponction, site destinataire)"
 
     class Status(models.TextChoices):
         DECLARED = "DECLARED", "Déclaré"
@@ -1357,7 +1375,7 @@ class FuelMovement(models.Model):
     site_id = models.CharField(max_length=64, db_index=True)
     counterpart_site_id = models.CharField(max_length=64, null=True, blank=True, help_text="Site / dépôt source ou destination d'un transfert.")
     tank_id = models.CharField(max_length=32, null=True, blank=True)
-    movement_type = models.CharField(max_length=24, choices=MovementType.choices, null=True, blank=True, db_index=True)
+    movement_type = models.CharField(max_length=32, choices=MovementType.choices, null=True, blank=True, db_index=True)
     movement_datetime = models.DateTimeField(null=True, blank=True, db_index=True)
     requested_quantity_l = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True)
     quantity_l = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True, help_text="Quantité réellement mouvementée ; NULL si non déclarée (jamais 0 par défaut).")
@@ -1576,6 +1594,20 @@ class FuelEnocQualifiedMovement(models.Model):
     fuel_manager_reviewed_at = models.DateTimeField(null=True, blank=True)
     fuel_manager_comment = models.TextField(null=True, blank=True)
 
+    # Qualité NON exclusive : chaque indicateur est conservé indépendamment (un mouvement peut cumuler plusieurs défauts)
+    source_record_id = models.CharField(max_length=128, null=True, blank=True, db_index=True, help_text="Identifiant source (FuelEnocMovement.source_id).")
+    has_levels_before_after = models.BooleanField(default=False)
+    has_proof = models.BooleanField(default=False)
+    has_hourmeter = models.BooleanField(default=False)
+    has_site_source = models.BooleanField(null=True, blank=True, help_text="Ponction seulement (NULL : sans objet).")
+    has_site_destination = models.BooleanField(null=True, blank=True, help_text="Ponction seulement (NULL : sans objet).")
+    has_approved_quantity = models.BooleanField(default=False)
+    has_actual_quantity = models.BooleanField(default=False)
+    has_date = models.BooleanField(default=False)
+    level_coherence_status = models.CharField(max_length=24, null=True, blank=True, help_text="COHERENT / ECART / NON_CALCULABLE")
+    stock_eligibility = models.CharField(max_length=24, null=True, blank=True, db_index=True, help_text="ELIGIBLE / NON_ELIGIBLE")
+    quality_status_global = models.CharField(max_length=24, null=True, blank=True, db_index=True, help_text="COMPLET / DEFAUTS_MINEURS / DEFAUTS_MAJEURS / NON_INTEGRABLE")
+
     # Mapping figé du statut ENOC (enoc_canonical.map_status) : brut → statut métier eGrid, règle tracée
     source_provenance = models.CharField(max_length=32, null=True, blank=True, db_index=True,
                                          help_text="ENOC_MONGO / ENOC_OPERATION_SANS_DEMANDE / API_REST_HISTORIQUE")
@@ -1636,10 +1668,8 @@ class FuelStockBalance(models.Model):
 
     class Statut(models.TextChoices):
         PRET_A_CERTIFIER = "PRET_A_CERTIFIER", "Prêt à certifier"
-        PRET_A_CERTIFIER_AVEC_RESERVE = "PRET_A_CERTIFIER_AVEC_RESERVE", "Prêt à certifier avec réserve"
-        DONNEES_STOCK_INCOMPLETES = "DONNEES_STOCK_INCOMPLETES", "Données stock incomplètes"
-        MOUVEMENTS_A_CONTROLER = "MOUVEMENTS_A_CONTROLER", "Mouvements à contrôler"
-        HISTORIQUE_NON_VERIFIABLE = "HISTORIQUE_NON_VERIFIABLE", "Historique non vérifiable"
+        ESTIMATION_AVEC_RESERVE = "ESTIMATION_AVEC_RESERVE", "Estimation avec réserve"
+        NON_CALCULABLE = "NON_CALCULABLE", "Non calculable"
 
     class Niveau(models.TextChoices):
         NON_CERTIFIE = "NON_CERTIFIE", "Non certifié"
@@ -1683,6 +1713,21 @@ class FuelStockBalance(models.Model):
     niveau_certification = models.CharField(max_length=24, choices=Niveau.choices, default=Niveau.NON_CERTIFIE, db_index=True)
     motifs = models.JSONField(default=list, blank=True)
     alertes = models.JSONField(default=list, blank=True)
+    resultat_bilan = models.CharField(max_length=32, null=True, blank=True, db_index=True,
+                                      help_text="PRET_A_CERTIFIER / ESTIMATION_AVEC_RESERVE / NON_CALCULABLE")
+    cause_principale = models.CharField(max_length=40, null=True, blank=True, db_index=True)
+    score_confiance = models.IntegerField(null=True, blank=True)
+    score_detail = models.JSONField(default=list, blank=True, help_text="Points gagnés / perdus par critère, avec motifs.")
+    reserves = models.JSONField(default=list, blank=True)
+    estimation = models.BooleanField(default=False, help_text="Au moins un stock estimé (cuve géométrique sans plaque / proposée).")
+    age_stock_initial_j = models.IntegerField(null=True, blank=True)
+    age_stock_final_j = models.IntegerField(null=True, blank=True)
+    entrees_externes_nettes_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    volume_transfere_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    impact_ponctions_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True,
+                                             help_text="Entrants − sortants au niveau du site (nul au niveau pays).")
+    volume_brut_integre_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    proposition = models.JSONField(default=dict, blank=True, help_text="Données préparées pour la future recommandation de commande (indicatif).")
     candidats = models.JSONField(default=dict, blank=True, help_text="Relevés stock candidats (initial / final) et motif de sélection.")
     mouvements = models.JSONField(default=list, blank=True, help_text="Mouvements constitutifs retenus.")
     mouvements_exclus = models.JSONField(default=list, blank=True, help_text="Mouvements exclus ou à contrôler (avec motif).")

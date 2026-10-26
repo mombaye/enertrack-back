@@ -819,6 +819,46 @@ def fingerprint(c: dict) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
 
+def quality_indicators(c: dict, q: dict, m) -> dict:
+    """Indicateurs de qualité NON exclusifs (un mouvement peut cumuler plusieurs défauts) + statut global dérivé."""
+    fam = type_family(c.get("raw_movement_type"))
+    if fam == "PONCTION":
+        has_levels = (c.get("source_level_before_l") is not None or c.get("source_level_before_cm") is not None) and \
+                     (c.get("source_level_after_l") is not None or c.get("source_level_after_cm") is not None)
+    else:
+        has_levels = (c.get("tank_level_before_l") is not None or c.get("tank_level_before_cm") is not None) and \
+                     (c.get("tank_level_after_l") is not None or c.get("tank_level_after_cm") is not None)
+    codes = {a.get("code") for a in q.get("alerts") or []}
+    if codes & {"ECART_NIVEAU", "ECART_NIVEAU_PONCTION_A_CONTROLER", "NIVEAU_APRES_INFERIEUR"}:
+        coherence = "ECART"
+    elif has_levels and "NIVEAU_SOURCE_EN_CM" not in codes and not any("niveaux en cm" in x for x in q.get("quality_missing") or []):
+        coherence = "COHERENT"
+    else:
+        coherence = "NON_CALCULABLE"
+    integrated = q.get("integration_status") == "INTEGRE"
+    minor = [not has_levels, not c.get("proof_count"), c.get("generator_hourmeter_before_h") is None and c.get("generator_hourmeter_after_h") is None]
+    if not integrated:
+        glob = "NON_INTEGRABLE"
+    elif coherence == "ECART":
+        glob = "DEFAUTS_MAJEURS"
+    elif any(minor):
+        glob = "DEFAUTS_MINEURS"
+    else:
+        glob = "COMPLET"
+    return {
+        "source_record_id": getattr(m, "source_id", None), "has_levels_before_after": bool(has_levels),
+        "has_proof": bool(c.get("proof_count")),
+        "has_hourmeter": c.get("generator_hourmeter_before_h") is not None or c.get("generator_hourmeter_after_h") is not None,
+        "has_site_source": (bool(c.get("_source_site_resolved")) if fam == "PONCTION" else None),
+        "has_site_destination": bool(c.get("_site_resolved")),
+        "has_approved_quantity": bool(c.get("approved_quantity_l") and c["approved_quantity_l"] > 0),
+        "has_actual_quantity": bool(c.get("actual_quantity_l") and c["actual_quantity_l"] > 0),
+        "has_date": bool(q.get("accounting_at")),
+        "level_coherence_status": coherence, "stock_eligibility": "ELIGIBLE" if integrated else "NON_ELIGIBLE",
+        "quality_status_global": glob,
+    }
+
+
 def sync_qualified(movements=None, user=None) -> dict:
     """Extrait + qualifie chaque FuelEnocMovement. Idempotent ; un rapprochement n'est conservé que si la source n'a pas changé."""
     from fuel_tracking.models import FuelEnocMovement, FuelEnocQualifiedMovement as Q
@@ -863,6 +903,7 @@ def sync_qualified(movements=None, user=None) -> dict:
                     stats["rapprochements_annules"] += 1
                     q.reconciled_by, q.reconciled_at = None, None
             values.update(q_vals)
+            values.update(quality_indicators(c, q_vals, m))
             if q is None:
                 q = Q(enoc_movement=m, qualified_at=now, **values)
                 q.save()
