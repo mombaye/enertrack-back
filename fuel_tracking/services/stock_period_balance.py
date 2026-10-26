@@ -390,6 +390,8 @@ def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, pro
         if x:
             if x["estimation"]:
                 reserves.append(f"Stock {label} ESTIMÉ ({x['mode_valeur']}, confiance faible).")
+                if str(x["mode_valeur"]).endswith("GEOMETRIQUE_RESERVE"):
+                    reserves.append(f"Stock {label} : volume calculé à partir des dimensions de cuve, plaque non confirmée.")
             if x["tier"] == "RESERVE":
                 reserves.append(f"Stock {label} ancien de {x['age_jours']} j (4-{c['reserve_days']} j) : estimation avec réserve.")
             elif x["tier"] == "FRAIS" and x["age_jours"]:

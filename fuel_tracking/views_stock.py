@@ -539,7 +539,7 @@ class TankDetailView(APIView):
 
 def _batch(b):
     return {
-        "id": b.id, "source_type": b.source_type, "file_name": b.file_name, "file_hash": b.file_hash, "file_size": b.file_size,
+        "id": b.id, "source_type": b.source_type, "source_libelle": b.get_source_type_display(), "file_name": b.file_name, "file_hash": b.file_hash, "file_size": b.file_size,
         "origin": b.origin, "status": b.status, "status_message": b.status_message, "duplicate_of": b.duplicate_of_id,
         "relaunch_of": b.relaunch_of_id, "relaunch_reason": b.relaunch_reason, "rows_total": b.rows_total,
         "rows_accepted": b.rows_accepted, "rows_warning": b.rows_warning, "rows_rejected": b.rows_rejected,

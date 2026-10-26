@@ -388,5 +388,8 @@ FUEL_BALANCE_SCORE_RESERVE = int(os.getenv("FUEL_BALANCE_SCORE_RESERVE", "50"))
 FUEL_BALANCE_SCORE_WEIGHTS = json.loads(os.getenv("FUEL_BALANCE_SCORE_WEIGHTS", "{}") or "{}")
 # Score minimal de compatibilité (0-100) pour estimer des litres avec une cuve PROPOSÉE (jamais validée automatiquement).
 FUEL_PROPOSED_TANK_MIN_SCORE = int(os.getenv("FUEL_PROPOSED_TANK_MIN_SCORE", "70"))
+# Décision Steve : une cuve VALIDÉE mais SANS plaque (dimensions cohérentes) peut-elle produire une estimation ? Désactivé par défaut.
+# Si activé : résultat UNIQUEMENT « estimation avec réserve », jamais certifiable automatiquement.
+ALLOW_GEOMETRIC_TANK_ESTIMATION_WITH_RESERVE = os.getenv("ALLOW_GEOMETRIC_TANK_ESTIMATION_WITH_RESERVE", "0").lower() in ("1", "true", "yes", "on")
 # Données préparées pour la future recommandation de commande (indicatif, aucune commande automatique).
 FUEL_ORDER_HORIZON_DAYS = int(os.getenv("FUEL_ORDER_HORIZON_DAYS", "30"))

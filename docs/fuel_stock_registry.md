@@ -494,3 +494,27 @@ python manage.py compute_stock_balances --debut 2026-10-01 --fin 2026-10-31 --ex
 ## Variables / réglages
 `FUEL_BALANCE_FRESH_STOCK_DAYS=3`, `FUEL_BALANCE_RESERVE_STOCK_DAYS=14`, `FUEL_BALANCE_SCORE_READY=80`, `FUEL_BALANCE_SCORE_RESERVE=50`,
 `FUEL_BALANCE_SCORE_WEIGHTS` (JSON), `FUEL_PROPOSED_TANK_MIN_SCORE=70`, `FUEL_ORDER_HORIZON_DAYS=30`.
+
+---
+
+# Validation terrain (migration `0052`, libellés d'import)
+
+Libellés des fichiers d'import : `Closing mensuel — stocks et mouvements de période`, `Loliforce — relevés de stock terrain`,
+`SCSS — relevés de stock terrain`, `Historique refueling — source historique`, `Modèles de cuves — calculateur et conversion cm vers litres`.
+Le Closing n'est pas un « référentiel cuves ».
+
+Analyse AVANT import (lecture seule, aucune écriture) :
+```
+python manage.py analyze_stock_files                                  # tous les fichiers de <FUEL_IMPORT_ROOT>/incoming
+python manage.py analyze_stock_files --dossier /mnt/Suivi_carburant_prod/archive --json /tmp/analyse.json
+python manage.py analyze_stock_files --fichier /chemin/Loliforce.xlsx --source LOLIFORCE
+```
+Par fichier : feuille retenue, période, lignes, colonnes, mapping colonne → champ eGrid, unité détectée, sites reconnus / non reconnus,
+relevés en litres / en cm, lignes qui seraient rejetées et motifs (mêmes règles que l'import).
+
+Tableau de validation sur ~10 sites réels : `python manage.py fuel_validation_sites --debut AAAA-MM-JJ --fin AAAA-MM-JJ [--csv f.csv] [--anonymiser]`.
+
+Paramètre `ALLOW_GEOMETRIC_TANK_ESTIMATION_WITH_RESERVE` (variable d'environnement, **désactivé par défaut**, décision Steve) : si activé, une cuve
+validée sans plaque mais aux dimensions cohérentes produit une estimation, uniquement « estimation avec réserve » (« Volume calculé à partir des
+dimensions de cuve, plaque non confirmée »), jamais certifiable automatiquement. Après changement : `reestimate_stock_observations` puis
+`compute_stock_balances`.

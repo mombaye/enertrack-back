@@ -6,6 +6,7 @@ from unittest import mock
 
 from django.contrib.auth import get_user_model
 from django.core.management import call_command
+from django.test import override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -26,6 +27,9 @@ from fuel_tracking.tests_stock_registry import HEAD, TmpRootMixin, guard_row, ta
 class BalanceBase(EnocBase):
     def setUp(self):
         super().setUp()
+        ov = override_settings(ALLOW_GEOMETRIC_TANK_ESTIMATION_WITH_RESERVE=True)  # désactivé par défaut en production (décision Steve)
+        ov.enable()
+        self.addCleanup(ov.disable)
         Site.objects.filter(site_id="DKR_0001").update(zone="DKR", country="sen", installed_typology="A_Ax_GG GE")
         Site.objects.create(site_id="DKR_0002", name="SOURCE", zone="DKR", country="sen")
         day0 = timezone.localtime(timezone.now() - timedelta(days=60)).date()
@@ -156,6 +160,25 @@ class MvpBalanceTests(BalanceBase):
         with self.assertRaises(SB.BalanceError):
             SB.certify(b, None, "certifier_avec_reserve", "")
         SB.certify(b, None, "certifier_avec_reserve", "Cuve sans plaque : estimation validée par le Fuel Manager")
+
+    # 6 bis. paramètre ALLOW_GEOMETRIC_TANK_ESTIMATION_WITH_RESERVE désactivé : aucun litre, aucune estimation
+    def test_geometric_estimation_disabled_by_setting(self):
+        tank("DKR_0001", plate=None)
+        with self.settings(ALLOW_GEOMETRIC_TANK_ESTIMATION_WITH_RESERVE=False):
+            o = self.obs_cm(60, self.start + timedelta(hours=1))
+        self.assertEqual((o.reading_quality_status, o.estimated_liters, o.level_liters), ("CM_SANS_CUVE", None, None))
+        self.assertIn("ALLOW_GEOMETRIC_TANK_ESTIMATION_WITH_RESERVE", o.estimation_detail["refus"])
+
+    def test_geometric_reserve_text_and_never_certifiable(self):
+        tank("DKR_0001", plate=None)
+        self.obs_cm(60, self.start + timedelta(hours=1))
+        self.obs_cm(30, self.end - timedelta(hours=1), source="SCSS")
+        r = self.compute()["DKR_0001"]
+        self.assertEqual(r["statut_bilan"], "ESTIMATION_AVEC_RESERVE")
+        self.assertTrue(any("Volume calculé à partir des dimensions de cuve, plaque non confirmée".lower() in x.lower() for x in r["reserves"]))
+        b = FuelStockBalance.objects.get(site_id="DKR_0001")
+        with self.assertRaises(SB.BalanceError):
+            SB.certify(b, None, "certifier", "")
 
     # 7. cuve proposée : score de compatibilité configurable
     def test_proposed_tank_estimate_only_above_score_threshold(self):
@@ -433,6 +456,31 @@ class MvpImportTests(TmpRootMixin, BalanceBase):
         self.assertIn("marque ge", kolda["colonnes_non_reconnues"])
         self.assertTrue(next(s for s in res["feuilles"] if s["feuille"] == "Compile")["ignoree"])
         self.assertEqual((res["source_detectee"], res["version_mapping"], res["couverture_sites"]["inconnus"]), ("LOLIFORCE", "gardiennage-v1", 1))
+
+    def test_analysis_reports_units_sites_rejections_and_period(self):
+        from fuel_tracking.services.stock_file_analysis import analyze
+
+        rows = [guard_row("DKR_0001", cm=10, d=datetime(2026, 10, 3)), guard_row("DKR_0001", cm=None, l=300, d=datetime(2026, 10, 9)),
+                guard_row("XXX_9999", cm=5, d=datetime(2026, 10, 4)), guard_row("DKR_0003", cm=None, d=datetime(2026, 10, 5))]
+        res = analyze(xlsx({"KOLDA": [["SEMAINE 40"], [], HEAD] + rows}), "loliforce_oct.xlsx")  # source déduite du nom et des colonnes
+        c = res["controle_lignes"]
+        self.assertEqual((res["source_detectee"], res["libelle_source"]), ("LOLIFORCE", "Loliforce — relevés de stock terrain"))
+        self.assertEqual((c["lignes_lues"], c["lignes_rejetees"], c["releves_en_cm"], c["releves_en_litres"]), (4, 2, 2, 1))
+        self.assertEqual((c["sites_non_reconnus"], c["motifs_rejet"].get("UNKNOWN_SITE"), c["motifs_rejet"].get("MISSING_LEVEL")), (1, 1, 1))
+        self.assertEqual((res["feuilles_retenues"], res["periode_detectee"]), (["KOLDA"], ["2026-10-03", "2026-10-09"]))
+        self.assertEqual(c["unite_detectee"], "cm + litres")
+        self.assertEqual(FuelImportBatch.objects.count(), 0)  # rien n'est importé
+
+    def test_validation_sites_table_covers_profiles_read_only(self):
+        self.stocks(500, 300)
+        self.tc("TR-V1", 200, self.base + timedelta(days=10), typ="TRUCK")
+        self.compute(("DKR_0001",))
+        out = StringIO()
+        call_command("fuel_validation_sites", debut=self.start.strftime("%Y-%m-%d"), fin=self.end.strftime("%Y-%m-%d"), anonymiser=True, stdout=out)
+        text = out.getvalue()
+        self.assertIn("SITE_001", text)
+        self.assertIn("stock_litre_direct", text)
+        self.assertIn("lecture seule", text)
 
     # doublon potentiel entre sources
     def test_potential_duplicate_between_sources(self):

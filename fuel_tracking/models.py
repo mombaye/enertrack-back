@@ -1016,7 +1016,7 @@ class FuelObservation(models.Model):
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 1 — Registre unifié de stock et de mouvements carburant (Suivis Stock).
 # Sources : ENOC (connecteur existant, via FuelEnocMovement), fichiers des
-# sociétés de gardiennage (Loliforce, SCSS), Closing (référentiel cuves) et
+# sociétés de gardiennage (Loliforce, SCSS), Closing mensuel (stocks et mouvements de période) et
 # historique refueling. Règles : une donnée absente reste NULL (jamais 0),
 # aucun relevé ni mouvement n'est supprimé physiquement, toute correction est
 # tracée (FuelRegistryCorrection). Voir docs/fuel_stock_registry.md.
@@ -1028,11 +1028,11 @@ class FuelImportBatch(models.Model):
 
     class SourceType(models.TextChoices):
         ENOC = "ENOC", "ENOC"
-        LOLIFORCE = "LOLIFORCE", "Loliforce"
-        SCSS = "SCSS", "SCSS"
-        CLOSING = "CLOSING", "Closing (référentiel cuves)"
-        HISTORICAL_REFUELING = "HISTORICAL_REFUELING", "Historique refueling"
-        TANK_MODELS = "TANK_MODELS", "Bibliothèque de modèles de cuves (calculateur)"
+        LOLIFORCE = "LOLIFORCE", "Loliforce — relevés de stock terrain"
+        SCSS = "SCSS", "SCSS — relevés de stock terrain"
+        CLOSING = "CLOSING", "Closing mensuel — stocks et mouvements de période"
+        HISTORICAL_REFUELING = "HISTORICAL_REFUELING", "Historique refueling — source historique"
+        TANK_MODELS = "TANK_MODELS", "Modèles de cuves — calculateur et conversion cm vers litres"
 
     class Status(models.TextChoices):
         RECEIVED = "RECEIVED", "Reçu"

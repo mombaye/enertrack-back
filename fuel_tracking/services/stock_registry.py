@@ -247,6 +247,10 @@ def proposed_tank_min_score() -> int:
     return int(getattr(settings, "FUEL_PROPOSED_TANK_MIN_SCORE", 70))
 
 
+def geometric_estimation_allowed() -> bool:
+    return bool(getattr(settings, "ALLOW_GEOMETRIC_TANK_ESTIMATION_WITH_RESERVE", False))
+
+
 def reading_quality(unit, conv, estimate_mode, validation_status) -> tuple[str, str | None]:
     """(statut qualité du relevé, confiance). Les estimations sont toujours de confiance FAIBLE."""
     if unit not in ("L", "CM"):
@@ -322,6 +326,9 @@ def build_observation(inp: ObservationInput, tanks: list[TC.TankSpec], guard: tu
             and inp.level_unit == "CM":
         tank, _problem = TC.select_tank(tanks, inp.tank_id)
         est, why = TC.estimate_cm(float(level_cm), tank, proposed_tank_min_score())
+        if est is not None and est.mode == TC.EST_GEOMETRIC and not geometric_estimation_allowed():
+            est, why = None, ("Estimation géométrique (cuve sans plaque) désactivée : ALLOW_GEOMETRIC_TANK_ESTIMATION_WITH_RESERVE = faux "
+                              "(décision Steve en attente) — aucun litre calculé.")
         if est is not None:
             est_liters, est_mode, est_detail = est.liters, est.mode, est.detail
             messages.append({"code": est.mode, "message": f"Estimation {est.liters:.0f} L (confiance faible, avec réserve) : cuve "
