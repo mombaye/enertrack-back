@@ -439,3 +439,58 @@ Grain `country + site_id + observation_start + observation_end` (jamais limité 
   présent/absent, source, à contrôler), `stock/bilans/periodes/`, `stock/bilans/calculer/`, `stock/bilans/<id>/`,
   `stock/bilans/<id>/certifier/`, `stock/bilans/rapprochement/` (réel / instrumentée Snowflake / théorique CPH ; aucun écart si
   la consommation réelle est NULL).
+
+---
+
+# MVP opérationnel — estimations avec réserve, bilan v2, imports versionnés (migrations `0050`, `0051`)
+
+Périmètre : eGrid uniquement (ENOC jamais modifié). Rien n'est statique : tout est recalculé depuis les relevés, mouvements et cuves.
+
+## Ponction (inchangé sur le fond, libellés précisés)
+Deux écritures liées `TRANSFERT_INTERSITE_SORTANT` / `TRANSFERT_INTERSITE_ENTRANT`, `transfer_id = ENOC-PONCTION-<ref>`, somme nulle.
+Dans le bilan : impact réel par site (± volume), **impact global nul**, jamais compté comme achat ni entrée externe nette. Une Ponction
+déséquilibrée rend le bilan du site `NON_CALCULABLE` (`TRANSFERT_DESEQUILIBRE`).
+
+## Qualité d'un relevé (`reading_quality_status`)
+`LITRE_DIRECT`, `CM_CONVERTI_CUVE_VALIDEE`, `CM_CONVERTI_CUVE_GEOMETRIQUE_RESERVE`, `CM_CONVERTI_CUVE_PROPOSEE_RESERVE`, `CM_SANS_CUVE`,
+`SITE_NON_RECONNU`, `UNITE_INCONNUE`, `VALEUR_INVALIDE`, `DOUBLON_POTENTIEL` (même site / jour / cuve, sources différentes, ±1 %).
+Priorité des valeurs : litre direct > cuve validée (conversion certifiable) > cuve géométrique **sans plaque** (estimation, confiance FAIBLE,
+jamais certifiable) > cuve **proposée** dont `compat_score ≥ FUEL_PROPOSED_TANK_MIN_SCORE` (estimation avec réserve) > aucun litre.
+Les litres estimés sont stockés à part (`estimated_liters`, `estimation_mode`, `estimation_detail`) : `level_liters` n'est jamais rempli par une
+estimation et une cuve n'est jamais validée automatiquement. Version du modèle d'estimation : `estimation-cuve-v1`.
+
+## Bilan `bilan-v2` — par pays + site + période exacte
+`conso = stock_initial + livraisons_truck + carte_total + transferts_entrants + rajouts − transferts_sortants − retraits − vols − vidanges − stock_final`
+(`NULL` si un stock est inconnu, jamais 0). Fraîcheur : 0–3 j normal, 4–14 j estimation avec réserve, > 14 j non calculable ; relevé exact puis antérieur,
+jamais un relevé postérieur silencieux ; mouvements entre le relevé final et la fin de période signalés. Double comptage ENOC / fichiers évité
+(`DOUBLON_POTENTIEL`, ±1 j et max(5 L, 2 %)).
+Résultats : `PRET_A_CERTIFIER` / `ESTIMATION_AVEC_RESERVE` / `NON_CALCULABLE` + `cause_principale`.
+Score 0–100 expliqué (`score_detail`) : stock initial 25, stock final 25, litre direct/cuve validée 20, mouvements complets 15, stock récent 10,
+sans alerte majeure 5 ; ≥ 80 prêt, ≥ 50 réserve. Une estimation ne peut être que « certifiée avec réserve » (commentaire obligatoire) ; toute
+modification de donnée repasse la certification en `A_RECERTIFIER`. La `proposition` (stock final, fraîcheur, conso de référence, score, alertes,
+quantité indicative) est INDICATIVE : `ESTIMATION — VALIDATION FUEL MANAGER REQUISE`, aucune commande automatique.
+
+## Qualité des mouvements ENOC (indicateurs non exclusifs, `FuelEnocQualifiedMovement`)
+`has_levels_before_after`, `has_proof`, `has_hourmeter`, `has_site_source`, `has_site_destination`, `has_approved_quantity`, `has_actual_quantity`,
+`has_date`, `level_coherence_status`, `stock_eligibility`, `quality_status_global`, `source_record_id`.
+
+## Imports versionnés
+Lot : source, fichier, SHA-256, utilisateur, date, période déclarée (`declared_period_start/end`), `mapping_version`, lignes lues / acceptées / rejetées,
+motifs. Un fichier déjà reçu n'est jamais réimporté. Rapport CSV : `GET stock/imports/<id>/rapport/`. Analyse préalable en lecture seule :
+`POST stock/imports/analyser/` ou `python manage.py analyze_stock_file <fichier> --source LOLIFORCE`.
+
+## Nouveaux endpoints
+`stock/releves/` (+ `vue=rejetes`), `stock/cuves-a-traiter/`, `stock/priorites/`, `stock/imports/analyser/`, `stock/imports/<id>/rapport/`;
+`stock/bilans/` expose `volumes`, `seuils`, filtres `cause` et `estimation`.
+
+## Commandes (ordre de mise en service)
+```
+python manage.py evaluate_site_tanks              # compat_score de chaque cuve
+python manage.py reestimate_stock_observations    # qualité + estimations + doublons potentiels
+python manage.py sync_stock_registry_enoc
+python manage.py compute_stock_balances --debut 2026-10-01 --fin 2026-10-31 --exemples
+```
+
+## Variables / réglages
+`FUEL_BALANCE_FRESH_STOCK_DAYS=3`, `FUEL_BALANCE_RESERVE_STOCK_DAYS=14`, `FUEL_BALANCE_SCORE_READY=80`, `FUEL_BALANCE_SCORE_RESERVE=50`,
+`FUEL_BALANCE_SCORE_WEIGHTS` (JSON), `FUEL_PROPOSED_TANK_MIN_SCORE=70`, `FUEL_ORDER_HORIZON_DAYS=30`.
