@@ -449,13 +449,18 @@ def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, pro
                    "conso_closing_l": closing_ref.get("conso_closing_l")}
         for x in (ini, fin):
             x["reference_closing"] = ref_out
+        detail = (f"Closing : livré {closing_ref.get('livre_l') or 0:.0f} L, rajouts/retraits {closing_ref.get('rajout_retrait_l') or 0:+.0f} L, "
+                  f"volé {closing_ref.get('vole_l') or 0:.0f} L, vidangé {closing_ref.get('vidange_l') or 0:.0f} L (net {_f(cl):+.0f} L) ; "
+                  f"eGrid (ENOC) : net {_f(eg):+.0f} L")
+        ref_conso = closing_ref.get("conso_closing_l")
+        hint = f" — consommation du Closing : {round(ref_conso)} L" if ref_conso is not None else ""
         if gap < -tol:
             cause = cause or "ENTREES_NON_RETROUVEES"
-            motifs.append(f"Le Closing compte {_f(cl):.0f} L d'entrées nettes sur la période, eGrid (ENOC) seulement {_f(eg):.0f} L : "
-                          f"livraison(s) non retrouvée(s) dans ENOC ({_f(-gap):.0f} L) — consommation non calculée (conso du Closing : "
-                          f"{closing_ref.get('conso_closing_l') if closing_ref.get('conso_closing_l') is None else round(closing_ref['conso_closing_l'])} L).")
+            motifs.append(f"Livraison(s) du Closing non retrouvée(s) dans ENOC ({_f(-gap):.0f} L manquants). {detail}{hint} : consommation non calculée.")
         elif gap > tol:
-            major.append(f"Entrées eGrid (ENOC) supérieures de {_f(gap):.0f} L à celles du Closing ({_f(cl):.0f} L) : livraison non confirmée au Closing ?")
+            cause = cause or "MOUVEMENTS_NON_CONFIRMES_CLOSING"
+            motifs.append(f"Mouvements eGrid non confirmés par le Closing (écart {_f(gap):+.0f} L : entrée ENOC absente du Closing, ou sortie "
+                          f"volée/vidangée/retrait du Closing absente d'eGrid). {detail}{hint} : consommation non calculée.")
 
     conso = None
     can = ini and fin and not cause

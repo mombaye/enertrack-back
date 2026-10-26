@@ -83,6 +83,8 @@ class Command(BaseCommand):
         cov = [o for o in out if o["livre_closing_l"]]
         summary = {
             "sites_compares": len(out), "statuts": dict(status), "causes_non_calculable": dict(causes.most_common()),
+            "non_calculables_par_cause_et_formule_closing": {f"{k[0]} | formule Closing {'cohérente' if k[1] else 'incohérente' if k[1] is False else 'inconnue'}": n
+                                                             for k, n in Counter((o["cause"], o["formule_closing_coherente"]) for o in out if o["statut"] == "NON_CALCULABLE").most_common()},
             "comparables": len(comp), "concordants_5pct_ou_20L": sum(1 for o in comp if o["concordant"]),
             "ecart_absolu_median_l": round(median(errs), 1) if errs else None,
             "couverture_des_entrees": {

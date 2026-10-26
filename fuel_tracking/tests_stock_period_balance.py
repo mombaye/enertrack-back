@@ -534,6 +534,11 @@ class MvpImportTests(TmpRootMixin, BalanceBase):
         r = SB.compute_balances(start, end, site_ids=["DKR_0001"], persist=False)[0]
         self.assertEqual((float(r["consommation_reelle_l"]), r["statut_bilan"]), (400.0, "PRET_A_CERTIFIER"))
         self.assertEqual(r["stock_initial_detail"]["reference_closing"]["ecart_l"], 0.0)
+        # Une entrée ENOC de plus que le Closing (ou une sortie du Closing absente d'eGrid) : conflit à arbitrer, pas une consommation « estimée »
+        self.tc("TC-CL2", 300, datetime(2026, 8, 20, tzinfo=dt_tz.utc), typ="TRUCK",
+                req_extra={"level_before": 100, "level_before_unit": "L"}, op_extra={"level_after": 400, "level_after_unit": "L"})
+        r = SB.compute_balances(start, end, site_ids=["DKR_0001"], persist=False)[0]
+        self.assertEqual((r["statut_bilan"], r["cause_principale"], r["consommation_reelle_l"]), ("NON_CALCULABLE", "MOUVEMENTS_NON_CONFIRMES_CLOSING", None))
 
     def test_compare_closing_balances_end_to_end(self):
         from tempfile import NamedTemporaryFile
