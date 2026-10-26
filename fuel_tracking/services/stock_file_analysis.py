@@ -88,7 +88,7 @@ def closing_stock_rows(rows) -> tuple[list[dict], dict]:
                 i1 = _first_idx(header, "date de relevé finale", i0 + 1)
                 i_end = _first_idx(header, "test date", i1 + 1) or len(header)
                 h_idx = {
-                    "site": header.index("id du site"),
+                    "site": header.index("id du site"), "nb_ge": _first_idx(header, "nombre de ge installé"),
                     "date_initiale": i0, "stock_initial": _first_idx(header, "qtité laissée à la date du relevé", i0 + 1, i1),
                     "livre": _first_idx(header, "qtité totale livrée", i0 + 1, i1),
                     "rajout_retrait": _first_idx(header, "qté rajoutée ou retirée", i0 + 1, i1),
@@ -112,9 +112,21 @@ def closing_stock_rows(rows) -> tuple[list[dict], dict]:
             "livre_l": F.parse_number(get("livre")), "rajout_retrait_l": F.parse_number(get("rajout_retrait")),
             "vole_l": F.parse_number(get("vole")), "vidange_l": F.parse_number(get("vidange")),
             "conso_closing_l": F.parse_number(get("conso_closing")), "conso_niveau_l": F.parse_number(get("conso_niveau")),
+            "nb_ge": F.parse_number(get("nb_ge")),
         })
     diag = {k: (None if v is None else (header[v] if header and v < len(header) else None)) for k, v in (h_idx or {}).items()} if header else None
     return out, {"colonnes_utilisees": diag, "en_tete_trouve": header is not None}
+
+
+def closing_formula(r: dict) -> tuple[float | None, float | None, bool | None]:
+    """(conso calculée, conso du Closing, cohérent ?) — None si une valeur manque."""
+    if r["stock_initial_l"] is None or r["stock_final_l"] is None:
+        return None, None, None
+    ref = r["conso_closing_l"] if r["conso_closing_l"] is not None else r["conso_niveau_l"]
+    calc = r["stock_initial_l"] + (r["livre_l"] or 0) + (r["rajout_retrait_l"] or 0) - (r["vole_l"] or 0) - (r["vidange_l"] or 0) - r["stock_final_l"]
+    if ref is None:
+        return calc, None, None
+    return calc, ref, abs(calc - ref) <= max(20.0, 0.05 * abs(ref))
 
 
 def closing_stock_preview(file_bytes: bytes, file_name: str, resolver) -> dict | None:

@@ -8,9 +8,10 @@ interprétation — fuel_import_row.raw_payload — puis contrôlées une à une
                       TYPE DE GE, PUISSANCE GE, [CONTACT AGENT], Relevé en CM, Relevé en litres,
                       Compteur horaire (h), Date de relevé, Commentaires, Site gardé par.
                       → fuel_stock_observation (source LOLIFORCE / SCSS).
-  CLOSING (.xlsb)   : feuille « Synthese conso fuel » — affectation site → cuve (fuel_site_tank : forme, cotes,
-                      capacité ; GE et capteurs conservés en brut). Les quantités calculées du closing ne sont
-                      PAS des relevés certifiés : aucune observation créée.
+  CLOSING (.xlsb)   : feuille « Synthese conso fuel » — (1) affectation site → cuve (fuel_site_tank : forme, cotes,
+                      capacité ; GE et capteurs conservés en brut) ; (2) stocks INITIAL et FINAL du mois (lecture par blocs,
+                      en-têtes répétés) → fuel_stock_observation (source CLOSING, litres, total du site). Les mouvements du
+                      Closing sont des totaux sans date : non importés (ils viennent d'ENOC).
   TANK_MODELS       : calculateur de Steve (onglet « Tank DB ») → bibliothèque fuel_tank_model.
   HISTORICAL_REFUELING : feuille « Suivi refueling … » → fuel_movement (historique) ; feuille « Coef cuve »
                       → propositions de cuves (À VALIDER) pour les sites sans cuve référencée.
@@ -609,6 +610,78 @@ def process_closing_file(batch, file_bytes: bytes, file_name: str) -> dict:
         _process_tank_sheet(batch, sheet, rows, resolver, stats, only_new_sites=False)
     if not found:
         raise ValueError("Feuille « Synthese conso fuel » introuvable : fichier closing non reconnu.")
+    stats["stocks_closing"] = _process_closing_stocks(batch, file_bytes, file_name, resolver)
+    return stats
+
+
+SITE_TOTAL = "SITE"  # tank_id d'un stock Closing : total du site (toutes cuves), jamais attribué à une cuve
+
+
+def _process_closing_stocks(batch, file_bytes: bytes, file_name: str, resolver) -> dict:
+    """
+    Stocks INITIAL et FINAL du Closing mensuel (feuille de synthèse, lecture par blocs) → fuel_stock_observation (source CLOSING, litres).
+    Règles : site reconnu, date plausible, stock lu ; un stock 0 n'est importé que pour un site équipé d'au moins un GE (sinon : site sans
+    carburant, pas un 0 L mesuré) ; les sites dont la formule du Closing est incohérente sont importés À VALIDER (jamais certifiables seuls).
+    Les mouvements du Closing sont des totaux sans date : ils ne sont pas importés (les mouvements viennent d'ENOC).
+    """
+    from fuel_tracking.models import FuelStockObservation as Obs
+    from fuel_tracking.services.stock_file_analysis import CLOSING_SHEET, closing_formula, closing_stock_rows, plausible
+
+    stats = {"stocks_importes": 0, "doublons": 0, "sites_inconnus": 0, "sans_carburant_ignores": 0, "dates_invraisemblables": 0,
+             "formule_incoherente_a_valider": 0, "capacite_depassee_a_valider": 0}
+    data = []
+    for _name, rows in iter_sheets(file_bytes, file_name, only={CLOSING_SHEET}):
+        data, _diag = closing_stock_rows(rows)
+    site_ids = {resolver.resolve(r["site"]) for r in data} - {None}
+    tanks = R.site_tanks(site_ids)
+    existing = set(Obs.objects.filter(source_type="CLOSING", site_id__in=site_ids).values_list("source_event_id", flat=True))
+    for r in data:
+        site_id = resolver.resolve(r["site"])
+        if site_id is None:
+            stats["sites_inconnus"] += 1
+            continue
+        _calc, _ref, coherent = closing_formula(r)
+        for kind, value, d in (("initial", r["stock_initial_l"], r["date_initiale"]), ("final", r["stock_final_l"], r["date_finale"])):
+            if value is None or d is None:
+                continue
+            if not plausible(d):
+                stats["dates_invraisemblables"] += 1
+                continue
+            if value <= 0 and not (r["nb_ge"] and r["nb_ge"] >= 1):
+                stats["sans_carburant_ignores"] += 1  # site sans GE : pas de carburant, ce n'est pas un 0 L mesuré
+                continue
+            event_id = "CL:" + fingerprint("CLOSING", site_id, d, kind, value)
+            if event_id in existing:
+                stats["doublons"] += 1
+                continue
+            existing.add(event_id)
+            flags = []
+            if coherent is False:
+                flags.append(R.flag("CLOSING_FORMULE_INCOHERENTE", f"Formule du Closing incohérente pour ce site (calcul {_calc:.0f} L ≠ consommation "
+                                                                    f"du Closing {_ref:.0f} L) : stock à valider."))
+                stats["formule_incoherente_a_valider"] += 1
+            inp = R.ObservationInput(
+                source_type="CLOSING", source_event_id=event_id, site_id=site_id, observation_datetime=as_utc_datetime(d),
+                level_raw=f"{value:g} L (Closing, stock {kind})", level_value=value, level_unit="L", tank_id=None, source_user="Closing mensuel",
+                source_reference=f"{file_name} · {CLOSING_SHEET} · ligne {r['ligne']}",
+                comment=f"Stock {kind} du Closing mensuel (qtité laissée à la date du relevé).", review_flags=flags)
+            obs, _msgs = R.build_observation(inp, [], None)  # litres natifs : pas de conversion de cuve
+            obs.tank_id = SITE_TOTAL
+            blocking = {"CAPACITY_NOT_VALIDATED", "NO_VALIDATED_TANK", "MULTI_TANK_WITHOUT_ID"}
+            if obs.validation_status == Obs.ValidationStatus.PENDING and not flags and set(obs.issue_codes or []) <= blocking:
+                obs.validation_status = Obs.ValidationStatus.VALIDATED
+                obs.issue_codes = []
+                obs.validation_reason = "Stock du Closing mensuel (document de clôture) : litres natifs, capacité contrôlée sur le total du site si connue."
+            caps = [t.check_capacity_l() for t in tanks.get(site_id, []) if t.validated]
+            total_cap = sum(c for c in caps if c) if caps and all(caps) else None
+            if total_cap and value > total_cap * 1.05:
+                obs.validation_status = Obs.ValidationStatus.PENDING
+                obs.issue_codes = list(dict.fromkeys((obs.issue_codes or []) + ["OVER_CAPACITY"]))
+                obs.validation_reason = f"{value:.0f} L > capacité totale des cuves validées ({total_cap:.0f} L) : à vérifier."
+                stats["capacite_depassee_a_valider"] += 1
+            obs.batch = batch
+            obs.save()
+            stats["stocks_importes"] += 1
     return stats
 
 

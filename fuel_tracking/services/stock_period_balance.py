@@ -149,7 +149,7 @@ def _select(obs: list[dict], boundary, final: bool, tanks: list, c: dict) -> tup
     cands.sort(key=lambda x: (_tier_rank(x["tier"]), x["age_jours"], x["rang_priorite"]))
     validated_tanks = [t for t in tanks if t.validated]
     chosen = None
-    if usable and len(validated_tanks) > 1:
+    if usable and len(validated_tanks) > 1 and str(usable[0].get("cuve") or "").upper() != "SITE":  # « SITE » = stock total (Closing)
         best = usable[0]
         per_tank = {}
         for x in usable:

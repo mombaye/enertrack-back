@@ -526,3 +526,11 @@ dimensions de cuve, plaque non confirmée »), jamais certifiable automatiquemen
   contrôle de cohérence automatique (`closing_stocks`) ; l'import des stocks du Closing n'est activé qu'après validation de cet aperçu.
 - **Loliforce** : lignes de modèle pré-remplies (site seul, sans date ni niveau) ignorées et comptées à part (plus de faux rejets) ; dates invraisemblables
   signalées séparément ; la colonne « Site gardé par » indique le prestataire réel (`gardiennage_declare`).
+
+## Closing mensuel : import des stocks initial / final (validé sur le fichier d'août 2026)
+Lecture par blocs de la feuille « Synthese conso fuel » : sur 3 329 sites, 3 275 (98,4 %) vérifient
+`stock initial + livré + rajouts/retraits − volé − vidangé − stock final ≈ conso du Closing`. Les stocks initial et final deviennent des relevés
+`CLOSING` (litres natifs, `tank_id = SITE` = total du site, priorité 1). Un stock 0 d'un site sans GE n'est pas importé (pas de carburant ≠ 0 L mesuré) ;
+une formule incohérente rend le stock « à valider ». Les mouvements du Closing (totaux sans date) ne sont pas importés : ils viennent d'ENOC.
+Contrôle de bout en bout : `python manage.py compare_closing_balances --lot <id> [--limite N] [--csv f.csv]` (lecture seule) compare le bilan eGrid de
+chaque site, sur sa propre période, à la consommation du Closing et mesure la couverture des entrées ENOC par rapport au « livré » du Closing.

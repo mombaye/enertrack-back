@@ -1,4 +1,5 @@
 """MVP Suivi Carburant : bilan par site et période exacte, fraîcheur, estimations avec réserve, score, imports, qualité."""
+import json
 from datetime import datetime, time, timedelta
 from decimal import Decimal
 from io import StringIO
@@ -490,6 +491,48 @@ class MvpImportTests(TmpRootMixin, BalanceBase):
         self.assertEqual((cs["dates_initiales"], cs["dates_finales"]), (["2026-08-01", "2026-08-01"], ["2026-08-31", "2026-08-31"]))
         self.assertEqual(cs["stock_final_l"]["max"], 600.0)  # le stock final est lu dans le bloc FINAL, pas la valeur de la colonne répétée (999)
         self.assertEqual(FuelImportBatch.objects.count(), 0)
+
+    def closing_file(self):
+        head = ["Id du site", "Nombre de GE installé [ex: 1,2,3 …]", "Forme géométrique cuve", "Date de relevé initiale", "Qtité laissée à la date du relevé",
+                "Qtité totale livrée", "Qté rajoutée ou retirée de la cuve par les techniciens d' un site à l' autre", "Qté volée",
+                "Qté vidangée (fuel de mauvaise qualité)", "Date de relevé finale", "Qtité laissée à la date du relevé", "Qtité cons considéréé (l)", "Test date"]
+        d1, d2 = datetime(2026, 8, 1), datetime(2026, 8, 31)
+        rows = [["Synthèse"], head,
+                ["DKR_0001", 1, None, d1, 500, 200, 0, 0, 0, d2, 300, 400, None],    # cohérent
+                ["DKR_0002", 1, None, d1, 800, 0, 0, 0, 0, d2, 600, 500, None],      # formule incohérente → à valider
+                ["DKR_0003", 0, None, d1, 0, 0, 0, 0, 0, d2, 0, 0, None],            # site sans GE, stock 0 : ni mesuré ni importé
+                ["XXX_9999", 1, None, d1, 100, 0, 0, 0, 0, d2, 50, 50, None]]         # site inconnu
+        return xlsx({"Synthese conso fuel": rows})
+
+    def test_closing_stocks_import_idempotent_and_rules(self):
+        b = P.process_bytes(self.closing_file(), "closing_aout.xlsx", "CLOSING", origin="UPLOAD")
+        st = b.summary["stocks_closing"]
+        self.assertEqual((st["stocks_importes"], st["sans_carburant_ignores"], st["sites_inconnus"], st["formule_incoherente_a_valider"]), (4, 2, 1, 2))
+        obs = {(o.site_id, o.observation_datetime.date().isoformat()): o for o in Obs.objects.filter(source_type="CLOSING")}
+        ok = obs[("DKR_0001", "2026-08-01")]
+        self.assertEqual((float(ok.level_liters), ok.tank_id, ok.validation_status, ok.reading_quality_status), (500.0, "SITE", "VALIDATED", "LITRE_DIRECT"))
+        bad = obs[("DKR_0002", "2026-08-31")]
+        self.assertEqual(bad.validation_status, "PENDING")
+        self.assertIn("CLOSING_FORMULE_INCOHERENTE", [f["code"] for f in bad.review_flags])
+        self.assertFalse(Obs.objects.filter(site_id="DKR_0003", source_type="CLOSING").exists())  # pas de 0 inventé pour un site sans GE
+        n = Obs.objects.filter(source_type="CLOSING").count()
+        again = P.relaunch(b, "test idempotence")
+        self.assertEqual(Obs.objects.filter(source_type="CLOSING").count(), n)
+        self.assertEqual(again.summary["stocks_closing"]["doublons"], 4)
+
+    def test_compare_closing_balances_end_to_end(self):
+        from tempfile import NamedTemporaryFile
+
+        b = P.process_bytes(self.closing_file(), "closing_aout.xlsx", "CLOSING", origin="UPLOAD")
+        self.assertEqual(b.source_type, "CLOSING")
+        with NamedTemporaryFile(suffix=".xlsx") as f:
+            f.write(self.closing_file())
+            f.flush()
+            out = StringIO()
+            call_command("compare_closing_balances", fichier=f.name, stdout=out)
+        res = json.loads(out.getvalue().split("Lecture seule")[0])
+        self.assertEqual(res["sites_compares"], 2)  # DKR_0001 et DKR_0002 (le site sans GE et le site inconnu sont écartés)
+        self.assertIn("couverture_des_entrees", res)
 
     def test_guard_analysis_ignores_empty_template_rows_and_flags_odd_dates(self):
         from fuel_tracking.services.stock_file_analysis import analyze
