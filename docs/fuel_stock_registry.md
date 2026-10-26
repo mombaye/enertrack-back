@@ -543,3 +543,9 @@ du Closing (`source_context`) ; quand les deux stocks retenus viennent de la mê
 Closing (±5 % ou 20 L). Entrées eGrid inférieures → `NON_CALCULABLE`, cause `ENTREES_NON_RETROUVEES` (jamais une consommation fausse présentée comme
 estimée) ; supérieures → alerte majeure (au mieux estimation avec réserve). La décision « quelle source fait foi pour les livraisons d'une période de
 Closing » reste à prendre (Closing ou ENOC).
+
+Recette Closing août 2026 (300 sites) après garde-fou : 182 bilans calculables, 182 concordants avec le Closing (écart médian 0 L).
+Paramètre `FUEL_CLOSING_MOVEMENTS_AUTHORITATIVE` (désactivé par défaut, décision Steve) : si activé, pour une période couverte par un Closing
+(stocks initial ET final du même Closing), un écart de mouvements avec ENOC n'empêche plus le calcul : les totaux du Closing sont retenus, le bilan est
+UNIQUEMENT « estimation avec réserve » (« Closing retenu comme source de référence »), jamais certifiable automatiquement, l'écart avec ENOC restant affiché.
+Import des stocks du Closing : un stock 0 est importé si le site a au moins un GE ou un stock > 0 à l'autre borne (cuve vidée = vraie mesure).

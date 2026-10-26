@@ -620,7 +620,7 @@ SITE_TOTAL = "SITE"  # tank_id d'un stock Closing : total du site (toutes cuves)
 def _process_closing_stocks(batch, file_bytes: bytes, file_name: str, resolver) -> dict:
     """
     Stocks INITIAL et FINAL du Closing mensuel (feuille de synthèse, lecture par blocs) → fuel_stock_observation (source CLOSING, litres).
-    Règles : site reconnu, date plausible, stock lu ; un stock 0 n'est importé que pour un site équipé d'au moins un GE (sinon : site sans
+    Règles : site reconnu, date plausible, stock lu ; un stock 0 n'est importé que si le site a au moins un GE ou un stock > 0 à l'autre borne (sinon : site sans
     carburant, pas un 0 L mesuré) ; les sites dont la formule du Closing est incohérente sont importés À VALIDER (jamais certifiables seuls).
     Les mouvements du Closing sont des totaux sans date : ils ne sont pas importés (les mouvements viennent d'ENOC).
     """
@@ -647,8 +647,9 @@ def _process_closing_stocks(batch, file_bytes: bytes, file_name: str, resolver) 
             if not plausible(d):
                 stats["dates_invraisemblables"] += 1
                 continue
-            if value <= 0 and not (r["nb_ge"] and r["nb_ge"] >= 1):
-                stats["sans_carburant_ignores"] += 1  # site sans GE : pas de carburant, ce n'est pas un 0 L mesuré
+            has_fuel = (r["nb_ge"] or 0) >= 1 or (r["stock_initial_l"] or 0) > 0 or (r["stock_final_l"] or 0) > 0
+            if value <= 0 and not has_fuel:
+                stats["sans_carburant_ignores"] += 1  # site sans GE ni stock sur toute la période : pas de carburant, pas un 0 L mesuré
                 continue
             event_id = "CL:" + fingerprint("CLOSING", site_id, d, kind, value)
             context = {"type": "closing_periode", "periode": [r["date_initiale"].isoformat(), r["date_finale"].isoformat()],

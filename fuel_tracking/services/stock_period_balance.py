@@ -454,7 +454,19 @@ def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, pro
                   f"eGrid (ENOC) : net {_f(eg):+.0f} L")
         ref_conso = closing_ref.get("conso_closing_l")
         hint = f" — consommation du Closing : {round(ref_conso)} L" if ref_conso is not None else ""
-        if gap < -tol:
+        if abs(gap) > tol and getattr(settings, "FUEL_CLOSING_MOVEMENTS_AUTHORITATIVE", False):
+            # Le Closing fait foi (stocks et mouvements du même document) : ses totaux remplacent ceux d'ENOC, ENOC reste un contrôle visible.
+            D = lambda k: Decimal(str(closing_ref.get(k) or 0))  # noqa: E731
+            livre, rr = D("livre_l"), D("rajout_retrait_l")
+            comps = {k: D0 for k in comps}
+            comps["livraisons_externes_l"], comps["rajouts_l"] = max(livre, D0), max(rr, D0)
+            comps["retraits_l"], comps["vols_l"], comps["vidanges_l"] = max(-livre, D0) + max(-rr, D0), D("vole_l"), D("vidange_l")
+            counted = [{"source": "CLOSING", "reference": "Totaux de période du Closing", "date": _iso(t1), "type": "TOTAUX_CLOSING",
+                        "composante": k, "quantite_l": _f(v), "qualite": None, "statut_brut": None, "statut_metier": "CLOSING_FAIT_FOI"}
+                       for k, v in comps.items() if v]
+            reserves.append(f"Mouvements issus du Closing (ENOC en désaccord de {_f(gap):+.0f} L : {detail}) — Closing retenu comme source de référence.")
+            major.append("Mouvements ENOC non confirmés par le Closing : vérifier avec le Fuel Manager.")
+        elif gap < -tol:
             cause = cause or "ENTREES_NON_RETROUVEES"
             motifs.append(f"Livraison(s) du Closing non retrouvée(s) dans ENOC ({_f(-gap):.0f} L manquants). {detail}{hint} : consommation non calculée.")
         elif gap > tol:

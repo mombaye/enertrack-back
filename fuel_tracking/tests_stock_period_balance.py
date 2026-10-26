@@ -493,7 +493,7 @@ class MvpImportTests(TmpRootMixin, BalanceBase):
         self.assertEqual(cs["stock_final_l"]["max"], 600.0)  # le stock final est lu dans le bloc FINAL, pas la valeur de la colonne répétée (999)
         self.assertEqual(FuelImportBatch.objects.count(), 0)
 
-    def closing_file(self):
+    def closing_file(self, extra=()):
         head = ["Id du site", "Nombre de GE installé [ex: 1,2,3 …]", "Forme géométrique cuve", "Date de relevé initiale", "Qtité laissée à la date du relevé",
                 "Qtité totale livrée", "Qté rajoutée ou retirée de la cuve par les techniciens d' un site à l' autre", "Qté volée",
                 "Qté vidangée (fuel de mauvaise qualité)", "Date de relevé finale", "Qtité laissée à la date du relevé", "Qtité cons considéréé (l)", "Test date"]
@@ -503,7 +503,7 @@ class MvpImportTests(TmpRootMixin, BalanceBase):
                 ["DKR_0002", 1, None, d1, 800, 0, 0, 0, 0, d2, 600, 500, None],      # formule incohérente → à valider
                 ["DKR_0003", 0, None, d1, 0, 0, 0, 0, 0, d2, 0, 0, None],            # site sans GE, stock 0 : ni mesuré ni importé
                 ["XXX_9999", 1, None, d1, 100, 0, 0, 0, 0, d2, 50, 50, None]]         # site inconnu
-        return xlsx({"Synthese conso fuel": rows})
+        return xlsx({"Synthese conso fuel": rows + [list(x) for x in extra]})
 
     def test_closing_stocks_import_idempotent_and_rules(self):
         b = P.process_bytes(self.closing_file(), "closing_aout.xlsx", "CLOSING", origin="UPLOAD")
@@ -539,6 +539,23 @@ class MvpImportTests(TmpRootMixin, BalanceBase):
                 req_extra={"level_before": 100, "level_before_unit": "L"}, op_extra={"level_after": 400, "level_after_unit": "L"})
         r = SB.compute_balances(start, end, site_ids=["DKR_0001"], persist=False)[0]
         self.assertEqual((r["statut_bilan"], r["cause_principale"], r["consommation_reelle_l"]), ("NON_CALCULABLE", "MOUVEMENTS_NON_CONFIRMES_CLOSING", None))
+
+    def test_closing_zero_final_stock_imported_when_site_had_fuel(self):
+        d1, d2 = datetime(2026, 8, 1), datetime(2026, 8, 31)
+        # DKR_0003 : pas de GE déclaré mais 300 L au départ : le stock final de 0 L (cuve vide) est une vraie mesure et doit être importé
+        P.process_bytes(self.closing_file(extra=[["DKR_0003", 0, None, d1, 300, 0, 0, 0, 0, d2, 0, 300, None]]), "closing_zero.xlsx", "CLOSING", origin="UPLOAD")
+        got = {o.observation_datetime.date().isoformat(): float(o.level_liters) for o in Obs.objects.filter(source_type="CLOSING", site_id="DKR_0003")}
+        self.assertEqual(got, {"2026-08-01": 300.0, "2026-08-31": 0.0})
+
+    @override_settings(FUEL_CLOSING_MOVEMENTS_AUTHORITATIVE=True)
+    def test_closing_authoritative_setting_uses_closing_totals_with_reserve(self):
+        P.process_bytes(self.closing_file(), "closing_aout.xlsx", "CLOSING", origin="UPLOAD")
+        start, end = datetime(2026, 8, 1, tzinfo=dt_tz.utc), datetime(2026, 8, 31, 23, 59, 59, tzinfo=dt_tz.utc)
+        r = SB.compute_balances(start, end, site_ids=["DKR_0001"], persist=False)[0]  # aucune livraison ENOC : le Closing (200 L livrés) fait foi
+        self.assertEqual((float(r["consommation_reelle_l"]), r["statut_bilan"]), (400.0, "ESTIMATION_AVEC_RESERVE"))
+        self.assertTrue(any("Closing retenu" in x for x in r["reserves"]))
+        self.assertTrue(any(m["source"] == "CLOSING" for m in r["mouvements"]))
+        self.assertEqual(float(r["livraisons_externes_l"]), 200.0)
 
     def test_compare_closing_balances_end_to_end(self):
         from tempfile import NamedTemporaryFile
