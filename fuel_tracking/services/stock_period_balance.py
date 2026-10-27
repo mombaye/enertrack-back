@@ -377,7 +377,7 @@ def _score(c, ini, fin, st, major_alerts, has_movement_defects) -> tuple[int, li
 
 
 def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, profile, unbalanced) -> dict:  # noqa: C901
-    motifs, alerts, reserves, major = [], [], [], []
+    motifs, alerts, reserves, major, infos = [], [], [], [], []
     cause = None
     ini, ini_cands, a1 = _select(obs, start, False, tanks, c)
     fin, fin_cands, a2 = _select([o for o in obs if o["observation_datetime"] <= end + timedelta(days=1)], end, True, tanks, c)
@@ -405,7 +405,7 @@ def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, pro
             if x["tier"] == "RESERVE":
                 reserves.append(f"Stock {label} ancien de {x['age_jours']} j (4-{c['reserve_days']} j) : estimation avec réserve.")
             elif x["tier"] == "FRAIS" and x["age_jours"]:
-                reserves.append(f"Stock {label} antérieur de {x['age_jours']} j à la borne.")
+                infos.append(f"Stock {label} antérieur de {x['age_jours']} j à la borne (≤ {c['fresh_days']} j : exploitable normalement).")
             if x["rang_priorite"] >= 3:
                 reserves.append(f"Stock {label} issu de {x['source_libelle']} (source moins fiable).")
 
@@ -515,7 +515,7 @@ def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, pro
         "entrees_externes_nettes_l": entrees_ext, "volume_transfere_l": volume_transfere,
         "impact_ponctions_l": comps["transferts_entrants_l"] - comps["transferts_sortants_l"],
         "volume_brut_integre_l": entrees_ext + volume_transfere,
-        "motifs": motifs + list(dict.fromkeys(reserves)) + major, "alertes": list(dict.fromkeys(alerts + major)),
+        "motifs": motifs + list(dict.fromkeys(reserves)) + major + infos, "alertes": list(dict.fromkeys(alerts + major)),
         "candidats": {"initial": ini_cands[:20], "final": fin_cands[:20]},
         "mouvements": counted, "mouvements_exclus": excluded + [{**m, "motif": "Mouvement après le relevé final : non compté."} for m in after_final],
         "periode_effective_debut": t0, "periode_effective_fin": t1, "rule_version": RULE_VERSION,

@@ -12,7 +12,7 @@ from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
 COLUMNS = ["site_id", "periode", "source_stock_initial", "stock_initial_l", "source_stock_final", "stock_final_l", "truck_l", "carte_total_l",
-           "transferts_entrants_l", "transferts_sortants_l", "conso_reelle_estimee_l", "statut", "score", "reserves", "action_attendue", "profil_de_test"]
+           "transferts_entrants_l", "transferts_sortants_l", "conso_reelle_estimee_l", "statut", "cause", "score", "reserves", "action_attendue", "profil_de_test"]
 
 ACTIONS = {
     "DONNEES_STOCK_INCOMPLETES": "Obtenir / importer le relevé initial ou final manquant.",
@@ -26,7 +26,17 @@ ACTIONS = {
     "SCORE_INSUFFISANT": "Compléter les données pour dépasser le seuil de confiance.",
     "ESTIMATION": "Relever la plaque / valider la cuve pour rendre le bilan certifiable.",
     "RESERVES": "Lever les réserves (données manquantes) puis certifier.",
+    "ENTREES_NON_RETROUVEES": "Compléter dans ENOC la/les livraison(s) du Closing absente(s) (Fuel Manager).",
+    "MOUVEMENTS_NON_CONFIRMES_CLOSING": "Arbitrer ENOC vs Closing : entrée ENOC non confirmée, ou sortie du Closing absente d'eGrid.",
 }
+
+
+def action_for(b) -> str:
+    if b.cause_principale in ACTIONS:
+        return ACTIONS[b.cause_principale]
+    if b.statut_bilan == "PRET_A_CERTIFIER":
+        return "Certification manuelle par le Fuel Manager après contrôle des données."
+    return "Compléter les données du site (cause non référencée : voir les motifs)."
 
 
 def _mode(detail) -> str | None:
@@ -107,7 +117,7 @@ class Command(BaseCommand):
                 "transferts_entrants_l": f(b.transferts_entrants_l), "transferts_sortants_l": f(b.transferts_sortants_l),
                 "conso_reelle_estimee_l": f(b.consommation_reelle_l), "statut": b.statut_bilan, "score": b.score_confiance,
                 "reserves": " | ".join((b.reserves or [])[:3]) or (b.motifs or [""])[0],
-                "action_attendue": ACTIONS.get(b.cause_principale or "", "Certification manuelle par le Fuel Manager si les contrôles sont satisfaisants."),
+                "cause": b.cause_principale, "action_attendue": action_for(b),
                 "profil_de_test": ", ".join(p),
             })
         w = self.stdout.write

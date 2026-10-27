@@ -549,3 +549,7 @@ Paramètre `FUEL_CLOSING_MOVEMENTS_AUTHORITATIVE` (désactivé par défaut, déc
 (stocks initial ET final du même Closing), un écart de mouvements avec ENOC n'empêche plus le calcul : les totaux du Closing sont retenus, le bilan est
 UNIQUEMENT « estimation avec réserve » (« Closing retenu comme source de référence »), jamais certifiable automatiquement, l'écart avec ENOC restant affiché.
 Import des stocks du Closing : un stock 0 est importé si le site a au moins un GE ou un stock > 0 à l'autre borne (cuve vidée = vraie mesure).
+
+Correctif fraîcheur (recette sur la période commune d'août 2026) : un stock à 1-3 jours de la borne est « exploitable normalement » — c'est une information
+dans les motifs, plus une réserve (elle interdisait à tort le statut « prêt à certifier » : 0 prêt sur 824 bilans malgré des scores de 100). Seul un stock à
+4-14 jours reste une réserve. Priorités de fiabilisation : nouvelles catégories « Livraison du Closing absente d'ENOC » et « Mouvements ENOC / Closing en conflit ».

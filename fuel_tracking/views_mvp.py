@@ -266,7 +266,8 @@ class TanksToProcessView(APIView):
 PRIORITY_LABEL = {
     "forte_conso_estimee_sans_cuve_validee": "Forte consommation estimée sans cuve validée",
     "stock_trop_ancien": "Stock trop ancien", "stock_initial_final_manquant": "Stock initial / final manquant",
-    "cuve_incoherente": "Cuve incohérente", "mouvement_enoc_incomplet": "Mouvement ENOC incomplet",
+    "cuve_incoherente": "Cuve incohérente", "livraison_closing_absente_enoc": "Livraison du Closing absente d'ENOC",
+    "mouvements_enoc_closing_en_conflit": "Mouvements ENOC / Closing en conflit", "mouvement_enoc_incomplet": "Mouvement ENOC incomplet",
     "ecart_reel_cph_instrumente": "Écart élevé réel / CPH / instrumenté",
 }
 
@@ -293,6 +294,15 @@ class PrioritiesView(APIView):
                 if b.estimation and b.consommation_reelle_l is not None:
                     items.append({**base, "categorie": "forte_conso_estimee_sans_cuve_validee", "impact_l": _f(b.consommation_reelle_l),
                                   "motif": "; ".join(b.reserves[:2]) or "Stock estimé", "action": "Valider la cuve ou relever la plaque : la consommation devient certifiable."})
+                ref = (b.stock_initial_detail or {}).get("reference_closing") or {}
+                if b.cause_principale == "ENTREES_NON_RETROUVEES":
+                    items.append({**base, "categorie": "livraison_closing_absente_enoc", "impact_l": abs(ref.get("ecart_l") or 0) or None,
+                                  "motif": (b.motifs or ["Livraison du Closing non retrouvée dans ENOC"])[0],
+                                  "action": "Compléter la/les livraison(s) dans ENOC (Fuel Manager) : le bilan deviendra calculable."})
+                elif b.cause_principale == "MOUVEMENTS_NON_CONFIRMES_CLOSING":
+                    items.append({**base, "categorie": "mouvements_enoc_closing_en_conflit", "impact_l": abs(ref.get("ecart_l") or 0) or None,
+                                  "motif": (b.motifs or ["Mouvements ENOC non confirmés par le Closing"])[0],
+                                  "action": "Arbitrer avec le Fuel Manager : entrée ENOC non confirmée ou sortie du Closing absente d'eGrid."})
                 if b.cause_principale == "STOCK_TROP_ANCIEN":
                     items.append({**base, "categorie": "stock_trop_ancien", "impact_l": _f(b.volume_brut_integre_l),
                                   "motif": next(iter(b.motifs), "Relevé trop ancien"), "action": "Obtenir un relevé terrain proche de la borne (gardiennage / ENOC)."})

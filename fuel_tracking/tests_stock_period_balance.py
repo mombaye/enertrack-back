@@ -215,7 +215,9 @@ class MvpBalanceTests(BalanceBase):
         self.obs(500, self.start - timedelta(days=2))   # initial antérieur de 2 j : frais
         self.obs(300, self.end - timedelta(hours=1))
         r = self.compute()["DKR_0001"]
-        self.assertEqual((r["age_stock_initial_j"], r["stock_initial_detail"]["tier"], r["statut_bilan"]), (2, "FRAIS", "ESTIMATION_AVEC_RESERVE"))
+        self.assertEqual((r["age_stock_initial_j"], r["stock_initial_detail"]["tier"], r["statut_bilan"]), (2, "FRAIS", "PRET_A_CERTIFIER"))
+        self.assertEqual(r["reserves"], [])  # 0-3 j : information, pas une réserve
+        self.assertTrue(any("exploitable normalement" in m for m in r["motifs"]))
         Obs.objects.all().delete()
         self.obs(500, self.start - timedelta(days=10))  # 4-14 j : estimation avec réserve
         self.obs(300, self.end - timedelta(hours=1))
@@ -556,6 +558,21 @@ class MvpImportTests(TmpRootMixin, BalanceBase):
         self.assertTrue(any("Closing retenu" in x for x in r["reserves"]))
         self.assertTrue(any(m["source"] == "CLOSING" for m in r["mouvements"]))
         self.assertEqual(float(r["livraisons_externes_l"]), 200.0)
+
+    def test_priorities_list_missing_closing_deliveries_and_table_actions(self):
+        P.process_bytes(self.closing_file(), "closing_aout.xlsx", "CLOSING", origin="UPLOAD")
+        start, end = datetime(2026, 8, 1, tzinfo=dt_tz.utc), datetime(2026, 8, 31, 23, 59, 59, tzinfo=dt_tz.utc)
+        SB.compute_balances(start, end, site_ids=["DKR_0001"])  # persiste : livraison du Closing absente d'ENOC
+        U = get_user_model()
+        c = APIClient()
+        c.force_authenticate(U.objects.create_user("pr", "pr@x.sn", "p", role="admin"))
+        pr = c.get("/api/fuel-tracking/stock/priorites/?debut=2026-08-01&fin=2026-08-31&avec_ecarts=0").json()
+        item = next(i for i in pr["data"] if i["categorie"] == "livraison_closing_absente_enoc")
+        self.assertEqual((item["site_id"], item["impact_l"]), ("DKR_0001", 200.0))
+        out = StringIO()
+        call_command("fuel_validation_sites", debut="2026-08-01", fin="2026-08-31", stdout=out)
+        self.assertIn("Compléter dans ENOC", out.getvalue())
+        self.assertNotIn("Certification manuelle", out.getvalue().split("DKR_0001")[1].split("\n")[0])
 
     def test_compare_closing_balances_end_to_end(self):
         from tempfile import NamedTemporaryFile
