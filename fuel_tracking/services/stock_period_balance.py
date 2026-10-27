@@ -38,6 +38,7 @@ D0 = Decimal("0")
 SOURCE_RANK = {"CLOSING": 1, "LOLIFORCE": 2, "SCSS": 2, "ENOC": 3}
 SOURCE_LABEL = {"CLOSING": "Closing mensuel validé", "LOLIFORCE": "Gardiennage Loliforce validé", "SCSS": "Gardiennage SCSS validé",
                 "ENOC": "Relevé ENOC qualifié"}
+MIN_REFERENCE_L = Decimal(20)  # sous ce seuil, une référence (CPH théorique, Snowflake) ne permet pas de calculer un pourcentage d'écart
 COMPONENTS = ("truck_l", "carte_total_l", "transferts_entrants_l", "transferts_sortants_l", "vols_l", "vidanges_l",
               "retraits_l", "rajouts_l", "livraisons_externes_l")
 OTHER_COMPONENT = {"DELIVERY": "livraisons_externes_l", "DELIVERY_EYDON": "livraisons_externes_l",
@@ -639,6 +640,10 @@ def reconciliation(start, end, country=None, zone=None) -> list[dict]:
             motif.append("Consommation instrumentée indisponible.")
         if theo is None:
             motif.append("Consommation théorique CPH non calculable" + (f" ({r.get('cph_status')})" if r.get("cph_status") else "") + ".")
+        if theo is not None and abs(float(theo)) < float(MIN_REFERENCE_L):
+            motif.append(f"Référence CPH quasi nulle ({float(theo):.1f} L) : temps de marche absent ? Pourcentage non calculé.")
+        if instr is not None and abs(float(instr)) < float(MIN_REFERENCE_L):
+            motif.append(f"Consommation instrumentée quasi nulle ({float(instr):.1f} L) : sonde / période à vérifier. Pourcentage non calculé.")
         if cph_error:
             motif.append(cph_error)
 
@@ -646,7 +651,8 @@ def reconciliation(start, end, country=None, zone=None) -> list[dict]:
             if real is None or ref is None:
                 return None, None
             g = Decimal(str(real)) - Decimal(str(ref))
-            return _f(g), (_f(g / Decimal(str(ref)) * 100) if ref else None)
+            # Référence quasi nulle (temps de marche / mesure absents) : l'écart en litres reste visible, le pourcentage n'a aucun sens
+            return _f(g), (_f(g / Decimal(str(ref)) * 100) if ref and abs(Decimal(str(ref))) >= MIN_REFERENCE_L else None)
 
         g_i, p_i = gap(instr)
         g_t, p_t = gap(theo)

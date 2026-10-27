@@ -331,10 +331,15 @@ class PrioritiesView(APIView):
                 for r in reconciliation(start, end):
                     for key, label in (("instrumentee", "instrumentée Snowflake"), ("theorique", "théorique CPH")):
                         pct, gap = r.get(f"ecart_reel_{key}_pct"), r.get(f"ecart_reel_{key}_l")
+                        ref = r.get("conso_instrumentee_l" if key == "instrumentee" else "conso_theorique_l")
                         if pct is not None and abs(pct) >= threshold:
                             items.append({"site_id": r["site_id"], "site_name": r["site_name"], "bilan_id": r["bilan_id"], "categorie": "ecart_reel_cph_instrumente",
                                           "impact_l": abs(gap), "motif": f"Réel vs {label} : {gap:+.0f} L ({pct:+.0f} %)",
                                           "action": "Vérifier stocks, mouvements et mesure (sonde / CPH)."})
+                        elif pct is None and gap is not None and ref is not None and abs(gap) >= 200:  # référence quasi nulle : litres seulement
+                            items.append({"site_id": r["site_id"], "site_name": r["site_name"], "bilan_id": r["bilan_id"], "categorie": "ecart_reel_cph_instrumente",
+                                          "impact_l": abs(gap), "motif": f"Réel vs {label} : {gap:+.0f} L (référence quasi nulle : {ref:.1f} L, pourcentage non calculé)",
+                                          "action": "Vérifier le temps de marche / la sonde, puis les stocks et mouvements."})
             except Exception:  # Snowflake / CPH indisponibles : le reste de la file reste affiché
                 pass
         counts = {}

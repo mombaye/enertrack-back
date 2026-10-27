@@ -369,6 +369,11 @@ class MvpBalanceTests(BalanceBase):
         with mock.patch("fuel_tracking.services.cph_service.compute_period_summary", return_value=cph):
             rows = {r["site_id"]: r for r in SB.reconciliation(self.start, self.end)}
         a, b = rows["DKR_0001"], rows["DKR_0002"]
+        with mock.patch("fuel_tracking.services.cph_service.compute_period_summary",
+                        return_value=[{"site_id": "DKR_0001", "conso_mesuree_l": Decimal("0.5"), "conso_theorique_l": Decimal("0.8")}]):
+            tiny = {r["site_id"]: r for r in SB.reconciliation(self.start, self.end)}["DKR_0001"]
+        self.assertEqual((tiny["ecart_reel_theorique_l"], tiny["ecart_reel_theorique_pct"], tiny["ecart_reel_instrumentee_pct"]), (199.2, None, None))
+        self.assertIn("quasi nulle", tiny["motif"])
         self.assertEqual((a["conso_reelle_l"], a["ecart_reel_instrumentee_l"], a["ecart_reel_theorique_l"], a["score_confiance"]), (200.0, 50.0, -50.0, 100))
         self.assertEqual((b["conso_reelle_l"], b["conso_instrumentee_l"], b["ecart_reel_instrumentee_l"]), (None, 90.0, None))
         self.assertIn("aucun écart", b["motif"])
