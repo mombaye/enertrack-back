@@ -572,6 +572,10 @@ class MvpImportTests(TmpRootMixin, BalanceBase):
         out = StringIO()
         call_command("fuel_validation_sites", debut="2026-08-01", fin="2026-08-31", stdout=out)
         self.assertIn("Compléter dans ENOC", out.getvalue())
+        out2 = StringIO()
+        call_command("fuel_priorites", debut="2026-08-01", fin="2026-08-31", stdout=out2)
+        self.assertIn("Livraison du Closing absente d'ENOC", out2.getvalue())
+        self.assertIn("Cuves à traiter", out2.getvalue())
         self.assertNotIn("Certification manuelle", out.getvalue().split("DKR_0001")[1].split("\n")[0])
 
     def test_compare_closing_balances_end_to_end(self):

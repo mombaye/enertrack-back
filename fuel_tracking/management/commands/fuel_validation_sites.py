@@ -12,7 +12,7 @@ from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
 COLUMNS = ["site_id", "periode", "source_stock_initial", "stock_initial_l", "source_stock_final", "stock_final_l", "truck_l", "carte_total_l",
-           "transferts_entrants_l", "transferts_sortants_l", "conso_reelle_estimee_l", "statut", "cause", "score", "reserves", "action_attendue", "profil_de_test"]
+           "transferts_entrants_l", "transferts_sortants_l", "conso_reelle_estimee_l", "statut", "cause", "score", "reserves", "motifs", "action_attendue", "profil_de_test"]
 
 ACTIONS = {
     "DONNEES_STOCK_INCOMPLETES": "Obtenir / importer le relevé initial ou final manquant.",
@@ -116,7 +116,8 @@ class Command(BaseCommand):
                 "truck_l": f(b.livraisons_externes_l), "carte_total_l": f(b.carte_total_l),
                 "transferts_entrants_l": f(b.transferts_entrants_l), "transferts_sortants_l": f(b.transferts_sortants_l),
                 "conso_reelle_estimee_l": f(b.consommation_reelle_l), "statut": b.statut_bilan, "score": b.score_confiance,
-                "reserves": " | ".join((b.reserves or [])[:3]) or (b.motifs or [""])[0],
+                "reserves": " | ".join((b.reserves or [])[:3]) or "aucune",
+                "motifs": " | ".join((b.motifs or [])[:2]),
                 "cause": b.cause_principale, "action_attendue": action_for(b),
                 "profil_de_test": ", ".join(p),
             })
