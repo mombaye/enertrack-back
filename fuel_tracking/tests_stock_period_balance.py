@@ -647,6 +647,10 @@ class MvpImportTests(TmpRootMixin, BalanceBase):
             text = r.content.decode("utf-8-sig")
             return text.splitlines()[0].split(";"), [l.split(";") for l in text.splitlines()[1:]]
 
+        j = c.get("/api/fuel-tracking/stock/bilans/?debut=2026-08-01&fin=2026-08-31&alerte=CONFLIT_ENOC_CLOSING").json()
+        self.assertEqual([r["site_id"] for r in j["data"]], ["DKR_0001"])
+        self.assertEqual(j["par_alerte"].get("CONFLIT_ENOC_CLOSING"), 1)
+        self.assertIn("ALLOW_GEOMETRIC_TANK_ESTIMATION_WITH_RESERVE", j["parametres"])
         head, rows = get("lignes_rejetees")
         self.assertTrue(any("XXX_8888" in r for r in rows) and "motifs" in head)
         head, rows = get("conflits_enoc_closing")

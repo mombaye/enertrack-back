@@ -113,6 +113,11 @@ def filtered(params):
         qs = qs.filter(cause_principale=p["cause"])
     if p.get("estimation") in ("1", "true"):
         qs = qs.filter(estimation=True)
+    if p.get("alerte"):  # code d'alerte (LIVRAISON_CLOSING_ABSENTE_ENOC, CONFLIT_ENOC_CLOSING…) : filtre en Python (JSON portable SQLite / PostgreSQL)
+        from fuel_tracking.views_mvp import alert_codes
+
+        ids = [pk for pk, al in qs.values_list("pk", "alertes") if p["alerte"] in alert_codes(al)]
+        qs = qs.filter(pk__in=ids)
     return qs, start, end
 
 
