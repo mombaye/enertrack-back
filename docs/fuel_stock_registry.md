@@ -553,3 +553,28 @@ Import des stocks du Closing : un stock 0 est importé si le site a au moins un 
 Correctif fraîcheur (recette sur la période commune d'août 2026) : un stock à 1-3 jours de la borne est « exploitable normalement » — c'est une information
 dans les motifs, plus une réserve (elle interdisait à tort le statut « prêt à certifier » : 0 prêt sur 824 bilans malgré des scores de 100). Seul un stock à
 4-14 jours reste une réserve. Priorités de fiabilisation : nouvelles catégories « Livraison du Closing absente d'ENOC » et « Mouvements ENOC / Closing en conflit ».
+
+---
+
+# Décisions de validation terrain (octobre 2026)
+
+**Cuve sans plaque** : `ALLOW_GEOMETRIC_TANK_ESTIMATION_WITH_RESERVE=true` (variable d'environnement du service `web`). Une cuve validée sans plaque mais aux
+dimensions cohérentes produit une estimation : bilan UNIQUEMENT `ESTIMATION_AVEC_RESERVE`, réserve « volume calculé à partir des dimensions de cuve, plaque non
+confirmée », jamais certifiable automatiquement. Cuve proposée avec score de compatibilité ≥ `FUEL_PROPOSED_TANK_MIN_SCORE` (70) : utilisable avec réserve, jamais
+marquée validée. Valeurs effectives : `python manage.py fuel_parametres` et ligne « Paramètres en vigueur » du Bilan de stock. Après changement :
+`reestimate_stock_observations` puis `compute_stock_balances`.
+
+**Closing et ENOC** (période disposant d'un Closing importé, stocks initial ET final du même Closing) :
+- livraison au Closing absente d'ENOC → ajoutée au calcul, `ESTIMATION_AVEC_RESERVE`, alerte `LIVRAISON_CLOSING_ABSENTE_ENOC` (lot, fichier, feuille, volume tracés),
+  jamais certifiable automatiquement sur cette base (sortie volée / vidangée / retrait : `SORTIE_CLOSING_ABSENTE_ENOC`) ;
+- divergence (ENOC a plus que le Closing) → les deux valeurs sont conservées et affichées, alerte `CONFLIT_ENOC_CLOSING` ; écart ≤ `FUEL_CLOSING_CONFLICT_REVIEW_L`
+  (300 L) : estimation avec réserve (valeurs ENOC conservées) ; au-delà : bilan à contrôler (non calculable, cause `CONFLIT_ENOC_CLOSING`) ;
+- `FUEL_CLOSING_AUTHORITATIVE_PERIODS` (liste de mois « AAAA-MM », vide par défaut) : uniquement pour les mois dont le Closing est validé, le Closing remplace ENOC en
+  cas de conflit (ENOC conservé dans les mouvements exclus, alerte maintenue, estimation avec réserve). Ce n'est pas une règle globale.
+
+**Rapports téléchargeables** (Imports stock et Priorités de fiabilisation ; `GET /api/fuel-tracking/stock/rapports/<kind>/`, CSV UTF-8 avec BOM, `;`) :
+`lignes_rejetees`, `validation_10_sites`, `livraisons_closing_absentes`, `ponctions_sans_source`, `conflits_enoc_closing`, `cuves_prioritaires`,
+`closing_formule_incoherente`. Lecture seule.
+
+**Données** : les dates de relevé impossibles sont isolées (`summary.dates_impossibles`, rapport des lignes rejetées) ; une feuille dont le nom cite un mois différent
+de ses dates est signalée (`summary.feuilles_suspectes`, analyse) ; `FUEL_PRIORITY_TANK_SITES` met des cuves en tête des cuves à traiter.

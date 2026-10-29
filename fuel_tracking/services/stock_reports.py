@@ -206,15 +206,15 @@ def _closing_rows(params, code, name, cols_extra=()):
         ref = (b.stock_initial_detail or {}).get("reference_closing") or {}
         rows.append({
             "site_id": b.site_id, "nom": b.site_name, "zone": b.zone, "periode": f"{start:%d/%m/%Y} → {end:%d/%m/%Y}",
-            "entrees_closing_l": ref.get("entrees_closing_l"), "entrees_egrid_enoc_l": ref.get("entrees_egrid_l"), "ecart_entrees_l": ref.get("ecart_entrees_l"),
-            "sorties_closing_l": ref.get("sorties_closing_l"), "sorties_egrid_enoc_l": ref.get("sorties_egrid_l"), "ecart_sorties_l": ref.get("ecart_sorties_l"),
+            "entrees_closing_l": ref.get("entrees_closing_l"), "entrees_egrid_enoc_l": ref.get("entrees_egrid_l"), "ecart_entrees_closing_moins_enoc_l": ref.get("ecart_entrees_l"),
+            "sorties_closing_l": ref.get("sorties_closing_l"), "sorties_egrid_enoc_l": ref.get("sorties_egrid_l"), "ecart_sorties_closing_moins_enoc_l": ref.get("ecart_sorties_l"),
             "conso_closing_l": ref.get("conso_closing_l"), "conso_egrid_l": _f(b.consommation_reelle_l), "decision": ref.get("decision"),
             "lot_closing": ref.get("lot"), "fichier_closing": ref.get("fichier"), "statut": b.statut_bilan, "cause": b.cause_principale,
             "score": b.score_confiance, "alerte": next((a for a in b.alertes if a.startswith(code)), None), "action_attendue": action_for(b),
         })
-    cols = ["site_id", "nom", "zone", "periode", "entrees_closing_l", "entrees_egrid_enoc_l", "ecart_entrees_l", "sorties_closing_l", "sorties_egrid_enoc_l",
-            "ecart_sorties_l", "conso_closing_l", "conso_egrid_l", "decision", "lot_closing", "fichier_closing", "statut", "cause", "score", "alerte", "action_attendue"]
-    key = "ecart_entrees_l" if code == "LIVRAISON_CLOSING_ABSENTE_ENOC" else "ecart_sorties_l"
+    cols = ["site_id", "nom", "zone", "periode", "entrees_closing_l", "entrees_egrid_enoc_l", "ecart_entrees_closing_moins_enoc_l", "sorties_closing_l", "sorties_egrid_enoc_l",
+            "ecart_sorties_closing_moins_enoc_l", "conso_closing_l", "conso_egrid_l", "decision", "lot_closing", "fichier_closing", "statut", "cause", "score", "alerte", "action_attendue"]
+    key = "ecart_entrees_closing_moins_enoc_l" if code == "LIVRAISON_CLOSING_ABSENTE_ENOC" else "ecart_sorties_closing_moins_enoc_l"
     rows.sort(key=lambda r: -abs(r.get(key) or 0))
     return f"{name}_{_label(start, end)}", cols, rows
 
