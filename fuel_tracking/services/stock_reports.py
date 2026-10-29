@@ -10,6 +10,8 @@ Tous en LECTURE SEULE : aucune donnée n'est modifiée, aucune certification.
   conflits_enoc_closing        mouvements ENOC et Closing en conflit (les deux valeurs)
   cuves_prioritaires           cuves à fiabiliser, classées par impact
   closing_formule_incoherente  lignes du Closing dont la formule interne est incohérente
+  consommations_negatives      bilans dont la consommation calculée est négative (mouvement manquant ou relevé erroné)
+  stocks_identiques_suspects   bilans dont les stocks initial et final sont identiques sans mouvement (relevé reporté / capteur figé ?)
 """
 from __future__ import annotations
 
@@ -39,6 +41,10 @@ REPORTS = {
                               "description": "Bilans où ENOC et le Closing divergent : les deux valeurs sont affichées, rien n'est écrasé."},
     "cuves_prioritaires": {"label": "Cuves prioritaires à fiabiliser", "periode": False, "lot": False,
                            "description": "Cuves sans plaque, proposées, incohérentes… classées par impact (sites prioritaires du métier en tête)."},
+    "consommations_negatives": {"label": "Consommations négatives à contrôler", "periode": True, "lot": False,
+                                "description": "Stock final plus haut que stock initial + entrées : livraison manquante, relevé erroné ou sortie non saisie. Aucune consommation n'est affichée."},
+    "stocks_identiques_suspects": {"label": "Stocks identiques sans mouvement (suspects)", "periode": True, "lot": False,
+                                   "description": "Stock initial = stock final sans aucun mouvement : relevé reporté ou capteur figé ? À faire vérifier sur site."},
     "closing_formule_incoherente": {"label": "Lignes du Closing à formule incohérente", "periode": False, "lot": True,
                                     "description": "Stock initial + livré + rajouts/retraits − volé − vidangé − stock final ≠ consommation du Closing : à faire relire."},
 }
@@ -281,7 +287,50 @@ def _rows_closing_incoherent(params):
     return "closing_lignes_formule_incoherente" + (f"_lot{params['lot']}" if params.get("lot") else ""), cols, rows
 
 
+def _rows_conso_negative(params):
+    start, end = _period(params)
+    cols = ["site_id", "nom", "zone", "periode", "source_stock_initial", "date_stock_initial", "stock_initial_l", "source_stock_final", "date_stock_final", "stock_final_l",
+            "entrees_l", "sorties_l", "conso_brute_calculee_l", "nb_mouvements", "statut", "cause", "score", "motif", "action_attendue"]
+    rows = []
+    for b in _balances(start, end):
+        if b.cause_principale != "CONSO_NEGATIVE":
+            continue
+        z = lambda v: float(v or 0)  # noqa: E731
+        ent = z(b.livraisons_externes_l) + z(b.carte_total_l) + z(b.transferts_entrants_l) + z(b.rajouts_l)
+        sor = z(b.transferts_sortants_l) + z(b.retraits_l) + z(b.vols_l) + z(b.vidanges_l)
+        brute = None if b.stock_initial_l is None or b.stock_final_l is None else round(z(b.stock_initial_l) + ent - sor - z(b.stock_final_l), 1)
+        rows.append({"site_id": b.site_id, "nom": b.site_name, "zone": b.zone, "periode": f"{start:%d/%m/%Y} → {end:%d/%m/%Y}",
+                     "source_stock_initial": b.source_stock_initial, "date_stock_initial": b.date_stock_initial.date().isoformat() if b.date_stock_initial else None,
+                     "stock_initial_l": _f(b.stock_initial_l), "source_stock_final": b.source_stock_final,
+                     "date_stock_final": b.date_stock_final.date().isoformat() if b.date_stock_final else None, "stock_final_l": _f(b.stock_final_l),
+                     "entrees_l": round(ent, 1), "sorties_l": round(sor, 1), "conso_brute_calculee_l": brute, "nb_mouvements": len(b.mouvements or []),
+                     "statut": b.statut_bilan, "cause": b.cause_principale, "score": b.score_confiance,
+                     "motif": next((m for m in (b.motifs or []) if "négative" in m), None),
+                     "action_attendue": "Chercher la livraison / le relevé manquant (stock final > stock initial + entrées), puis saisir dans ENOC ou corriger le relevé."})
+    rows.sort(key=lambda r: (r["conso_brute_calculee_l"] if r["conso_brute_calculee_l"] is not None else 0))
+    return f"consommations_negatives_{_label(start, end)}", cols, rows
+
+
+def _rows_stocks_identiques(params):
+    start, end = _period(params)
+    cols = ["site_id", "nom", "zone", "periode", "source_stock_initial", "date_stock_initial", "source_stock_final", "date_stock_final", "stock_l", "nb_mouvements",
+            "statut", "score", "action_attendue"]
+    rows = []
+    for b in _balances(start, end):
+        if not any("identiques sans aucun mouvement" in m for m in (b.alertes or []) + (b.motifs or [])):
+            continue
+        rows.append({"site_id": b.site_id, "nom": b.site_name, "zone": b.zone, "periode": f"{start:%d/%m/%Y} → {end:%d/%m/%Y}",
+                     "source_stock_initial": b.source_stock_initial, "date_stock_initial": b.date_stock_initial.date().isoformat() if b.date_stock_initial else None,
+                     "source_stock_final": b.source_stock_final, "date_stock_final": b.date_stock_final.date().isoformat() if b.date_stock_final else None,
+                     "stock_l": _f(b.stock_initial_l), "nb_mouvements": len(b.mouvements or []), "statut": b.statut_bilan, "score": b.score_confiance,
+                     "action_attendue": "Faire vérifier le niveau sur site (relevé reporté ou capteur figé ?) avant toute certification."})
+    rows.sort(key=lambda r: -(r["stock_l"] or 0))
+    return f"stocks_identiques_suspects_{_label(start, end)}", cols, rows
+
+
 BUILDERS = {
+    "consommations_negatives": _rows_conso_negative,
+    "stocks_identiques_suspects": _rows_stocks_identiques,
     "lignes_rejetees": _rows_lignes_rejetees,
     "validation_10_sites": _rows_validation,
     "livraisons_closing_absentes": lambda p: _closing_rows(p, "LIVRAISON_CLOSING_ABSENTE_ENOC", "livraisons_closing_absentes_enoc"),

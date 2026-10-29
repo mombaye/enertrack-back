@@ -355,6 +355,17 @@ class MvpBalanceTests(BalanceBase):
         self.assertTrue(any("identiques" in a for a in r["alertes"]))
         self.assertLess(r["score_confiance"], 100)
 
+    def test_negative_and_identical_stock_reports(self):
+        self.stocks(400, 400, site="DKR_0001")  # identiques, aucun mouvement
+        self.stocks(100, 500, site="DKR_0002")  # stock final > stock initial, aucune entrée : consommation négative
+        SB.compute_balances(self.start, self.end, site_ids=["DKR_0001", "DKR_0002"])
+        from fuel_tracking.services.stock_reports import build_report
+        p = {"debut": self.start.strftime("%Y-%m-%d"), "fin": self.end.strftime("%Y-%m-%d")}
+        _n, cols, rows = build_report("consommations_negatives", p)
+        self.assertEqual([(r["site_id"], r["conso_brute_calculee_l"]) for r in rows], [("DKR_0002", -400.0)])
+        _n, cols, rows = build_report("stocks_identiques_suspects", p)
+        self.assertEqual([(r["site_id"], r["stock_l"]) for r in rows], [("DKR_0001", 400.0)])
+
     def test_site_not_recognised(self):
         self.stocks(500, 300, site="GHOST_1")
         r = self.compute(("GHOST_1",))["GHOST_1"]
@@ -637,7 +648,8 @@ class MvpImportTests(TmpRootMixin, BalanceBase):
         c.force_authenticate(U.objects.create_user("rep", "rep@x.sn", "p", role="analyst"))
         listing = c.get("/api/fuel-tracking/stock/rapports/").json()["data"]
         self.assertEqual({r["kind"] for r in listing}, {"lignes_rejetees", "validation_10_sites", "livraisons_closing_absentes", "ponctions_sans_source",
-                                                        "conflits_enoc_closing", "cuves_prioritaires", "closing_formule_incoherente"})
+                                                        "conflits_enoc_closing", "cuves_prioritaires", "closing_formule_incoherente",
+                                                        "consommations_negatives", "stocks_identiques_suspects"})
         qs = "?debut=2026-08-01&fin=2026-08-31"
 
         def get(kind, extra=""):
@@ -665,6 +677,8 @@ class MvpImportTests(TmpRootMixin, BalanceBase):
         head, rows = get("livraisons_closing_absentes")
         self.assertEqual(head[0], "site_id")
         get("ponctions_sans_source")
+        get("consommations_negatives")
+        get("stocks_identiques_suspects")
         r = c.get("/api/fuel-tracking/stock/rapports/validation_10_sites/")  # sans période
         self.assertEqual(r.status_code, 400)
         self.assertEqual(c.get("/api/fuel-tracking/stock/rapports/inconnu/").status_code, 400)
