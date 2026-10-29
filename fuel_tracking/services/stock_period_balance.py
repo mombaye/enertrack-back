@@ -337,6 +337,13 @@ def _movements(site_id, enoc, movements, t0, t1, end, c, unbalanced):  # noqa: C
     return comps, counted, excluded, after_final, st, sorted(defect_kinds)
 
 
+def alert_codes_of(alertes) -> set:
+    """Codes d'alerte (préfixe « CODE : texte ») d'une liste d'alertes de bilan."""
+    import re
+
+    return {m.group(1) for a in (alertes or []) if (m := re.match(r"^([A-Z][A-Z_]{5,}) :", a))}
+
+
 def effective_parameters() -> dict:
     """Valeurs EFFECTIVES (celles que le moteur applique en ce moment) des paramètres métier du suivi carburant."""
     import os

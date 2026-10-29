@@ -11,7 +11,7 @@ from fuel_tracking.views import (
 )
 from fuel_tracking.views_balance import (StockBalanceCertifyView, StockBalanceComputeView, StockBalanceDetailView,
                                          StockBalanceListView, StockBalancePeriodsView, StockBalanceReconciliationView)
-from fuel_tracking.views_mvp import (ImportAnalyzeView, ImportBatchReportView, PrioritiesView, StockReadingsView,
+from fuel_tracking.views_mvp import (StockReportListView, StockReportView, ImportAnalyzeView, ImportBatchReportView, PrioritiesView, StockReadingsView,
                                      TanksToProcessView)
 from fuel_tracking.views_enoc import EnocMovementDetailView, EnocMovementListView, EnocMovementReconcileView, StockSiteBalanceView
 from fuel_tracking.views_stock import (
@@ -82,6 +82,8 @@ urlpatterns = [
     path("stock/releves/", StockReadingsView.as_view(), name="fuel-stock-readings"),
     path("stock/cuves-a-traiter/", TanksToProcessView.as_view(), name="fuel-stock-tanks-to-process"),
     path("stock/priorites/", PrioritiesView.as_view(), name="fuel-stock-priorities"),
+    path("stock/rapports/", StockReportListView.as_view(), name="fuel-stock-reports"),
+    path("stock/rapports/<str:kind>/", StockReportView.as_view(), name="fuel-stock-report"),
     path("stock/imports/", ImportBatchListView.as_view(), name="fuel-stock-imports"),
     path("stock/imports/<int:pk>/lignes/", ImportBatchRowsView.as_view(), name="fuel-stock-import-lignes"),
     path("stock/imports/<int:pk>/relancer/", ImportBatchRelaunchView.as_view(), name="fuel-stock-import-relancer"),

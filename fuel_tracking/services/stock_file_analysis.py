@@ -189,7 +189,7 @@ def guard_dry_run(file_bytes: bytes, file_name: str, resolver) -> dict:
     today = timezone.now().date()
     skipped: dict = {}
     codes, rejected_examples, sites, unknown, dates = Counter(), [], set(), {}, []
-    declared, odd_dates = Counter(), set()
+    declared, odd_dates, by_sheet = Counter(), set(), {}
     n_lines = n_rejected = n_l = n_cm = n_both = n_empty = 0
     for sheet, n, raw, rec in F.iter_guard_rows(file_bytes, file_name, skipped):
         if rec.get("cm") in (None, "") and rec.get("l") in (None, "") and rec.get("date") in (None, ""):
@@ -215,6 +215,7 @@ def guard_dry_run(file_bytes: bytes, file_name: str, resolver) -> dict:
             reasons.append(("IMPLAUSIBLE_DATE", f"Date invraisemblable ({d:%d/%m/%Y})"))
         else:
             dates.append(d)
+            by_sheet.setdefault(sheet, []).append(d)
         if d is not None and not plausible(d):
             odd_dates.add(d.isoformat())
         cm, lt = F.parse_level_cell(rec.get("cm"), "CM"), F.parse_level_cell(rec.get("l"), "L")
@@ -241,7 +242,7 @@ def guard_dry_run(file_bytes: bytes, file_name: str, resolver) -> dict:
         "sites_distincts": len(sites), "sites_reconnus": known, "sites_non_reconnus": len(unknown),
         "sites_non_reconnus_detail": dict(sorted(unknown.items(), key=lambda kv: -kv[1])[:15]),
         "periode_detectee": [min(dates).isoformat(), max(dates).isoformat()] if dates else None,
-        "lignes_modele_vides_ignorees": n_empty, "dates_invraisemblables": sorted(odd_dates),
+        "lignes_modele_vides_ignorees": n_empty, "dates_invraisemblables": sorted(odd_dates), "feuilles_suspectes": F.suspicious_sheets(by_sheet),
         "gardiennage_declare": dict(declared), "feuilles_ignorees": skipped,
     }
 

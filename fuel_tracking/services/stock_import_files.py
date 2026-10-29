@@ -274,6 +274,37 @@ def iter_guard_rows(file_bytes: bytes, file_name: str, skipped: dict | None = No
             yield sheet, n, {k: _jsonable(v) for k, v in raw.items()}, rec
 
 
+MONTHS_FR = {"janvier": 1, "février": 2, "fevrier": 2, "mars": 3, "avril": 4, "mai": 5, "juin": 6, "juillet": 7, "août": 8, "aout": 8,
+             "septembre": 9, "octobre": 10, "novembre": 11, "décembre": 12, "decembre": 12}
+
+
+def sheet_name_month(name: str) -> int | None:
+    """Mois cité dans le nom d'une feuille (« Remonte carburant 20 septembre » → 9), None s'il n'y en a pas."""
+    low = (name or "").lower()
+    for word, num in MONTHS_FR.items():
+        if re.search(rf"\b{word}\b", low):
+            return num
+    return None
+
+
+def suspicious_sheets(dates_by_sheet: dict) -> list[dict]:
+    """Feuilles dont le nom cite un mois différent du mois dominant des dates de relevé qu'elles contiennent."""
+    from collections import Counter
+
+    out = []
+    for sheet, dates in dates_by_sheet.items():
+        named = sheet_name_month(sheet)
+        if named is None or not dates:
+            continue
+        month, n = Counter(d.month for d in dates).most_common(1)[0]
+        if month != named:
+            out.append({"feuille": sheet.strip(), "mois_dans_le_nom": named, "mois_des_dates": month, "lignes": len(dates),
+                        "dates": [min(dates).isoformat(), max(dates).isoformat()],
+                        "message": f"Le nom de la feuille cite le mois {named:02d} mais ses {len(dates)} relevés sont datés du mois {month:02d} "
+                                   f"({min(dates):%d/%m/%Y} → {max(dates):%d/%m/%Y}) : nom de feuille ou dates à vérifier avec le prestataire."})
+    return out
+
+
 def process_guard_file(batch, file_bytes: bytes, file_name: str) -> dict:
     from fuel_tracking.models import FuelImportRow, FuelStockObservation
 
@@ -288,7 +319,8 @@ def process_guard_file(batch, file_bytes: bytes, file_name: str) -> dict:
     existing_ids = set(FuelStockObservation.objects.filter(source_type=provider, site_id__in=site_ids)
                        .values_list("source_event_id", flat=True))
     seen_in_file: set[str] = set()
-    stats = {"observations_creees": 0, "doublons": 0, "codes": {}, "feuilles_ignorees": skipped}
+    stats = {"observations_creees": 0, "doublons": 0, "codes": {}, "feuilles_ignorees": skipped, "dates_impossibles": []}
+    dates_by_sheet: dict = {}
     touched_sites = set()
 
     for sheet, n, raw, rec in rows:
@@ -312,6 +344,8 @@ def process_guard_file(batch, file_bytes: bytes, file_name: str) -> dict:
         def reject(code, message):
             messages.append({"code": code, "message": message})
             row.validation_status = "REJECTED"
+            if code in ("FUTURE_DATE", "IMPLAUSIBLE_DATE"):
+                stats["dates_impossibles"].append({"feuille": sheet, "ligne": n, "site": site_raw, "date": f"{d:%d/%m/%Y}", "code": code})
 
         if site_id is None:
             reject("UNKNOWN_SITE", f"Site « {site_raw} » absent de Gestion des sites"
@@ -325,6 +359,8 @@ def process_guard_file(batch, file_bytes: bytes, file_name: str) -> dict:
         elif d.year < 2020:
             reject("IMPLAUSIBLE_DATE", f"Date de relevé invraisemblable ({d:%d/%m/%Y}).")
 
+        if d is not None and row.validation_status != "REJECTED":
+            dates_by_sheet.setdefault(sheet, []).append(d)
         cm = parse_level_cell(rec.get("cm"), "CM")
         lt = parse_level_cell(rec.get("l"), "L")
         hour_meter = parse_number(rec.get("hour_meter"))
@@ -408,6 +444,7 @@ def process_guard_file(batch, file_bytes: bytes, file_name: str) -> dict:
         _count(stats, messages)
 
     stats["conflits_gardiennage_repasses_a_valider"] = R.apply_guard_conflicts(touched_sites)
+    stats["feuilles_suspectes"] = suspicious_sheets(dates_by_sheet)
     return stats
 
 

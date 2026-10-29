@@ -623,6 +623,48 @@ class MvpImportTests(TmpRootMixin, BalanceBase):
         call_command("fuel_parametres", stdout=out)
         self.assertIn('"ALLOW_GEOMETRIC_TANK_ESTIMATION_WITH_RESERVE": true', out.getvalue())
 
+    def test_downloadable_reports(self):
+        b = P.process_bytes(self.closing_file(extra=[["XXX_8888", 1, None, datetime(2026, 8, 1), 10, 0, 0, 0, 0, datetime(2026, 8, 31), 5, 5, None]]),
+                            "closing_aout.xlsx", "CLOSING", origin="UPLOAD")
+        start, end = self.aug()
+        SB.compute_balances(start, end, site_ids=["DKR_0001", "DKR_0002"])
+        self.tc("TC-CL9", 900, datetime(2026, 8, 25, tzinfo=dt_tz.utc), typ="TRUCK",
+                req_extra={"level_before": 100, "level_before_unit": "L"}, op_extra={"level_after": 600, "level_after_unit": "L"})
+        SB.compute_balances(start, end, site_ids=["DKR_0001"])  # conflit de 900 L
+        tank("DKR_0002", plate=None)
+        U = get_user_model()
+        c = APIClient()
+        c.force_authenticate(U.objects.create_user("rep", "rep@x.sn", "p", role="analyst"))
+        listing = c.get("/api/fuel-tracking/stock/rapports/").json()["data"]
+        self.assertEqual({r["kind"] for r in listing}, {"lignes_rejetees", "validation_10_sites", "livraisons_closing_absentes", "ponctions_sans_source",
+                                                        "conflits_enoc_closing", "cuves_prioritaires", "closing_formule_incoherente"})
+        qs = "?debut=2026-08-01&fin=2026-08-31"
+
+        def get(kind, extra=""):
+            r = c.get(f"/api/fuel-tracking/stock/rapports/{kind}/{qs}{extra}")
+            self.assertEqual(r.status_code, 200, (kind, r.content))
+            self.assertIn("attachment", r["Content-Disposition"])
+            text = r.content.decode("utf-8-sig")
+            return text.splitlines()[0].split(";"), [l.split(";") for l in text.splitlines()[1:]]
+
+        head, rows = get("lignes_rejetees")
+        self.assertTrue(any("XXX_8888" in r for r in rows) and "motifs" in head)
+        head, rows = get("conflits_enoc_closing")
+        self.assertTrue(any(r[0] == "DKR_0001" for r in rows))
+        head, rows = get("closing_formule_incoherente")
+        row = next(r for r in rows if r[0] == "DKR_0002")
+        self.assertEqual((row[head.index("conso_closing_l")], row[head.index("conso_calculee_l")], row[head.index("lot")]), ("500.0", "200.0", str(b.pk)))
+        head, rows = get("cuves_prioritaires")
+        self.assertTrue(any(r[0] == "" or r[0] == "oui" for r in rows))
+        head, rows = get("validation_10_sites")
+        self.assertIn("action_attendue", head)
+        head, rows = get("livraisons_closing_absentes")
+        self.assertEqual(head[0], "site_id")
+        get("ponctions_sans_source")
+        r = c.get("/api/fuel-tracking/stock/rapports/validation_10_sites/")  # sans période
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(c.get("/api/fuel-tracking/stock/rapports/inconnu/").status_code, 400)
+
     def test_compare_closing_balances_end_to_end(self):
         from tempfile import NamedTemporaryFile
 
@@ -649,6 +691,20 @@ class MvpImportTests(TmpRootMixin, BalanceBase):
         self.assertEqual(c["dates_invraisemblables"], ["2016-10-01", "2027-06-14"])
         self.assertEqual(c["gardiennage_declare"], {"LOLIFORCE": 3})
         self.assertEqual(res["periode_detectee"], ["2026-10-03", "2026-10-03"])
+
+    def test_import_isolates_impossible_dates_and_flags_misnamed_sheet(self):
+        rows = [guard_row("DKR_0001", cm=10, d=datetime(2026, 10, 3)), guard_row("DKR_0001", cm=12, d=datetime(2026, 10, 4)),
+                guard_row("DKR_0001", cm=14, d=datetime(2016, 10, 1)), guard_row("DKR_0001", cm=15, d=datetime(2027, 6, 14))]
+        data = xlsx({"Remonte carburant 20 septembre ": [["SEMAINE 40"], [], HEAD] + rows})
+        b = P.process_bytes(data, "REMONTE CARBURANT OCTOBRE 2026.xlsx", "SCSS", origin="UPLOAD")
+        st = b.summary
+        self.assertEqual(sorted(x["date"] for x in st["dates_impossibles"]), ["01/10/2016", "14/06/2027"])
+        self.assertEqual(len(st["feuilles_suspectes"]), 1)
+        self.assertIn("mois 09", st["feuilles_suspectes"][0]["message"])
+        self.assertEqual(Obs.objects.filter(batch=b).count(), 2)  # les deux dates impossibles ne deviennent jamais des relevés
+        from fuel_tracking.services.stock_file_analysis import analyze
+        res = analyze(data, "REMONTE CARBURANT OCTOBRE 2026.xlsx", "SCSS")
+        self.assertEqual(len(res["controle_lignes"]["feuilles_suspectes"]), 1)
 
     def test_validation_sites_table_covers_profiles_read_only(self):
         self.stocks(500, 300)

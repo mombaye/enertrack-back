@@ -90,6 +90,8 @@ class Command(BaseCommand):
                 w(f"  Gardiennage déclaré dans le fichier : {c['gardiennage_declare']} (colonne « Site gardé par »)")
             if c.get("lignes_modele_vides_ignorees"):
                 w(f"  Lignes de modèle vides ignorées (ni date ni niveau) : {c['lignes_modele_vides_ignorees']}")
+            for fs in c.get("feuilles_suspectes") or []:
+                w(f"  ⚠ Feuille « {fs['feuille']} » : {fs['message']}")
             if c.get("dates_invraisemblables"):
                 w(f"  Dates invraisemblables (rejetées) : {c['dates_invraisemblables']}")
             w(f"  Unité         : {c['unite_detectee']} — relevés en litres {c['releves_en_litres']}, en cm {c['releves_en_cm']}, lignes avec deux unités {c['lignes_avec_deux_unites']}")

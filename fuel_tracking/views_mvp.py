@@ -24,10 +24,9 @@ from fuel_tracking.views_cph import IsCphValidator
 
 
 def alert_codes(alertes) -> set:
-    """Codes d'alerte (préfixe « CODE : texte ») d'une liste d'alertes de bilan."""
-    import re
+    from fuel_tracking.services.stock_period_balance import alert_codes_of
 
-    return {m.group(1) for a in (alertes or []) if (m := re.match(r"^([A-Z][A-Z_]{5,}) :", a))}
+    return alert_codes_of(alertes)
 
 
 def _f(v):
@@ -214,57 +213,67 @@ def tank_class(spec, min_score: int) -> dict:
     return {"categories": cats, "usage": usage, "geometrie_l": round(full) if full else None, "ecart_plaque_pct": cal["gap_pct"]}
 
 
+TANK_ACTIONS = {
+    "INCOHERENTE": "Relever cotes et plaque sur site, corriger la fiche cuve.",
+    "SANS_PLAQUE": "Relever la capacité de plaque (sinon estimation avec réserve seulement).",
+    "PROPOSEE": "Vérifier le modèle proposé puis valider la cuve (Cuves & gardiennage).",
+    "GEOMETRIE_ABSENTE": "Relever forme et cotes de la cuve.",
+    "VALIDEE": "Aucune action.",
+}
+
+
+def tank_rows(site=None, categorie=None, usage=None):
+    """Cuves à traiter classées par impact (sites prioritaires décidés par le métier en tête). Retourne (rows, counts, usages, last, min_score)."""
+    from django.conf import settings
+
+    from fuel_tracking.models import FuelStockBalance, FuelStockObservation as O, FuelTankMaster as T
+    from fuel_tracking.services import tank_conversion as TC
+    from fuel_tracking.services.stock_registry import proposed_tank_min_score
+
+    min_score = proposed_tank_min_score()
+    pinned = [x.upper() for x in (getattr(settings, "FUEL_PRIORITY_TANK_SITES", []) or [])]
+    blocked = dict(O.objects.filter(level_unit="CM", level_liters__isnull=True, estimated_liters__isnull=True)
+                   .exclude(source_type="SNOWFLAKE").values_list("site_id").annotate(n=Count("id")))
+    estimated = dict(O.objects.filter(estimated_liters__isnull=False).values_list("site_id").annotate(n=Count("id")))
+    last = FuelStockBalance.objects.order_by("-calculated_at").values("observation_start", "observation_end").first()
+    impact = {}
+    if last:
+        for b in FuelStockBalance.objects.filter(**last).filter(Q(estimation=True) | Q(cause_principale__in=("CM_SANS_CUVE", "DONNEES_STOCK_INCOMPLETES"))):
+            impact[b.site_id] = impact.get(b.site_id, 0) + 1
+    rows, counts = [], {}
+    qs = T.objects.filter(active=True).exclude(validation_status="REJETEE").select_related("tank_model")
+    if site:
+        qs = qs.filter(site_id__icontains=site.strip())
+    for t in qs:
+        spec = TC.TankSpec.from_model(t)
+        info = tank_class(spec, min_score)
+        for c in info["categories"]:
+            counts[c] = counts.get(c, 0) + 1
+        if categorie and categorie not in info["categories"]:
+            continue
+        main = next((c for c in ("INCOHERENTE", "SANS_PLAQUE", "PROPOSEE", "GEOMETRIE_ABSENTE", "VALIDEE") if c in info["categories"]), "VALIDEE")
+        rows.append({
+            "id": t.pk, "site_id": t.site_id, "cuve": t.tank_id, "statut": t.validation_status, "forme": spec.family,
+            "cotes_cm": [spec.d1, spec.d2, spec.d3], "plaque_l": spec.plate_capacity_l, "capacite_source_l": _f(t.capacity_l),
+            "modele": spec.model_ref, "score_compatibilite": t.compat_score, "score_min_estimation": min_score, **info,
+            "releves_bloques": blocked.get(t.site_id, 0), "releves_estimes": estimated.get(t.site_id, 0),
+            "bilans_impactes": impact.get(t.site_id, 0), "action": TANK_ACTIONS[main], "prioritaire_demande": t.site_id.upper() in pinned,
+        })
+    rows.sort(key=lambda r: (0 if r["prioritaire_demande"] else 1, -(r["bilans_impactes"]), -(r["releves_bloques"] + r["releves_estimes"]), r["site_id"]))
+    if usage:
+        rows = [r for r in rows if r["usage"] == usage]
+    usages = {}
+    for r in rows:
+        usages[r["usage"]] = usages.get(r["usage"], 0) + 1
+    return rows, counts, usages, last, min_score
+
+
 class TanksToProcessView(APIView):
     permission_classes = [IsAuthenticated]
 
-    ACTIONS = {
-        "INCOHERENTE": "Relever cotes et plaque sur site, corriger la fiche cuve.",
-        "SANS_PLAQUE": "Relever la capacité de plaque (sinon estimation avec réserve seulement).",
-        "PROPOSEE": "Vérifier le modèle proposé puis valider la cuve (Cuves & gardiennage).",
-        "GEOMETRIE_ABSENTE": "Relever forme et cotes de la cuve.",
-        "VALIDEE": "Aucune action.",
-    }
-
     def get(self, request):
-        from fuel_tracking.models import FuelStockBalance, FuelStockObservation as O, FuelTankMaster as T
-        from fuel_tracking.services import tank_conversion as TC
-        from fuel_tracking.services.stock_registry import proposed_tank_min_score
-
         p = request.query_params
-        min_score = proposed_tank_min_score()
-        blocked = dict(O.objects.filter(level_unit="CM", level_liters__isnull=True, estimated_liters__isnull=True)
-                       .exclude(source_type="SNOWFLAKE").values_list("site_id").annotate(n=Count("id")))
-        estimated = dict(O.objects.filter(estimated_liters__isnull=False).values_list("site_id").annotate(n=Count("id")))
-        last = FuelStockBalance.objects.order_by("-calculated_at").values("observation_start", "observation_end").first()
-        impact = {}
-        if last:
-            for b in FuelStockBalance.objects.filter(**last).filter(Q(estimation=True) | Q(cause_principale__in=("CM_SANS_CUVE", "DONNEES_STOCK_INCOMPLETES"))):
-                impact[b.site_id] = impact.get(b.site_id, 0) + 1
-        rows, counts = [], {}
-        qs = T.objects.filter(active=True).exclude(validation_status="REJETEE").select_related("tank_model")
-        if p.get("site"):
-            qs = qs.filter(site_id__icontains=p["site"].strip())
-        for t in qs:
-            spec = TC.TankSpec.from_model(t)
-            info = tank_class(spec, min_score)
-            for c in info["categories"]:
-                counts[c] = counts.get(c, 0) + 1
-            if p.get("categorie") and p["categorie"] not in info["categories"]:
-                continue
-            main = next((c for c in ("INCOHERENTE", "SANS_PLAQUE", "PROPOSEE", "GEOMETRIE_ABSENTE", "VALIDEE") if c in info["categories"]), "VALIDEE")
-            rows.append({
-                "id": t.pk, "site_id": t.site_id, "cuve": t.tank_id, "statut": t.validation_status, "forme": spec.family,
-                "cotes_cm": [spec.d1, spec.d2, spec.d3], "plaque_l": spec.plate_capacity_l, "capacite_source_l": _f(t.capacity_l),
-                "modele": spec.model_ref, "score_compatibilite": t.compat_score, "score_min_estimation": min_score, **info,
-                "releves_bloques": blocked.get(t.site_id, 0), "releves_estimes": estimated.get(t.site_id, 0),
-                "bilans_impactes": impact.get(t.site_id, 0), "action": self.ACTIONS[main],
-            })
-        rows.sort(key=lambda r: (-(r["bilans_impactes"]), -(r["releves_bloques"] + r["releves_estimes"]), r["site_id"]))
-        if p.get("usage"):
-            rows = [r for r in rows if r["usage"] == p["usage"]]
-        usages = {}
-        for r in rows:
-            usages[r["usage"]] = usages.get(r["usage"], 0) + 1
+        rows, counts, usages, last, min_score = tank_rows(p.get("site"), p.get("categorie"), p.get("usage"))
         page_rows, pagination = _paginate(rows, request, 50)
         return Response({"data": page_rows, "pagination": pagination, "totaux_categories": counts, "totaux_usage": usages,
                          "periode_impact": last, "seuil_score_proposee": min_score,
@@ -368,3 +377,32 @@ class PrioritiesView(APIView):
             it["libelle_categorie"] = PRIORITY_LABEL[it["categorie"]]
         data, pagination = _paginate(items, request, 50)
         return Response({"data": data, "pagination": pagination, "periode": {"debut": start, "fin": end}, "totaux": counts, "libelles": PRIORITY_LABEL})
+
+
+class StockReportListView(APIView):
+    """Rapports téléchargeables (CSV) : libellé, description, paramètres demandés."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from fuel_tracking.services.stock_reports import REPORTS
+
+        return Response({"data": [{"kind": k, **v} for k, v in REPORTS.items()]})
+
+
+class StockReportView(APIView):
+    """Télécharge un rapport en CSV (UTF-8 avec BOM, séparateur « ; »). Lecture seule."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, kind: str):
+        from fuel_tracking.services.stock_reports import ReportError, build_report, to_csv
+
+        try:
+            name, cols, rows = build_report(kind, request.query_params.dict())
+        except ReportError as e:
+            return Response({"detail": str(e)}, status=400)
+        resp = HttpResponse(to_csv(cols, rows), content_type="text/csv; charset=utf-8")
+        resp["Content-Disposition"] = f'attachment; filename="{name}.csv"'
+        resp["X-Report-Rows"] = str(len(rows))
+        return resp
