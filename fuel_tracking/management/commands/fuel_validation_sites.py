@@ -26,12 +26,23 @@ ACTIONS = {
     "SCORE_INSUFFISANT": "Compléter les données pour dépasser le seuil de confiance.",
     "ESTIMATION": "Relever la plaque / valider la cuve pour rendre le bilan certifiable.",
     "RESERVES": "Lever les réserves (données manquantes) puis certifier.",
-    "ENTREES_NON_RETROUVEES": "Compléter dans ENOC la/les livraison(s) du Closing absente(s) (Fuel Manager).",
-    "MOUVEMENTS_NON_CONFIRMES_CLOSING": "Arbitrer ENOC vs Closing : entrée ENOC non confirmée, ou sortie du Closing absente d'eGrid.",
+    "CONFLIT_ENOC_CLOSING": "Arbitrer ENOC vs Closing (conflit supérieur au seuil de contrôle).",
+}
+
+
+ALERT_ACTIONS = {
+    "LIVRAISON_CLOSING_ABSENTE_ENOC": "Compléter dans ENOC la/les livraison(s) du Closing absente(s) : le bilan pourra alors être certifié.",
+    "SORTIE_CLOSING_ABSENTE_ENOC": "Saisir dans ENOC le retrait / vol / vidange présent au Closing.",
+    "CONFLIT_ENOC_CLOSING": "Arbitrer ENOC vs Closing (les deux valeurs sont conservées).",
 }
 
 
 def action_for(b) -> str:
+    from fuel_tracking.views_mvp import alert_codes
+
+    for code, action in ALERT_ACTIONS.items():
+        if code in alert_codes(b.alertes):
+            return action
     if b.cause_principale in ACTIONS:
         return ACTIONS[b.cause_principale]
     if b.statut_bilan == "PRET_A_CERTIFIER":

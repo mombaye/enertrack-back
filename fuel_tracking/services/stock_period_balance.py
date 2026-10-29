@@ -129,7 +129,7 @@ def _candidate(o: dict, boundary, final: bool, c: dict) -> dict:
         "methode_conversion": o["conversion_method"], "modele_cuve": o.get("tank_model_ref"),
         "regle_conversion": o.get("conversion_rule"), "cuve": o.get("tank_id"),
         "confiance": "FAIBLE" if est else (o.get("confidence") or ("MOYENNE" if o["source_type"] == "ENOC" else "HAUTE" if certifiable else "FAIBLE")),
-        "detail_estimation": o.get("estimation_detail") if est else None, "contexte_source": o.get("source_context") or None,
+        "detail_estimation": o.get("estimation_detail") if est else None, "contexte_source": o.get("source_context") or None, "lot": o.get("batch_id"),
         "certifiable": certifiable, "dans_periode": tier in ("EXACT",) or (tier == "POSTERIEUR" and not final),
         "ecart_borne_h": round(abs((t - boundary).total_seconds()) / 3600, 1),
         "utilisable": reason is None, "motif_rejet": reason,
@@ -214,7 +214,7 @@ def compute_balances(start, end, site_ids=None, persist=True) -> list[dict]:
     for o in obs_qs.values("id", "site_id", "tank_id", "source_type", "observation_datetime", "level_raw", "level_value", "level_unit",
                            "level_cm", "level_liters", "conversion_method", "conversion_status", "conversion_rule", "tank_model_ref",
                            "validation_status", "eligible_for_stock", "business_status", "reading_quality_status", "confidence",
-                           "estimated_liters", "estimation_mode", "estimation_detail", "source_context"):
+                           "estimated_liters", "estimation_mode", "estimation_detail", "source_context", "batch_id"):
         obs_by_site[o["site_id"]].append(o)
     enoc_by_site = defaultdict(list)
     for q in enoc_qs:
@@ -231,8 +231,12 @@ def compute_balances(start, end, site_ids=None, persist=True) -> list[dict]:
     profiles = energy_profiles(site_ids)
     tanks = site_tanks(site_ids)
     unbalanced = {b["transfer_id"] for b in check_transfer_balance()}
+    from fuel_tracking.models import FuelImportBatch
+
+    batch_ids = {o["batch_id"] for lst in obs_by_site.values() for o in lst if o.get("batch_id")}
+    batches = dict(FuelImportBatch.objects.filter(pk__in=batch_ids).values_list("pk", "file_name"))
     rows = [_site_balance(sid, start, end, c, obs_by_site.get(sid, []), enoc_by_site.get(sid, []), mv_by_site.get(sid, []),
-                          tanks.get(sid, []), sites.get(sid), profiles.get(sid, {}), unbalanced) for sid in site_ids]
+                          tanks.get(sid, []), sites.get(sid), profiles.get(sid, {}), unbalanced, batches) for sid in site_ids]
     if persist:
         _persist(rows, start, end)
     return rows
@@ -333,14 +337,100 @@ def _movements(site_id, enoc, movements, t0, t1, end, c, unbalanced):  # noqa: C
     return comps, counted, excluded, after_final, st, sorted(defect_kinds)
 
 
+def effective_parameters() -> dict:
+    """Valeurs EFFECTIVES (celles que le moteur applique en ce moment) des paramètres métier du suivi carburant."""
+    import os
+
+    g = lambda k, d=None: getattr(settings, k, d)  # noqa: E731
+    allow = bool(g("ALLOW_GEOMETRIC_TANK_ESTIMATION_WITH_RESERVE", False))
+    return {
+        "ALLOW_GEOMETRIC_TANK_ESTIMATION_WITH_RESERVE": allow,
+        "ALLOW_GEOMETRIC_TANK_ESTIMATION_WITH_RESERVE_definie_dans_l_environnement": "ALLOW_GEOMETRIC_TANK_ESTIMATION_WITH_RESERVE" in os.environ,
+        "FUEL_PROPOSED_TANK_MIN_SCORE": g("FUEL_PROPOSED_TANK_MIN_SCORE", 70),
+        "FUEL_CLOSING_AUTHORITATIVE_PERIODS": list(g("FUEL_CLOSING_AUTHORITATIVE_PERIODS", []) or []),
+        "FUEL_CLOSING_CONFLICT_REVIEW_L": g("FUEL_CLOSING_CONFLICT_REVIEW_L", 300),
+        "FUEL_BALANCE_FRESH_STOCK_DAYS": g("FUEL_BALANCE_FRESH_STOCK_DAYS", 3), "FUEL_BALANCE_RESERVE_STOCK_DAYS": g("FUEL_BALANCE_RESERVE_STOCK_DAYS", 14),
+        "FUEL_BALANCE_SCORE_READY": g("FUEL_BALANCE_SCORE_READY", 80), "FUEL_BALANCE_SCORE_RESERVE": g("FUEL_BALANCE_SCORE_RESERVE", 50),
+        "FUEL_ORDER_HORIZON_DAYS": g("FUEL_ORDER_HORIZON_DAYS", 30), "FUEL_PRIORITY_TANK_SITES": list(g("FUEL_PRIORITY_TANK_SITES", []) or []),
+    }
+
+
 def _closing_reference(ini, fin) -> dict | None:
     """Totaux de période du Closing, si les deux stocks retenus viennent de la même ligne de Closing (même période)."""
     if not (ini and fin) or ini.get("source") != "CLOSING" or fin.get("source") != "CLOSING":
         return None
     a, b = ini.get("contexte_source") or {}, fin.get("contexte_source") or {}
     if a.get("type") == "closing_periode" and a.get("periode") and a.get("periode") == b.get("periode"):
-        return a
+        return dict(a)
     return None
+
+
+def _closing_crosscheck(ref, ini, fin, comps, counted, excluded, t1, c, batches, alerts, reserves, major, motifs):  # noqa: C901
+    """Complète / confronte les mouvements d'ENOC avec les totaux du Closing. Retourne (comps, counted, excluded) ; alertes et réserves par effet de bord."""
+    D = lambda k: Decimal(str(ref.get(k) or 0))  # noqa: E731
+    livre, rr, vole, vid = D("livre_l"), D("rajout_retrait_l"), D("vole_l"), D("vidange_l")
+    cl_in, cl_out = max(livre, D0) + max(rr, D0), max(-livre, D0) + max(-rr, D0) + vole + vid
+    en_in = comps["livraisons_externes_l"] + comps["carte_total_l"] + comps["transferts_entrants_l"] + comps["rajouts_l"]
+    en_out = comps["transferts_sortants_l"] + comps["retraits_l"] + comps["vols_l"] + comps["vidanges_l"]
+    tol = lambda x: max(Decimal(20), Decimal("0.05") * abs(x))  # noqa: E731
+    d_in, d_out = cl_in - en_in, cl_out - en_out
+    lot = ini.get("lot")
+    fichier = batches.get(lot)
+    trace = f"lot #{lot}, fichier « {fichier} », feuille « {ref.get('feuille') or 'Synthese conso fuel'} »" if lot else "Closing (lot non tracé)"
+    info = {"lot": lot, "fichier": fichier, "livre_closing_l": _f(livre), "rajout_retrait_closing_l": _f(rr), "vole_closing_l": _f(vole),
+            "vidange_closing_l": _f(vid), "conso_closing_l": ref.get("conso_closing_l"), "entrees_closing_l": _f(cl_in), "entrees_egrid_l": _f(en_in),
+            "sorties_closing_l": _f(cl_out), "sorties_egrid_l": _f(en_out), "ecart_entrees_l": _f(d_in), "ecart_sorties_l": _f(d_out),
+            "mouvements_nets_closing_l": _f(cl_in - cl_out), "mouvements_nets_egrid_l": _f(en_in - en_out), "ecart_l": _f((en_in - en_out) - (cl_in - cl_out)),
+            "decision": "CONCORDANT"}
+    period_month = str((ref.get("periode") or ["", ""])[1])[:7]
+    authoritative = period_month in (getattr(settings, "FUEL_CLOSING_AUTHORITATIVE_PERIODS", None) or [])
+    conflict_in, conflict_out = (-d_in if d_in < -tol(en_in) else D0), (-d_out if d_out < -tol(en_out) else D0)
+    comp_in, comp_out = (d_in if d_in > tol(cl_in) else D0), (d_out if d_out > tol(cl_out) else D0)
+
+    def entry(comp, qty, label):
+        return {"source": "CLOSING", "reference": label, "date": _iso(t1), "type": "COMPLEMENT_CLOSING", "composante": comp, "quantite_l": _f(qty),
+                "qualite": None, "statut_brut": None, "statut_metier": "COMPLEMENT_CLOSING", "lot": lot, "fichier": fichier}
+
+    if (conflict_in or conflict_out) and authoritative:
+        # Période au Closing validé : les totaux du Closing remplacent ceux d'ENOC (ENOC reste visible dans les mouvements exclus).
+        excluded = excluded + [{**m, "motif": f"Remplacé par les totaux du Closing (période {period_month} validée) — valeur ENOC conservée pour audit."} for m in counted]
+        comps = {k: D0 for k in comps}
+        comps["livraisons_externes_l"], comps["rajouts_l"] = max(livre, D0), max(rr, D0)
+        comps["retraits_l"], comps["vols_l"], comps["vidanges_l"] = max(-livre, D0) + max(-rr, D0), vole, vid
+        counted = [entry(k, v, "Totaux de période du Closing (période validée)") for k, v in comps.items() if v]
+        info["decision"] = "CLOSING_FAIT_FOI"
+        alerts.append(f"CONFLIT_ENOC_CLOSING : ENOC {_f(en_in):.0f} L entrés / {_f(en_out):.0f} L sortis, Closing {_f(cl_in):.0f} / {_f(cl_out):.0f} L — "
+                      f"Closing retenu (période {period_month} validée), ENOC conservé ({trace}).")
+        reserves.append(f"Mouvements issus du Closing de la période validée {period_month} (ENOC en conflit) : estimation, non certifiable automatiquement.")
+    elif conflict_in or conflict_out:
+        gap = max(conflict_in, conflict_out)
+        info["decision"] = "CONFLIT"
+        msg = (f"CONFLIT_ENOC_CLOSING : ENOC {_f(en_in):.0f} L entrés / {_f(en_out):.0f} L sortis, Closing {_f(cl_in):.0f} L entrés / {_f(cl_out):.0f} L sortis "
+               f"(écart {_f(gap):.0f} L) — les deux valeurs sont conservées ({trace}).")
+        alerts.append(msg)
+        major.append(msg)
+        if gap > Decimal(str(getattr(settings, "FUEL_CLOSING_CONFLICT_REVIEW_L", 300))):
+            ref["_conflit_a_controler"] = True
+            motifs.append(f"Conflit ENOC / Closing de {_f(gap):.0f} L (> {getattr(settings, 'FUEL_CLOSING_CONFLICT_REVIEW_L', 300):.0f} L) : bilan à contrôler, "
+                          "consommation non calculée tant que les deux sources divergent.")
+        else:
+            reserves.append(f"Conflit ENOC / Closing de {_f(gap):.0f} L : valeurs ENOC conservées, Closing affiché en regard, à arbitrer.")
+    if comp_in and not authoritative:
+        comps = {**comps, "livraisons_externes_l": comps["livraisons_externes_l"] + comp_in}
+        counted = counted + [entry("livraisons_externes_l", comp_in, "Livraison du Closing absente d'ENOC")]
+        info["decision"] = "COMPLEMENT_CLOSING" if info["decision"] == "CONCORDANT" else info["decision"]
+        alerts.append(f"LIVRAISON_CLOSING_ABSENTE_ENOC : {_f(comp_in):.0f} L de livraison au Closing, absents d'ENOC — ajoutés au calcul ({trace}).")
+        reserves.append(f"{_f(comp_in):.0f} L de livraison issus du Closing (absents d'ENOC) : estimation avec réserve, non certifiable automatiquement.")
+    if comp_out and not authoritative:
+        comps = {**comps, "retraits_l": comps["retraits_l"] + comp_out}
+        counted = counted + [entry("retraits_l", comp_out, "Sortie du Closing (volé / vidangé / retrait) absente d'ENOC")]
+        info["decision"] = "COMPLEMENT_CLOSING" if info["decision"] == "CONCORDANT" else info["decision"]
+        alerts.append(f"SORTIE_CLOSING_ABSENTE_ENOC : {_f(comp_out):.0f} L de sortie (volé / vidangé / retrait) au Closing, absents d'eGrid — ajoutés au calcul ({trace}).")
+        reserves.append(f"{_f(comp_out):.0f} L de sortie issus du Closing (absents d'eGrid) : estimation avec réserve, non certifiable automatiquement.")
+    for x in (ini, fin):
+        x["reference_closing"] = info
+    ref["_decision"] = info["decision"]
+    return comps, counted, excluded
 
 
 def ponctions_globales(start, end) -> dict:
@@ -377,7 +467,7 @@ def _score(c, ini, fin, st, major_alerts, has_movement_defects) -> tuple[int, li
     return sum(d["points"] for d in detail), detail
 
 
-def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, profile, unbalanced) -> dict:  # noqa: C901
+def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, profile, unbalanced, batches=None) -> dict:  # noqa: C901
     motifs, alerts, reserves, major, infos = [], [], [], [], []
     cause = None
     ini, ini_cands, a1 = _select(obs, start, False, tanks, c)
@@ -437,43 +527,14 @@ def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, pro
         cause = "SITE_NON_RECONNU"
         motifs.insert(0, "Site absent de Gestion des sites : bilan non calculable.")
 
-    # Contrôle croisé : quand les DEUX stocks viennent du même Closing, ses totaux de période (livré, rajouts/retraits, volé, vidangé) disent
-    # ce qui est réellement entré / sorti. Des entrées eGrid (ENOC) inférieures = livraison(s) non retrouvée(s) → consommation fausse par défaut.
+    # Closing / ENOC : quand les DEUX stocks viennent du même Closing, ses totaux de période (livré, rajouts/retraits, volé, vidangé) sont
+    # comparés aux mouvements d'ENOC. Closing seul → il COMPLÈTE (estimation avec réserve) ; divergence → conflit tracé, jamais écrasé en silence.
     closing_ref = _closing_reference(ini, fin)
     if closing_ref:
-        eg = (comps["livraisons_externes_l"] + comps["carte_total_l"] + comps["transferts_entrants_l"] + comps["rajouts_l"]
-              - comps["transferts_sortants_l"] - comps["retraits_l"] - comps["vols_l"] - comps["vidanges_l"])
-        cl = Decimal(str(closing_ref.get("livre_l") or 0)) + Decimal(str(closing_ref.get("rajout_retrait_l") or 0)) \
-            - Decimal(str(closing_ref.get("vole_l") or 0)) - Decimal(str(closing_ref.get("vidange_l") or 0))
-        gap, tol = eg - cl, max(Decimal(20), Decimal("0.05") * abs(cl))
-        ref_out = {"mouvements_nets_egrid_l": _f(eg), "mouvements_nets_closing_l": _f(cl), "ecart_l": _f(gap),
-                   "conso_closing_l": closing_ref.get("conso_closing_l")}
-        for x in (ini, fin):
-            x["reference_closing"] = ref_out
-        detail = (f"Closing : livré {closing_ref.get('livre_l') or 0:.0f} L, rajouts/retraits {closing_ref.get('rajout_retrait_l') or 0:+.0f} L, "
-                  f"volé {closing_ref.get('vole_l') or 0:.0f} L, vidangé {closing_ref.get('vidange_l') or 0:.0f} L (net {_f(cl):+.0f} L) ; "
-                  f"eGrid (ENOC) : net {_f(eg):+.0f} L")
-        ref_conso = closing_ref.get("conso_closing_l")
-        hint = f" — consommation du Closing : {round(ref_conso)} L" if ref_conso is not None else ""
-        if abs(gap) > tol and getattr(settings, "FUEL_CLOSING_MOVEMENTS_AUTHORITATIVE", False):
-            # Le Closing fait foi (stocks et mouvements du même document) : ses totaux remplacent ceux d'ENOC, ENOC reste un contrôle visible.
-            D = lambda k: Decimal(str(closing_ref.get(k) or 0))  # noqa: E731
-            livre, rr = D("livre_l"), D("rajout_retrait_l")
-            comps = {k: D0 for k in comps}
-            comps["livraisons_externes_l"], comps["rajouts_l"] = max(livre, D0), max(rr, D0)
-            comps["retraits_l"], comps["vols_l"], comps["vidanges_l"] = max(-livre, D0) + max(-rr, D0), D("vole_l"), D("vidange_l")
-            counted = [{"source": "CLOSING", "reference": "Totaux de période du Closing", "date": _iso(t1), "type": "TOTAUX_CLOSING",
-                        "composante": k, "quantite_l": _f(v), "qualite": None, "statut_brut": None, "statut_metier": "CLOSING_FAIT_FOI"}
-                       for k, v in comps.items() if v]
-            reserves.append(f"Mouvements issus du Closing (ENOC en désaccord de {_f(gap):+.0f} L : {detail}) — Closing retenu comme source de référence.")
-            major.append("Mouvements ENOC non confirmés par le Closing : vérifier avec le Fuel Manager.")
-        elif gap < -tol:
-            cause = cause or "ENTREES_NON_RETROUVEES"
-            motifs.append(f"Livraison(s) du Closing non retrouvée(s) dans ENOC ({_f(-gap):.0f} L manquants). {detail}{hint} : consommation non calculée.")
-        elif gap > tol:
-            cause = cause or "MOUVEMENTS_NON_CONFIRMES_CLOSING"
-            motifs.append(f"Mouvements eGrid non confirmés par le Closing (écart {_f(gap):+.0f} L : entrée ENOC absente du Closing, ou sortie "
-                          f"volée/vidangée/retrait du Closing absente d'eGrid). {detail}{hint} : consommation non calculée.")
+        comps, counted, excluded = _closing_crosscheck(closing_ref, ini, fin, comps, counted, excluded, t1, c, batches or {},
+                                                       alerts, reserves, major, motifs)
+        if closing_ref.get("_conflit_a_controler") and not cause:
+            cause = "CONFLIT_ENOC_CLOSING"
 
     conso = None
     can = ini and fin and not cause

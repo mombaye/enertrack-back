@@ -390,9 +390,16 @@ FUEL_BALANCE_SCORE_WEIGHTS = json.loads(os.getenv("FUEL_BALANCE_SCORE_WEIGHTS", 
 FUEL_PROPOSED_TANK_MIN_SCORE = int(os.getenv("FUEL_PROPOSED_TANK_MIN_SCORE", "70"))
 # Décision Steve : une cuve VALIDÉE mais SANS plaque (dimensions cohérentes) peut-elle produire une estimation ? Désactivé par défaut.
 # Si activé : résultat UNIQUEMENT « estimation avec réserve », jamais certifiable automatiquement.
-# Décision à prendre : pour une période couverte par un Closing (stocks initial ET final du même Closing), les mouvements du Closing font-ils foi
-# quand ENOC diverge ? Désactivé : divergence = non calculable. Activé : consommation du Closing, uniquement « estimation avec réserve ».
-FUEL_CLOSING_MOVEMENTS_AUTHORITATIVE = os.getenv("FUEL_CLOSING_MOVEMENTS_AUTHORITATIVE", "0").lower() in ("1", "true", "yes", "on")
+# Closing mensuel et ENOC : une livraison présente au Closing et absente d'ENOC COMPLÈTE le calcul (estimation avec réserve, alerte
+# LIVRAISON_CLOSING_ABSENTE_ENOC). Si les deux divergent : conflit tracé (CONFLIT_ENOC_CLOSING), jamais d'écrasement silencieux ;
+# au-delà de FUEL_CLOSING_CONFLICT_REVIEW_L litres d'écart, le bilan est « à contrôler » (non calculable).
+FUEL_CLOSING_CONFLICT_REVIEW_L = float(os.getenv("FUEL_CLOSING_CONFLICT_REVIEW_L", "300"))
+# Périodes (mois AAAA-MM, séparés par des virgules) dont le Closing est VALIDÉ : sur ces périodes seulement, en cas de conflit, les totaux du
+# Closing remplacent ceux d'ENOC (ENOC reste affiché). Jamais une règle globale applicable à tous les mois. Exemple : "2026-08".
+FUEL_CLOSING_AUTHORITATIVE_PERIODS = [x.strip() for x in os.getenv("FUEL_CLOSING_AUTHORITATIVE_PERIODS", "").split(",") if x.strip()]
+# Cuves à traiter en premier (décision métier), séparées par des virgules.
+FUEL_PRIORITY_TANK_SITES = [x.strip() for x in os.getenv("FUEL_PRIORITY_TANK_SITES", "KLD_2035,KLD_2049,KLD_1259,KLD_1775,BKL_0516").split(",") if x.strip()]
+# Cuve VALIDÉE sans plaque, dimensions cohérentes : estimation autorisée UNIQUEMENT « avec réserve » (jamais certifiable automatiquement).
 ALLOW_GEOMETRIC_TANK_ESTIMATION_WITH_RESERVE = os.getenv("ALLOW_GEOMETRIC_TANK_ESTIMATION_WITH_RESERVE", "0").lower() in ("1", "true", "yes", "on")
 # Données préparées pour la future recommandation de commande (indicatif, aucune commande automatique).
 FUEL_ORDER_HORIZON_DAYS = int(os.getenv("FUEL_ORDER_HORIZON_DAYS", "30"))

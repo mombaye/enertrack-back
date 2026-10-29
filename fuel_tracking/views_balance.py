@@ -43,6 +43,19 @@ def parse_bound(value: str | None, end: bool = False):
     return timezone.make_aware(dt) if timezone.is_naive(dt) else dt
 
 
+def alert_counts(period_qs) -> dict:
+    """Nombre de bilans portant chaque code d'alerte (préfixe « CODE : texte »)."""
+    from collections import Counter
+
+    from fuel_tracking.views_mvp import alert_codes
+
+    n = Counter()
+    for alertes in period_qs.values_list("alertes", flat=True):
+        for code in alert_codes(alertes):
+            n[code] += 1
+    return dict(n.most_common())
+
+
 def row(b) -> dict:
     return {
         "id": b.pk, "country": b.country, "site_id": b.site_id, "site_name": b.site_name, "zone": b.zone,
@@ -156,6 +169,8 @@ class StockBalanceListView(APIView):
             "formule": "conso_reelle = stock_initial + livraisons_truck + carte_total + transferts_entrants + rajouts "
                        "− transferts_sortants − retraits − vols − vidanges − stock_final",
             "seuils": __import__("fuel_tracking.services.stock_period_balance", fromlist=["cfg"]).cfg(),
+            "parametres": __import__("fuel_tracking.services.stock_period_balance", fromlist=["x"]).effective_parameters(),
+            "par_alerte": alert_counts(period),
         })
 
 

@@ -528,25 +528,6 @@ class MvpImportTests(TmpRootMixin, BalanceBase):
         self.assertEqual(Obs.objects.filter(source_type="CLOSING").count(), n)
         self.assertEqual(again.summary["stocks_closing"]["doublons"], 4)
 
-    def test_closing_period_totals_cross_check_blocks_false_certification(self):
-        P.process_bytes(self.closing_file(), "closing_aout.xlsx", "CLOSING", origin="UPLOAD")
-        start, end = datetime(2026, 8, 1, tzinfo=dt_tz.utc), datetime(2026, 8, 31, 23, 59, 59, tzinfo=dt_tz.utc)
-        # Le Closing compte 200 L livrés ; aucune livraison dans ENOC : consommation NON calculée (pas de 300 L « certifiés » à tort)
-        r = SB.compute_balances(start, end, site_ids=["DKR_0001"], persist=False)[0]
-        self.assertEqual((r["statut_bilan"], r["cause_principale"], r["consommation_reelle_l"]), ("NON_CALCULABLE", "ENTREES_NON_RETROUVEES", None))
-        self.assertTrue(any("non retrouvée" in m for m in r["motifs"]))
-        # La livraison est retrouvée dans ENOC : la consommation (400 L) concorde avec le Closing
-        self.tc("TC-CL1", 200, datetime(2026, 8, 15, tzinfo=dt_tz.utc), typ="TRUCK",
-                req_extra={"level_before": 100, "level_before_unit": "L"}, op_extra={"level_after": 300, "level_after_unit": "L"})
-        r = SB.compute_balances(start, end, site_ids=["DKR_0001"], persist=False)[0]
-        self.assertEqual((float(r["consommation_reelle_l"]), r["statut_bilan"]), (400.0, "PRET_A_CERTIFIER"))
-        self.assertEqual(r["stock_initial_detail"]["reference_closing"]["ecart_l"], 0.0)
-        # Une entrée ENOC de plus que le Closing (ou une sortie du Closing absente d'eGrid) : conflit à arbitrer, pas une consommation « estimée »
-        self.tc("TC-CL2", 300, datetime(2026, 8, 20, tzinfo=dt_tz.utc), typ="TRUCK",
-                req_extra={"level_before": 100, "level_before_unit": "L"}, op_extra={"level_after": 400, "level_after_unit": "L"})
-        r = SB.compute_balances(start, end, site_ids=["DKR_0001"], persist=False)[0]
-        self.assertEqual((r["statut_bilan"], r["cause_principale"], r["consommation_reelle_l"]), ("NON_CALCULABLE", "MOUVEMENTS_NON_CONFIRMES_CLOSING", None))
-
     def test_closing_zero_final_stock_imported_when_site_had_fuel(self):
         d1, d2 = datetime(2026, 8, 1), datetime(2026, 8, 31)
         # DKR_0003 : pas de GE déclaré mais 300 L au départ : le stock final de 0 L (cuve vide) est une vraie mesure et doit être importé
@@ -554,20 +535,10 @@ class MvpImportTests(TmpRootMixin, BalanceBase):
         got = {o.observation_datetime.date().isoformat(): float(o.level_liters) for o in Obs.objects.filter(source_type="CLOSING", site_id="DKR_0003")}
         self.assertEqual(got, {"2026-08-01": 300.0, "2026-08-31": 0.0})
 
-    @override_settings(FUEL_CLOSING_MOVEMENTS_AUTHORITATIVE=True)
-    def test_closing_authoritative_setting_uses_closing_totals_with_reserve(self):
-        P.process_bytes(self.closing_file(), "closing_aout.xlsx", "CLOSING", origin="UPLOAD")
-        start, end = datetime(2026, 8, 1, tzinfo=dt_tz.utc), datetime(2026, 8, 31, 23, 59, 59, tzinfo=dt_tz.utc)
-        r = SB.compute_balances(start, end, site_ids=["DKR_0001"], persist=False)[0]  # aucune livraison ENOC : le Closing (200 L livrés) fait foi
-        self.assertEqual((float(r["consommation_reelle_l"]), r["statut_bilan"]), (400.0, "ESTIMATION_AVEC_RESERVE"))
-        self.assertTrue(any("Closing retenu" in x for x in r["reserves"]))
-        self.assertTrue(any(m["source"] == "CLOSING" for m in r["mouvements"]))
-        self.assertEqual(float(r["livraisons_externes_l"]), 200.0)
-
     def test_priorities_list_missing_closing_deliveries_and_table_actions(self):
         P.process_bytes(self.closing_file(), "closing_aout.xlsx", "CLOSING", origin="UPLOAD")
         start, end = datetime(2026, 8, 1, tzinfo=dt_tz.utc), datetime(2026, 8, 31, 23, 59, 59, tzinfo=dt_tz.utc)
-        SB.compute_balances(start, end, site_ids=["DKR_0001"])  # persiste : livraison du Closing absente d'ENOC
+        SB.compute_balances(start, end, site_ids=["DKR_0001"])  # persiste : livraison du Closing absente d'ENOC (complétée avec réserve)
         U = get_user_model()
         c = APIClient()
         c.force_authenticate(U.objects.create_user("pr", "pr@x.sn", "p", role="admin"))
@@ -582,6 +553,75 @@ class MvpImportTests(TmpRootMixin, BalanceBase):
         self.assertIn("Livraison du Closing absente d'ENOC", out2.getvalue())
         self.assertIn("Cuves à traiter", out2.getvalue())
         self.assertNotIn("Certification manuelle", out.getvalue().split("DKR_0001")[1].split("\n")[0])
+
+    # ── Closing / ENOC : complément avec réserve, conflit tracé, période validée ─────────────────────────────────
+    def aug(self):
+        return datetime(2026, 8, 1, tzinfo=dt_tz.utc), datetime(2026, 8, 31, 23, 59, 59, tzinfo=dt_tz.utc)
+
+    def test_closing_delivery_missing_from_enoc_completes_with_reserve(self):
+        b = P.process_bytes(self.closing_file(), "closing_aout.xlsx", "CLOSING", origin="UPLOAD")
+        start, end = self.aug()
+        r = SB.compute_balances(start, end, site_ids=["DKR_0001"])[0]  # le Closing compte 200 L livrés, ENOC aucun
+        self.assertEqual((float(r["consommation_reelle_l"]), r["statut_bilan"]), (400.0, "ESTIMATION_AVEC_RESERVE"))
+        self.assertTrue(any(a.startswith("LIVRAISON_CLOSING_ABSENTE_ENOC") and f"lot #{b.pk}" in a and "closing_aout.xlsx" in a for a in r["alertes"]))
+        add = next(m for m in r["mouvements"] if m["source"] == "CLOSING")
+        self.assertEqual((add["quantite_l"], add["lot"], add["fichier"], add["composante"]), (200.0, b.pk, "closing_aout.xlsx", "livraisons_externes_l"))
+        self.assertEqual(r["stock_initial_detail"]["reference_closing"]["decision"], "COMPLEMENT_CLOSING")
+        bal = FuelStockBalance.objects.get(site_id="DKR_0001", observation_start=start)
+        with self.assertRaises(SB.BalanceError):
+            SB.certify(bal, None, "certifier", "")  # jamais certifiable automatiquement sur cette base
+        SB.certify(bal, None, "certifier_avec_reserve", "Livraison confirmée par téléphone")
+
+    def test_closing_and_enoc_agree_is_ready(self):
+        P.process_bytes(self.closing_file(), "closing_aout.xlsx", "CLOSING", origin="UPLOAD")
+        self.tc("TC-CL1", 200, datetime(2026, 8, 15, tzinfo=dt_tz.utc), typ="TRUCK",
+                req_extra={"level_before": 100, "level_before_unit": "L"}, op_extra={"level_after": 300, "level_after_unit": "L"})
+        r = SB.compute_balances(*self.aug(), site_ids=["DKR_0001"], persist=False)[0]
+        self.assertEqual((float(r["consommation_reelle_l"]), r["statut_bilan"]), (400.0, "PRET_A_CERTIFIER"))
+        self.assertEqual(r["stock_initial_detail"]["reference_closing"]["decision"], "CONCORDANT")
+
+    def test_closing_enoc_conflict_keeps_both_values(self):
+        P.process_bytes(self.closing_file(), "closing_aout.xlsx", "CLOSING", origin="UPLOAD")
+        for ref, qty, day in (("TC-CL1", 200, 15), ("TC-CL2", 100, 20)):  # ENOC : 300 L ; Closing : 200 L → conflit de 100 L (< 300 L)
+            self.tc(ref, qty, datetime(2026, 8, day, tzinfo=dt_tz.utc), typ="TRUCK",
+                    req_extra={"level_before": 100, "level_before_unit": "L"}, op_extra={"level_after": 300, "level_after_unit": "L"})
+        r = SB.compute_balances(*self.aug(), site_ids=["DKR_0001"], persist=False)[0]
+        self.assertEqual((float(r["consommation_reelle_l"]), r["statut_bilan"]), (500.0, "ESTIMATION_AVEC_RESERVE"))  # valeurs ENOC conservées
+        ref = r["stock_initial_detail"]["reference_closing"]
+        self.assertEqual((ref["decision"], ref["entrees_egrid_l"], ref["entrees_closing_l"]), ("CONFLIT", 300.0, 200.0))
+        self.assertTrue(any(a.startswith("CONFLIT_ENOC_CLOSING") for a in r["alertes"]))
+        # grand conflit (> 300 L) : à contrôler, aucune consommation
+        self.tc("TC-CL3", 500, datetime(2026, 8, 25, tzinfo=dt_tz.utc), typ="TRUCK",
+                req_extra={"level_before": 100, "level_before_unit": "L"}, op_extra={"level_after": 600, "level_after_unit": "L"})
+        r = SB.compute_balances(*self.aug(), site_ids=["DKR_0001"], persist=False)[0]
+        self.assertEqual((r["statut_bilan"], r["cause_principale"], r["consommation_reelle_l"]), ("NON_CALCULABLE", "CONFLIT_ENOC_CLOSING", None))
+
+    def test_closing_authoritative_only_for_listed_validated_periods(self):
+        P.process_bytes(self.closing_file(), "closing_aout.xlsx", "CLOSING", origin="UPLOAD")
+        self.tc("TC-CL3", 900, datetime(2026, 8, 25, tzinfo=dt_tz.utc), typ="TRUCK",
+                req_extra={"level_before": 100, "level_before_unit": "L"}, op_extra={"level_after": 600, "level_after_unit": "L"})
+        with override_settings(FUEL_CLOSING_AUTHORITATIVE_PERIODS=["2026-07"]):  # autre mois : aucune autorité
+            r = SB.compute_balances(*self.aug(), site_ids=["DKR_0001"], persist=False)[0]
+        self.assertEqual(r["cause_principale"], "CONFLIT_ENOC_CLOSING")
+        with override_settings(FUEL_CLOSING_AUTHORITATIVE_PERIODS=["2026-08"]):  # période au Closing validé
+            r = SB.compute_balances(*self.aug(), site_ids=["DKR_0001"], persist=False)[0]
+        self.assertEqual((float(r["consommation_reelle_l"]), r["statut_bilan"]), (400.0, "ESTIMATION_AVEC_RESERVE"))
+        self.assertEqual(r["stock_initial_detail"]["reference_closing"]["decision"], "CLOSING_FAIT_FOI")
+        self.assertTrue(any(m["reference"] == "TC-CL3" and "conservée pour audit" in m["motif"] for m in r["mouvements_exclus"]))  # ENOC conservé
+        self.assertTrue(any(a.startswith("CONFLIT_ENOC_CLOSING") for a in r["alertes"]))
+
+    def test_effective_parameters_and_tank_usage_follow_the_flag(self):
+        from fuel_tracking.views_mvp import tank_class
+
+        tank("DKR_0001", plate=None)
+        spec = TC.TankSpec.from_model(FuelTankMaster.objects.get(site_id="DKR_0001"))
+        self.assertEqual(tank_class(spec, 70)["usage"], "ESTIMATION_GEOMETRIQUE")  # BalanceBase active le paramètre
+        with override_settings(ALLOW_GEOMETRIC_TANK_ESTIMATION_WITH_RESERVE=False):
+            self.assertEqual(tank_class(spec, 70)["usage"], "ESTIMATION_GEOMETRIQUE_DESACTIVEE")
+            self.assertFalse(SB.effective_parameters()["ALLOW_GEOMETRIC_TANK_ESTIMATION_WITH_RESERVE"])
+        out = StringIO()
+        call_command("fuel_parametres", stdout=out)
+        self.assertIn('"ALLOW_GEOMETRIC_TANK_ESTIMATION_WITH_RESERVE": true', out.getvalue())
 
     def test_compare_closing_balances_end_to_end(self):
         from tempfile import NamedTemporaryFile

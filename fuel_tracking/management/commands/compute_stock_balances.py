@@ -9,6 +9,8 @@ ne certifie jamais (action Fuel Manager dans l'interface).
 import json
 from collections import Counter
 
+from fuel_tracking.services.stock_period_balance import effective_parameters
+from fuel_tracking.views_mvp import alert_codes
 from django.core.management.base import BaseCommand, CommandError
 
 from fuel_tracking.services.stock_period_balance import BalanceError, compute_balances
@@ -62,6 +64,14 @@ class Command(BaseCommand):
                "causes_principales": dict(Counter(r["cause_principale"] for r in rows if r["statut_bilan"] == "NON_CALCULABLE").most_common()),
                "reserves_principales": dict(Counter(x.split(" (")[0].split(" :")[0][:60] for r in rows
                                                     if r["statut_bilan"] == "ESTIMATION_AVEC_RESERVE" for x in r["reserves"]).most_common(8)),
+               "alertes_closing_enoc": {
+                   "bilans_avec_livraison_closing_ajoutee_avec_reserve": sum(1 for r in rows if "LIVRAISON_CLOSING_ABSENTE_ENOC" in alert_codes(r["alertes"])),
+                   "bilans_avec_sortie_closing_ajoutee_avec_reserve": sum(1 for r in rows if "SORTIE_CLOSING_ABSENTE_ENOC" in alert_codes(r["alertes"])),
+                   "conflits_enoc_closing": sum(1 for r in rows if "CONFLIT_ENOC_CLOSING" in alert_codes(r["alertes"])),
+                   "volume_livraisons_closing_ajoutees_l": round(sum(float((r.get("stock_initial_detail") or {}).get("reference_closing", {}).get("ecart_entrees_l") or 0)
+                                                                      for r in rows if "LIVRAISON_CLOSING_ABSENTE_ENOC" in alert_codes(r["alertes"])), 1),
+                   "periodes_closing_faisant_foi": sum(1 for r in rows if (r.get("stock_initial_detail") or {}).get("reference_closing", {}).get("decision") == "CLOSING_FAIT_FOI")},
+               "parametres_effectifs": effective_parameters(),
                "stock_initial_present": sum(1 for r in rows if r["stock_initial_l"] is not None),
                "stock_final_present": sum(1 for r in rows if r["stock_final_l"] is not None),
                "sources_stock_utilisees": dict(sources), "nature_des_valeurs_de_stock": dict(modes),
