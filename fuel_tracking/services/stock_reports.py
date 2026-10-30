@@ -124,7 +124,11 @@ def profils(b) -> list[str]:
     modes = {m for m in ((b.stock_initial_detail or {}).get("mode_valeur"), (b.stock_final_detail or {}).get("mode_valeur")) if m}
     out = []
     if b.statut_bilan == "NON_CALCULABLE":
+        # Un bilan non calculable n'illustre que « non calculable » (et mouvement à contrôler) : les autres profils sont montrés par des bilans calculés.
         out.append("non_calculable")
+        if b.cause_principale == "MOUVEMENTS_A_CONTROLER" or any("contrôler" in (m.get("motif") or "") for m in (b.mouvements_exclus or [])):
+            out.append("mouvement_a_controler")
+        return out
     if modes and modes <= {"LITRE_DIRECT"}:
         out.append("stock_litre_direct")
     if modes and modes <= {"LITRE_DIRECT", "CM_CONVERTI_CUVE_VALIDEE"} and "CM_CONVERTI_CUVE_VALIDEE" in modes:
