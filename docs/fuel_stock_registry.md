@@ -578,3 +578,7 @@ marquée validée. Valeurs effectives : `python manage.py fuel_parametres` et li
 
 **Données** : les dates de relevé impossibles sont isolées (`summary.dates_impossibles`, rapport des lignes rejetées) ; une feuille dont le nom cite un mois différent
 de ses dates est signalée (`summary.feuilles_suspectes`, analyse) ; `FUEL_PRIORITY_TANK_SITES` met des cuves en tête des cuves à traiter.
+
+Sélection du stock (correctif de recette) : à fraîcheur équivalente (0-3 j, relevé exact ou frais), une valeur CERTIFIABLE (litre direct, cm sur cuve validée) prime sur une
+estimation même plus récente ; le relevé exact précède ensuite le frais. Sans cela, activer l'estimation sur cuve sans plaque faisait passer des bilans « prêts à
+certifier » (stock en litres à 2 j) en « estimation » (estimation géométrique du jour).

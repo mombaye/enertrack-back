@@ -123,6 +123,17 @@ class MvpBalanceTests(BalanceBase):
         self.assertEqual(r["statut_bilan"], "PRET_A_CERTIFIER")
         self.assertTrue(any(c["estimation"] for c in r["candidats"]["initial"]))  # l'estimation reste visible comme candidat
 
+    # 4 bis. à fraîcheur équivalente (0-3 j), la valeur certifiable prime sur une estimation plus récente
+    def test_fresh_certifiable_stock_beats_same_day_estimate(self):
+        tank("DKR_0001", plate=None)
+        self.obs(480, self.start - timedelta(days=2), source="CLOSING")        # litres directs, 2 j avant la borne (frais)
+        self.obs_cm(48, self.start + timedelta(hours=1), source="LOLIFORCE")  # estimation géométrique du jour : plus récente mais NON certifiable
+        self.obs(300, self.end - timedelta(hours=1))
+        r = self.compute()["DKR_0001"]
+        d = r["stock_initial_detail"]
+        self.assertEqual((float(r["stock_initial_l"]), d["mode_valeur"], d["estimation"]), (480.0, "LITRE_DIRECT", False))
+        self.assertEqual(r["statut_bilan"], "PRET_A_CERTIFIER")
+
     # 5. cm avec cuve validée : conversion tracée
     def test_cm_with_validated_tank_traced(self):
         tank("DKR_0001")  # 100×100×100, plaque 1 000 L : 1 cm = 10 L

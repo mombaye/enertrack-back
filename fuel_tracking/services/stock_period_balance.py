@@ -144,7 +144,10 @@ def _select(obs: list[dict], boundary, final: bool, tanks: list, c: dict) -> tup
     alerts = []
     cands = [_candidate(o, boundary, final, c) for o in obs]
     usable = [x for x in cands if x["utilisable"]]
-    key = lambda x: (_tier_rank(x["tier"]), 0 if x["certifiable"] else 1, x["rang_priorite"],  # noqa: E731
+    # 0-3 j (EXACT et FRAIS) = « exploitable normalement » : à fraîcheur équivalente, la valeur CERTIFIABLE prime sur une estimation, même plus récente
+    # (sinon un stock en litres à 2 j perdrait contre une estimation géométrique du jour et le bilan ne serait plus certifiable). Puis le relevé exact avant le frais.
+    group = lambda x: 0 if x["tier"] in ("EXACT", "FRAIS") else _tier_rank(x["tier"])  # noqa: E731
+    key = lambda x: (group(x), 0 if x["certifiable"] else 1, _tier_rank(x["tier"]), x["rang_priorite"],  # noqa: E731
                      VALUE_RANK.get(x["mode_valeur"], 9), x["age_jours"])
     usable.sort(key=key)
     cands.sort(key=lambda x: (_tier_rank(x["tier"]), x["age_jours"], x["rang_priorite"]))
