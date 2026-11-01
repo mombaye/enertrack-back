@@ -867,3 +867,13 @@ class ConsoComparisonTests(BalanceBase):
                 self.assertEqual(resp.status_code, 200, kind)
             full = c.get("/api/fuel-tracking/consommations/export/controle_complet/", {"date_debut": d1, "date_fin": d2}).content.decode()
             self.assertIn("Consommation réelle stock (L)", full)
+
+    def test_recette_command_runs_and_prints_counts(self):
+        self.stocks(1000, 400)
+        SB.compute_balances(self.start, self.end, site_ids=["DKR_0001"])
+        out = StringIO()
+        with mock.patch("fuel_tracking.services.cph_service.compute_period_summary", return_value=[self.cph_row(theo="610")]):
+            call_command("fuel_comparaison_controle", debut=self.start.strftime("%Y-%m-%d"), fin=self.end.strftime("%Y-%m-%d"), stdout=out)
+        txt = out.getvalue()
+        self.assertIn("PÉRIODE EXACTE", txt)
+        self.assertIn("conso réelle calculable                      : 1", txt)
