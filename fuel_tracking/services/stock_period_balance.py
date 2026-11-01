@@ -686,7 +686,9 @@ def reconciliation(start, end, country=None, zone=None) -> list[dict]:
     from fuel_tracking.models import FuelStockBalance as B
     from fuel_tracking.services.cph_service import compute_period_summary
 
-    balances = B.objects.filter(observation_start=start, observation_end=end)
+    from fuel_tracking.services.period_utils import balances_for_days, to_day
+
+    balances = balances_for_days(to_day(start), to_day(end))
     if country:
         balances = balances.filter(country__iexact=country)
     if zone:

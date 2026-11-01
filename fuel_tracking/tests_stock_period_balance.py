@@ -377,6 +377,24 @@ class MvpBalanceTests(BalanceBase):
         _n, cols, rows = build_report("stocks_identiques_suspects", p)
         self.assertEqual([(r["site_id"], r["stock_l"]) for r in rows], [("DKR_0001", 400.0)])
 
+    def test_period_formats_never_lose_the_balance(self):
+        """Régression production : « 2026-08-31T23:59 » (minutes) ne retrouvait pas un bilan enregistré à 23:59:59."""
+        self.stocks(500, 300)
+        SB.compute_balances(self.start, self.end, site_ids=["DKR_0001"])
+        U = get_user_model()
+        c = APIClient()
+        c.force_authenticate(U.objects.create_user("per", "per@x.sn", "p", role="analyst"))
+        d1, d2 = self.start.strftime("%Y-%m-%d"), self.end.strftime("%Y-%m-%d")
+        for debut, fin in ((d1, d2), (f"{d1}T00:00", f"{d2}T23:59"), (f"{d1}T00:00:00", f"{d2}T23:59:59"), (f"{d1} 00:00:00", f"{d2} 23:59:59"),
+                           (f"{d1}T00:00:00Z", f"{d2}T23:59:59Z")):
+            j = c.get("/api/fuel-tracking/stock/bilans/", {"debut": debut, "fin": fin}).json()
+            self.assertEqual(j["totaux"]["calculables"], 1, (debut, fin))
+            r = c.get("/api/fuel-tracking/stock/bilans/rapprochement/", {"debut": debut, "fin": fin}).json()
+            self.assertTrue(r["calcule"], (debut, fin))
+        periods = c.get("/api/fuel-tracking/stock/bilans/periodes/").json()
+        self.assertEqual(periods["defaut"], {"debut": d1, "fin": d2})
+        self.assertEqual(periods["data"][0]["libelle"][11:19], "00:00:00")
+
     def test_site_not_recognised(self):
         self.stocks(500, 300, site="GHOST_1")
         r = self.compute(("GHOST_1",))["GHOST_1"]

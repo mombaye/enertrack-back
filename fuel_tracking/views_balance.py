@@ -82,10 +82,11 @@ def row(b) -> dict:
 def filtered(params):
     from fuel_tracking.models import FuelStockBalance as B
 
-    start, end = parse_bound(params.get("debut")), parse_bound(params.get("fin"), end=True)
-    qs = B.objects.all()
-    if start and end:
-        qs = qs.filter(observation_start=start, observation_end=end)
+    from fuel_tracking.services.period_utils import balances_for_days, day_bounds, period_from_params
+
+    days = period_from_params(params.get("debut"), params.get("fin"))
+    start, end = day_bounds(*days) if days else (None, None)
+    qs = balances_for_days(*days) if days else B.objects.all()
     p = params
     if p.get("pays"):
         qs = qs.filter(country__iexact=p["pays"])
@@ -128,17 +129,23 @@ class StockBalanceListView(APIView):
         from fuel_tracking.models import FuelStockBalance as B
         from fuel_tracking.views_stock import _page, _pagination
 
+        from fuel_tracking.services.period_utils import balances_for_days, day_bounds, default_period
+
         qs, start, end = filtered(request.query_params)
+        used = None
         if not (start and end):
-            last = B.objects.order_by("-calculated_at").values("observation_start", "observation_end").first()
-            if last:
-                qs = qs.filter(observation_start=last["observation_start"], observation_end=last["observation_end"])
-                start, end = last["observation_start"], last["observation_end"]
+            used = default_period()  # dernière période complète pour laquelle un bilan existe
+            if used:
+                start, end = day_bounds(*used)
+                qs = balances_for_days(*used)
+        else:
+            from fuel_tracking.services.period_utils import period_from_params
+            used = period_from_params(request.query_params.get("debut"), request.query_params.get("fin"))
         page, limit = _page(request, default=50, maximum=200)
         total = qs.count()
         lo = (page - 1) * limit
         data = [row(b) for b in qs.order_by("statut_bilan", "site_id")[lo:lo + limit]]
-        period = B.objects.filter(observation_start=start, observation_end=end) if start and end else B.objects.none()
+        period = balances_for_days(*used) if used else B.objects.none()
         totals = {r["statut_bilan"]: r["n"] for r in period.values("statut_bilan").annotate(n=Count("id"))}
         sources = {}
         for field in ("source_stock_initial", "source_stock_final"):
@@ -180,15 +187,18 @@ class StockBalanceListView(APIView):
 
 
 class StockBalancePeriodsView(APIView):
+    """Périodes (jours entiers) pour lesquelles un bilan existe ; `defaut` = dernière période complète."""
+
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        from fuel_tracking.models import FuelStockBalance as B
+        from fuel_tracking.services.period_utils import available_periods, default_period
 
-        rows = (B.objects.values("observation_start", "observation_end")
-                .annotate(sites=Count("id"), calculables=Count("id", filter=Q(consommation_reelle_l__isnull=False)))
-                .order_by("-observation_end", "-observation_start")[:50])
-        return Response({"data": list(rows)})
+        rows = available_periods(50)
+        for r in rows:  # clés historiques conservées pour les écrans existants
+            r["observation_start"], r["observation_end"] = f"{r['debut']}T00:00:00", f"{r['fin']}T23:59:59"
+        d = default_period()
+        return Response({"data": rows, "defaut": {"debut": d[0].isoformat(), "fin": d[1].isoformat()} if d else None})
 
 
 class StockBalanceComputeView(APIView):
@@ -198,9 +208,12 @@ class StockBalanceComputeView(APIView):
     def post(self, request):
         from fuel_tracking.services.stock_period_balance import BalanceError, compute_balances
 
-        start, end = parse_bound(request.data.get("debut")), parse_bound(request.data.get("fin"), end=True)
-        if not (start and end):
-            return Response({"detail": "Période obligatoire : debut et fin (AAAA-MM-JJ ou AAAA-MM-JJTHH:MM)."}, status=400)
+        from fuel_tracking.services.period_utils import day_bounds, period_from_params
+
+        days = period_from_params(request.data.get("debut"), request.data.get("fin"))
+        if not days:
+            return Response({"detail": "Période obligatoire : debut et fin (AAAA-MM-JJ), début ≤ fin. La période est toujours en jours entiers (00:00:00 → 23:59:59)."}, status=400)
+        start, end = day_bounds(*days)
         if (end - start).days > 400:
             return Response({"detail": "Période limitée à 400 jours."}, status=400)
         site = (request.data.get("site") or "").strip()
@@ -268,10 +281,13 @@ class StockBalanceReconciliationView(APIView):
         from fuel_tracking.services.stock_period_balance import reconciliation
         from fuel_tracking.views_stock import _page, _pagination
 
-        start, end = parse_bound(request.query_params.get("debut")), parse_bound(request.query_params.get("fin"), end=True)
-        if not (start and end):
+        from fuel_tracking.services.period_utils import balances_for_days, day_bounds, period_from_params
+
+        days = period_from_params(request.query_params.get("debut"), request.query_params.get("fin"))
+        if not days:
             return Response({"detail": "Période obligatoire (debut, fin)."}, status=400)
-        if not B.objects.filter(observation_start=start, observation_end=end).exists():
+        start, end = day_bounds(*days)
+        if not balances_for_days(*days).exists():
             return Response({"data": [], "pagination": _pagination(1, 50, 0), "calcule": False,
                              "message": "Aucun bilan de stock calculé pour cette période exacte : le calculer dans l'onglet Stock › Bilan de stock."})
         rows = reconciliation(start, end, country=request.query_params.get("pays"), zone=request.query_params.get("zone"))

@@ -70,7 +70,9 @@ def _period(params):
 def _balances(start, end):
     from fuel_tracking.models import FuelStockBalance as B
 
-    rows = list(B.objects.filter(observation_start=start, observation_end=end).order_by("site_id"))
+    from fuel_tracking.services.period_utils import balances_for_days, to_day
+
+    rows = list(balances_for_days(to_day(start), to_day(end)).order_by("site_id"))
     if not rows:
         raise ReportError("Aucun bilan calculé pour cette période exacte : calculer d'abord le bilan (Stock › Bilan de stock).")
     return rows

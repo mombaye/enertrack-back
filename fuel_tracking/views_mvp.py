@@ -307,7 +307,9 @@ class PrioritiesView(APIView):
             start, end = (last["observation_start"], last["observation_end"]) if last else (None, None)
         items = []
         if start and end:
-            for b in B.objects.filter(observation_start=start, observation_end=end):
+            from fuel_tracking.services.period_utils import balances_for_days, to_day
+
+            for b in balances_for_days(to_day(start), to_day(end)):
                 base = {"site_id": b.site_id, "site_name": b.site_name, "zone": b.zone, "bilan_id": b.pk}
                 if b.estimation and b.consommation_reelle_l is not None:
                     items.append({**base, "categorie": "forte_conso_estimee_sans_cuve_validee", "impact_l": _f(b.consommation_reelle_l),
