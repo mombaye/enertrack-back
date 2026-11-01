@@ -795,3 +795,75 @@ class TankPlateDiagnosticTests(BalanceBase):
         self.assertIn("→ PLAQUE_ABSENTE", text)
         a.refresh_from_db()
         self.assertEqual(float(a.dimension_1_cm), 157.0)  # lecture seule
+
+
+class ConsoComparisonTests(BalanceBase):
+    """Suivis Consommations : un tableau, une période, trois consommations, écarts signés."""
+
+    def cph_row(self, site="DKR_0001", theo=None, measured=None, days_measured=0):
+        d = (self.end.date() - self.start.date()).days + 1
+        return {"site_id": site, "site_name": "N", "country": "sen", "zone": "DKR", "perimetre": "GE", "days": d, "cph_days": d if theo is not None else 0,
+                "cph_status": "COMPLET" if theo is not None else "NON_CALCULE_PERIODE", "statut_cph": "CPH_CALCULE" if theo is not None else "CPH_NON_CALCULE",
+                "conso_theorique_l": None if theo is None else Decimal(theo), "conso_partielle_l": None, "motif_cph": None,
+                "runtime_source_main": "DSE", "power_source_main": "ENOC", "kind": "GE", "runtime_days": d, "running_days": d, "ge_label": "GE1", "curve": "C1",
+                "power_method_days": d, "statut_rapprochement_calcul": "CALCULE",
+                "comparaison": {"conso_mesuree_l": None if measured is None else Decimal(measured), "jours_mesure": days_measured}}
+
+    def build(self, rows, **params):
+        from fuel_tracking.services import conso_comparison as CC
+        with mock.patch("fuel_tracking.services.cph_service.compute_period_summary", return_value=rows):
+            return CC.build(self.start.date(), self.end.date(), params, with_cph_quality=False)
+
+    def test_three_values_gaps_sign_and_period(self):
+        self.stocks(1000, 400)                       # consommation réelle 600 L
+        SB.compute_balances(self.start, self.end, site_ids=["DKR_0001"])
+        d = (self.end.date() - self.start.date()).days + 1
+        out = self.build([self.cph_row(theo="660", measured="570", days_measured=d)])
+        r = out["rows"][0]
+        self.assertEqual(r["reel"]["conso_l"], 600.0)
+        self.assertEqual(r["ecart_instrumentee"]["l"], -30.0)   # instrumentée − réelle
+        self.assertEqual(r["ecart_theorique"]["l"], 60.0)       # théorique − réelle
+        self.assertEqual(r["ecart_theorique"]["pct"], 10.0)
+        self.assertIn("23:59:59", out["periode"]["libelle"])
+        self.assertTrue(out["periode"]["bilan_disponible"])
+
+    def test_no_value_invented_without_real_or_instrumented(self):
+        self.stocks(1000, 400)
+        SB.compute_balances(self.start, self.end, site_ids=["DKR_0001"])
+        r = self.build([self.cph_row(theo=None, measured=None)])["rows"][0]
+        self.assertIsNone(r["theorique"]["conso_l"])
+        self.assertIsNone(r["ecart_theorique"]["l"])
+        self.assertIsNone(r["instrumentee"]["conso_l"])
+        self.assertEqual(r["statut_global"], "MESURE_INSTRUMENTEE_ABSENTE")
+
+    def test_non_calculable_has_no_real_value_and_no_gap(self):
+        r = self.build([self.cph_row(theo="500", measured="500", days_measured=19)])["rows"][0]   # aucun bilan
+        self.assertIsNone(r["reel"]["conso_l"])
+        self.assertEqual(r["reel"]["statut"], "NON_CALCULABLE")
+        self.assertIsNone(r["ecart_theorique"]["l"])
+        self.assertEqual(r["statut_global"], "DONNEES_INCOMPLETES")
+
+    def test_percentage_guard_near_zero_reference(self):
+        from fuel_tracking.services.conso_comparison import _pct
+        self.assertEqual(_pct(50, 5), (None, "Référence quasi nulle"))
+        self.assertEqual(_pct(None, 500), (None, None))
+        self.assertEqual(_pct(50, 500), (10.0, None))
+
+    def test_api_all_period_formats_and_exports(self):
+        self.stocks(1000, 400)
+        SB.compute_balances(self.start, self.end, site_ids=["DKR_0001"])
+        c = APIClient()
+        c.force_authenticate(get_user_model().objects.create_user("cmp", "cmp@x.sn", "p", role="analyst"))
+        d1, d2 = self.start.strftime("%Y-%m-%d"), self.end.strftime("%Y-%m-%d")
+        with mock.patch("fuel_tracking.services.cph_service.compute_period_summary", return_value=[self.cph_row(theo="610")]):
+            for debut, fin in ((d1, d2), (f"{d1}T00:00", f"{d2}T23:59"), (f"{d1}T00:00:00", f"{d2}T23:59:59")):
+                j = c.get("/api/fuel-tracking/consommations/", {"date_debut": debut, "date_fin": fin}).json()
+                self.assertEqual(j["kpis"]["reel"]["sites_calculables"], 1, (debut, fin))
+            j = c.get("/api/fuel-tracking/consommations/").json()      # période par défaut = dernière avec bilan
+            self.assertEqual(j["periode"]["debut"], d1)
+            self.assertTrue(j["periode"]["par_defaut"])
+            for kind in ("controle_complet", "anomalies_fuel", "bilan_certification"):
+                resp = c.get(f"/api/fuel-tracking/consommations/export/{kind}/", {"date_debut": d1, "date_fin": d2})
+                self.assertEqual(resp.status_code, 200, kind)
+            full = c.get("/api/fuel-tracking/consommations/export/controle_complet/", {"date_debut": d1, "date_fin": d2}).content.decode()
+            self.assertIn("Consommation réelle stock (L)", full)
