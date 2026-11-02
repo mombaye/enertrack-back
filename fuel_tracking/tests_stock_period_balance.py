@@ -877,3 +877,21 @@ class ConsoComparisonTests(BalanceBase):
         txt = out.getvalue()
         self.assertIn("PÉRIODE EXACTE", txt)
         self.assertIn("conso réelle calculable                      : 1", txt)
+
+
+class SnowflakeBadgeTests(BalanceBase):
+    def test_orphan_running_syncs_turn_badge_red_with_message(self):
+        from fuel_tracking.models import FuelConsommationSyncRun as R
+        old = timezone.now() - timedelta(days=3)
+        ok = R.objects.create(status=R.Status.SUCCESS, sites_fetched=5)
+        R.objects.filter(pk=ok.pk).update(started_at=old)
+        r = R.objects.create(status=R.Status.RUNNING)
+        R.objects.filter(pk=r.pk).update(started_at=timezone.now() - timedelta(hours=5))
+        c = APIClient()
+        c.force_authenticate(get_user_model().objects.create_user("sf", "sf@x.sn", "p", role="analyst"))
+        j = c.get("/api/fuel-tracking/consommation/").json()
+        sf = j["sources"]["snowflake"]
+        self.assertFalse(sf["connected"])
+        self.assertIn("ne se sont jamais terminées", sf["error"])
+        R.objects.filter(pk=r.pk).update(started_at=timezone.now() - timedelta(minutes=5))   # récente = simplement en cours
+        self.assertTrue(c.get("/api/fuel-tracking/consommation/").json()["sources"]["snowflake"]["connected"])

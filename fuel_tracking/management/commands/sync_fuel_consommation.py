@@ -74,6 +74,12 @@ class Command(BaseCommand):
 
         sync_run = None
         if not dry_run:
+            # Synchros restées RUNNING depuis > 1 h = processus tué ou bloqué : on les clôture en échec (traçabilité honnête).
+            from datetime import timedelta
+            FuelConsommationSyncRun.objects.filter(
+                status=FuelConsommationSyncRun.Status.RUNNING, started_at__lt=timezone.now() - timedelta(hours=1),
+            ).update(status=FuelConsommationSyncRun.Status.FAILED, finished_at=timezone.now(),
+                     error_message="Synchronisation interrompue : processus arrêté avant la fin (clôturée automatiquement).")
             sync_run = FuelConsommationSyncRun.objects.create(
                 month_from=from_month, month_to=to_month,
                 status=FuelConsommationSyncRun.Status.RUNNING,

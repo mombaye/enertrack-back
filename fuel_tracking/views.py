@@ -139,8 +139,11 @@ class FuelConsommationListView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
+        from datetime import timedelta
+
         from django.db.models import Count, Max, Q, Sum
         from django.db.models.functions import Coalesce
+        from django.utils import timezone
 
         from billing.models import SonatelInvoice
         from fuel_tracking.models import (
@@ -157,7 +160,14 @@ class FuelConsommationListView(APIView):
             .distinct()
         )
 
-        last_sf_run = FuelConsommationSyncRun.objects.order_by("-started_at").first()
+        # Une synchro « en cours » n'est pas une panne : on lit la dernière synchro TERMINÉE. Mais des synchros restées RUNNING
+        # depuis plus d'une heure (processus tué / bloqué, jamais terminées) sont une vraie panne : voyant rouge + message explicite.
+        last_sf_run = FuelConsommationSyncRun.objects.exclude(status=FuelConsommationSyncRun.Status.RUNNING).order_by("-started_at").first()
+        orphan_qs = FuelConsommationSyncRun.objects.filter(status=FuelConsommationSyncRun.Status.RUNNING, started_at__lt=timezone.now() - timedelta(hours=1))
+        if last_sf_run is not None:
+            orphan_qs = orphan_qs.filter(started_at__gt=last_sf_run.started_at)
+        sf_orphans = orphan_qs.count()
+        sf_orphan_since = orphan_qs.order_by("started_at").values_list("started_at", flat=True).first()
         last_enoc_run = FuelEnocSyncRun.objects.order_by("-started_at").first()
 
         # Date de la donnée elle-même (pas l'heure d'exécution de la synchro,
@@ -173,11 +183,12 @@ class FuelConsommationListView(APIView):
 
         sources = {
             "snowflake": {
-                "connected": bool(last_sf_run and last_sf_run.status == FuelConsommationSyncRun.Status.SUCCESS),
+                "connected": bool(last_sf_run and last_sf_run.status == FuelConsommationSyncRun.Status.SUCCESS and sf_orphans == 0),
                 "last_status": last_sf_run.status if last_sf_run else None,
                 "last_run_at": (last_sf_run.finished_at or last_sf_run.started_at) if last_sf_run else None,
                 "last_data_date": snowflake_last_data,
-                "error": last_sf_run.error_message if last_sf_run else None,
+                "error": (f"{sf_orphans} synchronisation(s) démarrée(s) depuis le {sf_orphan_since:%d/%m/%Y %H:%M} ne se sont jamais terminées "
+                          "(processus interrompu ou bloqué).") if sf_orphans else (last_sf_run.error_message if last_sf_run else None),
             },
             "enoc": {
                 "connected": bool(last_enoc_run and last_enoc_run.status == FuelEnocSyncRun.Status.SUCCESS and last_enoc_run.rows_fetched > 0),
