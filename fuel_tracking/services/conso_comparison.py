@@ -290,7 +290,17 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
         rows.sort(key=lambda r: (-max(abs(r["ecart_instrumentee"]["l"] or 0), abs(r["ecart_theorique"]["l"] or 0)), r["site_id"]))
     else:
         rows.sort(key=lambda r: r["site_id"])
+    from fuel_tracking.services.cph_health import freshness
+
+    fr = freshness()
+    last = fr["facts_last_date"]
+    non_couverts = max(0, min(days, (d_to - last).days)) if last else days
     return {
+        "fraicheur": {
+            "snowflake_derniere_date": last.isoformat() if last else None, "age_jours": fr["facts_age_days"], "seuil_jours": fr["stale_after_days"],
+            "perime": bool(fr["facts_stale"]), "synchro_en_echec": bool(fr["last_sync_failed"]), "erreur_synchro": fr["last_sync_error"],
+            "jours_non_couverts": non_couverts, "periode_incomplete": non_couverts > 0,
+        },
         "periode": {"debut": d_from.isoformat(), "fin": d_to.isoformat(), "debut_dt": start.isoformat(), "fin_dt": end.isoformat(), "jours": days,
                     "libelle": f"{d_from:%d/%m/%Y} 00:00:00 → {d_to:%d/%m/%Y} 23:59:59",
                     "bilan_disponible": bool(balances), "sites_avec_bilan": len(balances),

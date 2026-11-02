@@ -826,6 +826,8 @@ class ConsoComparisonTests(BalanceBase):
         self.assertEqual(r["ecart_theorique"]["pct"], 10.0)
         self.assertIn("23:59:59", out["periode"]["libelle"])
         self.assertTrue(out["periode"]["bilan_disponible"])
+        self.assertIn("jours_non_couverts", out["fraicheur"])
+        self.assertTrue(out["fraicheur"]["perime"])        # aucun fait Snowflake en base de test
 
     def test_no_value_invented_without_real_or_instrumented(self):
         self.stocks(1000, 400)
