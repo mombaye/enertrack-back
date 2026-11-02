@@ -897,3 +897,19 @@ class SnowflakeBadgeTests(BalanceBase):
         self.assertIn("ne se sont jamais terminées", sf["error"])
         R.objects.filter(pk=r.pk).update(started_at=timezone.now() - timedelta(minutes=5))   # récente = simplement en cours
         self.assertTrue(c.get("/api/fuel-tracking/consommation/").json()["sources"]["snowflake"]["connected"])
+
+
+class ExclusiveTaskTests(BalanceBase):
+    def test_overlapping_scheduled_sync_is_skipped(self):
+        from django.core.cache import cache
+        from fuel_tracking import tasks as T
+        cache.delete("fuel_tracking:lock:sync_fuel_consommation")
+        calls = []
+        with mock.patch("django.core.management.call_command", side_effect=lambda *a, **k: calls.append(a)):
+            cache.add("fuel_tracking:lock:sync_fuel_consommation", "x", timeout=60)   # exécution précédente en cours
+            T.sync_fuel_consommation_current_month.run()
+            self.assertEqual(calls, [])
+            cache.delete("fuel_tracking:lock:sync_fuel_consommation")
+            T.sync_fuel_consommation_current_month.run()
+            self.assertEqual(len(calls), 1)
+            self.assertIsNone(cache.get("fuel_tracking:lock:sync_fuel_consommation"))   # verrou libéré

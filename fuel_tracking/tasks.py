@@ -27,6 +27,40 @@ from django.utils import timezone
 logger = logging.getLogger(__name__)
 
 
+def _exclusive(lock_name: str, ttl_s: int):
+    """
+    Décorateur anti-chevauchement des tâches planifiées toutes les 5 min : si la précédente tourne encore
+    (synchro Snowflake lente), la nouvelle est ignorée au lieu de s'empiler (file Celery saturée, synchros
+    « RUNNING » jamais terminées, faits journaliers qui n'avancent plus). Le verrou expire seul (ttl) si le
+    processus est tué. Cache indisponible → on exécute quand même (pas de blocage silencieux).
+    """
+    from functools import wraps
+
+    def deco(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            from django.core.cache import cache
+
+            key = f"fuel_tracking:lock:{lock_name}"
+            try:
+                acquired = cache.add(key, timezone.now().isoformat(), timeout=ttl_s)
+            except Exception:
+                acquired = None
+            if acquired is False:
+                logger.warning("[fuel_tracking] %s ignorée : l'exécution précédente n'est pas terminée", lock_name)
+                return None
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                if acquired:
+                    try:
+                        cache.delete(key)
+                    except Exception:
+                        pass
+        return wrapper
+    return deco
+
+
 def _prev_month(month_str: str) -> str:
     """Retourne le mois précédent au format YYYY-MM."""
     year, month = int(month_str[:4]), int(month_str[5:7])
@@ -36,6 +70,7 @@ def _prev_month(month_str: str) -> str:
 
 
 @shared_task(bind=True, name="fuel_tracking.sync_fuel_consommation_current_month")
+@_exclusive("sync_fuel_consommation", 1800)
 def sync_fuel_consommation_current_month(self):
     from django.core.management import call_command
 
@@ -50,6 +85,7 @@ def sync_fuel_consommation_current_month(self):
 
 
 @shared_task(bind=True, name="fuel_tracking.sync_enoc_fuel_movements_current_month")
+@_exclusive("sync_enoc_fuel_movements", 1800)
 def sync_enoc_fuel_movements_current_month(self):
     from django.core.management import call_command
 
@@ -138,6 +174,7 @@ def check_cph_health_daily(self):
 
 
 @shared_task(bind=True, name="fuel_tracking.sync_fuel_stock_current")
+@_exclusive("sync_fuel_stock", 1800)
 def sync_fuel_stock_current(self):
     from django.core.management import call_command
 
