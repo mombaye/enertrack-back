@@ -87,11 +87,19 @@ def available_periods(limit: int = 60) -> list[dict]:
 
 
 def default_period(today: date | None = None) -> tuple[date, date] | None:
-    """Dernière période COMPLÈTE (fin avant aujourd'hui) pour laquelle un bilan existe ; à défaut la plus récente."""
+    """
+    Période affichée par défaut : la dernière période COMPLÈTE (fin avant aujourd'hui) réellement EXPLOITABLE.
+    Exploitable = au moins la moitié des sites calculables de la meilleure période : une période récente à
+    0 site calculable (calcul partiel, essai sur quelques sites) ne doit jamais masquer le bilan complet du mois.
+    Repli : dernière période complète avec au moins un site calculable, puis la plus récente.
+    """
     today = today or timezone.localdate()
     periods = available_periods()
     if not periods:
         return None
-    complete = [p for p in periods if date.fromisoformat(p["fin"]) < today]
-    p = (complete or periods)[0]
+    complete = [p for p in periods if date.fromisoformat(p["fin"]) < today] or periods
+    best = max((p["calculables"] for p in complete), default=0)
+    ranked = ([p for p in complete if best > 0 and p["calculables"] * 2 >= best]
+              or [p for p in complete if p["calculables"] > 0] or complete)
+    p = ranked[0]
     return date.fromisoformat(p["debut"]), date.fromisoformat(p["fin"])

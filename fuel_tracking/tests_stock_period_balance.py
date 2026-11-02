@@ -913,3 +913,16 @@ class ExclusiveTaskTests(BalanceBase):
             T.sync_fuel_consommation_current_month.run()
             self.assertEqual(len(calls), 1)
             self.assertIsNone(cache.get("fuel_tracking:lock:sync_fuel_consommation"))   # verrou libéré
+
+
+class DefaultPeriodTests(BalanceBase):
+    def test_default_period_skips_recent_period_without_calculable_sites(self):
+        from fuel_tracking.services.period_utils import default_period
+        self.stocks(1000, 400)
+        SB.compute_balances(self.start, self.end, site_ids=["DKR_0001"])            # période complète exploitable (1 calculable)
+        # période plus récente, calculée sur un site sans stock → 0 calculable
+        recent_start = self.end + timedelta(days=1, seconds=1)
+        recent_end = recent_start + timedelta(days=10) - timedelta(seconds=1)
+        SB.compute_balances(recent_start, recent_end, site_ids=["DKR_0002"])
+        d1, d2 = default_period(today=(recent_end + timedelta(days=5)).date())
+        self.assertEqual((d1, d2), (self.start.date(), self.end.date()))
