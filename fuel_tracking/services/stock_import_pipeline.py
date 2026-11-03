@@ -97,7 +97,7 @@ def _finalize_counts(batch):
 
 
 MAPPING_VERSIONS = {"LOLIFORCE": "gardiennage-v1", "SCSS": "gardiennage-v1", "CLOSING": "closing-v1",
-                    "HISTORICAL_REFUELING": "refueling-v1", "TANK_MODELS": "tank-models-v1"}
+                    "HISTORICAL_REFUELING": "refueling-v1", "TANK_MODELS": "tank-models-v1", "TARGET_FUEL": "target-fuel-v1"}
 
 
 def _declare_period(batch):

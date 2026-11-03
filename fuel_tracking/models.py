@@ -1033,6 +1033,7 @@ class FuelImportBatch(models.Model):
         CLOSING = "CLOSING", "Closing mensuel — stocks et mouvements de période"
         HISTORICAL_REFUELING = "HISTORICAL_REFUELING", "Historique refueling — source historique"
         TANK_MODELS = "TANK_MODELS", "Modèles de cuves — calculateur et conversion cm vers litres"
+        TARGET_FUEL = "TARGET_FUEL", "Target fuel mensuel par site (Closing historique, onglet NR analyse variation conso fuel)"
 
     class Status(models.TextChoices):
         RECEIVED = "RECEIVED", "Reçu"
@@ -1708,6 +1709,7 @@ class FuelStockBalance(models.Model):
     livraisons_externes_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True,
                                                 help_text="Truck / Eydon et autres livraisons externes (hors Carte Total).")
     consommation_reelle_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    variation_stock_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True, help_text="Résultat mathématique du bilan (peut être négatif : alors anomalie, jamais certifiable). NULL si non calculable.")
     conso_journaliere_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True,
                                               help_text="Consommation réelle / jours entre les deux relevés (référence commande).")
 
@@ -1772,3 +1774,35 @@ class FuelStockBalanceCertification(models.Model):
 
     def delete(self, *args, **kwargs):
         raise ValueError("Historique de certification non modifiable.")
+
+
+class FuelSiteTarget(models.Model):
+    """
+    Target fuel MENSUEL par SITE (L/mois) — jamais déduit de la puissance GE, d'une courbe CPH, d'un target load ou d'un target énergie.
+    Valeurs historiques du Closing : « TARGET_HISTORIQUE_A_CONFIRMER » tant que le Fuel Manager ne les a pas confirmées pour l'année concernée.
+    """
+    site_id = models.CharField(max_length=64, db_index=True)
+    site_name = models.CharField(max_length=255, null=True, blank=True)
+    region = models.CharField(max_length=128, null=True, blank=True)
+    typologie = models.CharField(max_length=255, null=True, blank=True)
+    target_mensuel_l = models.DecimalField(max_digits=14, decimal_places=3)
+    target_type = models.CharField(max_length=32, default="TARGET_FUEL_SITE")
+    target_unit = models.CharField(max_length=16, default="L/mois")
+    source_target = models.CharField(max_length=32, default="CLOSING_HISTORIQUE")
+    niveau_target = models.CharField(max_length=16, default="SITE")
+    statut_target = models.CharField(max_length=32, default="A_CONFIRMER_PERIODE")
+    reference_year = models.IntegerField(null=True, blank=True, help_text="Année des consommations historiques associées (ex. 2025).")
+    confirmed_year = models.IntegerField(null=True, blank=True, help_text="Année pour laquelle le Fuel Manager a confirmé la validité du target.")
+    confirmed_by = models.CharField(max_length=255, blank=True, default="")
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+    historique = models.JSONField(default=dict, blank=True, help_text="Consommations historiques et écarts de la feuille source (traçabilité).")
+    batch = models.ForeignKey("FuelImportBatch", null=True, blank=True, on_delete=models.PROTECT, related_name="targets")
+    source_sheet = models.CharField(max_length=128, blank=True, default="")
+    source_row = models.IntegerField(null=True, blank=True)
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = "fuel_site_target"
+        indexes = [models.Index(fields=["site_id", "is_active"])]
+        constraints = [models.UniqueConstraint(fields=["site_id"], condition=models.Q(is_active=True), name="uniq_fuel_site_target_active")]

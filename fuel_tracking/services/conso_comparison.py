@@ -1,56 +1,64 @@
 # fuel_tracking/services/conso_comparison.py
 """
-« Suivis Consommations » : UN tableau, UNE période exacte (jours entiers 00:00:00 → 23:59:59), UNE ligne par site, trois consommations côte à côte :
+« Suivis Consommations » : UN tableau, UNE période exacte (jours entiers 00:00:00 → 23:59:59), UNE ligne par site. CINQ mesures distinctes, jamais confondues :
 
-  Consommation réelle stock (L)            bilan physique des stocks et mouvements validés (FuelStockBalance, règle bilan-v2)
-  Consommation instrumentée Snowflake (L) capteurs / niveau de cuve (VW_FUEL_REPORT), sur les jours exploitables
-  Consommation théorique CPH (L)           runtime GE qualifié × puissance qualifiée × courbe CPH (moteur CPH-PRP-50HZ)
+  1. Variation de stock (L)                    bilan mathématique des stocks et mouvements (jamais appelée « consommation réelle » automatiquement)
+  2. Consommation Closing (L)                  consommation déclarée historiquement dans le Closing (contrôle)
+  3. Consommation instrumentée Snowflake (L)   mesure capteur, indépendante du stock
+  4. Consommation théorique CPH (L)            complète / partielle (runtime GE × CPH de la courbe)
+  5. Consommation réelle certifiée (L)         variation de stock validée EXPLICITEMENT par le Fuel Manager (vide tant que non certifiée)
 
-Écarts (même période pour les trois) :  écart réel vs instrumentée = instrumentée − réelle ;  écart réel vs théorique = théorique − réelle.
-Pourcentage = écart / consommation réelle, « non applicable » (référence quasi nulle) sous FUEL_COMPARE_MIN_REFERENCE_L. Une donnée absente reste NULL.
-Aucune simulation : si la consommation réelle n'existe pas, aucun écart n'est calculé.
+Écarts (périodes strictement identiques) : écart = autre mesure − variation de stock sauf mention contraire ; variation − Closing ; variation − target.
+Une donnée absente reste NULL (jamais 0). Aucune valeur n'est inventée ni substituée.
 """
 from __future__ import annotations
 
 import csv
 import io
 from datetime import date
-from decimal import Decimal
 
 from django.conf import settings
 
+from fuel_tracking.services import fuel_target as TG
 from fuel_tracking.services.period_utils import day_bounds, latest_balances_by_site
-from fuel_tracking.services.stock_period_balance import alert_codes_of
+from fuel_tracking.services.stock_period_balance import RULE_VERSION, alert_codes_of
 
-# ── Libellés métier ─────────────────────────────────────────────────────────────────────────────────────────────────
+# ── Libellés et aides (définition · formule · unité · période · source · limites) ───────────────────────────────────────────────────
 LABELS = {
-    "reel": "Consommation réelle stock (L)",
+    "variation": "Variation de stock (L)",
+    "closing": "Consommation Closing (L)",
     "instrumentee": "Consommation instrumentée Snowflake (L)",
-    "theorique": "Consommation théorique CPH (L)",
+    "cph_complete": "Consommation théorique CPH complète (L)",
+    "cph_partielle": "Consommation théorique CPH partielle (L)",
+    "certifiee": "Consommation réelle certifiée (L)",
+    "target": "Target fuel période (L)",
 }
 HELP = {
-    "reel": "Consommation obtenue à partir du bilan physique des stocks et mouvements validés : stock initial + livraisons externes + Carte Total + transferts entrants + rajouts − "
-            "transferts sortants − retraits − vols − vidanges − stock final. Une donnée absente reste vide, jamais 0.",
-    "instrumentee": "Consommation déduite des capteurs / mesure de niveau Snowflake. Ce n'est PAS la consommation réelle certifiée.",
-    "theorique": "Estimation à partir du runtime GE qualifié, de la puissance qualifiée et de la courbe CPH. Vide si le runtime, la puissance ou la courbe manquent.",
-    "ecart_instrumentee": "Consommation instrumentée − consommation réelle stock. Positif : le capteur voit plus de consommation que le bilan de stock.",
-    "ecart_theorique": "Consommation théorique CPH − consommation réelle stock. Positif : le CPH attend plus de consommation que le bilan de stock.",
-    "estimation_avec_reserve": "Valeur calculée mais comportant une source ou une conversion non certifiée (cuve sans plaque, cuve proposée, stock ancien, livraison issue du Closing…).",
-    "non_calculable": "Valeur non calculée faute de prérequis suffisants.",
+    "variation": "Définition : résultat mathématique du bilan de stock. Formule : stock initial + livraisons + transferts entrants + rajouts − transferts sortants − retraits − vols − "
+                 "vidanges − stock final. Unité : L. Période : exacte sélectionnée. Source : relevés de stock (Closing, gardiennage, terrain) et mouvements ENOC. "
+                 "Limite : n'est PAS une consommation réelle tant qu'elle n'est pas certifiée. Négative = anomalie.",
+    "closing": "Consommation déclarée dans le fichier Closing (référence de contrôle historique). Elle ne remplace ni la variation de stock ni la certification.",
+    "instrumentee": "Mesure déduite des capteurs de niveau Snowflake sur les jours exploitables. Indépendante du stock, jamais utilisée pour le remplacer ; "
+                    "comparée à la variation seulement sur une période strictement identique.",
+    "cph_complete": "Σ jours (runtime GE × CPH L/h de la courbe), uniquement si TOUS les jours de la période sont calculés (runtime qualifié, puissance exploitable, "
+                    "puissance nominale connue, courbe valide).",
+    "cph_partielle": "Somme des seuls jours calculés. Elle ne couvre pas toute la période : à ne jamais lire comme une consommation théorique totale.",
+    "certifiee": "Variation de stock validée explicitement par le Fuel Manager (action « Certifier le bilan »). Vide tant que le statut n'est pas CONSOMMATION_REELLE_CERTIFIEE.",
+    "target": "Target fuel mensuel du site (L/mois), proratisé au nombre de jours sélectionnés, mois par mois. Valeur historique du Closing : à confirmer pour l'année de la période. "
+              "Jamais déduit d'une puissance, d'un modèle de GE, d'une courbe CPH, d'un target load ou énergie.",
+    "ecart_closing": "Variation de stock − Consommation Closing (L). % = écart / Closing, seulement si les deux existent et que le Closing est non nul.",
+    "ecart_target": "Variation de stock − Target fuel période (L). % = écart / target, seulement si les deux existent et que le target est non nul.",
+    "ecart_instrumentee": "Variation de stock − Consommation instrumentée (L), sur période strictement identique.",
+    "ecart_cph": "Variation de stock − CPH complète (L). Jamais calculé avec la CPH partielle.",
 }
 
-# Statut de la consommation réelle (qualité du bilan de stock)
-CERTIFIABLE, ESTIMATION, A_CONTROLER, DONNEES_INCOMPLETES, NON_CALCULABLE = (
-    "CERTIFIABLE", "ESTIMATION_AVEC_RESERVE", "A_CONTROLER", "DONNEES_INCOMPLETES", "NON_CALCULABLE")
-REEL_STATUTS = (CERTIFIABLE, ESTIMATION, A_CONTROLER, DONNEES_INCOMPLETES, NON_CALCULABLE)
-_A_CONTROLER_CAUSES = {"CONFLIT_ENOC_CLOSING", "CONSO_NEGATIVE", "MOUVEMENTS_A_CONTROLER", "TRANSFERT_DESEQUILIBRE", "RELEVES_INCOHERENTS"}
-_INCOMPLETES_CAUSES = {"DONNEES_STOCK_INCOMPLETES", "CM_SANS_CUVE", "STOCK_TROP_ANCIEN"}
-
-# Statut global (comparaison des trois consommations)
-COHERENT, A_JUSTIFIER, A_INVESTIGUER = "COHERENT", "A_JUSTIFIER", "A_INVESTIGUER"
-G_RESERVE, G_INCOMPLETES, G_CPH_NON_CALCULE, G_INSTR_ABSENTE = "ESTIMATION_AVEC_RESERVE", "DONNEES_INCOMPLETES", "CPH_NON_CALCULE", "MESURE_INSTRUMENTEE_ABSENTE"
-GLOBAL_STATUTS = (COHERENT, A_JUSTIFIER, A_INVESTIGUER, G_RESERVE, G_INCOMPLETES, G_CPH_NON_CALCULE, G_INSTR_ABSENTE)
-_SEVERITY = {A_INVESTIGUER: 0, A_JUSTIFIER: 1, G_INCOMPLETES: 2, G_RESERVE: 3, G_CPH_NON_CALCULE: 4, G_INSTR_ABSENTE: 5, COHERENT: 6}
+# Statuts du bilan
+NON_CALCULABLE, VARIATION_CALCULEE, ESTIMATION, PRET, CERTIFIEE = (
+    "NON_CALCULABLE", "VARIATION_CALCULEE", "ESTIMATION_AVEC_RESERVE", "PRET_A_CERTIFIER", "CONSOMMATION_REELLE_CERTIFIEE")
+STATUTS_BILAN = (NON_CALCULABLE, VARIATION_CALCULEE, ESTIMATION, PRET, CERTIFIEE)
+_BLOCKING_CAUSES = {"DONNEES_STOCK_INCOMPLETES", "CM_SANS_CUVE", "STOCK_TROP_ANCIEN", "CONFLIT_ENOC_CLOSING", "MOUVEMENTS_A_CONTROLER", "TRANSFERT_DESEQUILIBRE",
+                    "RELEVES_INCOHERENTS", "SITE_NON_RECONNU", "SCORE_INSUFFISANT"}
+_CERTIFIED = ("CERTIFIE", "CERTIFIE_AVEC_RESERVE")
 
 
 def _f(v, places=3):
@@ -61,213 +69,256 @@ def _cfg(name, default):
     return getattr(settings, name, default)
 
 
-def reel_status(b) -> str:
-    """Statut de la consommation réelle à partir du bilan (jamais de valeur sur A_CONTROLER / DONNEES_INCOMPLETES / NON_CALCULABLE)."""
+def bilan_status(b) -> str:
     if b is None:
         return NON_CALCULABLE
+    if b.niveau_certification in _CERTIFIED and b.statut_bilan != "NON_CALCULABLE":
+        return CERTIFIEE
+    if b.cause_principale == "CONSO_NEGATIVE" and b.variation_stock_l is not None:
+        return VARIATION_CALCULEE                                    # visible mais anomalie : jamais certifiable
+    if b.statut_bilan == "NON_CALCULABLE" or b.cause_principale in _BLOCKING_CAUSES:
+        return NON_CALCULABLE
     if b.statut_bilan == "PRET_A_CERTIFIER":
-        return CERTIFIABLE
+        return PRET
     if b.statut_bilan == "ESTIMATION_AVEC_RESERVE":
         return ESTIMATION
-    if b.cause_principale in _A_CONTROLER_CAUSES:
-        return A_CONTROLER
-    if b.cause_principale in _INCOMPLETES_CAUSES or b.cause_principale is None:
-        return DONNEES_INCOMPLETES
-    return NON_CALCULABLE
+    return VARIATION_CALCULEE
 
 
-def _source_text(b) -> str | None:
-    if b is None:
+def variation_of(b, statut: str) -> float | None:
+    """Variation de stock affichée : valeur du bilan (négative conservée), jamais pour un bilan non calculable."""
+    if b is None or statut == NON_CALCULABLE:
         return None
-    lab = {"CLOSING": "Closing", "LOLIFORCE": "Loliforce", "SCSS": "SCSS", "ENOC": "ENOC", "HISTORICAL_REFUELING": "Historique refueling"}
-    si, sf = lab.get(b.source_stock_initial, b.source_stock_initial), lab.get(b.source_stock_final, b.source_stock_final)
-    stocks = None if not (si or sf) else (f"Stocks : {si} → {sf}" if si != sf else f"Stocks : {si}")
-    mv = sorted({lab.get(m.get("source"), m.get("source")) for m in (b.mouvements or []) if m.get("source")})
-    return " · ".join(x for x in (stocks, f"Mouvements : {', '.join(mv)}" if mv else None) if x)
+    v = b.variation_stock_l if b.variation_stock_l is not None else b.consommation_reelle_l      # anciens bilans (avant recalcul)
+    return _f(v)
 
 
-def _pct(gap, base) -> tuple[float | None, str | None]:
-    """(pourcentage, message). Référence = consommation réelle ; sous le seuil de référence quasi nulle : pas de pourcentage."""
+def _pct(gap, base, min_ref=0.0) -> tuple[float | None, str | None]:
     if gap is None:
         return None, None
-    if base is None or abs(float(base)) < float(_cfg("FUEL_COMPARE_MIN_REFERENCE_L", 20)):
-        return None, "Référence quasi nulle"
+    if base is None or base == 0 or abs(float(base)) < min_ref:
+        return None, "Référence nulle ou quasi nulle"
     return round(float(gap) / float(base) * 100, 1), None
 
 
-def _gap_status(gap: Decimal, base: Decimal, thresholds: dict) -> str:
-    """Seuils configurables (FuelRapprochementThreshold) : COHERENT / A_JUSTIFIER / A_INVESTIGUER."""
-    from fuel_tracking.services.cph_engine import R_A_JUSTIFIER, R_OK, _thresholds_status
-
-    st = _thresholds_status(gap, abs(base), thresholds)
-    return COHERENT if st == R_OK else A_JUSTIFIER if st == R_A_JUSTIFIER else A_INVESTIGUER
+def _gap(a, b):
+    return None if a is None or b is None else round(a - b, 1)
 
 
-def _action(b, statut_reel, statut_global, instr_ok, cph_ok) -> str:
+def _closing_of(b) -> dict | None:
+    for d in ((b.stock_initial_detail or {}), (b.stock_final_detail or {})):
+        ref = d.get("reference_closing")
+        if ref:
+            return ref
+    for d in ((b.stock_initial_detail or {}), (b.stock_final_detail or {})):
+        ctx = d.get("source_context") or {}
+        if ctx.get("conso_closing_l") is not None:
+            return {"conso_closing_l": ctx["conso_closing_l"]}
+    return None
+
+
+def _source_text(src) -> str | None:
+    lab = {"CLOSING": "Closing", "LOLIFORCE": "Loliforce", "SCSS": "SCSS", "ENOC": "ENOC", "HISTORICAL_REFUELING": "Historique refueling"}
+    return lab.get(src, src)
+
+
+def _certif(b) -> dict:
+    out = {"valeur_l": None, "par": None, "date": None, "commentaire": None, "niveau": b.niveau_certification if b else None}
+    if b is None or b.niveau_certification not in _CERTIFIED:
+        return out
+    c = b.certifications.order_by("-created_at").first()
+    out.update(valeur_l=_f(b.variation_stock_l if b.variation_stock_l is not None else b.consommation_reelle_l), par=getattr(c, "user_label", None) or None,
+               date=c.created_at.isoformat() if c else None, commentaire=getattr(c, "comment", None) or None)
+    return out
+
+
+def _energy_typology(b, cph) -> str | None:
+    parts = [(b.profil_energetique if b is not None else None), (cph or {}).get("kind")]
+    return " · ".join(dict.fromkeys(str(p) for p in parts if p)) or None
+
+
+def _action(b, statut) -> str:
     from fuel_tracking.services.stock_reports import action_for
 
-    if statut_reel in (A_CONTROLER, DONNEES_INCOMPLETES, NON_CALCULABLE):
-        return action_for(b) if b is not None else "Calculer le bilan de stock de la période (aucun bilan pour ce site)."
-    parts = []
-    if statut_reel == ESTIMATION:
-        parts.append(action_for(b))
-    if statut_global == A_INVESTIGUER:
-        parts.append("Investiguer l'écart (stocks, mouvements, sonde, runtime GE) avant toute certification.")
-    elif statut_global == A_JUSTIFIER:
-        parts.append("Faire justifier l'écart par l'exploitation.")
-    if not instr_ok:
-        parts.append("Vérifier la sonde / la remontée Snowflake.")
-    if not cph_ok:
-        parts.append("Compléter runtime, puissance ou courbe (Contrôle CPH).")
-    if statut_reel == CERTIFIABLE and statut_global == COHERENT:
-        parts.append("Certification manuelle par le Fuel Manager.")
-    return " ".join(dict.fromkeys(parts)) or "—"
+    if b is None:
+        return "Calculer le bilan de stock de la période (aucun bilan pour ce site)."
+    if statut == CERTIFIEE:
+        return "Aucune : bilan certifié."
+    if statut == PRET:
+        return "Certification par le Fuel Manager."
+    return action_for(b)
 
 
-def _global_status(statut_reel, ecart_i, ecart_t, instr_ok, cph_ok) -> str:
-    if statut_reel in (A_CONTROLER, DONNEES_INCOMPLETES, NON_CALCULABLE):
-        return G_INCOMPLETES
-    gaps = [g for g in (ecart_i, ecart_t) if g is not None]
-    if not gaps:
-        return G_INSTR_ABSENTE if not instr_ok else G_CPH_NON_CALCULE
-    worst = min(gaps, key=lambda s: _SEVERITY[s])
-    if worst == COHERENT and statut_reel == ESTIMATION:
-        return G_RESERVE
-    return worst
-
-
-def _row(cph: dict | None, b, thresholds: dict, days: int) -> dict:
+def _row(cph: dict | None, b, d_from: date, d_to: date, days: int, target, thresholds_used: dict) -> dict:
     site_id = (cph or {}).get("site_id") or b.site_id
-    statut_reel = reel_status(b)
-    reel_l = _f(b.consommation_reelle_l) if (b is not None and statut_reel in (CERTIFIABLE, ESTIMATION)) else None  # jamais de valeur inventée
+    statut = bilan_status(b)
+    var = variation_of(b, statut)
+    certif = _certif(b) if b is not None else {"valeur_l": None, "par": None, "date": None, "commentaire": None, "niveau": None}
+    if statut == CERTIFIEE:
+        certif["valeur_l"] = var
+    else:
+        certif["valeur_l"] = None                                     # vide tant que non certifiée
 
-    # Instrumentée (capteur) : somme des jours mesurés ; exploitable si la couverture de la période atteint le seuil configurable.
+    # Closing
+    ref = _closing_of(b) if b is not None else None
+    conso_closing = _f(ref.get("conso_closing_l")) if ref else None
+    ecart_cl = _gap(var, conso_closing)
+    pct_cl, na_cl = _pct(ecart_cl, conso_closing)
+
+    # Target
+    tgt_l = TG.prorated_target(target.target_mensuel_l, d_from, d_to) if target is not None else None
+    tgt_f = _f(tgt_l)
+    if target is None:
+        statut_target = TG.INDISPONIBLE
+    elif not TG.confirmed_for(target, d_from, d_to):
+        statut_target = TG.A_CONFIRMER
+    else:
+        statut_target = TG.classify(var, tgt_f) or TG.A_CONFIRMER
+    position = TG.classify(var, tgt_f)
+    ecart_tg = _gap(var, tgt_f)
+    pct_tg, na_tg = _pct(ecart_tg, tgt_f)
+
+    # Instrumentée : couverture = jours mesurés / jours de la période
     cmp_ = (cph or {}).get("comparaison") or {}
     instr_total, jours_mesure = cmp_.get("conso_mesuree_l"), cmp_.get("jours_mesure") or 0
     n_days = (cph or {}).get("days") or days
     instr_cov = round(jours_mesure / n_days * 100, 1) if n_days else None
     instr_ok = instr_total is not None and instr_cov is not None and instr_cov >= float(_cfg("FUEL_COMPARE_INSTR_MIN_COVERAGE_PCT", 80))
-    # Théorique CPH : valeur uniquement si le CPH est calculé sur toute la période (jamais de fallback silencieux).
-    statut_cph = (cph or {}).get("statut_cph") or (cph or {}).get("cph_status")
-    cph_ok = (cph or {}).get("conso_theorique_l") is not None and (cph or {}).get("cph_status") == "COMPLET"
-    cph_cov = round(((cph or {}).get("cph_days") or 0) / n_days * 100, 1) if (cph and n_days) else None
+    instr_l = _f(instr_total)
+    strict_instr = instr_ok and jours_mesure == n_days                  # comparaison seulement sur période strictement identique
+    ecart_in = _gap(var, instr_l) if strict_instr else None
+    pct_in, na_in = _pct(ecart_in, instr_l, float(_cfg("FUEL_COMPARE_MIN_REFERENCE_L", 20)))
 
-    e_i = e_t = None
-    gi = gt = None
-    if reel_l is not None:
-        base = Decimal(str(reel_l))
-        if instr_ok:
-            gi = float(instr_total) - reel_l
-            e_i = _gap_status(Decimal(str(gi)), base, thresholds)
-        if cph_ok:
-            gt = float(cph["conso_theorique_l"]) - reel_l
-            e_t = _gap_status(Decimal(str(gt)), base, thresholds)
-    pct_i, na_i = _pct(gi, reel_l)
-    pct_t, na_t = _pct(gt, reel_l)
-    statut_global = _global_status(statut_reel, e_i, e_t, instr_ok, cph_ok)
+    # CPH : complète séparée de partielle
+    cph_status = (cph or {}).get("cph_status")
+    complete = _f((cph or {}).get("conso_theorique_l")) if cph_status == "COMPLET" else None
+    partielle = _f((cph or {}).get("conso_partielle_l")) if cph_status == "PARTIEL" else None
+    cph_cov = round(((cph or {}).get("cph_days") or 0) / n_days * 100, 1) if (cph and n_days) else None
+    ecart_cp = _gap(var, complete)
+    pct_cp, na_cp = _pct(ecart_cp, complete, float(_cfg("FUEL_COMPARE_MIN_REFERENCE_L", 20)))
 
     motifs = []
-    if reel_l is None:
-        motifs.extend((b.motifs or [])[:2] if b is not None else ["Aucun bilan de stock calculé pour ce site sur la période."])
+    if b is None:
+        motifs.append("Aucun bilan de stock calculé pour ce site sur la période exacte.")
     else:
-        if gi is not None:
-            motifs.append(f"Écart vs instrumentée {gi:+.0f} L" + (f" ({pct_i:+.0f} %)" if pct_i is not None else f" ({na_i.lower()})"))
-        if gt is not None:
-            motifs.append(f"Écart vs théorique {gt:+.0f} L" + (f" ({pct_t:+.0f} %)" if pct_t is not None else f" ({na_t.lower()})"))
-        if b is not None and b.reserves:
+        motifs.extend((b.motifs or [])[:3])
+        if statut != NON_CALCULABLE and b.reserves:
             motifs.append(b.reserves[0])
-    if reel_l is not None and not instr_ok:
-        motifs.append("Mesure instrumentée absente ou partielle" + (f" ({jours_mesure}/{n_days} j)" if instr_total is not None else "") + ".")
-    if reel_l is not None and not cph_ok:
-        mc = (cph or {}).get("motif_cph") or {}
-        motifs.append("CPH non calculé" + (f" : {mc.get('code')}" if mc.get("code") else "") + ".")
+    if statut == VARIATION_CALCULEE and var is not None and var < 0:
+        motifs.insert(0, f"Variation de stock négative ({var:.0f} L) : anomalie à contrôler.")
 
+    alerts = alert_codes_of(b.alertes) if b is not None else []
     row = {
-        "site_id": site_id, "site_name": (cph or {}).get("site_name") or b.site_name, "country": (cph or {}).get("country") or (b.country if b else None),
+        "site_id": site_id, "site_name": (cph or {}).get("site_name") or (b.site_name if b else None), "country": (cph or {}).get("country") or (b.country if b else None),
         "zone": (cph or {}).get("zone") or (b.zone if b else None), "typologie": (b.typologie if b else None) or (cph or {}).get("site_type"),
-        "configuration": (cph or {}).get("kind") or (b.profil_energetique if b else None),
-        "reel": {"conso_l": reel_l, "statut": statut_reel, "statut_bilan": b.statut_bilan if b else None, "cause": b.cause_principale if b else None,
-                 "score": b.score_confiance if b else None, "source": _source_text(b), "reserves": (b.reserves if b else []) or [], "bilan_id": b.pk if b else None,
-                 "alertes": alert_codes_of(b.alertes) if b else [], "certification": b.niveau_certification if b else None},
-        "instrumentee": {"conso_l": _f(instr_total), "jours_mesure": jours_mesure, "jours": n_days, "couverture_pct": instr_cov, "disponible": instr_ok},
-        "theorique": {"conso_l": _f(cph.get("conso_theorique_l")) if cph_ok else None, "partielle_l": _f((cph or {}).get("conso_partielle_l")),
-                      "statut_cph": statut_cph, "cph_status": (cph or {}).get("cph_status"), "jours_cph": (cph or {}).get("cph_days"), "couverture_pct": cph_cov,
-                      "disponible": cph_ok, "motif_code": ((cph or {}).get("motif_cph") or {}).get("code"),
-                      "runtime_source": (cph or {}).get("runtime_source_main"), "power_source": (cph or {}).get("power_source_main")},
-        "ecart_instrumentee": {"l": _f(gi, 1), "pct": pct_i, "pct_na": na_i, "statut": e_i},
-        "ecart_theorique": {"l": _f(gt, 1), "pct": pct_t, "pct_na": na_t, "statut": e_t},
-        "statut_global": statut_global, "motif": " · ".join(motifs) or None,
-        "action": _action(b, statut_reel, statut_global, instr_ok, cph_ok),
+        "typologie_energie": _energy_typology(b, cph), "modele_ge": (cph or {}).get("ge_label"), "puissance_nominale_kva": _f((cph or {}).get("ge_kva")),
+        "source_puissance": (cph or {}).get("power_source_main"),
+        "periode": {"debut": d_from.isoformat(), "fin": d_to.isoformat(), "jours": days},
+        "stock": {
+            "initial_l": _f(b.stock_initial_l) if b else None, "source_initial": _source_text(b.source_stock_initial) if b else None,
+            "entrees_l": None if b is None else _f(sum((x or 0) for x in (b.livraisons_externes_l, b.carte_total_l, b.transferts_entrants_l, b.rajouts_l))),
+            "carte_total_l": _f(b.carte_total_l) if b else None, "truck_l": _f(b.truck_l) if b else None, "livraisons_externes_l": _f(b.livraisons_externes_l) if b else None,
+            "ponctions_entrantes_l": _f(b.transferts_entrants_l) if b else None, "ponctions_sortantes_l": _f(b.transferts_sortants_l) if b else None,
+            "rajouts_l": _f(b.rajouts_l) if b else None, "retraits_l": _f(b.retraits_l) if b else None, "vols_l": _f(b.vols_l) if b else None, "vidanges_l": _f(b.vidanges_l) if b else None,
+            "final_l": _f(b.stock_final_l) if b else None, "source_final": _source_text(b.source_stock_final) if b else None,
+            "variation_l": var, "statut": statut, "statut_moteur": b.statut_bilan if b else None, "cause": b.cause_principale if b else None,
+            "score": b.score_confiance if b else None, "reserves": (b.reserves or []) if b else [], "alertes": alerts, "bilan_id": b.pk if b else None,
+            "motif": " · ".join(motifs) or None, "action": _action(b, statut),
+        },
+        "closing": {"conso_l": conso_closing, "ecart_l": ecart_cl, "ecart_pct": pct_cl, "pct_na": na_cl},
+        "target": {"periode_l": tgt_f, "mensuel_l": _f(target.target_mensuel_l) if target else None, "source": target.source_target if target else None,
+                   "statut": statut_target, "position": position, "annee_reference": target.reference_year if target else None,
+                   "ecart_l": ecart_tg, "ecart_pct": pct_tg, "pct_na": na_tg},
+        "instrumentee": {"conso_l": instr_l if instr_ok else None, "jours_mesure": jours_mesure, "jours": n_days, "couverture_pct": instr_cov, "disponible": instr_ok,
+                         "ecart_l": ecart_in, "ecart_pct": pct_in, "pct_na": na_in},
+        "cph": {"complete_l": complete, "partielle_l": partielle, "statut": cph_status, "jours_cph": (cph or {}).get("cph_days"), "couverture_pct": cph_cov,
+                "ecart_l": ecart_cp, "ecart_pct": pct_cp, "pct_na": na_cp, "motif_code": ((cph or {}).get("motif_cph") or {}).get("code"),
+                "runtime_h": _f((cph or {}).get("runtime_total_h"), 1), "runtime_source": (cph or {}).get("runtime_source_main"),
+                "runtime_disponibilite": _f((cph or {}).get("runtime_source_availability"), 2), "power_source": (cph or {}).get("power_source_main"),
+                "charge_pct": _f((cph or {}).get("charge_moy_pct"), 1), "cph_l_h": _f((cph or {}).get("cph_moy_l_h"), 2),
+                "niveau_mediane": None, "nb_mesures": None},          # renseignés avec la cascade de médianes (étape CPH)
+        "certification": {"valeur_l": certif["valeur_l"], "par": certif["par"], "date": certif["date"], "commentaire": certif["commentaire"], "niveau": certif["niveau"]},
         "hors_referentiel": bool((cph or {}).get("hors_referentiel")),
     }
     return row
 
 
 def _filter(rows: list[dict], p) -> list[dict]:
-    def eq(_unused, key, getter):
+    def eq(value: str, getter):
         nonlocal rows
-        v = (p.get(key) or "").strip()
+        v = (value or "").strip().lower()
         if v:
-            rows = [r for r in rows if getter(r) == v]
+            rows = [r for r in rows if (str(getter(r) or "")).lower() == v]
 
-    pays = (p.get("pays") or "").strip().lower()
-    if pays:
-        rows = [r for r in rows if (r["country"] or "").lower() == pays]
-    zone = (p.get("zone") or "").strip().lower()
-    if zone:
-        rows = [r for r in rows if (r["zone"] or "").lower() == zone]
+    eq(p.get("pays"), lambda r: r["country"])
+    eq(p.get("zone"), lambda r: r["zone"])
+    eq(p.get("typologie"), lambda r: r["typologie"])
+    eq(p.get("typologie_energie"), lambda r: r["typologie_energie"])
+    eq(p.get("statut_bilan"), lambda r: r["stock"]["statut"])
+    eq(p.get("source_runtime"), lambda r: r["cph"]["runtime_source"] or "AUCUNE")
+    eq(p.get("source_puissance"), lambda r: r["cph"]["power_source"] or "AUCUNE")
+    eq(p.get("source_target"), lambda r: r["target"]["source"] or "AUCUNE")
     site = (p.get("site") or "").strip().lower()
     if site:
         rows = [r for r in rows if site in r["site_id"].lower() or site in (r["site_name"] or "").lower()]
-    typ = (p.get("typologie") or "").strip().lower()
-    if typ:
-        rows = [r for r in rows if (r["typologie"] or "").lower() == typ]
-    conf = (p.get("configuration") or "").strip().lower()
-    if conf:
-        rows = [r for r in rows if (r["configuration"] or "").lower() == conf]
-    eq(None, "statut_global", lambda r: r["statut_global"])
-    eq(None, "qualite_reel", lambda r: r["reel"]["statut"])
-    eq(None, "source_runtime", lambda r: r["theorique"]["runtime_source"] or "AUCUNE")
-    eq(None, "source_puissance", lambda r: r["theorique"]["power_source"] or "AUCUNE")
-    eq(None, "statut_cph", lambda r: r["theorique"]["statut_cph"] or "CPH_NON_CALCULE")
+    cert = (p.get("statut_certification") or "").strip().lower()
+    if cert == "certifie":
+        rows = [r for r in rows if r["stock"]["statut"] == CERTIFIEE]
+    elif cert == "non_certifie":
+        rows = [r for r in rows if r["stock"]["statut"] != CERTIFIEE]
+    src = (p.get("source_stock") or "").strip().lower()
+    if src:
+        rows = [r for r in rows if src in {(r["stock"]["source_initial"] or "").lower(), (r["stock"]["source_final"] or "").lower()}]
+    q = (p.get("qualite") or "").strip().lower()
+    if q == "reserve":
+        rows = [r for r in rows if r["stock"]["reserves"]]
+    elif q == "sans_reserve":
+        rows = [r for r in rows if not r["stock"]["reserves"] and r["stock"]["variation_l"] is not None]
+    elif q == "anomalie":
+        rows = [r for r in rows if r["stock"]["statut"] in (NON_CALCULABLE, VARIATION_CALCULEE)]
     return rows
 
 
 def _kpis(rows: list[dict]) -> dict:
-    calc = [r for r in rows if r["reel"]["conso_l"] is not None]
-    instr = [r for r in rows if r["instrumentee"]["disponible"]]
-    cph = [r for r in rows if r["theorique"]["disponible"]]
-    comp_i = [r for r in calc if r["ecart_instrumentee"]["l"] is not None]
-    comp_t = [r for r in calc if r["ecart_theorique"]["l"] is not None]
-
-    def gap(group, key):
-        s_gap, s_ref = sum(r[key]["l"] for r in group), sum(r["reel"]["conso_l"] for r in group)
-        return {"sites_comparables": len(group), "ecart_l": round(s_gap, 1) if group else None,
-                "ecart_pct": round(s_gap / s_ref * 100, 1) if group and s_ref >= float(_cfg("FUEL_COMPARE_MIN_REFERENCE_L", 20)) else None,
-                "reel_compare_l": round(s_ref, 1) if group else None}
-
-    n = lambda statut: sum(1 for r in rows if r["reel"]["statut"] == statut)  # noqa: E731
+    n = len(rows)
+    calc = [r for r in rows if r["stock"]["variation_l"] is not None]
+    cert = [r for r in rows if r["stock"]["statut"] == CERTIFIEE]
+    clo = [r for r in rows if r["closing"]["conso_l"] is not None]
+    ins = [r for r in rows if r["instrumentee"]["disponible"]]
+    cpc = [r for r in rows if r["cph"]["complete_l"] is not None]
+    cpp = [r for r in rows if r["cph"]["partielle_l"] is not None]
+    with_t = [r for r in rows if r["target"]["periode_l"] is not None]
+    comp = [r for r in with_t if r["stock"]["variation_l"] is not None]
+    s = lambda grp, f: round(sum(f(r) for r in grp), 1) if grp else None  # noqa: E731
+    sum_var, sum_tgt = sum(r["stock"]["variation_l"] for r in comp), sum(r["target"]["periode_l"] for r in comp)
+    cnt = lambda st: sum(1 for r in rows if r["stock"]["statut"] == st)  # noqa: E731
     return {
-        "reel": {"total_l": round(sum(r["reel"]["conso_l"] for r in calc), 1) if calc else None, "sites_calculables": len(calc),
-                 "sites_certifiables": n(CERTIFIABLE), "sites_avec_reserve": n(ESTIMATION)},
-        "instrumentee": {"total_l": round(sum(r["instrumentee"]["conso_l"] for r in instr), 1) if instr else None, "sites_couverts": len(instr),
-                         "note": "Mesure capteur Snowflake : ce n'est pas la consommation réelle certifiée."},
-        "theorique": {"total_l": round(sum(r["theorique"]["conso_l"] for r in cph), 1) if cph else None, "sites_complets": len(cph),
-                      "sites_partiels": sum(1 for r in rows if (r["theorique"]["cph_status"] or "") == "PARTIEL"),
-                      "note": "Estimation CPH (runtime × puissance × courbe)."},
-        "ecart_instrumentee": gap(comp_i, "ecart_instrumentee"),
-        "ecart_theorique": gap(comp_t, "ecart_theorique"),
-        "a_traiter": {"sites_non_calculables": sum(1 for r in rows if r["reel"]["statut"] in (NON_CALCULABLE, DONNEES_INCOMPLETES, A_CONTROLER)),
-                      "sites_a_controler": n(A_CONTROLER), "sites_donnees_incompletes": n(DONNEES_INCOMPLETES),
-                      "conflits_enoc_closing": sum(1 for r in rows if "CONFLIT_ENOC_CLOSING" in r["reel"]["alertes"]),
-                      "sites_avec_reserve": n(ESTIMATION)},
-        "sites": len(rows),
+        "sites": n,
+        "variation": {"total_l": s(calc, lambda r: r["stock"]["variation_l"]), "sites": len(calc), "negatives": sum(1 for r in calc if r["stock"]["variation_l"] < 0)},
+        "certifiee": {"total_l": s(cert, lambda r: r["certification"]["valeur_l"] or 0), "sites": len(cert)},
+        "closing": {"total_l": s(clo, lambda r: r["closing"]["conso_l"]), "sites": len(clo)},
+        "instrumentee": {"total_l": s(ins, lambda r: r["instrumentee"]["conso_l"]), "sites": len(ins)},
+        "cph_complete": {"total_l": s(cpc, lambda r: r["cph"]["complete_l"]), "sites": len(cpc)},
+        "cph_partielle": {"total_l": s(cpp, lambda r: r["cph"]["partielle_l"]), "sites": len(cpp)},
+        "target": {
+            "total_periode_l": s(with_t, lambda r: r["target"]["periode_l"]), "sites_avec_target": len(with_t), "sites_sans_target": n - len(with_t),
+            "target_moyen_site_l": round(sum_tgt / len(comp), 1) if comp else None, "variation_moyenne_site_l": round(sum_var / len(comp), 1) if comp else None,
+            "sites_comparables": len(comp),
+            # Écart global = (Σ variations comparables − Σ targets comparables) / Σ targets comparables : jamais une moyenne de pourcentages
+            "ecart_global_l": round(sum_var - sum_tgt, 1) if comp else None,
+            "ecart_global_pct": round((sum_var - sum_tgt) / sum_tgt * 100, 1) if comp and sum_tgt else None,
+            "couverture_pct": round(len(with_t) / n * 100, 1) if n else None,
+            "a_confirmer": sum(1 for r in with_t if r["target"]["statut"] == TG.A_CONFIRMER),
+        },
+        "bilans": {"prets": cnt(PRET), "avec_reserve": cnt(ESTIMATION), "non_calculables": cnt(NON_CALCULABLE), "certifies": cnt(CERTIFIEE), "variation_calculee": cnt(VARIATION_CALCULEE)},
+        "couverture_cph_pct": round(len(cpc) / n * 100, 1) if n else None,
     }
 
 
 def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) -> dict:
     """Calcule le tableau de comparaison unique pour la période EXACTE [d_from 00:00:00 ; d_to 23:59:59]."""
-    from fuel_tracking.services.cph_service import _thresholds, compute_period_summary
+    from fuel_tracking.services.cph_health import freshness
+    from fuel_tracking.services.cph_service import compute_period_summary
     from fuel_tracking.views_cph import _couvertures
 
     params = params or {}
@@ -276,25 +327,24 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
     cph_rows = compute_period_summary(d_from, d_to, country=params.get("pays") or None, zone=params.get("zone") or None)
     cph_by_site = {r["site_id"]: r for r in cph_rows}
     balances = latest_balances_by_site(d_from, d_to)
-    thresholds = _thresholds()
-    rows = []
-    for sid in sorted(set(balances) | {s for s, r in cph_by_site.items() if r.get("perimetre", "GE") == "GE"}):
-        rows.append(_row(cph_by_site.get(sid), balances.get(sid), thresholds, days))
+    targets = TG.active_targets()
+    ids = sorted(set(balances) | {s for s, r in cph_by_site.items() if r.get("perimetre", "GE") == "GE"})
+    rows = [_row(cph_by_site.get(sid), balances.get(sid), d_from, d_to, days, targets.get(sid.upper()), {}) for sid in ids]
     rows = _filter(rows, params)
-    ordre = (params.get("tri") or "site").strip()
-    if ordre == "gravite":
-        rows.sort(key=lambda r: (_SEVERITY[r["statut_global"]], r["site_id"]))
-    elif ordre == "reel":
-        rows.sort(key=lambda r: (r["reel"]["conso_l"] is None, -(r["reel"]["conso_l"] or 0), r["site_id"]))
-    elif ordre == "ecart":
-        rows.sort(key=lambda r: (-max(abs(r["ecart_instrumentee"]["l"] or 0), abs(r["ecart_theorique"]["l"] or 0)), r["site_id"]))
+    order = (params.get("tri") or "site").strip()
+    sev = {NON_CALCULABLE: 0, VARIATION_CALCULEE: 1, ESTIMATION: 2, PRET: 3, CERTIFIEE: 4}
+    if order == "gravite":
+        rows.sort(key=lambda r: (sev[r["stock"]["statut"]], r["site_id"]))
+    elif order == "variation":
+        rows.sort(key=lambda r: (r["stock"]["variation_l"] is None, -(abs(r["stock"]["variation_l"] or 0)), r["site_id"]))
+    elif order == "ecart_target":
+        rows.sort(key=lambda r: (r["target"]["ecart_l"] is None, -abs(r["target"]["ecart_l"] or 0), r["site_id"]))
     else:
         rows.sort(key=lambda r: r["site_id"])
-    from fuel_tracking.services.cph_health import freshness
-
     fr = freshness()
     last = fr["facts_last_date"]
     non_couverts = max(0, min(days, (d_to - last).days)) if last else days
+    uniq = lambda f: sorted({f(r) for r in rows if f(r)})  # noqa: E731
     return {
         "fraicheur": {
             "snowflake_derniere_date": last.isoformat() if last else None, "age_jours": fr["facts_age_days"], "seuil_jours": fr["stale_after_days"],
@@ -304,28 +354,33 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
         "periode": {"debut": d_from.isoformat(), "fin": d_to.isoformat(), "debut_dt": start.isoformat(), "fin_dt": end.isoformat(), "jours": days,
                     "libelle": f"{d_from:%d/%m/%Y} 00:00:00 → {d_to:%d/%m/%Y} 23:59:59",
                     "bilan_disponible": bool(balances), "sites_avec_bilan": len(balances),
-                    "sites_calculables": sum(1 for b in balances.values() if b.consommation_reelle_l is not None)},
+                    "sites_calculables": sum(1 for b in balances.values() if bilan_status(b) != NON_CALCULABLE), "regle": RULE_VERSION},
         "kpis": _kpis(rows), "rows": rows, "labels": LABELS, "aide": HELP,
         "qualite_cph": _couvertures([r for r in cph_rows if r.get("perimetre", "GE") == "GE"]) if with_cph_quality else [],
         "facettes": {
-            "pays": sorted({r["country"] for r in rows if r["country"]}), "zones": sorted({r["zone"] for r in rows if r["zone"]}),
-            "typologies": sorted({r["typologie"] for r in rows if r["typologie"]}), "configurations": sorted({r["configuration"] for r in rows if r["configuration"]}),
-            "statuts_globaux": list(GLOBAL_STATUTS), "qualites_reel": list(REEL_STATUTS),
-            "sources_runtime": sorted({r["theorique"]["runtime_source"] or "AUCUNE" for r in rows}),
-            "sources_puissance": sorted({r["theorique"]["power_source"] or "AUCUNE" for r in rows}),
-            "statuts_cph": ["CPH_CALCULE", "CPH_PARTIEL", "CPH_NON_CALCULE"],
+            "pays": uniq(lambda r: r["country"]), "zones": uniq(lambda r: r["zone"]), "typologies": uniq(lambda r: r["typologie"]),
+            "typologies_energie": uniq(lambda r: r["typologie_energie"]), "statuts_bilan": list(STATUTS_BILAN),
+            "sources_stock": uniq(lambda r: r["stock"]["source_initial"]), "sources_runtime": uniq(lambda r: r["cph"]["runtime_source"]),
+            "sources_puissance": uniq(lambda r: r["cph"]["power_source"]), "sources_target": uniq(lambda r: r["target"]["source"]),
         },
-        "seuils": {"couverture_instrumentee_min_pct": float(_cfg("FUEL_COMPARE_INSTR_MIN_COVERAGE_PCT", 80)),
-                   "reference_minimale_l": float(_cfg("FUEL_COMPARE_MIN_REFERENCE_L", 20)),
-                   "ecarts": {k: float(v) for k, v in thresholds.items()}},
+        "seuils": {"couverture_instrumentee_min_pct": float(_cfg("FUEL_COMPARE_INSTR_MIN_COVERAGE_PCT", 80)), "tolerance_target_pct": TG.tolerance_pct(),
+                   "reference_minimale_l": float(_cfg("FUEL_COMPARE_MIN_REFERENCE_L", 20))},
     }
 
 
-# ── Exports CSV ─────────────────────────────────────────────────────────────────────────────────────────────────────
+# ── Exports CSV ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 EXPORTS = {
-    "controle_complet": {"label": "Contrôle complet", "description": "Toutes les colonnes, sources, périodes, réserves, motifs et détails d'audit."},
-    "anomalies_fuel": {"label": "Anomalies Fuel", "description": "Seulement les lignes dont le statut global n'est pas COHERENT."},
-    "bilan_certification": {"label": "Bilan certification", "description": "Consommation réelle, statut, score, réserves et actions attendues."},
+    "controle_complet": {"label": "Contrôle complet", "description": "Toutes les colonnes : stock, comparaisons, CPH, certification, sources et motifs."},
+    "anomalies_fuel": {"label": "Anomalies Fuel", "description": "Bilans non certifiables : non calculables et variations à contrôler (dont négatives)."},
+    "priorites_donnees": {"label": "Priorités données", "description": "Stocks manquants, cuves à traiter, conflits, mouvements incomplets, conversions impossibles."},
+    "rapport_imports": {"label": "Rapport imports", "description": "Imports acceptés, rejetés, doublons et motifs (hash, date, utilisateur, version de règle)."},
+}
+PRIORITY_CAUSES = {
+    "DONNEES_STOCK_INCOMPLETES": "Stock initial ou final manquant", "CM_SANS_CUVE": "Cuve à traiter / conversion cm vers litres impossible",
+    "STOCK_TROP_ANCIEN": "Relevé de stock trop éloigné de la borne", "CONFLIT_ENOC_CLOSING": "Conflit ENOC / Closing",
+    "MOUVEMENTS_A_CONTROLER": "Mouvement incomplet ou à contrôler", "TRANSFERT_DESEQUILIBRE": "Ponction déséquilibrée",
+    "RELEVES_INCOHERENTS": "Relevés de stock incohérents (conflit de relevés)", "SITE_NON_RECONNU": "Site non reconnu", "SCORE_INSUFFISANT": "Score de confiance insuffisant",
+    "CONSO_NEGATIVE": "Variation de stock négative",
 }
 
 
@@ -338,68 +393,57 @@ def _csv(columns: list[str], lines: list[dict]) -> str:
     return "﻿" + buf.getvalue()
 
 
+def _flat(r: dict) -> dict:
+    s, cl, tg, ins, cp, ce = r["stock"], r["closing"], r["target"], r["instrumentee"], r["cph"], r["certification"]
+    pc = lambda g: g["ecart_pct"] if g["ecart_pct"] is not None else g.get("pct_na")  # noqa: E731
+    return {
+        "Pays": r["country"], "Zone": r["zone"], "Site ID": r["site_id"], "Nom du site": r["site_name"], "Typologie site": r["typologie"], "Typologie énergie": r["typologie_energie"],
+        "Modèle GE": r["modele_ge"], "Puissance nominale GE (kVA)": r["puissance_nominale_kva"], "Source puissance GE": r["source_puissance"],
+        "Date début": r["periode"]["debut"], "Date fin": r["periode"]["fin"], "Nombre de jours": r["periode"]["jours"],
+        "Stock initial (L)": s["initial_l"], "Source stock initial": s["source_initial"], "Entrées carburant (L)": s["entrees_l"], "Carte Total (L)": s["carte_total_l"],
+        "Truck (L)": s["truck_l"], "Livraisons externes (L)": s["livraisons_externes_l"], "Ponctions entrantes (L)": s["ponctions_entrantes_l"],
+        "Ponctions sortantes (L)": s["ponctions_sortantes_l"], "Rajouts (L)": s["rajouts_l"], "Retraits (L)": s["retraits_l"], "Vols (L)": s["vols_l"], "Vidanges (L)": s["vidanges_l"],
+        "Stock final (L)": s["final_l"], "Source stock final": s["source_final"], LABELS["variation"]: s["variation_l"], "Statut bilan": s["statut"], "Score": s["score"],
+        "Réserve / motif": s["motif"], "Alertes": " | ".join(s["alertes"]), "Action attendue": s["action"],
+        LABELS["closing"]: cl["conso_l"], "Écart variation vs Closing (L)": cl["ecart_l"], "Écart variation vs Closing (%)": pc(cl),
+        LABELS["target"]: tg["periode_l"], "Target mensuel (L/mois)": tg["mensuel_l"], "Source target": tg["source"], "Statut target": tg["statut"], "Position vs target": tg["position"],
+        "Écart variation vs target (L)": tg["ecart_l"], "Écart variation vs target (%)": pc(tg),
+        LABELS["instrumentee"]: ins["conso_l"], "Couverture instrumentée (%)": ins["couverture_pct"], "Écart variation vs instrumentée (L)": ins["ecart_l"],
+        "Écart variation vs instrumentée (%)": pc(ins), LABELS["cph_complete"]: cp["complete_l"], LABELS["cph_partielle"]: cp["partielle_l"], "Couverture CPH (%)": cp["couverture_pct"],
+        "Écart variation vs CPH complète (L)": cp["ecart_l"], "Écart variation vs CPH complète (%)": pc(cp),
+        "Runtime retenu (h)": cp["runtime_h"], "Source runtime": cp["runtime_source"], "Disponibilité runtime": cp["runtime_disponibilite"], "Source puissance": cp["power_source"],
+        "Niveau médiane": cp["niveau_mediane"], "Nombre de mesures": cp["nb_mesures"], "Taux de charge (%)": cp["charge_pct"], "CPH retenu (L/h)": cp["cph_l_h"],
+        "Motif CPH non calculée": cp["motif_code"],
+        LABELS["certifiee"]: ce["valeur_l"], "Validée par": ce["par"], "Date validation": ce["date"], "Commentaire certification": ce["commentaire"],
+    }
+
+
 def export_csv(kind: str, d_from: date, d_to: date, params) -> tuple[str, str, int]:
+    label = f"{d_from:%Y-%m-%d}_{d_to:%Y-%m-%d}"
+    if kind == "rapport_imports":
+        from fuel_tracking.models import FuelImportBatch as B
+
+        cols = ["Type fichier", "Nom fichier", "Empreinte (SHA-256)", "Date import", "Utilisateur", "Lignes lues", "Lignes acceptées", "Lignes avec alerte", "Lignes rejetées",
+                "Doublons", "Statut", "Motif / message", "Version de règle"]
+        lines = [{"Type fichier": b.source_type, "Nom fichier": b.file_name, "Empreinte (SHA-256)": b.file_hash, "Date import": b.received_at.isoformat(),
+                  "Utilisateur": getattr(b.received_by, "email", None) or getattr(b.received_by, "username", None), "Lignes lues": b.rows_total, "Lignes acceptées": b.rows_accepted,
+                  "Lignes avec alerte": b.rows_warning, "Lignes rejetées": b.rows_rejected, "Doublons": b.rows_duplicate, "Statut": b.status, "Motif / message": b.status_message,
+                  "Version de règle": b.mapping_version} for b in B.objects.select_related("received_by").order_by("-received_at")[:500]]
+        return "rapport_imports.csv", _csv(cols, lines), len(lines)
     data = build(d_from, d_to, params, with_cph_quality=False)
     rows = data["rows"]
-    label = f"{d_from:%Y-%m-%d}_{d_to:%Y-%m-%d}"
-    base_cols = ["Site ID", "Nom du site", "Pays", "Zone", "Typologie site", "Configuration énergétique", LABELS["reel"], "Qualité consommation réelle", "Source consommation réelle",
-                 LABELS["instrumentee"], "Disponibilité instrumentée (%)", LABELS["theorique"], "Disponibilité CPH (%)", "Écart réel vs instrumentée (L)", "Écart réel vs instrumentée (%)",
-                 "Écart réel vs théorique (L)", "Écart réel vs théorique (%)", "Statut global", "Motif", "Action attendue"]
-
-    def base(r):
-        return {"Site ID": r["site_id"], "Nom du site": r["site_name"], "Pays": r["country"], "Zone": r["zone"], "Typologie site": r["typologie"],
-                "Configuration énergétique": r["configuration"], LABELS["reel"]: r["reel"]["conso_l"], "Qualité consommation réelle": r["reel"]["statut"],
-                "Source consommation réelle": r["reel"]["source"], LABELS["instrumentee"]: r["instrumentee"]["conso_l"],
-                "Disponibilité instrumentée (%)": r["instrumentee"]["couverture_pct"], LABELS["theorique"]: r["theorique"]["conso_l"],
-                "Disponibilité CPH (%)": r["theorique"]["couverture_pct"], "Écart réel vs instrumentée (L)": r["ecart_instrumentee"]["l"],
-                "Écart réel vs instrumentée (%)": r["ecart_instrumentee"]["pct"] if r["ecart_instrumentee"]["pct"] is not None else r["ecart_instrumentee"]["pct_na"],
-                "Écart réel vs théorique (L)": r["ecart_theorique"]["l"],
-                "Écart réel vs théorique (%)": r["ecart_theorique"]["pct"] if r["ecart_theorique"]["pct"] is not None else r["ecart_theorique"]["pct_na"],
-                "Statut global": r["statut_global"], "Motif": r["motif"], "Action attendue": r["action"]}
-
-    if kind == "bilan_certification":
-        cols = ["Site ID", "Nom du site", "Période", LABELS["reel"], "Qualité consommation réelle", "Statut du bilan", "Cause principale", "Score de confiance", "Réserves",
-                "Alertes", "Niveau de certification", "Action attendue"]
-        from fuel_tracking.services.period_utils import latest_balances_by_site
-
-        bal = latest_balances_by_site(d_from, d_to)
-        lines = []
-        for r in rows:
-            b = bal.get(r["site_id"])
-            if b is None:
-                continue
-            lines.append({"Site ID": r["site_id"], "Nom du site": r["site_name"], "Période": data["periode"]["libelle"], LABELS["reel"]: r["reel"]["conso_l"],
-                          "Qualité consommation réelle": r["reel"]["statut"], "Statut du bilan": b.statut_bilan, "Cause principale": b.cause_principale,
-                          "Score de confiance": b.score_confiance, "Réserves": " | ".join(b.reserves or []), "Alertes": " | ".join(b.alertes or []),
-                          "Niveau de certification": b.niveau_certification, "Action attendue": r["action"]})
-        return f"bilan_certification_{label}.csv", _csv(cols, lines), len(lines)
     if kind == "anomalies_fuel":
-        lines = [base(r) for r in rows if r["statut_global"] != COHERENT]
-        return f"anomalies_fuel_{label}.csv", _csv(base_cols, lines), len(lines)
+        lines = [_flat(r) for r in rows if r["stock"]["statut"] in (NON_CALCULABLE, VARIATION_CALCULEE)]
+        cols = list(_flat(rows[0]).keys()) if rows else []
+        return f"anomalies_fuel_{label}.csv", _csv(cols, lines), len(lines)
+    if kind == "priorites_donnees":
+        cols = ["Site ID", "Nom du site", "Zone", "Priorité", "Cause", "Statut bilan", "Motif", "Action attendue"]
+        lines = [{"Site ID": r["site_id"], "Nom du site": r["site_name"], "Zone": r["zone"], "Priorité": PRIORITY_CAUSES[r["stock"]["cause"]], "Cause": r["stock"]["cause"],
+                  "Statut bilan": r["stock"]["statut"], "Motif": r["stock"]["motif"], "Action attendue": r["stock"]["action"]}
+                 for r in rows if r["stock"]["cause"] in PRIORITY_CAUSES and r["stock"]["statut"] in (NON_CALCULABLE, VARIATION_CALCULEE)]
+        return f"priorites_donnees_{label}.csv", _csv(cols, lines), len(lines)
     if kind == "controle_complet":
-        from fuel_tracking.services.period_utils import latest_balances_by_site
-
-        bal = latest_balances_by_site(d_from, d_to)
-        extra = ["Période", "Source runtime", "Source puissance", "Statut CPH", "CPH partiel (L)", "Jours CPH", "Jours mesurés Snowflake", "Jours de la période",
-                 "Stock initial (L)", "Source stock initial", "Date stock initial", "Stock final (L)", "Source stock final", "Date stock final", "Livraison externe (L)",
-                 "Carte Total (L)", "Transfert entrant (L)", "Rajouts (L)", "Transfert sortant (L)", "Retraits (L)", "Vols (L)", "Vidanges (L)", "Statut du bilan",
-                 "Cause principale", "Score de confiance", "Réserves", "Alertes", "Niveau de certification", "Bilan calculé le", "Version des règles"]
-        lines = []
-        for r in rows:
-            b = bal.get(r["site_id"])
-            d = base(r)
-            d.update({"Période": data["periode"]["libelle"], "Source runtime": r["theorique"]["runtime_source"], "Source puissance": r["theorique"]["power_source"],
-                      "Statut CPH": r["theorique"]["statut_cph"], "CPH partiel (L)": r["theorique"]["partielle_l"], "Jours CPH": r["theorique"]["jours_cph"],
-                      "Jours mesurés Snowflake": r["instrumentee"]["jours_mesure"], "Jours de la période": r["instrumentee"]["jours"]})
-            if b is not None:
-                z = lambda v: None if v is None else float(v)  # noqa: E731
-                d.update({"Stock initial (L)": z(b.stock_initial_l), "Source stock initial": b.source_stock_initial, "Date stock initial": b.date_stock_initial,
-                          "Stock final (L)": z(b.stock_final_l), "Source stock final": b.source_stock_final, "Date stock final": b.date_stock_final,
-                          "Livraison externe (L)": z(b.livraisons_externes_l), "Carte Total (L)": z(b.carte_total_l), "Transfert entrant (L)": z(b.transferts_entrants_l),
-                          "Rajouts (L)": z(b.rajouts_l), "Transfert sortant (L)": z(b.transferts_sortants_l), "Retraits (L)": z(b.retraits_l), "Vols (L)": z(b.vols_l),
-                          "Vidanges (L)": z(b.vidanges_l), "Statut du bilan": b.statut_bilan, "Cause principale": b.cause_principale, "Score de confiance": b.score_confiance,
-                          "Réserves": " | ".join(b.reserves or []), "Alertes": " | ".join(b.alertes or []), "Niveau de certification": b.niveau_certification,
-                          "Bilan calculé le": b.calculated_at, "Version des règles": b.rule_version})
-            lines.append(d)
-        return f"controle_complet_{label}.csv", _csv(base_cols + extra, lines), len(lines)
+        lines = [_flat(r) for r in rows]
+        cols = list(_flat(rows[0]).keys()) if rows else []
+        return f"controle_complet_{label}.csv", _csv(cols, lines), len(lines)
     raise ValueError(f"Export inconnu : {kind}")

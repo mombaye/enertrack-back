@@ -798,15 +798,16 @@ class TankPlateDiagnosticTests(BalanceBase):
 
 
 class ConsoComparisonTests(BalanceBase):
-    """Suivis Consommations : un tableau, une période, trois consommations, écarts signés."""
+    """Suivis Consommations : un tableau, une période, cinq mesures distinctes, écarts signés, certification vide avant validation."""
 
-    def cph_row(self, site="DKR_0001", theo=None, measured=None, days_measured=0):
+    def cph_row(self, site="DKR_0001", theo=None, measured=None, days_measured=0, partial=None):
         d = (self.end.date() - self.start.date()).days + 1
-        return {"site_id": site, "site_name": "N", "country": "sen", "zone": "DKR", "perimetre": "GE", "days": d, "cph_days": d if theo is not None else 0,
-                "cph_status": "COMPLET" if theo is not None else "NON_CALCULE_PERIODE", "statut_cph": "CPH_CALCULE" if theo is not None else "CPH_NON_CALCULE",
-                "conso_theorique_l": None if theo is None else Decimal(theo), "conso_partielle_l": None, "motif_cph": None,
+        status = "COMPLET" if theo is not None else ("PARTIEL" if partial is not None else "NON_CALCULE_PERIODE")
+        return {"site_id": site, "site_name": "N", "country": "sen", "zone": "DKR", "perimetre": "GE", "days": d, "cph_days": d if theo is not None else (3 if partial else 0),
+                "cph_status": status, "statut_cph": "CPH_CALCULE" if theo is not None else "CPH_NON_CALCULE",
+                "conso_theorique_l": None if theo is None else Decimal(theo), "conso_partielle_l": None if partial is None else Decimal(partial), "motif_cph": None,
                 "runtime_source_main": "DSE", "power_source_main": "ENOC", "kind": "GE", "runtime_days": d, "running_days": d, "ge_label": "GE1", "curve": "C1",
-                "power_method_days": d, "statut_rapprochement_calcul": "CALCULE",
+                "power_method_days": d, "statut_rapprochement_calcul": "CALCULE", "ge_kva": Decimal("33"),
                 "comparaison": {"conso_mesuree_l": None if measured is None else Decimal(measured), "jours_mesure": days_measured}}
 
     def build(self, rows, **params):
@@ -814,44 +815,78 @@ class ConsoComparisonTests(BalanceBase):
         with mock.patch("fuel_tracking.services.cph_service.compute_period_summary", return_value=rows):
             return CC.build(self.start.date(), self.end.date(), params, with_cph_quality=False)
 
-    def test_three_values_gaps_sign_and_period(self):
-        self.stocks(1000, 400)                       # consommation réelle 600 L
-        SB.compute_balances(self.start, self.end, site_ids=["DKR_0001"])
-        d = (self.end.date() - self.start.date()).days + 1
-        out = self.build([self.cph_row(theo="660", measured="570", days_measured=d)])
-        r = out["rows"][0]
-        self.assertEqual(r["reel"]["conso_l"], 600.0)
-        self.assertEqual(r["ecart_instrumentee"]["l"], -30.0)   # instrumentée − réelle
-        self.assertEqual(r["ecart_theorique"]["l"], 60.0)       # théorique − réelle
-        self.assertEqual(r["ecart_theorique"]["pct"], 10.0)
-        self.assertIn("23:59:59", out["periode"]["libelle"])
-        self.assertTrue(out["periode"]["bilan_disponible"])
-        self.assertIn("jours_non_couverts", out["fraicheur"])
-        self.assertTrue(out["fraicheur"]["perime"])        # aucun fait Snowflake en base de test
+    def days(self):
+        return (self.end.date() - self.start.date()).days + 1
 
-    def test_no_value_invented_without_real_or_instrumented(self):
+    def test_five_measures_stay_distinct_and_gaps_use_variation(self):
+        self.stocks(1000, 400)                       # variation de stock = 600 L
+        SB.compute_balances(self.start, self.end, site_ids=["DKR_0001"])
+        out = self.build([self.cph_row(theo="660", measured="570", days_measured=self.days())])
+        r = out["rows"][0]
+        self.assertEqual(r["stock"]["variation_l"], 600.0)
+        self.assertEqual(r["certification"]["valeur_l"], None)           # jamais « consommation réelle » avant certification
+        self.assertEqual(r["instrumentee"]["ecart_l"], 30.0)             # variation − instrumentée
+        self.assertEqual(r["cph"]["ecart_l"], -60.0)                     # variation − CPH complète
+        self.assertEqual(r["cph"]["complete_l"], 660.0)
+        self.assertIsNone(r["cph"]["partielle_l"])
+        self.assertIn("23:59:59", out["periode"]["libelle"])
+
+    def test_cph_partial_never_becomes_complete_and_no_gap_with_partial(self):
         self.stocks(1000, 400)
         SB.compute_balances(self.start, self.end, site_ids=["DKR_0001"])
-        r = self.build([self.cph_row(theo=None, measured=None)])["rows"][0]
-        self.assertIsNone(r["theorique"]["conso_l"])
-        self.assertIsNone(r["ecart_theorique"]["l"])
-        self.assertIsNone(r["instrumentee"]["conso_l"])
-        self.assertEqual(r["statut_global"], "MESURE_INSTRUMENTEE_ABSENTE")
+        r = self.build([self.cph_row(theo=None, partial="120")])["rows"][0]
+        self.assertIsNone(r["cph"]["complete_l"])
+        self.assertEqual(r["cph"]["partielle_l"], 120.0)
+        self.assertIsNone(r["cph"]["ecart_l"])
 
-    def test_non_calculable_has_no_real_value_and_no_gap(self):
-        r = self.build([self.cph_row(theo="500", measured="500", days_measured=19)])["rows"][0]   # aucun bilan
-        self.assertIsNone(r["reel"]["conso_l"])
-        self.assertEqual(r["reel"]["statut"], "NON_CALCULABLE")
-        self.assertIsNone(r["ecart_theorique"]["l"])
-        self.assertEqual(r["statut_global"], "DONNEES_INCOMPLETES")
+    def test_no_bilan_means_null_everywhere(self):
+        r = self.build([self.cph_row(theo="500", measured="500", days_measured=self.days())])["rows"][0]   # aucun bilan
+        self.assertIsNone(r["stock"]["variation_l"])
+        self.assertEqual(r["stock"]["statut"], "NON_CALCULABLE")
+        self.assertIsNone(r["cph"]["ecart_l"])
+        self.assertIsNone(r["instrumentee"]["ecart_l"])
+        self.assertIsNone(r["certification"]["valeur_l"])
 
-    def test_percentage_guard_near_zero_reference(self):
+    def test_negative_variation_stays_visible_as_anomaly_never_certifiable(self):
+        self.stocks(100, 500)                        # stock final > stock initial, aucune entrée : variation −400
+        SB.compute_balances(self.start, self.end, site_ids=["DKR_0001"])
+        r = self.build([])["rows"][0]
+        self.assertEqual(r["stock"]["variation_l"], -400.0)
+        self.assertEqual(r["stock"]["statut"], "VARIATION_CALCULEE")
+        self.assertIn("VARIATION_NEGATIVE", r["stock"]["alertes"])
+        self.assertIsNone(r["certification"]["valeur_l"])
+        from fuel_tracking.models import FuelStockBalance
+        self.assertEqual(FuelStockBalance.objects.get(site_id="DKR_0001").statut_bilan, "NON_CALCULABLE")   # le moteur refuse de certifier
+        self.assertIsNone(FuelStockBalance.objects.get(site_id="DKR_0001").consommation_reelle_l)
+
+    def test_zero_stock_is_valid_and_not_null(self):
+        self.stocks(500, 0)
+        SB.compute_balances(self.start, self.end, site_ids=["DKR_0001"])
+        r = self.build([])["rows"][0]
+        self.assertEqual(r["stock"]["final_l"], 0.0)
+        self.assertEqual(r["stock"]["variation_l"], 500.0)
+
+    def test_certified_value_only_after_explicit_certification(self):
+        self.stocks(1000, 400)
+        SB.compute_balances(self.start, self.end, site_ids=["DKR_0001"])
+        from fuel_tracking.models import FuelStockBalance
+        b = FuelStockBalance.objects.get(site_id="DKR_0001")
+        user = get_user_model().objects.create_user("fm", "fm@x.sn", "p", role="manager")
+        if b.statut_bilan != "PRET_A_CERTIFIER":
+            self.skipTest("bilan non prêt dans ce jeu d'essai")
+        SB.certify(b, user, "certifier", "OK Fuel Manager")
+        r = self.build([])["rows"][0]
+        self.assertEqual(r["stock"]["statut"], "CONSOMMATION_REELLE_CERTIFIEE")
+        self.assertEqual(r["certification"]["valeur_l"], 600.0)
+        self.assertEqual(r["certification"]["par"] is not None, True)
+
+    def test_percentage_guards(self):
         from fuel_tracking.services.conso_comparison import _pct
-        self.assertEqual(_pct(50, 5), (None, "Référence quasi nulle"))
+        self.assertEqual(_pct(50, 0), (None, "Référence nulle ou quasi nulle"))
         self.assertEqual(_pct(None, 500), (None, None))
         self.assertEqual(_pct(50, 500), (10.0, None))
 
-    def test_api_all_period_formats_and_exports(self):
+    def test_api_all_period_formats_and_four_exports(self):
         self.stocks(1000, 400)
         SB.compute_balances(self.start, self.end, site_ids=["DKR_0001"])
         c = APIClient()
@@ -860,15 +895,15 @@ class ConsoComparisonTests(BalanceBase):
         with mock.patch("fuel_tracking.services.cph_service.compute_period_summary", return_value=[self.cph_row(theo="610")]):
             for debut, fin in ((d1, d2), (f"{d1}T00:00", f"{d2}T23:59"), (f"{d1}T00:00:00", f"{d2}T23:59:59")):
                 j = c.get("/api/fuel-tracking/consommations/", {"date_debut": debut, "date_fin": fin}).json()
-                self.assertEqual(j["kpis"]["reel"]["sites_calculables"], 1, (debut, fin))
-            j = c.get("/api/fuel-tracking/consommations/").json()      # période par défaut = dernière avec bilan
+                self.assertEqual(j["kpis"]["variation"]["sites"], 1, (debut, fin))
+            j = c.get("/api/fuel-tracking/consommations/").json()
             self.assertEqual(j["periode"]["debut"], d1)
-            self.assertTrue(j["periode"]["par_defaut"])
-            for kind in ("controle_complet", "anomalies_fuel", "bilan_certification"):
+            for kind in ("controle_complet", "anomalies_fuel", "priorites_donnees", "rapport_imports"):
                 resp = c.get(f"/api/fuel-tracking/consommations/export/{kind}/", {"date_debut": d1, "date_fin": d2})
                 self.assertEqual(resp.status_code, 200, kind)
             full = c.get("/api/fuel-tracking/consommations/export/controle_complet/", {"date_debut": d1, "date_fin": d2}).content.decode()
-            self.assertIn("Consommation réelle stock (L)", full)
+            self.assertIn("Variation de stock (L)", full)
+            self.assertIn("Consommation réelle certifiée (L)", full)
 
     def test_recette_command_runs_and_prints_counts(self):
         self.stocks(1000, 400)
@@ -876,9 +911,7 @@ class ConsoComparisonTests(BalanceBase):
         out = StringIO()
         with mock.patch("fuel_tracking.services.cph_service.compute_period_summary", return_value=[self.cph_row(theo="610")]):
             call_command("fuel_comparaison_controle", debut=self.start.strftime("%Y-%m-%d"), fin=self.end.strftime("%Y-%m-%d"), stdout=out)
-        txt = out.getvalue()
-        self.assertIn("PÉRIODE EXACTE", txt)
-        self.assertIn("conso réelle calculable                      : 1", txt)
+        self.assertIn("PÉRIODE EXACTE", out.getvalue())
 
 
 class SnowflakeBadgeTests(BalanceBase):

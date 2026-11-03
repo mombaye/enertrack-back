@@ -6,7 +6,7 @@
   GET /api/fuel-tracking/consommations/periodes/        périodes disposant d'un bilan (+ défaut)
   GET /api/fuel-tracking/consommations/export/<kind>/   controle_complet | anomalies_fuel | bilan_certification (CSV)
 Paramètres : date_debut, date_fin (AAAA-MM-JJ, jours entiers 00:00:00 → 23:59:59), filtres pays, zone, site, typologie, configuration,
-statut_global, qualite_reel, source_runtime, source_puissance, statut_cph, tri, page, page_size.
+typologie_energie, statut_bilan, statut_certification, source_stock, source_runtime, source_puissance, source_target, qualite (reserve|sans_reserve|anomalie), tri, page, page_size.
 """
 from __future__ import annotations
 

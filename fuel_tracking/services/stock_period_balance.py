@@ -547,13 +547,16 @@ def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, pro
             cause = "CONFLIT_ENOC_CLOSING"
 
     conso = None
+    variation = None          # résultat mathématique du bilan, négatif conservé (anomalie visible)
     can = ini and fin and not cause
     if can:
         conso = (Decimal(str(ini["litres"])) + comps["livraisons_externes_l"] + comps["carte_total_l"] + comps["transferts_entrants_l"]
                  + comps["rajouts_l"] - comps["transferts_sortants_l"] - comps["retraits_l"] - comps["vols_l"] - comps["vidanges_l"]
                  - Decimal(str(fin["litres"])))
+        variation = conso
         if conso < 0:
-            motifs.append(f"Consommation calculée négative ({conso:.0f} L) : mouvement manquant ou relevé erroné — non retenue.")
+            motifs.append(f"Variation de stock négative ({conso:.0f} L) : mouvement manquant ou relevé erroné — anomalie, non certifiable.")
+            alerts.append("VARIATION_NEGATIVE : variation de stock négative, bilan non certifiable")
             conso, cause = None, "CONSO_NEGATIVE"
     score, detail = _score(c, ini, fin, st, major, st["defects"] > 0)
     if conso is None:
@@ -580,7 +583,7 @@ def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, pro
         "date_stock_initial": t0 if ini else None, "stock_initial_detail": ini or {},
         "stock_final_l": Decimal(str(fin["litres"])) if fin else None, "source_stock_final": fin["source"] if fin else None,
         "date_stock_final": t1 if fin else None, "stock_final_detail": fin or {},
-        **comps, "consommation_reelle_l": conso, "conso_journaliere_l": conso_j,
+        **comps, "consommation_reelle_l": conso, "variation_stock_l": variation, "conso_journaliere_l": conso_j,
         "statut_bilan": statut, "resultat_bilan": statut, "cause_principale": cause, "score_confiance": score, "score_detail": detail,
         "reserves": list(dict.fromkeys(reserves)), "estimation": any(x and x["estimation"] for x in (ini, fin)),
         "age_stock_initial_j": ini["age_jours"] if ini else None, "age_stock_final_j": fin["age_jours"] if fin else None,
@@ -614,7 +617,7 @@ def _proposition(r: dict, tanks, c: dict) -> dict:
     return out
 
 
-FINGERPRINT_KEYS = ("stock_initial_l", "stock_final_l", "consommation_reelle_l", "source_stock_initial", "source_stock_final",
+FINGERPRINT_KEYS = ("stock_initial_l", "stock_final_l", "consommation_reelle_l", "variation_stock_l", "source_stock_initial", "source_stock_final",
                     "date_stock_initial", "date_stock_final", "score_confiance", *COMPONENTS)
 
 
@@ -651,7 +654,7 @@ def _persist(rows: list[dict], start, end):
 
 
 SNAPSHOT_KEYS = ("site_id", "observation_start", "observation_end", "stock_initial_l", "source_stock_initial", "stock_final_l",
-                 "source_stock_final", *COMPONENTS, "consommation_reelle_l", "statut_bilan", "score_confiance", "reserves", "motifs")
+                 "source_stock_final", *COMPONENTS, "consommation_reelle_l", "variation_stock_l", "statut_bilan", "score_confiance", "reserves", "motifs")
 
 
 def certify(balance, user, decision: str, comment: str):
