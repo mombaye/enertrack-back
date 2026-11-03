@@ -74,6 +74,7 @@ INSTALLED_APPS = [
     'optimization',
     "fuel_tracking",
     "bo_analysis",
+    "pilotage_grid",
 
 ]
 

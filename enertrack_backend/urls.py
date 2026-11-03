@@ -39,6 +39,7 @@ urlpatterns = [
 
     path("api/optimization/", include("optimization.urls")),
     path("api/fuel-tracking/", include("fuel_tracking.urls")),
+    path("api/pilotage-grid/", include("pilotage_grid.urls")),
 
     
 ]
