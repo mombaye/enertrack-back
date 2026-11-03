@@ -43,3 +43,71 @@ class PilotageDataset(models.Model):
 
     def __str__(self):
         return f"{self.key} v{self.version}{' (actif)' if self.is_active else ''}"
+
+
+# ── Tables relationnelles alimentées depuis les jeux de données actifs (source unique : la base) ─────────────────────────────────
+class PgInvoiceFact(models.Model):
+    """Cube des factures : une ligne par (statut, porteur, échéance, mois comptable, région, tarif)."""
+    statut = models.PositiveSmallIntegerField(db_index=True, help_text="0 Payée · 1 Annulée · 2 Impayée · 3 Hors scope/remplacée/annulée · 4 Sans statut")
+    porteur = models.CharField(max_length=64, db_index=True)
+    echeance = models.CharField(max_length=7, blank=True, default="")
+    comptable = models.CharField(max_length=7, db_index=True)
+    region = models.CharField(max_length=64, db_index=True)
+    tarif = models.CharField(max_length=32, db_index=True)
+    nb = models.IntegerField()
+    ttc = models.BigIntegerField()
+    ht = models.BigIntegerField(default=0)
+
+    class Meta:
+        db_table = "pilotage_grid_invoice_fact"
+
+
+class PgInvoice(models.Model):
+    """Détail des factures non payées / hors périmètre (tableau « Factures » de Paiements)."""
+    numero = models.BigIntegerField(db_index=True)
+    contrat = models.BigIntegerField(db_index=True)
+    site_id = models.CharField(max_length=80, db_index=True)
+    site_name = models.CharField(max_length=255, blank=True, default="")
+    date_comptable = models.CharField(max_length=10, db_index=True)
+    ttc = models.BigIntegerField()
+    statut = models.PositiveSmallIntegerField(db_index=True)
+    porteur = models.CharField(max_length=64, db_index=True)
+    localisation = models.CharField(max_length=255, blank=True, default="")
+    region = models.CharField(max_length=64, db_index=True)
+    tarif = models.CharField(max_length=32, db_index=True)
+
+    class Meta:
+        db_table = "pilotage_grid_invoice"
+
+
+class PgSite(models.Model):
+    site_key = models.CharField(max_length=120, unique=True)
+    name = models.CharField(max_length=255, blank=True, default="")
+    region = models.CharField(max_length=64, db_index=True)
+    tarif = models.CharField(max_length=32, db_index=True)
+    tension = models.CharField(max_length=8, db_index=True)
+    puissance_kw = models.FloatField(null=True, blank=True)
+    porteur = models.CharField(max_length=64, db_index=True)
+    contrat = models.BigIntegerField(null=True, blank=True)
+    derniere_facture = models.CharField(max_length=10, blank=True, default="")
+    changement_contrat = models.BooleanField(default=False)
+
+    class Meta:
+        db_table = "pilotage_grid_site"
+
+
+class PgSiteMonth(models.Model):
+    """Consommation et montants d'un site pour un mois calendaire (après prorata des factures)."""
+    site = models.ForeignKey(PgSite, on_delete=models.CASCADE, related_name="months")
+    month = models.CharField(max_length=7, db_index=True)
+    ht = models.BigIntegerField(default=0)
+    ttc = models.BigIntegerField(default=0)
+    k1 = models.BigIntegerField(default=0)
+    k2 = models.BigIntegerField(default=0)
+    jours = models.PositiveSmallIntegerField(default=0)
+    imp = models.BigIntegerField(default=0)
+
+    class Meta:
+        db_table = "pilotage_grid_site_month"
+        indexes = [models.Index(fields=["month", "site"])]
+        constraints = [models.UniqueConstraint(fields=["site", "month"], name="uniq_pg_site_month")]

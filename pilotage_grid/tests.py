@@ -137,3 +137,90 @@ class ApiTests(TestCase):
 
     def test_bo_role_has_no_access(self):
         self.assertEqual(self.client_for("bo").get("/api/pilotage-grid/datasets/").status_code, 403)
+
+
+def calc_fixtures():
+    paiements = {
+        "lists": {"st": ["Payée", "Annulée", "Impayée", "Hors", "Sans"], "por": ["AKTIVCO", "SONATEL"], "ech": ["", "2026-02"], "cpt": ["2026-01", "2026-02", "2026-03"],
+                  "reg": ["DKR", "KLK"], "tar": ["PMP", "MTLU"]},
+        # [statut, porteur, échéance, mois comptable, région, tarif, nb, ttc, ht]
+        "cube": [[0, 0, 1, 1, 0, 0, 10, 1000, 800], [2, 1, 0, 1, 0, 0, 2, 300, 250], [0, 1, 1, 2, 1, 1, 5, 500, 400], [0, 0, 1, 0, 0, 0, 99, 9999, 9]],
+        # [n° facture, contrat, site, nom, date, ttc, statut, porteur, localisation, région, tarif]
+        "det": [[111, 222, "S1", "Site un", "2026-02-10", 300, 2, "SONATEL", "Dakar", "DKR", "PMP"], [112, 223, "S2", "Site deux", "2026-03-05", 50, 2, "AKTIVCO", "Kaolack", "KLK", "MTLU"]],
+        "hors": [],
+    }
+    months = [f"2026-{m:02d}" for m in range(1, 7)] + ["2026-07"]
+    jours = [31, 28, 31, 30, 31, 30, 10]
+    ser = lambda base: [0, [base * j for j in jours], [base * j * 2 for j in jours], [base * j for j in jours], [0] * 7, jours, [0] * 7]  # noqa: E731
+    sites = {
+        "months": months,
+        "sites": [["S1", "Site un", "DKR", "PMP", "BT", 10.0, 0, "x", "x", "c1", "AKTIVCO", 222, 1, "ok", 0.0, False, "2026-06-30", 6, 0],
+                  ["S2", "Site deux", "KLK", "MTLU", "MT", 20.0, 0, "x", "x", "c2", "SONATEL", 223, 1, "ok", 0.0, False, "2026-06-30", 6, 0]],
+        "ser": [ser(100), ser(30)], "con": [[], []], "reps": [["S2"]], "gp": [None, None], "avg": [None, None], "pm": [], "srcs": [], "corr": {"today": "2026-07-05"},
+    }
+    return paiements, sites
+
+
+class CalculsTests(TestCase):
+    def setUp(self):
+        p, s = calc_fixtures()
+        S.save_version("paiements", p)
+        S.save_version("sites", s)
+
+    def test_tables_follow_active_version(self):
+        from pilotage_grid.models import PgInvoice, PgInvoiceFact, PgSite, PgSiteMonth
+        self.assertEqual((PgInvoiceFact.objects.count(), PgInvoice.objects.count(), PgSite.objects.count(), PgSiteMonth.objects.count()), (4, 2, 2, 14))
+        p, s = calc_fixtures()
+        p["cube"].append([0, 0, 1, 1, 0, 0, 1, 1, 1])
+        S.save_version("paiements", p)                      # un import met les tables à jour
+        self.assertEqual(PgInvoiceFact.objects.count(), 5)
+
+    def test_synthese_totals_filters_and_rule_of_accounting_month(self):
+        from pilotage_grid.services import calculs as C
+        m = C.months_list()
+        # période 2026-01 → 2026-03 : le cube est filtré sur le mois COMPTABLE 2026-02 → 2026-04 (règle d'origine)
+        s = C.synthese(m, {"from": "2026-01", "to": "2026-03"})
+        self.assertEqual(s["kpis"]["ttc"], 1000 + 300 + 500)                 # la ligne du mois comptable 2026-01 est exclue
+        self.assertEqual(s["statuts"][0]["ttc"], 1500)
+        self.assertEqual(s["kpis"]["nb_factures"], 17)
+        self.assertEqual(round(s["pct_paye"], 1), round(1500 / 1800 * 100, 1))
+        mt = C.synthese(m, {"from": "2026-01", "to": "2026-03", "tension": "MT"})
+        self.assertEqual(mt["kpis"]["ttc"], 500)
+        self.assertEqual(mt["kpis"]["avec_changement_contrat"], 1)
+        self.assertEqual(C.synthese(m, {"from": "2026-01", "to": "2026-03", "porteur": "AKTIVCO"})["kpis"]["ttc"], 1000)
+
+    def test_synthese_consumption_series_variations_and_costs(self):
+        from pilotage_grid.services import calculs as C
+        m = C.months_list()
+        s = C.synthese(m, {"from": "2026-01", "to": "2026-06"})
+        self.assertEqual([x["month"] for x in s["mensuel"]], m[:6])
+        self.assertEqual(s["mensuel"][0]["k1"], (100 + 30) * 31)
+        self.assertEqual(s["kpis"]["sites_factures"], 2)
+        self.assertEqual(round(s["kpis"]["cout_kwh"], 3), round(sum(x["ht"] for x in s["mensuel"]) / sum(x["k1"] + x["k2"] for x in s["mensuel"]), 3))
+        self.assertEqual([c["site"] for c in s["couts"]], ["S1"])                  # S2 : 30 kWh/j < 1 000 kWh/mois ? 30×30,4 = 913 → exclu
+        self.assertEqual({v["site"]: v["d"] for v in s["variations"]}, {"S1": 0.0, "S2": 0.0})   # consommation stable : écart nul
+
+    def test_paiements_sections_and_invoices(self):
+        from pilotage_grid.services import calculs as C
+        m = C.months_list()
+        p = C.paiements(m, {"from": "2026-01", "to": "2026-03"})
+        self.assertEqual(p["kpis"]["nb"], 17)
+        self.assertEqual(p["echeance"]["labels"], ["2026-02"])
+        self.assertEqual({x["porteur"] for x in p["echeance"]["series"]}, {"AKTIVCO", "SONATEL"})
+        self.assertEqual(sorted(p["regions"]["labels"]), ["DKR", "KLK"])
+        n = C.paiements(m, {"from": "2026-01", "to": "2026-03", "metric": "nb"})
+        self.assertEqual(n["kpis"]["nb"], 17)
+        f = C.factures(m, {"from": "2026-01", "to": "2026-03", "statuts": "2"})
+        self.assertEqual((f["total"], f["ttc"]), (2, 350))
+        self.assertEqual(C.factures(m, {"from": "2026-01", "to": "2026-03", "statuts": "2", "q": "kaolack"})["total"], 1)
+
+    def test_api_endpoints_and_empty_state(self):
+        c = APIClient()
+        c.force_authenticate(U.objects.create_user("calc", "calc@x.sn", "p", role="analyst"))
+        self.assertEqual(c.get("/api/pilotage-grid/facets/").json()["default_from"], "2026-01")
+        self.assertEqual(c.get("/api/pilotage-grid/synthese/", {"from": "2026-01", "to": "2026-03"}).status_code, 200)
+        self.assertEqual(c.get("/api/pilotage-grid/paiements/").status_code, 200)
+        self.assertEqual(c.get("/api/pilotage-grid/paiements/factures/", {"statuts": "2"}).json()["total"], 2)
+        from pilotage_grid.models import PgSiteMonth
+        PgSiteMonth.objects.all().delete()
+        self.assertEqual(c.get("/api/pilotage-grid/synthese/").status_code, 404)

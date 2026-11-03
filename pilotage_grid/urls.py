@@ -10,4 +10,8 @@ urlpatterns = [
     path("datasets/<str:key>/export/", V.DatasetExportView.as_view(), name="pg-dataset-export"),
     path("datasets/<str:key>/versions/<int:version>/restore/", V.DatasetRestoreView.as_view(), name="pg-dataset-restore"),
     path("export/", V.ExportAllView.as_view(), name="pg-export"),
+    path("facets/", V.FacetsView.as_view(), name="pg-facets"),
+    path("synthese/", V.SyntheseView.as_view(), name="pg-synthese"),
+    path("paiements/", V.PaiementsView.as_view(), name="pg-paiements"),
+    path("paiements/factures/", V.FacturesView.as_view(), name="pg-factures"),
 ]

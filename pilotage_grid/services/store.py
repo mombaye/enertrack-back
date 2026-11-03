@@ -80,7 +80,18 @@ def save_version(key: str, data, *, user=None, source: str = "import", source_fi
         source=source, source_file=source_file[:255], note=note[:500], imported_by=user if getattr(user, "pk", None) else None,
         imported_by_label=(getattr(user, "email", "") or getattr(user, "username", "") or "")[:255],
     )
+    _sync_tables(key)
     return ds, True
+
+
+def _sync_tables(key: str) -> None:
+    """Les tables relationnelles suivent toujours la version active (import, restauration)."""
+    from pilotage_grid.services import tables
+
+    if key == "paiements":
+        tables.rebuild_paiements()
+    elif key == "sites":
+        tables.rebuild_sites()
 
 
 @transaction.atomic

@@ -42,6 +42,7 @@ BRIDGE_JS = """
       catch(err){document.body.insertAdjacentHTML('afterbegin','<p style="padding:16px;color:#B0425A">Erreur d\u2019affichage : '+String(err&&err.message||err)+'</p>');parent.postMessage({type:'pg:error',message:String(err&&err.message||err)},origin);}
     }
     if(d.type==='pg:section'){pending=d.id;if(started)go(d.id);}
+    if(d.type==='pg:site'&&started&&typeof window.openSite==='function'){window.openSite(d.id);}
   });
   parent.postMessage({type:'pg:ready'},origin);
 })();

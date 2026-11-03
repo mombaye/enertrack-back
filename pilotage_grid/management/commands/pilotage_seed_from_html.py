@@ -37,3 +37,7 @@ class Command(BaseCommand):
                 continue
             ds, created = S.save_version(key, data, source="seed-html", source_file=file.rsplit("/", 1)[-1], note="Chargement initial depuis le HTML")
             self.stdout.write(f"{key} : {'version ' + str(ds.version) + ' créée' if created else 'inchangé (v' + str(ds.version) + ')'} — {counts}")
+        if not dry_run:
+            from pilotage_grid.services import tables
+
+            self.stdout.write(f"Tables relationnelles reconstruites : {tables.rebuild_all()}")

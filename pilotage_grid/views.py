@@ -164,3 +164,51 @@ class ExportAllView(APIView):
         r = HttpResponse(content, content_type="application/zip")
         r["Content-Disposition"] = f'attachment; filename="pilotage_grid_base_{timezone.now():%Y%m%d_%H%M}.zip"'
         return r
+
+
+# ── Sections calculées côté serveur (SQL sur les tables relationnelles) ──────────────────────────────────────────────────────────────
+def _months_or_empty():
+    from pilotage_grid.services import calculs as C
+
+    months = C.months_list()
+    return C, months
+
+
+class FacetsView(APIView):
+    permission_classes = [CanRead]
+
+    def get(self, request):
+        C, months = _months_or_empty()
+        if not months:
+            return Response({"detail": "Aucune donnée en base : importez le fichier initial."}, status=404)
+        return Response(C.facets())
+
+
+class SyntheseView(APIView):
+    permission_classes = [CanRead]
+
+    def get(self, request):
+        C, months = _months_or_empty()
+        if not months:
+            return Response({"detail": "Aucune donnée en base : importez le fichier initial."}, status=404)
+        return Response(C.synthese(months, request.query_params))
+
+
+class PaiementsView(APIView):
+    permission_classes = [CanRead]
+
+    def get(self, request):
+        C, months = _months_or_empty()
+        if not months:
+            return Response({"detail": "Aucune donnée en base : importez le fichier initial."}, status=404)
+        return Response(C.paiements(months, request.query_params))
+
+
+class FacturesView(APIView):
+    permission_classes = [CanRead]
+
+    def get(self, request):
+        C, months = _months_or_empty()
+        if not months:
+            return Response({"detail": "Aucune donnée en base : importez le fichier initial."}, status=404)
+        return Response(C.factures(months, request.query_params))
