@@ -25,8 +25,17 @@ class Command(BaseCommand):
 
     def _pilotage(self, w, dry_run):
         try:
+            from pathlib import Path
+
+            from django.conf import settings
+            from django.core.management import call_command
+
             from pilotage_grid.models import PgInvoiceFact, PgSite, PilotageDataset
             from pilotage_grid.services import tables
+
+            initial = Path(settings.BASE_DIR) / "data_imports" / "pilotage_grid" / "pilotage_grid_initial.html"
+            if initial.is_file() and not dry_run:   # jeux initiaux versionnés dans le dépôt : chargés seulement s'ils manquent en base
+                call_command("pilotage_seed_from_html", only_missing=True, stdout=self.stdout)
 
             has_data = PilotageDataset.objects.filter(is_active=True, key__in=("paiements", "sites")).exists()
             empty = not PgInvoiceFact.objects.exists() or not PgSite.objects.exists()

@@ -224,3 +224,26 @@ class CalculsTests(TestCase):
         from pilotage_grid.models import PgSiteMonth
         PgSiteMonth.objects.all().delete()
         self.assertEqual(c.get("/api/pilotage-grid/synthese/").status_code, 404)
+
+
+class SeedOnlyMissingTests(TestCase):
+    def test_only_missing_loads_absent_sets_and_never_overwrites_ui_imports(self):
+        import os
+        import tempfile
+
+        from django.core.management import call_command
+
+        # une version déjà importée depuis l'interface (contenu différent du HTML)
+        edited = {**PAIEMENTS, "cube": [[9, 9]]}
+        S.save_version("paiements", edited, source="import")
+        with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8") as fh:
+            fh.write(tiny_html())
+        from unittest import mock
+        try:
+            with mock.patch("pilotage_grid.services.tables.rebuild_paiements"), mock.patch("pilotage_grid.services.tables.rebuild_sites"):   # fixture minimale : pas de tables
+                call_command("pilotage_seed_from_html", file=fh.name, only_missing=True, stdout=io.StringIO())
+        finally:
+            os.unlink(fh.name)
+        active = PilotageDataset.objects.get(key="paiements", is_active=True)
+        self.assertEqual((active.version, active.data["cube"]), (1, [[9, 9]]))                 # jamais écrasé
+        self.assertTrue(PilotageDataset.objects.filter(key="tarifs", is_active=True).exists())  # les jeux absents sont chargés

@@ -20,4 +20,4 @@ Ce qui est automatique (aucune autre action manuelle) :
 `fuel_post_deploy` est idempotent : relancé, il ne fait rien si tout est à jour (`--dry-run` pour simuler). Il ne crée ni ne modifie
 jamais de certification et ne touche ni à ENOC ni à Snowflake.
 
-Reste manuel (données, pas code) : l'import initial Pilotage Grid (`pilotage_seed_from_html`) et l'import du target fuel (Suivis Stock).
+L'import initial Pilotage Grid est **automatique** : le HTML d'origine est versionné (`data_imports/pilotage_grid/pilotage_grid_initial.html`) et `fuel_post_deploy` charge les jeux de données **absents** de la base (jamais d'écrasement d'une version importée depuis l'interface). Un simple `git pull` + redéploiement suffit. Reste manuel : l'import du target fuel — ou son dépôt dans `incoming/target_fuel/`.

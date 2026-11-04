@@ -1030,7 +1030,7 @@ class PostDeployTests(BalanceBase):
         call_command("fuel_post_deploy", stdout=out)
         self.assertGreater(PgSite.objects.count(), 0)
         self.assertGreater(PgInvoiceFact.objects.count(), 0)
-        self.assertIn("reconstruction", out.getvalue())
+        self.assertTrue("reconstruction" in out.getvalue() or "Tables relationnelles reconstruites" in out.getvalue())   # reconstruites par le chargement initial ou par le contrôle
 
 
 class ClosingGapAndHealthTests(BalanceBase):

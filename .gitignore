@@ -21,5 +21,8 @@ data_imports/stan/*.xlsb
 # En prod le vrai fichier est à /mnt/ESCO/… (GRID_SITES_LIST_DIR dans .env).
 !data_imports/grid_sites/
 !data_imports/grid_sites/Listes_Sites_GRID_sample.csv
+# Données initiales Pilotage Grid (HTML d'origine) : commitées pour un déploiement par simple git pull.
+!data_imports/pilotage_grid/
+!data_imports/pilotage_grid/pilotage_grid_initial.html
 celerybeat-schedule
 .demo/
