@@ -47,13 +47,26 @@ Tâches Celery planifiées côté serveur :
 | **Fichier Closing** (Excel, envoyé à la Finance, stocks du mois précédent) | Stock initial/final, livraisons, mouvements, consommation déclarée par site. **C'est la base de référence : mêmes sites que ce fichier.** | mensuelle | `<FUEL_IMPORT_ROOT>/incoming/closing/` |
 | **Relevés gardiens** Loliforce | Niveaux de cuve (cm ou L), **cumulés depuis janvier**, envoyés **toutes les 2 semaines** | bimensuelle | `<FUEL_IMPORT_ROOT>/incoming/loliforce/` |
 | Relevés gardiens SCSS | idem | bimensuelle | `<FUEL_IMPORT_ROOT>/incoming/scss/` |
-| Target fuel (Excel) | cible de consommation par site | à la demande | via upload plateforme/commande d'import (source `TARGET_FUEL`) — **ne pas déposer ailleurs** |
+| Target fuel (Excel) | cible de consommation par site | à la demande | `<FUEL_IMPORT_ROOT>/incoming/target_fuel/` |
 | **ENOC** | mouvements de carburant | continu | synchronisé par la plateforme |
 | **Snowflake** | consommation instrumentée, faits journaliers (runtime GE, puissances) | continu | synchronisé par la plateforme |
 
 Formats acceptés : `.xlsx`, `.xlsm`, `.xlsb`. Les fichiers gardiens étant **cumulés depuis janvier**, un nouveau fichier contient les anciennes lignes : c'est normal, la plateforme dédoublonne ligne par ligne. **Ne jamais modifier ni renommer le contenu d'un fichier original.** Ajoute un horodatage au nom seulement si le nom existe déjà.
 
 ⚠️ Je ne sais pas par quel canal arrivent les fichiers (e-mail, Google Drive, SFTP, dossier partagé). **Pose-moi la question avant de figer les nœuds d'entrée**, et prévois ces entrées sous forme de déclencheurs interchangeables (Gmail/IMAP, Google Drive, SFTP, Webhook).
+
+## 4 bis. Dossier monté = point d'entrée unique
+
+Un seul dossier partagé (`/mnt/Suivi_carburant_prod` sur l'hôte, monté dans les conteneurs backend/Celery) sert d'interface. **n8n surveille et alimente ce dossier ; la plateforme le traite toute seule toutes les 15 min.**
+
+```
+Suivi_carburant_prod/
+  incoming/closing/  incoming/loliforce/  incoming/scss/  incoming/target_fuel/  incoming/modeles_cuves/   ← dépôt (n8n ou humain)
+  processing/   accepted/   rejected/   archive/AAAA-MM/                                                  ← gérés par la plateforme
+```
+- Un fichier déposé dans `incoming/<source>/` est traité puis **déplacé** vers `accepted/` ou `rejected/` (avec rapport CSV) ; l'original est archivé avec son empreinte. Ne jamais écrire dans `processing/`, `accepted/`, `rejected/`, `archive/`.
+- n8n peut donc utiliser le déclencheur **Local File Trigger** (ou SFTP/Drive) sur les dossiers sources, et un second déclencheur sur `accepted/` / `rejected/` pour savoir quand le traitement est terminé et lancer WF-04 / alerter avec le rapport.
+- Si n8n tourne dans Docker, monter le même chemin hôte dans le conteneur n8n (`/mnt/suivi_carburant_prod:/files/suivi_carburant`) ; n8n n'a besoin d'écrire que dans `incoming/`.
 
 ## 5. Accès à la plateforme
 

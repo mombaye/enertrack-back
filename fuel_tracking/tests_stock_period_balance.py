@@ -1106,3 +1106,8 @@ class ClosingGapAndHealthTests(BalanceBase):
         self.assertEqual(out[0]["variation_l"], 600.0)
         self.assertIsNone(out[0]["closing_l"])           # aucun Closing connu : None, jamais 0
         self.assertEqual(out[0]["sites_closing"], 0)
+
+    def test_incoming_tree_includes_target_fuel_folder(self):
+        from fuel_tracking.services import stock_import_pipeline as P
+        self.assertEqual(P.INCOMING["target_fuel"], "TARGET_FUEL")
+        self.assertIn("target_fuel", P.INCOMING)
