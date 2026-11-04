@@ -791,6 +791,24 @@ class AuditAndApiTests(TmpRootMixin, TestCase):
         self.assertEqual(self.client.post("/api/fuel-tracking/stock/enoc/types/", {"raw_value": "X", "category": "AJOUT", "reason": "x"}, format="json").status_code, 403)
         self.assertEqual(self.client.get("/api/fuel-tracking/stock/audit-profil-energetique/").status_code, 200)
 
+    def test_process_incoming_endpoint_returns_result_per_file_and_is_idempotent(self):
+        P.ensure_dirs()
+        rows = [["SEMAINE 40"], [], HEAD, guard_row("DKR_0001", cm=18)]
+        (P.root() / "incoming" / "loliforce" / "releves.xlsx").write_bytes(xlsx({"KOLDA": rows}))
+        self.client.force_authenticate(self.analyst)
+        self.assertEqual(self.client.post("/api/fuel-tracking/stock/imports/traiter-dossier/").status_code, 403)   # réservé admin/manager
+        self.client.force_authenticate(self.manager)
+        r = self.client.post("/api/fuel-tracking/stock/imports/traiter-dossier/")
+        self.assertEqual(r.status_code, 200, r.content)
+        j = r.json()
+        self.assertEqual(j["nombre_traites"], 1)
+        t = j["traites"][0]
+        self.assertEqual((t["source_type"], t["file_name"]), ("LOLIFORCE", "releves.xlsx"))
+        self.assertEqual(t["resume"]["lignes_lues"], 1)
+        self.assertTrue(t["rapport_url"].endswith("/rapport/"))
+        self.assertEqual(j["restant_dans_incoming"]["loliforce"], 0)             # le fichier a été déplacé
+        self.assertEqual(self.client.post("/api/fuel-tracking/stock/imports/traiter-dossier/").json()["nombre_traites"], 0)   # rien de nouveau
+
     def test_audit_command_runs_every_section_read_only(self):
         from django.core.management import call_command
         tank("DKR_0001")

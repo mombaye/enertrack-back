@@ -1,133 +1,149 @@
-# Prompt n8n — Automatisation « SUIVI CARBURANT » (étape 1 : Suivi Consommation)
+# Prompt n8n — Automatisation « SUIVI CARBURANT » · Étape 1 : Suivi Consommation
 
-> À coller tel quel dans l'assistant de création de workflows n8n. Les valeurs entre `<CHEVRONS>` sont à renseigner dans les *Credentials* / variables n8n, jamais en dur dans un workflow.
+> **Mode d'emploi** : colle tout ce document dans l'assistant de création de workflows n8n. Il est **complet** : n8n doit produire les workflows, les exécuter, et **afficher les sorties** (résultats de chaque étape + rapport final). Les valeurs `<ENTRE_CHEVRONS>` se renseignent dans les *Credentials* / *Variables* n8n, jamais en dur.
 
 ---
 
-## 1. Rôle et objectif
+## 0. Ce que tu dois livrer (et afficher)
 
-Tu es un expert n8n, data-engineering et exploitation de plateformes carburant pour sites télécom. Construis des workflows n8n **robustes, idempotents et surveillés** qui alimentent et pilotent automatiquement le module **« Suivi Carburant » de la plateforme eGrid/EnerTrack** (backend Django/DRF, PostgreSQL, Celery ; frontend React).
-L'objectif final est un outil **utilisable en continu, sans action manuelle répétitive**. On avance **étape par étape** :
+Construis, active et teste **3 workflows** + 1 sous-workflow, puis **affiche pour chacun** : le schéma des nœuds, la sortie (JSON) de chaque nœud clé, et le **RAPPORT FINAL** défini au §7.
 
-| Étape | Partie | Statut |
-|---|---|---|
-| **1** | **Suivi Consommation** (Closing, relevés gardiens, ENOC, Snowflake → variation de stock, écart vs Closing, explication) | **À faire maintenant** |
-| 2 | Suivi Stock (registre, cuves, relevés, certification) | plus tard |
-| 3 | Commandes | plus tard |
-| 4 | Estimation commande / prédiction | plus tard |
-
-**Ne construis QUE l'étape 1.** Structure les workflows pour que les étapes suivantes se branchent sans refonte (sous-workflows réutilisables : *auth*, *dépôt de fichier*, *appel API*, *alerte*, *journal*).
-
-## 2. Règles non négociables
-
-1. **Snowflake = lecture seule.** Aucun INSERT/UPDATE/DELETE/DROP/CREATE. Si tu interroges Snowflake dans n8n, utilise un rôle dédié en SELECT uniquement et des requêtes bornées par date (économie de crédits). Les identifiants vivent dans les Credentials n8n.
-2. **ENOC est lu, jamais modifié.**
-3. **Aucune donnée inventée, aucun calcul simulé, aucun repli silencieux.** Une donnée absente reste `null` / « non calculable ». `null` ≠ `0` ≠ `estimé`. Un stock de 0 L est une valeur valide.
-4. **Ne recalcule pas les consommations dans n8n.** Le moteur de calcul est dans la plateforme (règle bilan-v2). n8n **collecte, dépose, déclenche, vérifie, alerte, archive**. Il ne réimplémente ni la variation de stock, ni l'écart Closing, ni le CPH.
-5. **Idempotence** : relancer un workflow ne doit jamais dupliquer des données. La plateforme dédoublonne par empreinte SHA-256 ; conserve toi aussi l'empreinte/nom/date de chaque fichier traité et saute les doublons.
-6. **Aucun secret dans les workflows, logs, messages ou notifications.**
-7. Une estimation n'est jamais présentée comme certifiée. La « Consommation réelle certifiée » reste vide tant que le Fuel Manager n'a pas certifié (action humaine, **jamais automatisée**).
-8. Un site sans correspondance dans le fichier Closing est **affiché mais exclu des totaux** (comportement de la plateforme — ne le contourne pas).
-
-## 3. Ce que la plateforme fait DÉJÀ seule (ne pas dupliquer)
-
-Tâches Celery planifiées côté serveur :
-- Synchro **Snowflake** consommation mesurée : toutes les 5 min (mois courant) ; faits journaliers (CPH/instrumentée) : toutes les heures + rattrapage nocturne J-35.
-- Synchro **ENOC** (mouvements Truck, Carte Total, Ponction) : toutes les 5 min.
-- Traitement des fichiers déposés dans `incoming/` : toutes les 15 min (`:07 :22 :37 :52`).
-- **Calcul automatique des bilans des 2 derniers mois complets : chaque nuit à 03h11** (nouvelles données prises en compte seules).
-- Contrôle santé CPH quotidien.
-
-➡ Le rôle de n8n est donc **(a) amener les fichiers manquants, (b) surveiller que tout est frais, (c) forcer un recalcul après un import, (d) produire les rapports et alertes**.
-
-## 4. Données et sources (étape 1)
-
-| Source | Contenu | Fréquence | Où la déposer |
+| # | Workflow | Déclencheur | Rôle |
 |---|---|---|---|
-| **Fichier Closing** (Excel, envoyé à la Finance, stocks du mois précédent) | Stock initial/final, livraisons, mouvements, consommation déclarée par site. **C'est la base de référence : mêmes sites que ce fichier.** | mensuelle | `<FUEL_IMPORT_ROOT>/incoming/closing/` |
-| **Relevés gardiens** Loliforce | Niveaux de cuve (cm ou L), **cumulés depuis janvier**, envoyés **toutes les 2 semaines** | bimensuelle | `<FUEL_IMPORT_ROOT>/incoming/loliforce/` |
-| Relevés gardiens SCSS | idem | bimensuelle | `<FUEL_IMPORT_ROOT>/incoming/scss/` |
-| Target fuel (Excel) | cible de consommation par site | à la demande | `<FUEL_IMPORT_ROOT>/incoming/target_fuel/` |
-| **ENOC** | mouvements de carburant | continu | synchronisé par la plateforme |
-| **Snowflake** | consommation instrumentée, faits journaliers (runtime GE, puissances) | continu | synchronisé par la plateforme |
+| 0 | `SC_00_auth_egrid` (sous-workflow) | appelé | obtient/renouvelle le jeton JWT |
+| 1 | `SC_01_import_fichiers` | **fichier déposé** dans un dossier + cron de secours */10 min | traite les fichiers, affiche le résultat par fichier |
+| 2 | `SC_02_controle_et_calcul` | fin de SC_01 + cron 04h00 | vérifie la fraîcheur, recalcule, vérifie les KPI |
+| 3 | `SC_03_rapport` | cron lundi 07h00 + bouton manuel | rapport hebdo + page HTML des dernières sorties |
 
-Formats acceptés : `.xlsx`, `.xlsm`, `.xlsb`. Les fichiers gardiens étant **cumulés depuis janvier**, un nouveau fichier contient les anciennes lignes : c'est normal, la plateforme dédoublonne ligne par ligne. **Ne jamais modifier ni renommer le contenu d'un fichier original.** Ajoute un horodatage au nom seulement si le nom existe déjà.
+On avance **étape par étape** : ne construis **que** l'étape 1 (Suivi Consommation). Étapes futures (ne pas faire maintenant) : 2 Suivi Stock · 3 Commandes · 4 Estimation. Garde des sous-workflows réutilisables (auth, alerte, journal) pour les brancher plus tard.
 
-⚠️ Je ne sais pas par quel canal arrivent les fichiers (e-mail, Google Drive, SFTP, dossier partagé). **Pose-moi la question avant de figer les nœuds d'entrée**, et prévois ces entrées sous forme de déclencheurs interchangeables (Gmail/IMAP, Google Drive, SFTP, Webhook).
+## 1. Règles non négociables
 
-## 4 bis. Dossier monté = point d'entrée unique
+1. **Snowflake en lecture seule.** n8n n'interroge **pas** Snowflake : la plateforme le synchronise déjà (toutes les 5 min / 1 h). n8n vérifie seulement la fraîcheur via l'API.
+2. **ENOC lu, jamais modifié.**
+3. **Aucune donnée inventée, aucun calcul simulé, aucun repli silencieux.** Valeur absente → afficher `—` (jamais `0`). `null` ≠ `0` ≠ `estimé`.
+4. **Ne recalcule rien dans n8n.** Les chiffres affichés sont ceux renvoyés par l'API, tels quels.
+5. **Idempotence** : relancer ne duplique rien (la plateforme dédoublonne par empreinte SHA-256 et ligne par ligne). Tiens quand même un journal.
+6. **Aucun secret** dans les workflows, logs, messages. La certification « réelle » par le Fuel Manager reste **humaine**.
+7. Un site absent du fichier Closing est **affiché mais exclu des totaux** (comportement de la plateforme).
+8. **Erreur API ou fichier illisible → ne continue pas comme si de rien n'était** : alerte + arrêt de la branche + ligne dans le rapport.
 
-Un seul dossier partagé (`/mnt/Suivi_carburant_prod` sur l'hôte, monté dans les conteneurs backend/Celery) sert d'interface. **n8n surveille et alimente ce dossier ; la plateforme le traite toute seule toutes les 15 min.**
+## 2. Dossier partagé (point d'entrée unique)
+
+Dossier monté (hôte) : `/mnt/suivi_carburant_prod` — vu par la plateforme comme `/mnt/Suivi_carburant_prod`. Si n8n est dans Docker : ajouter le volume `/mnt/suivi_carburant_prod:/files/suivi_carburant` au conteneur n8n (chemin n8n : `/files/suivi_carburant`).
 
 ```
-Suivi_carburant_prod/
-  incoming/closing/  incoming/loliforce/  incoming/scss/  incoming/target_fuel/  incoming/modeles_cuves/   ← dépôt (n8n ou humain)
-  processing/   accepted/   rejected/   archive/AAAA-MM/                                                  ← gérés par la plateforme
+incoming/closing/        ← fichier Closing mensuel  (ex. « Esco Senegal - Synthèse Conso Fuel Septembre 2026 Final v1.xlsb »)
+incoming/loliforce/      ← relevés Loliforce CUMULÉS  (ex. « Template remontées Loliforce Camusat 2026 v03112026.xlsx »)
+incoming/scss/           ← relevés SCSS HEBDOMADAIRES (ex. « REMONTEES DE CARBURANT DU 26 OCTOBRE AU 01 NOVEMBRE 2026.xlsx »)
+incoming/target_fuel/    ← target fuel (à la demande)
+processing/ accepted/ rejected/ archive/AAAA-MM/   ← gérés par la plateforme : n8n ne les modifie JAMAIS
 ```
-- Un fichier déposé dans `incoming/<source>/` est traité puis **déplacé** vers `accepted/` ou `rejected/` (avec rapport CSV) ; l'original est archivé avec son empreinte. Ne jamais écrire dans `processing/`, `accepted/`, `rejected/`, `archive/`.
-- n8n peut donc utiliser le déclencheur **Local File Trigger** (ou SFTP/Drive) sur les dossiers sources, et un second déclencheur sur `accepted/` / `rejected/` pour savoir quand le traitement est terminé et lancer WF-04 / alerter avec le rapport.
-- Si n8n tourne dans Docker, monter le même chemin hôte dans le conteneur n8n (`/mnt/suivi_carburant_prod:/files/suivi_carburant`) ; n8n n'a besoin d'écrire que dans `incoming/`.
+Formats : `.xlsx`, `.xlsm`, `.xlsb`. **La source se déduit du dossier, la période du contenu — jamais du nom du fichier.** n8n n'écrit rien dans ce dossier : c'est l'utilisateur qui y dépose les fichiers.
 
-### Règle « dernières données » (à appliquer dans WF-01/WF-02)
-- **Loliforce = fichier CUMULÉ** (« Template remontées Loliforce Camusat … vJJMMAAAA », une feuille par zone, blocs « SEMAINE n », ~13 000 lignes depuis février). Le plus récent contient tout : ne traiter que **la version la plus récente** du dossier (date `vJJMMAAAA` du nom, sinon date de modification). Les anciennes versions sont inutiles (les relire est inoffensif : la plateforme dédoublonne ligne par ligne).
-- **SCSS = fichier HEBDOMADAIRE non cumulé** (« REMONTEES DE CARBURANT DU jj AU jj mois aaaa ») : traiter **chaque nouveau fichier** (dédoublonné par empreinte).
-- **Closing = fichier mensuel** : traiter le plus récent par mois (« … Conso Fuel <Mois> <Année> … »).
-- La source se déduit du **dossier**, la période du **contenu** : ne jamais deviner d'après le nom du fichier.
-- Après chaque import, lire le lot et le rapport : alerter si > 15 % de lignes rejetées, si une date est invraisemblable (futur/antérieure à l'année), si un texte libre figure dans la colonne « Relevé en CM » (ex. « Pas de jauge »), ou si le fichier est tronqué/illisible.
+### Règle « dernières données »
+- **Loliforce = CUMULÉ** (11 feuilles par zone, blocs « SEMAINE n », ~13 000 lignes depuis février) → seule la **version la plus récente** compte (date `vJJMMAAAA` du nom, sinon date de modification). Si plusieurs fichiers Loliforce sont présents, n8n **affiche un avertissement** « plusieurs versions cumulées » ; il ne les supprime pas.
+- **SCSS = HEBDOMADAIRE, non cumulé** → chaque nouveau fichier est traité.
+- **Closing = mensuel** → le plus récent par mois.
 
-## 5. Accès à la plateforme
+## 3. Accès API
 
-- Base : `<EGRID_API_URL>` (se termine par `/api`).
-- **Auth JWT** : `POST /auth/login/` `{username, password}` → `{access, refresh}` ; `POST /auth/refresh/` pour renouveler. Utilise un compte de service dédié (rôle autorisé à valider/calculer) stocké dans les Credentials n8n. Gère l'expiration (refresh automatique, une seule reprise).
-- Dépôt de fichiers : le volume partagé `<FUEL_IMPORT_ROOT>` (nœud SFTP / SSH / Read-Write Files selon l'infrastructure). Vérifier qu'un fichier est bien arrivé avant de le déclarer traité.
+- Base : `<EGRID_API_URL>` (se termine par `/api`, ex. `https://egrid.exemple.sn/api`).
+- **Connexion** : `POST {BASE}/auth/login/` JSON `{"username":"<SERVICE_USER>","password":"<SERVICE_PASSWORD>"}` → `{"access":"…","refresh":"…"}`. Compte de service **admin ou manager** (les imports/calculs sont réservés à ces rôles).
+- Ensuite : header `Authorization: Bearer <access>`. Si `401` → `POST {BASE}/auth/refresh/` `{"refresh":"…"}` → `{"access":"…"}` puis **une seule** reprise ; sinon alerte « authentification impossible ».
+- Préfixe métier : `{BASE}/fuel-tracking/`.
 
-Endpoints utiles (préfixe `/fuel-tracking/`) :
+| Besoin | Appel | Champs à utiliser dans la réponse |
+|---|---|---|
+| **Traiter le dossier maintenant** | `POST stock/imports/traiter-dossier/` (corps vide) | `nombre_traites`, `statuts`, `restant_dans_incoming`, `traites[]` : `file_name`, `source_type`, `status`, `status_message`, `resume.{lignes_lues, acceptees, rejetees, doublons, a_valider, taux_rejet_pct, periode, motifs_rejet}`, `summary.dates_impossibles`, `rapport_url` |
+| Rapport CSV d'un lot | `GET stock/imports/{id}/rapport/` | CSV (lignes rejetées + motifs) |
+| Historique des lots | `GET stock/imports/?source_type=&statut=&page=` | `data[]`, `pagination` |
+| Santé des sources | `GET consommations/sante/` | `sources.{closing, gardiennage, enoc, snowflake, target_fuel}`, `couverture.{sites_base_closing, sites_releve_gardien_recent, seuil_jours, sites_releve_en_retard, sites_sans_releve_gardien, sites_enoc_hors_base_closing}`, `releves_en_retard[]`, `sites_sans_releve[]` |
+| Périodes avec bilan | `GET consommations/periodes/` | `periodes[]` (`debut`, `fin`, `sites`, `calculables`), `defaut` |
+| Calcul d'une période | `POST stock/bilans/calculer/` JSON `{"debut":"AAAA-MM-JJ","fin":"AAAA-MM-JJ"}` | `sites`, `calculables`, `incomplets` |
+| Tableau + KPI | `GET consommations/?date_debut=&date_fin=&page=1&page_size=200` | `periode`, `fraicheur`, `kpis`, `rows[]`, `total` |
+| Évolution | `GET consommations/evolution/` | `periodes[]` (`variation_l`, `closing_l`) |
+| Exports CSV | `GET consommations/export/{controle_complet\|anomalies_fuel\|priorites_donnees\|rapport_imports}/?date_debut=&date_fin=` | CSV (en-tête `Content-Disposition`, `X-Row-Count`) |
 
-| Besoin | Appel |
-|---|---|
-| Santé des sources (fraîcheur Closing/gardiens/ENOC/Snowflake/target, relevés en retard, sites sans relevé) | `GET consommations/sante/` |
-| Périodes disposant d'un bilan | `GET consommations/periodes/` |
-| Tableau Suivis Consommations + KPI + fraîcheur (`date_debut`, `date_fin`, filtres, `page`, `page_size`) | `GET consommations/` |
-| Évolution par période | `GET consommations/evolution/` |
-| Lots d'import et statut | `GET stock/imports/` ; rapport CSV : `GET stock/imports/<id>/rapport/` ; lignes : `GET stock/imports/<id>/lignes/` |
-| Analyse d'un fichier **sans import** (multipart `file`, `source_type`) | `POST stock/imports/analyser/` |
-| Forcer le calcul d'une période (`debut`, `fin`, optionnel `site`) | `POST stock/bilans/calculer/` |
-| Exports CSV (`controle_complet`, `anomalies_fuel`, `priorites_donnees`, `rapport_imports`) | `GET consommations/export/<kind>/?date_debut=&date_fin=` |
+`kpis` utiles : `variation.{total_l, sites, negatives}`, `closing.{total_l, sites}`, `instrumentee.{total_l, sites}`, `cph_complete.{total_l, sites}`, `bilans.{prets, avec_reserve, variation_calculee, non_calculables, certifies}`, `sans_correspondance.{sites, base_closing_sites}`, `alertes.*`. Chaque `rows[]` : `site_id`, `site_name`, `stock.{variation_l, statut}`, `closing.{conso_l, ecart_l, ecart_pct, explication}`, `correspondance.utilise`.
 
-Si un endpoint renvoie 4xx/5xx : **ne continue pas comme si de rien n'était** → journalise, alerte, arrête la branche.
+## 4. SC_00_auth_egrid (sous-workflow)
 
-## 6. Workflows à construire (étape 1)
+Entrée : rien. Sortie : `{ "token": "<access>", "base": "<EGRID_API_URL>" }`. Nœuds : `Execute Workflow Trigger` → `HTTP Request` (login) → `Set` (token). Met le jeton en cache 20 min (variable statique du workflow). **Ne jamais écrire le jeton ni le mot de passe dans une sortie affichée** (masquer : `token: "***"` dans les rapports).
 
-**WF-00 — Sous-workflows communs** : `auth_egrid` (login + refresh, renvoie le token), `deposer_fichier` (calcule SHA-256, vérifie le doublon dans le journal, dépose, vérifie la présence), `alerter` (e-mail et/ou Slack/Teams/WhatsApp selon `<CANAL_ALERTE>`, message court sans secret), `journal` (table/Google Sheet/Data Table n8n : date, workflow, fichier, empreinte, résultat, détail).
+## 5. SC_01_import_fichiers
 
-**WF-01 — Fichier Closing mensuel**
-Déclencheur : arrivée du fichier (canal à confirmer) + cron de rattrapage les 1er–7 de chaque mois. Étapes : récupérer la pièce jointe/fichier → n'accepter que `.xlsx/.xlsm/.xlsb` → `POST stock/imports/analyser/` (source `CLOSING`) → si illisible : alerte + stop → déposer dans `incoming/closing/` → attendre le prochain cycle (≤15 min) puis lire `GET stock/imports/` : le lot doit être `ACCEPTED` (ou `VALIDATION_REQUIRED` → alerte « validation humaine requise ») ; `REJECTED` → alerte avec le rapport CSV. Après succès : déclencher WF-04.
+**Déclencheurs** : (a) `Local File Trigger` (ou SFTP/Drive Trigger selon l'accès) sur `incoming/closing`, `incoming/loliforce`, `incoming/scss`, `incoming/target_fuel` — événement « fichier ajouté », attendre 10 s que l'écriture soit finie (taille stable 2 lectures) ; (b) `Schedule` toutes les 10 min (secours si le dossier n'émet pas d'événement).
 
-**WF-02 — Relevés gardiens (toutes les 2 semaines)**
-Mêmes étapes pour Loliforce → `incoming/loliforce/` et SCSS → `incoming/scss/`. Rappeler que les fichiers sont cumulés depuis janvier (pas de découpage, pas de filtrage). Si aucun fichier n'est reçu **J+16** après le précédent : alerte « relevés gardiens en retard » avec les sites listés par `consommations/sante/` (`releves_en_retard`, `sites_sans_releve`).
+**Nœuds, dans l'ordre :**
+1. **Lister** les fichiers de chaque sous-dossier (`Read/Write Files from Disk`, motif `*.xlsx;*.xlsm;*.xlsb`, ignorer `~$*` et `.*`). Si aucun fichier → fin silencieuse (aucune alerte).
+2. **Règle « dernières données »** (`Code`) : par dossier, regrouper ; pour `loliforce` garder la version la plus récente (parse `v(\d{2})(\d{2})(\d{4})` sinon date de modification) et émettre un warning `PLUSIEURS_VERSIONS_CUMULEES` s'il y en a plusieurs ; pour `scss` garder tous ; pour `closing` le plus récent par mois.
+3. **Contrôle préalable** : fichier de taille 0, extension inconnue, ou archive Excel illisible → alerte « fichier illisible/tronqué : <nom> » et **ne pas appeler l'API** pour ce fichier.
+4. **Appel** `SC_00_auth_egrid` puis `POST stock/imports/traiter-dossier/` (timeout 300 s, **1 seul appel** même s'il y a plusieurs fichiers). Statut `503` → alerte « dossier d'import indisponible (montage ?) » ; `403` → alerte « compte de service sans droit admin/manager ».
+5. **Pour chaque élément de `traites[]`** (`Split Out`) construire une ligne de sortie :
+   `fichier | source | statut | lues | acceptées | rejetées | doublons | taux_rejet_% | période | motifs_rejet | dates_impossibles | rapport`.
+6. **Règles d'alerte** (`IF`/`Code`) :
+   - `status = REJECTED` → 🔴 « fichier rejeté » + lien du rapport CSV (télécharger `rapport_url` et joindre).
+   - `status = VALIDATION_REQUIRED` → 🟠 « validation humaine requise ».
+   - `taux_rejet_pct > 15` → 🟠 avec top 5 `motifs_rejet`.
+   - `summary.dates_impossibles` non vide → 🟠 liste (feuille, ligne, site, date).
+   - `motifs_rejet` contient `UNKNOWN_UNIT` / `MISSING_LEVEL` / `MISSING_DATE` → 🟠 consigne : « demander au gardien de corriger (date au format date, cm numérique, une seule unité par ligne) ».
+   - doublon (`duplicate_of` non nul, ou tout en `rows_duplicate`) → ℹ️ « déjà reçu », **pas d'alerte**.
+7. **Journal** : une ligne par fichier (date, source, nom, empreinte `file_hash`, statut, compteurs).
+8. **Sortie du workflow** (affichée) : tableau des lignes du point 5 + liste des alertes + compteur `restant_dans_incoming` (doit être 0). Puis déclenche `SC_02`.
 
-**WF-03 — Contrôle de fraîcheur (toutes les heures)**
-`GET consommations/sante/` et `GET consommations/` (bloc `fraicheur`). Alerter (anti-spam : 1 alerte par cause et par 24 h, message de résolution quand ça revient) si : Snowflake sans journée récente > 3 j, synchro en échec, ENOC sans synchro récente, aucun Closing importé, target fuel non importé, période incomplète. **Ne corrige rien** : signale.
+**Attendu avec les fichiers de test fournis** (à vérifier, en base réelle avec les sites connus) :
+- `Template remontées Loliforce … v03112026.xlsx` → source `LOLIFORCE`, 11 feuilles retenues, période `2026-02-02 → 2026-10-30`, ~13 231 lignes lues, ~219 sites ; **attendu** : rejets pour `MISSING_LEVEL` (~1 598), `MISSING_DATE` (~344), `UNKNOWN_UNIT` (~93), `FUTURE_DATE` (1 : 14/06/2027) → alerte 🟠.
+- `REMONTEES DE CARBURANT DU 26 OCTOBRE AU 01 NOVEMBRE 2026.xlsx` → source `SCSS`, 22 lignes, période `2026-10-30 → 2026-11-01` ; **attendu** : 1 `MISSING_DATE` (date texte `30/10:2026`) et 1 `MISSING_LEVEL` (THS_1690) → alerte 🟠.
+- Fichier Closing `.xlsb` (34 feuilles, feuille de travail « Synthese conso fuel », contient aussi « Relevés Sociétés de Gardiennage ») → si le fichier est **tronqué** (archive incomplète), SC_01 doit lever 🔴 « fichier illisible » et demander de le renvoyer.
 
-**WF-04 — Recalcul après import + contrôle qualité**
-Déclencheur : fin d'un import accepté (WF-01/02) ou cron quotidien 04h00 (après le calcul nocturne de 03h11). Étapes : `GET consommations/periodes/` → pour la dernière période complète : `POST stock/bilans/calculer/` (si le calcul nocturne n'a pas déjà couvert les nouvelles données) → `GET consommations/` et vérifier les invariants : nombre de sites calculables > 0, `kpis.sans_correspondance` raisonnable, pas de `variation.negatives` en hausse brutale. Écart anormal → alerte (ex. variation négative, stock identique suspect, écart Closing extrême) en s'appuyant sur `kpis.alertes`.
+## 6. SC_02_controle_et_calcul
 
-**WF-05 — Rapport hebdomadaire / mensuel**
-Chaque lundi 07h00 (et le 3 de chaque mois pour M-1) : télécharger `controle_complet`, `anomalies_fuel`, `priorites_donnees` pour la dernière période complète ; les archiver (Drive/SharePoint, nom `AAAA-MM_<type>.csv`) ; envoyer un résumé : KPIs (variation de stock, Closing, instrumentée, CPH complète), nombre de sites par statut de bilan, sites hors Closing, top 10 des écarts vs Closing, sites sans relevé gardien. **Chiffres repris tels que renvoyés par l'API, avec `—` pour les valeurs absentes.**
+**Déclencheurs** : fin de `SC_01` (si au moins un lot `ACCEPTED`) + `Schedule` 04h00 (Africa/Dakar). Étapes :
+1. **Santé** : `GET consommations/sante/`. Alertes (1 par cause / 24 h, message « résolu » au retour à la normale) :
+   - `sources.closing = null` → 🔴 « aucun Closing importé » ;
+   - `sources.snowflake.age_jours > 3` ou `derniere_journee = null` → 🔴 Snowflake en retard ;
+   - `sources.enoc.statut` ≠ succès ou aucune synchro récente → 🔴 ENOC ;
+   - `sources.target_fuel = null` → 🟠 « target fuel non importé » ;
+   - `couverture.sites_releve_en_retard + sites_sans_releve_gardien > 0` → 🟠 avec la liste `releves_en_retard` (site, jours) et `sites_sans_releve` (top 30).
+2. **Période** : `GET consommations/periodes/` → prendre `defaut`.
+3. **Calcul** : `POST stock/bilans/calculer/` pour cette période (la plateforme le fait aussi chaque nuit à 03h11 : ne pas répéter si `periodes[].calculables` est déjà > 0 **et** qu'aucun lot n'a été accepté depuis).
+4. **Contrôle qualité** : `GET consommations/?date_debut=…&date_fin=…&page_size=200` → vérifier `total > 0`, `kpis.variation.sites > 0`, `fraicheur.perime = false`, `fraicheur.periode_incomplete = false`. Sinon 🟠/🔴 avec `fraicheur.erreur_synchro`.
+5. **Sortie (affichée)** : KPI de la période (variation de stock, Closing, instrumentée, CPH complète, bilans par statut, sites hors Closing) + top 10 des plus gros écarts `closing.ecart_l` (valeur absolue, hors `null`) avec `closing.explication.items[].label`.
 
-**WF-06 — Surveillance des workflows** : Error Trigger global → `alerter` + `journal`. Chaque workflow : 3 tentatives espacées (backoff 1/5/15 min) sur les erreurs réseau, **jamais** sur une erreur de validation de fichier.
+## 7. SC_03_rapport — RAPPORT FINAL (à afficher à chaque exécution)
 
-## 7. Exigences de qualité
+**Déclencheurs** : `Schedule` lundi 07h00, le 3 de chaque mois (M-1), et `Webhook` GET `/webhook/suivi-carburant/rapport` (bouton manuel). Produit :
 
-- Tous les nœuds nommés en français, un commentaire par bloc, variables et credentials centralisés.
-- Fuseau **Africa/Dakar (UTC+0)** pour les crons et les dates ; périodes en jours entiers `00:00:00 → 23:59:59`.
-- Aucun traitement en masse sans pagination (`page_size` ≤ 200).
-- Chaque workflow est livré avec : schéma, déclencheur, entrées/sorties, cas d'erreur, et **jeu de tests** : (1) fichier valide, (2) doublon, (3) fichier illisible, (4) fichier sans les feuilles attendues, (5) API indisponible, (6) token expiré.
-- Livre d'abord **WF-00, WF-03, WF-01**, fais-moi valider, puis WF-02, WF-04, WF-05, WF-06.
+**A. JSON de sortie (visible dans n8n)**
+```json
+{
+  "genere_le": "AAAA-MM-JJ hh:mm",
+  "periode": {"debut": "…", "fin": "…", "jours": 31},
+  "fichiers_traites": [{"fichier":"…","source":"…","statut":"…","lues":0,"acceptees":0,"rejetees":0,"taux_rejet_pct":0,"periode":["…","…"]}],
+  "sante": {"closing":"…","dernier_releve_gardien":"…","snowflake_derniere_journee":"…","enoc_derniere_synchro":"…","target_fuel":"…"},
+  "kpis": {"variation_stock_l":null,"closing_l":null,"instrumentee_l":null,"cph_complete_l":null,
+           "sites_par_statut":{"prets":0,"avec_reserve":0,"variation_a_controler":0,"non_calculables":0,"certifies":0},
+           "sites_hors_closing":0},
+  "top_ecarts_vs_closing": [{"site_id":"…","ecart_l":0,"cause_principale":"…"}],
+  "releves_gardiens_en_retard": [{"site_id":"…","jours":0}],
+  "alertes": [{"niveau":"ROUGE|ORANGE|INFO","code":"…","message":"…"}]
+}
+```
+(valeur absente = `null`, affichée `—`.)
 
-## 8. Ce que tu me renvoies
+**B. Page HTML** (réponse du `Webhook`, `Respond to Webhook` en `text/html`) : titre « Suivi Consommation — <période> », 4 cartes (Variation de stock, Closing, Instrumentée, CPH complète ; unité L, `—` si null), tableau des fichiers traités (couleur : vert accepté, orange avec rejets, rouge rejeté), tableau « Top 10 écarts vs Closing », liste des alertes triées (rouge → orange → info), bandeau « Dernière mise à jour ». Aucune donnée secrète.
 
-1. Les questions bloquantes (canal d'arrivée des fichiers, accès au volume `incoming/`, canal d'alerte, compte de service).
-2. Les workflows exportés (JSON n8n) un par un, avec leur mode d'emploi.
-3. La liste des Credentials à créer (noms uniquement, aucune valeur).
-4. Un récapitulatif de ce qui reste manuel (certification Fuel Manager, import du target fuel, arbitrage des conflits ENOC/Closing) et de ce qui est automatisé.
+**C. Notification** (e-mail et/ou Slack/Teams, `<CANAL_ALERTE>`) : résumé en 10 lignes + lien vers la page HTML + pièces jointes `controle_complet`, `anomalies_fuel`, `priorites_donnees` (CSV, nommés `AAAA-MM_<type>.csv`) archivées dans `<DOSSIER_ARCHIVE_RAPPORTS>`.
+
+## 8. Qualité et tests (à exécuter et afficher)
+
+- Nœuds nommés en français, un commentaire par bloc, **Error Trigger** global → alerte + journal. Nouvel essai 3× (1/5/15 min) sur erreur réseau, **jamais** sur une erreur de validation de fichier.
+- Fuseau `Africa/Dakar`. Pagination ≤ 200. Anti-spam : 1 alerte par cause et par 24 h.
+- **Jeu de tests à lancer et à afficher (✔/✘ + sortie)** : (1) dossier vide → aucune alerte ; (2) fichier SCSS valide ; (3) même fichier redéposé → « déjà reçu » ; (4) fichier Loliforce cumulé → alerte 🟠 rejets ; (5) fichier tronqué → 🔴 ; (6) API indisponible (`503`) ; (7) jeton expiré → refresh puis succès ; (8) deux versions Loliforce → warning `PLUSIEURS_VERSIONS_CUMULEES`.
+
+## 9. Ordre de livraison et questions
+
+1. **Pose d'abord ces questions** (une seule fois) : accès au dossier partagé par n8n (volume Docker ou SFTP ?) ; canal d'alerte ; URL de l'API ; compte de service créé (admin/manager) ?
+2. Livre dans l'ordre : `SC_00` → `SC_01` (+ tests 1–5) → `SC_02` → `SC_03`. À chaque livraison : JSON exporté du workflow, schéma, **sorties affichées**, liste des Credentials (noms seulement).
+3. Termine par un tableau « ce qui est automatisé / ce qui reste humain » (certification Fuel Manager, arbitrage conflits ENOC/Closing, renvoi des fichiers corrigés par les gardiens).

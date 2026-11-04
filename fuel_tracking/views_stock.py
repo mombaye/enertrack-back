@@ -799,3 +799,33 @@ class EnergyAuditView(APIView):
         from fuel_tracking.services.site_energy_profile import audit_energy_fields
 
         return Response({"data": audit_energy_fields()})
+
+
+class ImportProcessIncomingView(APIView):
+    """POST /api/fuel-tracking/stock/imports/traiter-dossier/ — traite IMMÉDIATEMENT les fichiers déposés dans incoming/* (au lieu d'attendre le cycle de 15 min).
+    Réponse : un résultat par fichier traité (lot, statut, lignes acceptées/rejetées, période, motifs) + ce qui reste en attente. Idempotent (empreinte SHA-256)."""
+
+    permission_classes = [IsCphValidator]
+
+    def post(self, request):
+        from pathlib import Path
+
+        from fuel_tracking.services import stock_import_pipeline as P
+
+        try:
+            r = P.ensure_dirs()
+            batches = P.scan_incoming(user=request.user)
+        except OSError as e:
+            return Response({"detail": f"Répertoire d'import indisponible ({e.__class__.__name__}) : vérifier le montage FUEL_IMPORT_ROOT."}, status=503)
+        out = []
+        for b in batches:
+            d = _batch(b)
+            motifs = (b.summary or {}).get("codes") or {}
+            d["resume"] = {"lignes_lues": b.rows_total, "acceptees": b.rows_accepted + b.rows_warning, "rejetees": b.rows_rejected, "doublons": b.rows_duplicate,
+                           "a_valider": b.rows_pending, "taux_rejet_pct": round(100.0 * b.rows_rejected / b.rows_total, 1) if b.rows_total else None,
+                           "periode": [str(b.declared_period_start or "") or None, str(b.declared_period_end or "") or None], "motifs_rejet": motifs}
+            d["rapport_url"] = f"/api/fuel-tracking/stock/imports/{b.pk}/rapport/"
+            out.append(d)
+        restant = {sub: sum(1 for f in (Path(r) / "incoming" / sub).iterdir() if f.is_file() and not f.name.startswith((".", "~$"))) for sub in P.INCOMING}
+        return Response({"traites": out, "nombre_traites": len(out), "restant_dans_incoming": restant,
+                         "statuts": {st: sum(1 for x in out if x["status"] == st) for st in sorted({x["status"] for x in out})}})
