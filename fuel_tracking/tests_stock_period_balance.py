@@ -1096,3 +1096,13 @@ class ClosingGapAndHealthTests(BalanceBase):
         self.assertEqual(AB.last_complete_months(2, date(2026, 1, 15)), [(date(2025, 12, 1), date(2025, 12, 31)), (date(2025, 11, 1), date(2025, 11, 30))])
         res = AB.compute_recent_months(1, date(2026, 11, 4))
         self.assertEqual(res[0]["debut"], "2026-10-01")
+
+    def test_evolution_series_per_period_never_invents_totals(self):
+        from fuel_tracking.services import conso_comparison as CC
+        self.stocks(1000, 400)
+        SB.compute_balances(self.start, self.end, site_ids=["DKR_0001"])
+        out = CC.evolution(12)["periodes"]
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["variation_l"], 600.0)
+        self.assertIsNone(out[0]["closing_l"])           # aucun Closing connu : None, jamais 0
+        self.assertEqual(out[0]["sites_closing"], 0)

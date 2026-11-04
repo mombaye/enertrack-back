@@ -528,3 +528,32 @@ def export_csv(kind: str, d_from: date, d_to: date, params) -> tuple[str, str, i
         cols = list(_flat(rows[0]).keys()) if rows else []
         return f"controle_complet_{label}.csv", _csv(cols, lines), len(lines)
     raise ValueError(f"Export inconnu : {kind}")
+
+
+def evolution(limit: int = 12) -> dict:
+    """Série par période (les `limit` plus récentes, ordre chronologique) : somme des variations de stock et des consommations Closing.
+    Un total est None quand aucun site n'a la valeur (jamais 0 inventé). Instrumentée/CPH ne sont pas historisées : absentes de la série."""
+    from fuel_tracking.models import FuelStockBalance as B
+    from fuel_tracking.services.period_utils import available_periods, to_day
+
+    wanted = {(date.fromisoformat(p["debut"]), date.fromisoformat(p["fin"])): p for p in available_periods(limit)}
+    acc = {k: {"var": None, "n_var": 0, "clo": None, "n_clo": 0} for k in wanted}
+    for b in B.objects.filter(observation_end__gte=min((k[1] for k in wanted), default=date.max)).iterator():
+        a = acc.get((to_day(b.observation_start), to_day(b.observation_end)))
+        if a is None:
+            continue
+        if b.variation_stock_l is not None:
+            a["var"] = (a["var"] or 0.0) + float(b.variation_stock_l)
+            a["n_var"] += 1
+        ref = _closing_of(b)
+        c = _f(ref.get("conso_closing_l")) if ref else None
+        if c is not None:
+            a["clo"] = (a["clo"] or 0.0) + c
+            a["n_clo"] += 1
+    out = []
+    for (ds, de), p in sorted(wanted.items(), key=lambda kv: (kv[0][1], kv[0][0])):
+        a = acc[(ds, de)]
+        out.append({"debut": p["debut"], "fin": p["fin"], "jours": (de - ds).days + 1, "sites": p["sites"],
+                    "variation_l": None if a["var"] is None else round(a["var"], 1), "sites_variation": a["n_var"],
+                    "closing_l": None if a["clo"] is None else round(a["clo"], 1), "sites_closing": a["n_clo"]})
+    return {"periodes": out}

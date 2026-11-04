@@ -91,3 +91,11 @@ class ConsommationsSanteView(APIView):
         from fuel_tracking.services.data_health import health
 
         return Response(health())
+
+
+class ConsommationsEvolutionView(APIView):
+    """GET /api/fuel-tracking/consommations/evolution/ — totaux par période (variation de stock, Closing) pour les graphiques."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        return Response(C.evolution(12))
