@@ -880,6 +880,39 @@ class ConsoComparisonTests(BalanceBase):
         self.assertEqual(r["certification"]["valeur_l"], 600.0)
         self.assertEqual(r["certification"]["par"] is not None, True)
 
+    def test_identical_stock_without_movement_is_flagged_suspect(self):
+        self.stocks(400, 400)
+        SB.compute_balances(self.start, self.end, site_ids=["DKR_0001"])
+        r = self.build([])["rows"][0]
+        self.assertEqual(r["stock"]["variation_l"], 0.0)
+        self.assertIn("STOCK_IDENTIQUE_SUSPECT", r["stock"]["alertes"])
+        self.assertIn("non mis à jour", r["stock"]["motif"])
+
+    def test_no_bilan_gets_explicit_cause(self):
+        r = self.build([self.cph_row(theo="10")])["rows"][0]
+        self.assertEqual(r["stock"]["cause"], "AUCUN_BILAN")
+        self.assertEqual(r["stock"]["statut"], "NON_CALCULABLE")
+
+    def test_extreme_gaps_are_flagged_but_values_kept(self):
+        self.stocks(1000, 400)                       # variation 600 L
+        SB.compute_balances(self.start, self.end, site_ids=["DKR_0001"])
+        r = self.build([self.cph_row(theo="0", measured="9000", days_measured=self.days())])["rows"][0]
+        self.assertEqual(r["instrumentee"]["conso_l"], 9000.0)       # valeur conservée
+        self.assertIn("INSTRUMENTEE_ECART_EXTREME", r["stock"]["alertes_comparaison"])
+        self.assertIn("CPH_NULLE_VARIATION_POSITIVE", r["stock"]["alertes_comparaison"])
+        ok = self.build([self.cph_row(theo="650", measured="620", days_measured=self.days())])["rows"][0]
+        self.assertEqual(ok["stock"]["alertes_comparaison"], [])
+
+    def test_obsolete_coverage_removed_and_ponction_kpi_present(self):
+        from fuel_tracking.services import conso_comparison as CC
+        self.stocks(1000, 400)
+        SB.compute_balances(self.start, self.end, site_ids=["DKR_0001"])
+        with mock.patch("fuel_tracking.services.cph_service.compute_period_summary", return_value=[self.cph_row(theo="610")]):
+            out = CC.build(self.start.date(), self.end.date(), {}, with_cph_quality=True)
+        self.assertNotIn("rapprochement", [c["code"] for c in out["qualite_cph"]])
+        self.assertIn("ecart_perimetre_l", out["kpis"]["ponctions"])
+        self.assertIn("stock_identique_suspect", out["kpis"]["alertes"])
+
     def test_percentage_guards(self):
         from fuel_tracking.services.conso_comparison import _pct
         self.assertEqual(_pct(50, 0), (None, "Référence nulle ou quasi nulle"))

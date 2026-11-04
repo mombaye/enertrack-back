@@ -101,6 +101,16 @@ def _pct(gap, base, min_ref=0.0) -> tuple[float | None, str | None]:
     return round(float(gap) / float(base) * 100, 1), None
 
 
+def _extreme(a, b) -> bool:
+    """Écart extrême entre deux mesures censées être du même ordre de grandeur (signalé « à investiguer », jamais corrigé ni remplacé)."""
+    if a is None or b is None:
+        return False
+    big, small = max(abs(a), abs(b)), min(abs(a), abs(b))
+    min_l = float(_cfg("FUEL_COMPARE_EXTREME_MIN_L", 100))
+    ratio = float(_cfg("FUEL_COMPARE_EXTREME_RATIO", 5))
+    return (big - small) >= min_l and (small == 0 or big / small >= ratio)
+
+
 def _gap(a, b):
     return None if a is None or b is None else round(a - b, 1)
 
@@ -207,7 +217,30 @@ def _row(cph: dict | None, b, d_from: date, d_to: date, days: int, target, thres
     if statut == VARIATION_CALCULEE and var is not None and var < 0:
         motifs.insert(0, f"Variation de stock négative ({var:.0f} L) : anomalie à contrôler.")
 
-    alerts = alert_codes_of(b.alertes) if b is not None else []
+    alerts = sorted(alert_codes_of(b.alertes)) if b is not None else []
+    cause = b.cause_principale if b is not None else "AUCUN_BILAN"
+
+    # Stock identique suspect : stock initial = stock final > 0 sans aucun mouvement → stock probablement non mis à jour (jamais présenté comme « 0 L consommé » fiable)
+    if b is not None and statut != NON_CALCULABLE and var is not None and abs(var) < 0.5 and b.stock_initial_l is not None and b.stock_final_l is not None \
+            and b.stock_initial_l == b.stock_final_l and b.stock_initial_l > 0 \
+            and not any((x or 0) for x in (b.livraisons_externes_l, b.carte_total_l, b.transferts_entrants_l, b.transferts_sortants_l, b.rajouts_l, b.retraits_l, b.vols_l, b.vidanges_l)):
+        alerts = alerts + ["STOCK_IDENTIQUE_SUSPECT"]
+        motifs.insert(0, "Stock initial = stock final sans aucun mouvement : stock probablement non mis à jour (variation de 0 L à confirmer sur le terrain).")
+
+    # Alertes de comparaison (valeurs conservées, signalées à investiguer)
+    cmp_alerts = []
+    if var is not None and instr_ok and _extreme(var, instr_l):
+        cmp_alerts.append("INSTRUMENTEE_ECART_EXTREME")
+    if var is not None and complete is not None and _extreme(var, complete):
+        cmp_alerts.append("CPH_ECART_EXTREME")
+    if var is not None and complete == 0 and var > float(_cfg("FUEL_COMPARE_EXTREME_MIN_L", 100)):
+        cmp_alerts.append("CPH_NULLE_VARIATION_POSITIVE")
+    cmp_alerts = list(dict.fromkeys(cmp_alerts))
+
+    # Indépendance du contrôle Closing : si les deux stocks ET les mouvements viennent du Closing, l'écart nul est mécanique (pas une validation indépendante)
+    closing_indep = None
+    if ref is not None and b is not None:
+        closing_indep = not (b.source_stock_initial == "CLOSING" and b.source_stock_final == "CLOSING" and (ref.get("decision") in (None, "COMPLEMENT_CLOSING", "CONFLIT", "CLOSING_FAIT_FOI")))
     row = {
         "site_id": site_id, "site_name": (cph or {}).get("site_name") or (b.site_name if b else None), "country": (cph or {}).get("country") or (b.country if b else None),
         "zone": (cph or {}).get("zone") or (b.zone if b else None), "typologie": (b.typologie if b else None) or (cph or {}).get("site_type"),
@@ -221,11 +254,11 @@ def _row(cph: dict | None, b, d_from: date, d_to: date, days: int, target, thres
             "ponctions_entrantes_l": _f(b.transferts_entrants_l) if b else None, "ponctions_sortantes_l": _f(b.transferts_sortants_l) if b else None,
             "rajouts_l": _f(b.rajouts_l) if b else None, "retraits_l": _f(b.retraits_l) if b else None, "vols_l": _f(b.vols_l) if b else None, "vidanges_l": _f(b.vidanges_l) if b else None,
             "final_l": _f(b.stock_final_l) if b else None, "source_final": _source_text(b.source_stock_final) if b else None,
-            "variation_l": var, "statut": statut, "statut_moteur": b.statut_bilan if b else None, "cause": b.cause_principale if b else None,
-            "score": b.score_confiance if b else None, "reserves": (b.reserves or []) if b else [], "alertes": alerts, "bilan_id": b.pk if b else None,
+            "variation_l": var, "statut": statut, "statut_moteur": b.statut_bilan if b else None, "cause": cause,
+            "score": b.score_confiance if b else None, "reserves": (b.reserves or []) if b else [], "alertes": alerts, "alertes_comparaison": cmp_alerts, "bilan_id": b.pk if b else None,
             "motif": " · ".join(motifs) or None, "action": _action(b, statut),
         },
-        "closing": {"conso_l": conso_closing, "ecart_l": ecart_cl, "ecart_pct": pct_cl, "pct_na": na_cl},
+        "closing": {"conso_l": conso_closing, "ecart_l": ecart_cl, "ecart_pct": pct_cl, "pct_na": na_cl, "controle_independant": closing_indep},
         "target": {"periode_l": tgt_f, "mensuel_l": _f(target.target_mensuel_l) if target else None, "source": target.source_target if target else None,
                    "statut": statut_target, "position": position, "annee_reference": target.reference_year if target else None,
                    "ecart_l": ecart_tg, "ecart_pct": pct_tg, "pct_na": na_tg},
@@ -275,7 +308,7 @@ def _filter(rows: list[dict], p) -> list[dict]:
     elif q == "sans_reserve":
         rows = [r for r in rows if not r["stock"]["reserves"] and r["stock"]["variation_l"] is not None]
     elif q == "anomalie":
-        rows = [r for r in rows if r["stock"]["statut"] in (NON_CALCULABLE, VARIATION_CALCULEE)]
+        rows = [r for r in rows if r["stock"]["statut"] in (NON_CALCULABLE, VARIATION_CALCULEE) or r["stock"]["alertes_comparaison"] or "STOCK_IDENTIQUE_SUSPECT" in r["stock"]["alertes"]]
     return rows
 
 
@@ -309,6 +342,18 @@ def _kpis(rows: list[dict]) -> dict:
             "ecart_global_pct": round((sum_var - sum_tgt) / sum_tgt * 100, 1) if comp and sum_tgt else None,
             "couverture_pct": round(len(with_t) / n * 100, 1) if n else None,
             "a_confirmer": sum(1 for r in with_t if r["target"]["statut"] == TG.A_CONFIRMER),
+        },
+        "ponctions": {
+            "entrantes_l": s(rows, lambda r: r["stock"]["ponctions_entrantes_l"] or 0), "sortantes_l": s(rows, lambda r: r["stock"]["ponctions_sortantes_l"] or 0),
+            "ecart_perimetre_l": s(rows, lambda r: (r["stock"]["ponctions_entrantes_l"] or 0) - (r["stock"]["ponctions_sortantes_l"] or 0)),
+            "note": "Un écart non nul ici signifie que le site en face d'une Ponction n'a pas de bilan sur la période affichée : l'impact global ENOC reste de 0 L.",
+        },
+        "alertes": {
+            "stock_identique_suspect": sum(1 for r in rows if "STOCK_IDENTIQUE_SUSPECT" in r["stock"]["alertes"]),
+            "instrumentee_ecart_extreme": sum(1 for r in rows if "INSTRUMENTEE_ECART_EXTREME" in r["stock"]["alertes_comparaison"]),
+            "cph_ecart_extreme": sum(1 for r in rows if "CPH_ECART_EXTREME" in r["stock"]["alertes_comparaison"]),
+            "cph_nulle_variation_positive": sum(1 for r in rows if "CPH_NULLE_VARIATION_POSITIVE" in r["stock"]["alertes_comparaison"]),
+            "closing_non_independant": sum(1 for r in rows if r["closing"]["controle_independant"] is False),
         },
         "bilans": {"prets": cnt(PRET), "avec_reserve": cnt(ESTIMATION), "non_calculables": cnt(NON_CALCULABLE), "certifies": cnt(CERTIFIEE), "variation_calculee": cnt(VARIATION_CALCULEE)},
         "couverture_cph_pct": round(len(cpc) / n * 100, 1) if n else None,
@@ -356,7 +401,7 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
                     "bilan_disponible": bool(balances), "sites_avec_bilan": len(balances),
                     "sites_calculables": sum(1 for b in balances.values() if bilan_status(b) != NON_CALCULABLE), "regle": RULE_VERSION},
         "kpis": _kpis(rows), "rows": rows, "labels": LABELS, "aide": HELP,
-        "qualite_cph": _couvertures([r for r in cph_rows if r.get("perimetre", "GE") == "GE"]) if with_cph_quality else [],
+        "qualite_cph": [c for c in _couvertures([r for r in cph_rows if r.get("perimetre", "GE") == "GE"]) if c.get("code") != "rapprochement"] if with_cph_quality else [],
         "facettes": {
             "pays": uniq(lambda r: r["country"]), "zones": uniq(lambda r: r["zone"]), "typologies": uniq(lambda r: r["typologie"]),
             "typologies_energie": uniq(lambda r: r["typologie_energie"]), "statuts_bilan": list(STATUTS_BILAN),
@@ -380,7 +425,7 @@ PRIORITY_CAUSES = {
     "STOCK_TROP_ANCIEN": "Relevé de stock trop éloigné de la borne", "CONFLIT_ENOC_CLOSING": "Conflit ENOC / Closing",
     "MOUVEMENTS_A_CONTROLER": "Mouvement incomplet ou à contrôler", "TRANSFERT_DESEQUILIBRE": "Ponction déséquilibrée",
     "RELEVES_INCOHERENTS": "Relevés de stock incohérents (conflit de relevés)", "SITE_NON_RECONNU": "Site non reconnu", "SCORE_INSUFFISANT": "Score de confiance insuffisant",
-    "CONSO_NEGATIVE": "Variation de stock négative",
+    "CONSO_NEGATIVE": "Variation de stock négative", "AUCUN_BILAN": "Aucun bilan de stock pour ce site (aucune donnée de stock)",
 }
 
 
@@ -404,8 +449,8 @@ def _flat(r: dict) -> dict:
         "Truck (L)": s["truck_l"], "Livraisons externes (L)": s["livraisons_externes_l"], "Ponctions entrantes (L)": s["ponctions_entrantes_l"],
         "Ponctions sortantes (L)": s["ponctions_sortantes_l"], "Rajouts (L)": s["rajouts_l"], "Retraits (L)": s["retraits_l"], "Vols (L)": s["vols_l"], "Vidanges (L)": s["vidanges_l"],
         "Stock final (L)": s["final_l"], "Source stock final": s["source_final"], LABELS["variation"]: s["variation_l"], "Statut bilan": s["statut"], "Score": s["score"],
-        "Réserve / motif": s["motif"], "Alertes": " | ".join(s["alertes"]), "Action attendue": s["action"],
-        LABELS["closing"]: cl["conso_l"], "Écart variation vs Closing (L)": cl["ecart_l"], "Écart variation vs Closing (%)": pc(cl),
+        "Réserve / motif": s["motif"], "Alertes": " | ".join(s["alertes"]), "Alertes de comparaison": " | ".join(s["alertes_comparaison"]), "Action attendue": s["action"],
+        LABELS["closing"]: cl["conso_l"], "Contrôle Closing indépendant": ("oui" if cl["controle_independant"] else "non" if cl["controle_independant"] is False else ""), "Écart variation vs Closing (L)": cl["ecart_l"], "Écart variation vs Closing (%)": pc(cl),
         LABELS["target"]: tg["periode_l"], "Target mensuel (L/mois)": tg["mensuel_l"], "Source target": tg["source"], "Statut target": tg["statut"], "Position vs target": tg["position"],
         "Écart variation vs target (L)": tg["ecart_l"], "Écart variation vs target (%)": pc(tg),
         LABELS["instrumentee"]: ins["conso_l"], "Couverture instrumentée (%)": ins["couverture_pct"], "Écart variation vs instrumentée (L)": ins["ecart_l"],
@@ -438,9 +483,19 @@ def export_csv(kind: str, d_from: date, d_to: date, params) -> tuple[str, str, i
         return f"anomalies_fuel_{label}.csv", _csv(cols, lines), len(lines)
     if kind == "priorites_donnees":
         cols = ["Site ID", "Nom du site", "Zone", "Priorité", "Cause", "Statut bilan", "Motif", "Action attendue"]
-        lines = [{"Site ID": r["site_id"], "Nom du site": r["site_name"], "Zone": r["zone"], "Priorité": PRIORITY_CAUSES[r["stock"]["cause"]], "Cause": r["stock"]["cause"],
-                  "Statut bilan": r["stock"]["statut"], "Motif": r["stock"]["motif"], "Action attendue": r["stock"]["action"]}
-                 for r in rows if r["stock"]["cause"] in PRIORITY_CAUSES and r["stock"]["statut"] in (NON_CALCULABLE, VARIATION_CALCULEE)]
+        lines = []
+        for r in rows:
+            st = r["stock"]
+            if st["cause"] in PRIORITY_CAUSES and st["statut"] in (NON_CALCULABLE, VARIATION_CALCULEE):
+                prio, cause = PRIORITY_CAUSES[st["cause"]], st["cause"]
+            elif "STOCK_IDENTIQUE_SUSPECT" in st["alertes"]:
+                prio, cause = "Stock identique suspect (stock probablement non mis à jour)", "STOCK_IDENTIQUE_SUSPECT"
+            elif st["alertes_comparaison"]:
+                prio, cause = "Écart extrême entre mesures à investiguer", " | ".join(st["alertes_comparaison"])
+            else:
+                continue
+            lines.append({"Site ID": r["site_id"], "Nom du site": r["site_name"], "Zone": r["zone"], "Priorité": prio, "Cause": cause, "Statut bilan": st["statut"],
+                          "Motif": st["motif"], "Action attendue": st["action"]})
         return f"priorites_donnees_{label}.csv", _csv(cols, lines), len(lines)
     if kind == "controle_complet":
         lines = [_flat(r) for r in rows]
