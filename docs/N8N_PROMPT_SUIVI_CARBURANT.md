@@ -50,6 +50,25 @@ Formats : `.xlsx`, `.xlsm`, `.xlsb`. **La source se déduit du dossier, la péri
 
 Si les fichiers sont déposés dans **Google Drive** plutôt que dans le dossier monté, **n8n n'a pas besoin d'écrire sur le serveur** : il télécharge le fichier depuis Drive et l'envoie **directement à l'API** (upload), qui répond tout de suite avec le résultat.
 
+**SITUATION RÉELLE (à respecter en priorité)** : les fichiers sont aujourd'hui dans **un seul dossier plat** `CAMUSAT › Suivi Carburant` (ID `12PXpapzJhN-JYiwmPH8lQXXl-k0nmY4Z`), **sans sous-dossiers**, avec leurs noms d'origine :
+- `Esco Senegal - Synthèse Conso Fuel Septembre 2026_Final v1 1.xlsb` (≈ 10,3 Mo) → **CLOSING**
+- `REMONTEES DE CARBURANT DU 26 OCTOBRE AU 01 NOVEMBRE 2026.xlsx` (≈ 12 Ko) → **SCSS**
+- `Template remontées Loliforce Camusat 2026 v03112026.xlsx` (≈ 1,2 Mo) → **LOLIFORCE**
+
+**Ne rien renommer, ne rien déplacer au premier lancement.** Deux modes, dans cet ordre :
+1. **Si des sous-dossiers `closing / loliforce / scss / target` existent** → mode « par dossier » (décrit plus bas).
+2. **Sinon (cas actuel) → mode « dossier plat »** : lister les fichiers du dossier racine (ignorer les dossiers, `~$*`, `.*`, et les fichiers déjà journalisés) et **déterminer la source** ainsi :
+   - nom contenant `Synth` **et** `Conso Fuel` (insensible à la casse/accents) → `CLOSING` ;
+   - nom contenant `REMONTEES DE CARBURANT` / `REMONTÉES DE CARBURANT` ou `scss` → `SCSS` ;
+   - nom contenant `Loliforce` → `LOLIFORCE` ;
+   - nom contenant `target` → `TARGET_FUEL` ;
+   - sinon (nom inconnu) : appeler `POST {BASE}/fuel-tracking/stock/imports/analyser/` (multipart `file`, **sans** `source_type`) et lire `source_detectee` ; si la valeur est `LOLIFORCE_OU_SCSS`, lire dans la réponse la colonne « Site gardé par » (`gardiennage declaré`) : tout `SCSS` → `SCSS`, tout `LOLIFORCE` → `LOLIFORCE`, mélange ou vide → **ne pas importer**, alerte « source ambiguë ».
+   - **Double contrôle obligatoire** : avant l'import, appeler `POST stock/imports/analyser/` avec la `source_type` déduite ; si `source_detectee` contredit la source déduite du nom (ex. nom = Loliforce mais le fichier contient « SCSS »), **ne pas importer** et lever 🔴 « source incohérente ».
+   - Après traitement, **déplacer** le fichier dans des sous-dossiers `_traites` / `_rejetes` créés sous le dossier racine (jamais supprimer ; préfixe `AAAA-MM-JJ_` si le nom existe déjà). Ces deux dossiers sont ignorés lors des listages.
+   - **Recommandation à afficher une fois** : « Pour plus de robustesse, créez les sous-dossiers `1_Closing`, `2_Loliforce`, `3_SCSS`, `4_Target_fuel` : la source ne dépendra plus du nom du fichier. »
+
+⚠️ **Fichier Closing `.xlsb`** : la copie qui m'a été transmise s'arrête brutalement (archive Excel incomplète, 21 parties sur ~34 feuilles lisibles). La taille indiquée sur Drive (≈ 10,3 Mo) est identique : le fichier est donc probablement **déjà incomplet à la source**. Si l'API répond « illisible » ou rejette le lot pour ce fichier : lever 🔴 « Closing illisible — ouvrir dans Excel (Réparer), enregistrer en `.xlsx` ou `.xlsb`, redéposer », **ne pas réessayer en boucle**, et poursuivre avec les autres fichiers.
+
 **Dossier Drive racine (déjà créé)** : https://drive.google.com/drive/u/0/folders/12PXpapzJhN-JYiwmPH8lQXXl-k0nmY4Z — **ID du dossier : `12PXpapzJhN-JYiwmPH8lQXXl-k0nmY4Z`** (à utiliser dans les nœuds Google Drive, option « By ID »).
 Ce dossier doit être **partagé avec le compte Google du credential n8n en lecture + écriture** (n8n y déplace les fichiers traités). Au premier lancement, n8n **liste d'abord les sous-dossiers existants** de ce dossier racine et affiche leurs noms : il fait correspondre chaque sous-dossier à une source par son nom (insensible à la casse/aux accents : contient `closing` → CLOSING, `loliforce` → LOLIFORCE, `scss` → SCSS, `target` → TARGET_FUEL). **Il crée les sous-dossiers manquants** (y compris `_traites` et `_rejetes`) et **ne déplace jamais rien tant que la correspondance n'est pas affichée et cohérente** ; en cas d'ambiguïté (plusieurs sous-dossiers possibles pour une source) il s'arrête et pose la question.
 
