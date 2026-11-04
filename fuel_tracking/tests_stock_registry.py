@@ -809,6 +809,12 @@ class AuditAndApiTests(TmpRootMixin, TestCase):
         self.assertEqual(j["restant_dans_incoming"]["loliforce"], 0)             # le fichier a été déplacé
         self.assertEqual(self.client.post("/api/fuel-tracking/stock/imports/traiter-dossier/").json()["nombre_traites"], 0)   # rien de nouveau
 
+    def test_upload_accepts_target_fuel_source_and_returns_summary(self):
+        self.client.force_authenticate(self.manager)
+        bad = self.client.post("/api/fuel-tracking/stock/imports/", {"file": SimpleUploadedFile("x.xlsx", b"x"), "source_type": "NOPE"})
+        self.assertEqual(bad.status_code, 400)
+        self.assertIn("TARGET_FUEL", bad.json()["detail"])
+
     def test_audit_command_runs_every_section_read_only(self):
         from django.core.management import call_command
         tank("DKR_0001")

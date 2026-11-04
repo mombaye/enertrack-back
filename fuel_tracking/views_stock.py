@@ -582,8 +582,8 @@ class ImportBatchListView(APIView):
         source_type = str(request.data.get("source_type") or "").upper()
         if f is None:
             return Response({"detail": "Fichier manquant."}, status=400)
-        if source_type not in ("LOLIFORCE", "SCSS", "CLOSING", "HISTORICAL_REFUELING", "TANK_MODELS"):
-            return Response({"detail": "Type de source invalide (LOLIFORCE, SCSS, CLOSING, HISTORICAL_REFUELING, TANK_MODELS)."}, status=400)
+        if source_type not in ("LOLIFORCE", "SCSS", "CLOSING", "TARGET_FUEL", "HISTORICAL_REFUELING", "TANK_MODELS"):
+            return Response({"detail": "Type de source invalide (LOLIFORCE, SCSS, CLOSING, TARGET_FUEL, HISTORICAL_REFUELING, TANK_MODELS)."}, status=400)
         if not f.name.lower().endswith(P.ACCEPTED_EXT):
             return Response({"detail": "Format accepté : .xlsx, .xlsm, .xlsb."}, status=400)
         try:

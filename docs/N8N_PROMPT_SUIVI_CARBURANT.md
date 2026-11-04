@@ -46,6 +46,29 @@ Formats : `.xlsx`, `.xlsm`, `.xlsb`. **La source se déduit du dossier, la péri
 - **SCSS = HEBDOMADAIRE, non cumulé** → chaque nouveau fichier est traité.
 - **Closing = mensuel** → le plus récent par mois.
 
+## 2 bis. Variante GOOGLE DRIVE (sans accès au serveur de fichiers)
+
+Si les fichiers sont déposés dans **Google Drive** plutôt que dans le dossier monté, **n8n n'a pas besoin d'écrire sur le serveur** : il télécharge le fichier depuis Drive et l'envoie **directement à l'API** (upload), qui répond tout de suite avec le résultat.
+
+**Arborescence Drive** (un dossier partagé `Suivi Carburant`, partagé avec le compte Google du credential n8n en lecture + écriture) :
+```
+Suivi Carburant/
+  1_Closing/   2_Loliforce/   3_SCSS/   4_Target_fuel/      ← l'utilisateur dépose ici
+  _traites/    _rejetes/                                    ← n8n y DÉPLACE les fichiers après traitement
+```
+**Workflow `SC_01_import_fichiers` (variante Drive)** :
+1. `Google Drive Trigger` (événement « fichier créé dans le dossier », un déclencheur par sous-dossier ; sondage chaque minute) + `Schedule` */10 min de secours (liste des fichiers présents dans `1_…`, `2_…`, `3_…`, `4_…`).
+2. `Google Drive – Download` (convertir **jamais** : garder le binaire d'origine ; les `.xlsb` restent `.xlsb`). Contrôles : taille > 0 ; si l'extension n'est pas `.xlsx/.xlsm/.xlsb` → alerte, ne pas envoyer ; calcul SHA-256 pour le journal.
+3. Règle « dernières données » (§2) appliquée **par dossier Drive**, d'après la date de création Drive et `vJJMMAAAA` du nom.
+4. Pour chaque fichier retenu : `SC_00_auth_egrid` puis `HTTP Request` **POST `{BASE}/fuel-tracking/stock/imports/`**, `multipart/form-data` : champ `file` (binaire), champ `source_type` = `CLOSING` (1_Closing) · `LOLIFORCE` (2_Loliforce) · `SCSS` (3_SCSS) · `TARGET_FUEL` (4_Target_fuel). Timeout 300 s. Réponse `201` = lot créé : `id`, `status` (`ACCEPTED` / `VALIDATION_REQUIRED` / `REJECTED`), `rows_total`, `rows_accepted`, `rows_warning`, `rows_rejected`, `rows_duplicate`, `rows_pending`, `declared_period_start/end`, `summary.codes` (motifs), `summary.dates_impossibles`, `duplicate_of`. `400` = source/format invalide, `403` = compte non admin/manager, `503` = dossier d'import serveur indisponible.
+5. Alertes et journal : **identiques au §5 points 6 à 8** (mêmes seuils : rejeté, validation requise, taux de rejet > 15 %, dates impossibles, motifs `UNKNOWN_UNIT` / `MISSING_LEVEL` / `MISSING_DATE`, doublon = info sans alerte). Rapport CSV du lot : `GET {BASE}/fuel-tracking/stock/imports/{id}/rapport/` (joindre aux alertes).
+6. **Déplacer** le fichier Drive : lot `ACCEPTED` ou doublon → `_traites/` ; `REJECTED` ou erreur → `_rejetes/` (jamais supprimer ; ajouter un préfixe `AAAA-MM-JJ_` au nom pour éviter les collisions). `VALIDATION_REQUIRED` → `_traites/` + alerte 🟠.
+7. Sortie affichée : même tableau que le §5 (fichier, source, statut, lues, acceptées, rejetées, doublons, taux de rejet, période, motifs, rapport) ; `restant_dans_incoming` ne s'applique pas dans cette variante.
+
+⚠️ L'upload via API traite le fichier **immédiatement** (pas de cycle de 15 min). Un fichier envoyé deux fois est reconnu (même empreinte) : statut `REJECTED` avec `duplicate_of` renseigné → à traiter comme « déjà reçu ». Si un proxy inverse précède l'API, il doit accepter des corps ≥ 50 Mo (`client_max_body_size 50m` pour nginx) : le Closing `.xlsb` fait plus de 10 Mo.
+
+Les **workflows SC_02 et SC_03 sont inchangés** (ils ne dépendent que de l'API). Choisis **une seule** variante (dossier monté §2 **ou** Drive §2 bis) : ne jamais traiter la même source par les deux.
+
 ## 3. Accès API
 
 - Base : `<EGRID_API_URL>` (se termine par `/api`, ex. `https://egrid.exemple.sn/api`).
