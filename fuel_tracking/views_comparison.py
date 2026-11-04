@@ -81,3 +81,13 @@ class ConsommationsExportView(APIView):
         r["Content-Disposition"] = f'attachment; filename="{name}"'
         r["X-Row-Count"] = str(n)
         return r
+
+
+class ConsommationsSanteView(APIView):
+    """GET /api/fuel-tracking/consommations/sante/ — fraîcheur des sources, couverture des relevés gardiens, sites en retard."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from fuel_tracking.services.data_health import health
+
+        return Response(health())

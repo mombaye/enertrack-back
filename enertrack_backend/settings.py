@@ -242,6 +242,11 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'fuel_tracking.check_cph_health_daily',
         'schedule': crontab(hour=6, minute=53),
     },
+    # Bilans de stock des 2 derniers mois complets : recalculés chaque nuit (nouvelles données Closing / gardiens / ENOC prises en compte seules).
+    'fuel-balances-nightly': {
+        'task': 'fuel_tracking.auto_compute_stock_balances',
+        'schedule': crontab(hour=3, minute=11),
+    },
     'fuel-stock-sync-5min': {
         'task': 'fuel_tracking.sync_fuel_stock_current',
         'schedule': crontab(minute='*/5'),

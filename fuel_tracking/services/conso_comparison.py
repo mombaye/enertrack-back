@@ -20,6 +20,7 @@ from datetime import date
 from django.conf import settings
 
 from fuel_tracking.services import fuel_target as TG
+from fuel_tracking.services import gap_explanation as GX
 from fuel_tracking.services.period_utils import day_bounds, latest_balances_by_site
 from fuel_tracking.services.stock_period_balance import RULE_VERSION, alert_codes_of
 
@@ -241,6 +242,7 @@ def _row(cph: dict | None, b, d_from: date, d_to: date, days: int, target, thres
     closing_indep = None
     if ref is not None and b is not None:
         closing_indep = not (b.source_stock_initial == "CLOSING" and b.source_stock_final == "CLOSING" and (ref.get("decision") in (None, "COMPLEMENT_CLOSING", "CONFLIT", "CLOSING_FAIT_FOI")))
+    explication = GX.explain(b, var, conso_closing, ref) if b is not None else GX.explain(None, None, None, None)
     row = {
         "site_id": site_id, "site_name": (cph or {}).get("site_name") or (b.site_name if b else None), "country": (cph or {}).get("country") or (b.country if b else None),
         "zone": (cph or {}).get("zone") or (b.zone if b else None), "typologie": (b.typologie if b else None) or (cph or {}).get("site_type"),
@@ -258,7 +260,7 @@ def _row(cph: dict | None, b, d_from: date, d_to: date, days: int, target, thres
             "score": b.score_confiance if b else None, "reserves": (b.reserves or []) if b else [], "alertes": alerts, "alertes_comparaison": cmp_alerts, "bilan_id": b.pk if b else None,
             "motif": " · ".join(motifs) or None, "action": _action(b, statut),
         },
-        "closing": {"conso_l": conso_closing, "ecart_l": ecart_cl, "ecart_pct": pct_cl, "pct_na": na_cl, "controle_independant": closing_indep},
+        "closing": {"conso_l": conso_closing, "ecart_l": ecart_cl, "ecart_pct": pct_cl, "pct_na": na_cl, "controle_independant": closing_indep, "explication": explication},
         "target": {"periode_l": tgt_f, "mensuel_l": _f(target.target_mensuel_l) if target else None, "source": target.source_target if target else None,
                    "statut": statut_target, "position": position, "annee_reference": target.reference_year if target else None,
                    "ecart_l": ecart_tg, "ecart_pct": pct_tg, "pct_na": na_tg},
@@ -294,6 +296,11 @@ def _filter(rows: list[dict], p) -> list[dict]:
     site = (p.get("site") or "").strip().lower()
     if site:
         rows = [r for r in rows if site in r["site_id"].lower() or site in (r["site_name"] or "").lower()]
+    corr = (p.get("correspondance") or "").strip().lower()
+    if corr == "avec":
+        rows = [r for r in rows if r["correspondance"]["utilise"]]
+    elif corr == "sans":
+        rows = [r for r in rows if not r["correspondance"]["utilise"]]
     cert = (p.get("statut_certification") or "").strip().lower()
     if cert == "certifie":
         rows = [r for r in rows if r["stock"]["statut"] == CERTIFIEE]
@@ -360,6 +367,13 @@ def _kpis(rows: list[dict]) -> dict:
     }
 
 
+def closing_base_sites() -> set[str]:
+    """Base de référence = sites présents dans le fichier Closing (mêmes sites que le fichier). Vide si aucun Closing n'a été importé."""
+    from fuel_tracking.models import FuelStockObservation as Obs
+
+    return {s.upper() for s in Obs.objects.filter(source_type="CLOSING").values_list("site_id", flat=True).distinct() if s}
+
+
 def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) -> dict:
     """Calcule le tableau de comparaison unique pour la période EXACTE [d_from 00:00:00 ; d_to 23:59:59]."""
     from fuel_tracking.services.cph_health import freshness
@@ -375,6 +389,12 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
     targets = TG.active_targets()
     ids = sorted(set(balances) | {s for s, r in cph_by_site.items() if r.get("perimetre", "GE") == "GE"})
     rows = [_row(cph_by_site.get(sid), balances.get(sid), d_from, d_to, days, targets.get(sid.upper()), {}) for sid in ids]
+    # Correspondance avec la base du fichier Closing : un site sans correspondance est AFFICHÉ mais jamais utilisé dans les totaux et indicateurs.
+    base = closing_base_sites()
+    for r in rows:
+        ok = (not base) or r["site_id"].upper() in base
+        r["correspondance"] = {"base_closing": ok, "utilise": ok,
+                               "motif": None if ok else "Site absent du fichier Closing (base de référence) : affiché pour information, exclu des totaux et des indicateurs."}
     rows = _filter(rows, params)
     order = (params.get("tri") or "site").strip()
     sev = {NON_CALCULABLE: 0, VARIATION_CALCULEE: 1, ESTIMATION: 2, PRET: 3, CERTIFIEE: 4}
@@ -400,7 +420,10 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
                     "libelle": f"{d_from:%d/%m/%Y} 00:00:00 → {d_to:%d/%m/%Y} 23:59:59",
                     "bilan_disponible": bool(balances), "sites_avec_bilan": len(balances),
                     "sites_calculables": sum(1 for b in balances.values() if bilan_status(b) != NON_CALCULABLE), "regle": RULE_VERSION},
-        "kpis": _kpis(rows), "rows": rows, "labels": LABELS, "aide": HELP,
+        "kpis": {**_kpis([r for r in rows if r["correspondance"]["utilise"]]),
+                 "sans_correspondance": {"sites": sum(1 for r in rows if not r["correspondance"]["utilise"]), "base_closing_sites": len(base),
+                                         "note": "Sites hors du fichier Closing : affichés, non utilisés dans les totaux."}},
+        "rows": rows, "labels": LABELS, "aide": HELP,
         "qualite_cph": [c for c in _couvertures([r for r in cph_rows if r.get("perimetre", "GE") == "GE"]) if c.get("code") != "rapprochement"] if with_cph_quality else [],
         "facettes": {
             "pays": uniq(lambda r: r["country"]), "zones": uniq(lambda r: r["zone"]), "typologies": uniq(lambda r: r["typologie"]),
@@ -442,6 +465,7 @@ def _flat(r: dict) -> dict:
     s, cl, tg, ins, cp, ce = r["stock"], r["closing"], r["target"], r["instrumentee"], r["cph"], r["certification"]
     pc = lambda g: g["ecart_pct"] if g["ecart_pct"] is not None else g.get("pct_na")  # noqa: E731
     return {
+        "Correspondance base Closing": "oui" if r["correspondance"]["utilise"] else "non (affiché, exclu des totaux)",
         "Pays": r["country"], "Zone": r["zone"], "Site ID": r["site_id"], "Nom du site": r["site_name"], "Typologie site": r["typologie"], "Typologie énergie": r["typologie_energie"],
         "Modèle GE": r["modele_ge"], "Puissance nominale GE (kVA)": r["puissance_nominale_kva"], "Source puissance GE": r["source_puissance"],
         "Date début": r["periode"]["debut"], "Date fin": r["periode"]["fin"], "Nombre de jours": r["periode"]["jours"],
@@ -451,6 +475,8 @@ def _flat(r: dict) -> dict:
         "Stock final (L)": s["final_l"], "Source stock final": s["source_final"], LABELS["variation"]: s["variation_l"], "Statut bilan": s["statut"], "Score": s["score"],
         "Réserve / motif": s["motif"], "Alertes": " | ".join(s["alertes"]), "Alertes de comparaison": " | ".join(s["alertes_comparaison"]), "Action attendue": s["action"],
         LABELS["closing"]: cl["conso_l"], "Contrôle Closing indépendant": ("oui" if cl["controle_independant"] else "non" if cl["controle_independant"] is False else ""), "Écart variation vs Closing (L)": cl["ecart_l"], "Écart variation vs Closing (%)": pc(cl),
+        "Explication de l'écart Closing": " | ".join(f"{i['label']}" + (f" ({i['montant_l']:+.0f} L)" if i["montant_l"] is not None else "") for i in cl["explication"]["items"]),
+        "Écart Closing expliqué (L)": cl["explication"]["explique_l"], "Écart Closing inexpliqué (L)": cl["explication"]["residuel_l"],
         LABELS["target"]: tg["periode_l"], "Target mensuel (L/mois)": tg["mensuel_l"], "Source target": tg["source"], "Statut target": tg["statut"], "Position vs target": tg["position"],
         "Écart variation vs target (L)": tg["ecart_l"], "Écart variation vs target (%)": pc(tg),
         LABELS["instrumentee"]: ins["conso_l"], "Couverture instrumentée (%)": ins["couverture_pct"], "Écart variation vs instrumentée (L)": ins["ecart_l"],

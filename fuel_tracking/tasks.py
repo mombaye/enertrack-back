@@ -212,3 +212,20 @@ def process_fuel_import_incoming(self):
             logger.info("[fuel_tracking] import stock %s %s → %s (%s)", b.source_type, b.file_name, b.status, b.status_message)
     except Exception:
         logger.exception("[fuel_tracking] Échec traitement des fichiers du registre stock")
+
+
+@shared_task(bind=True, name="fuel_tracking.auto_compute_stock_balances")
+@_exclusive("auto_compute_stock_balances", 3 * 3600)
+def auto_compute_stock_balances(self):
+    """
+    Calcul AUTOMATIQUE des bilans de stock des deux derniers mois complets (pour les mois à venir : plus aucune commande manuelle).
+    Les nouvelles données (Closing, gardiens cumulés, ENOC) sont prises en compte à chaque passage ; une certification existante dont les
+    données changent passe à « À recertifier » (jamais écrasée en silence). Idempotent.
+    """
+    from fuel_tracking.services.auto_balances import compute_recent_months
+
+    try:
+        return compute_recent_months(2)
+    except Exception:
+        logger.exception("[fuel_tracking] Échec du calcul automatique des bilans de stock")
+        return None

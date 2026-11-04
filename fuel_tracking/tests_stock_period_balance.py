@@ -1031,3 +1031,68 @@ class PostDeployTests(BalanceBase):
         self.assertGreater(PgSite.objects.count(), 0)
         self.assertGreater(PgInvoiceFact.objects.count(), 0)
         self.assertIn("reconstruction", out.getvalue())
+
+
+class ClosingGapAndHealthTests(BalanceBase):
+    """Écart variation vs Closing : décomposition exacte, correspondance avec la base Closing, santé des données, calcul automatique."""
+
+    cph_row = ConsoComparisonTests.cph_row
+    build = ConsoComparisonTests.build
+    days = ConsoComparisonTests.days
+
+    def test_gap_explained_by_initial_stock_difference(self):
+        from fuel_tracking.services import gap_explanation as GX
+        b = mock.Mock(candidats={"initial": [{"source": "CLOSING", "litres": 1000.0, "date": "2026-07-31"}], "final": [{"source": "CLOSING", "litres": 400.0, "date": "2026-08-31"}]},
+                      stock_initial_l=900, stock_final_l=400, source_stock_initial="LOLIFORCE", source_stock_final="CLOSING", date_stock_initial="2026-07-31", date_stock_final="2026-08-31",
+                      age_stock_initial_j=0, age_stock_final_j=0, estimation=False, mouvements_exclus=[], alertes=[],
+                      livraisons_externes_l=0, carte_total_l=0, transferts_entrants_l=0, rajouts_l=0, transferts_sortants_l=0, retraits_l=0, vols_l=0, vidanges_l=0)
+        out = GX.explain(b, 500.0, 600.0, {"mouvements_nets_closing_l": 0.0})
+        self.assertEqual(out["ecart_l"], -100.0)
+        self.assertEqual([i["code"] for i in out["items"]], ["STOCK_INITIAL_DIFFERENT"])
+        self.assertEqual((out["explique_l"], out["residuel_l"], out["quantifiable"]), (-100.0, 0.0, True))
+
+    def test_gap_not_quantifiable_without_closing_data(self):
+        from fuel_tracking.services import gap_explanation as GX
+        self.assertFalse(GX.explain(None, None, None, None)["quantifiable"])
+        b = mock.Mock(candidats={}, stock_initial_l=900, stock_final_l=400, age_stock_initial_j=3, age_stock_final_j=0, estimation=True, mouvements_exclus=[], alertes=[])
+        out = GX.explain(b, 500.0, 600.0, None)
+        self.assertFalse(out["quantifiable"])
+        self.assertIsNone(out["residuel_l"])                                    # jamais de résiduel inventé
+        self.assertEqual({i["code"] for i in out["items"]}, {"RELEVE_ELOIGNE_BORNE", "CONVERSION_ESTIMEE"})
+
+    def test_site_without_closing_match_displayed_but_excluded_from_kpis(self):
+        self.obs(900, self.start + timedelta(hours=1), site="DKR_0002", source="CLOSING")     # la base Closing ne contient que DKR_0002
+        self.stocks(1000, 400)
+        SB.compute_balances(self.start, self.end, site_ids=["DKR_0001"])
+        out = self.build([self.cph_row(theo="600", measured="600", days_measured=self.days())])
+        r = {x["site_id"]: x for x in out["rows"]}["DKR_0001"]
+        self.assertFalse(r["correspondance"]["utilise"])
+        self.assertEqual(out["kpis"]["sans_correspondance"]["sites"], 1)
+        self.assertEqual(len(self.build([self.cph_row(theo="600")], correspondance="sans")["rows"]), 1)
+        self.assertEqual(len(self.build([self.cph_row(theo="600")], correspondance="avec")["rows"]), 0)
+
+    def test_no_closing_base_means_no_exclusion(self):
+        self.stocks(1000, 400)
+        SB.compute_balances(self.start, self.end, site_ids=["DKR_0001"])
+        r = self.build([self.cph_row(theo="600")])["rows"][0]
+        self.assertTrue(r["correspondance"]["utilise"])
+
+    def test_health_lists_late_and_missing_readings(self):
+        from fuel_tracking.services import data_health as DH
+        old = timezone.now() - timedelta(days=40)
+        self.obs(800, timezone.now() - timedelta(days=2), site="DKR_0001", source="LOLIFORCE")
+        self.obs(800, old, site="DKR_0002", source="LOLIFORCE")
+        for s in ("DKR_0001", "DKR_0002", "DKR_0003"):
+            self.obs(700, old, site=s, source="CLOSING")
+        h = DH.health()
+        self.assertEqual(h["couverture"]["sites_base_closing"], 3)
+        self.assertEqual([x["site_id"] for x in h["releves_en_retard"]], ["DKR_0002"])
+        self.assertEqual(h["sites_sans_releve"], ["DKR_0003"])
+        self.assertEqual(h["couverture"]["sites_releve_gardien_recent"], 1)
+
+    def test_last_complete_months_and_auto_compute(self):
+        from datetime import date
+        from fuel_tracking.services import auto_balances as AB
+        self.assertEqual(AB.last_complete_months(2, date(2026, 1, 15)), [(date(2025, 12, 1), date(2025, 12, 31)), (date(2025, 11, 1), date(2025, 11, 30))])
+        res = AB.compute_recent_months(1, date(2026, 11, 4))
+        self.assertEqual(res[0]["debut"], "2026-10-01")
