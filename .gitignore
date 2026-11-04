@@ -22,3 +22,4 @@ data_imports/stan/*.xlsb
 !data_imports/grid_sites/
 !data_imports/grid_sites/Listes_Sites_GRID_sample.csv
 celerybeat-schedule
+.demo/
