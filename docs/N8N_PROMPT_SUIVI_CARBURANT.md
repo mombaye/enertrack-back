@@ -68,6 +68,13 @@ Suivi_carburant_prod/
 - n8n peut donc utiliser le déclencheur **Local File Trigger** (ou SFTP/Drive) sur les dossiers sources, et un second déclencheur sur `accepted/` / `rejected/` pour savoir quand le traitement est terminé et lancer WF-04 / alerter avec le rapport.
 - Si n8n tourne dans Docker, monter le même chemin hôte dans le conteneur n8n (`/mnt/suivi_carburant_prod:/files/suivi_carburant`) ; n8n n'a besoin d'écrire que dans `incoming/`.
 
+### Règle « dernières données » (à appliquer dans WF-01/WF-02)
+- **Loliforce = fichier CUMULÉ** (« Template remontées Loliforce Camusat … vJJMMAAAA », une feuille par zone, blocs « SEMAINE n », ~13 000 lignes depuis février). Le plus récent contient tout : ne traiter que **la version la plus récente** du dossier (date `vJJMMAAAA` du nom, sinon date de modification). Les anciennes versions sont inutiles (les relire est inoffensif : la plateforme dédoublonne ligne par ligne).
+- **SCSS = fichier HEBDOMADAIRE non cumulé** (« REMONTEES DE CARBURANT DU jj AU jj mois aaaa ») : traiter **chaque nouveau fichier** (dédoublonné par empreinte).
+- **Closing = fichier mensuel** : traiter le plus récent par mois (« … Conso Fuel <Mois> <Année> … »).
+- La source se déduit du **dossier**, la période du **contenu** : ne jamais deviner d'après le nom du fichier.
+- Après chaque import, lire le lot et le rapport : alerter si > 15 % de lignes rejetées, si une date est invraisemblable (futur/antérieure à l'année), si un texte libre figure dans la colonne « Relevé en CM » (ex. « Pas de jauge »), ou si le fichier est tronqué/illisible.
+
 ## 5. Accès à la plateforme
 
 - Base : `<EGRID_API_URL>` (se termine par `/api`).
