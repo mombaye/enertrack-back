@@ -60,6 +60,9 @@ python manage.py auto_import_stan
 echo "Synchronisation carburant initiale en arrière-plan (3 derniers mois)..."
 python manage.py sync_recent_months --months 3 &
 
+echo "Tâches post-déploiement en arrière-plan (tables Pilotage Grid, bilans obsolètes)..."
+python manage.py fuel_post_deploy &
+
 echo "Démarrage de Gunicorn..."
 exec gunicorn enertrack_backend.wsgi:application \
     --bind 0.0.0.0:8000 \

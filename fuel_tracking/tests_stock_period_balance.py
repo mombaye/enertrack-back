@@ -992,3 +992,42 @@ class DefaultPeriodTests(BalanceBase):
         SB.compute_balances(recent_start, recent_end, site_ids=["DKR_0002"])
         d1, d2 = default_period(today=(recent_end + timedelta(days=5)).date())
         self.assertEqual((d1, d2), (self.start.date(), self.end.date()))
+
+
+class PostDeployTests(BalanceBase):
+    def test_stale_balances_are_recomputed_once_and_command_is_idempotent(self):
+        from fuel_tracking.models import FuelStockBalance
+        self.stocks(1000, 400)
+        SB.compute_balances(self.start, self.end, site_ids=["DKR_0001"])
+        FuelStockBalance.objects.update(variation_stock_l=None)           # bilan issu de l'ancienne règle
+        out = StringIO()
+        call_command("fuel_post_deploy", stdout=out)
+        self.assertIn("recalcul", out.getvalue())
+        self.assertEqual(FuelStockBalance.objects.get(site_id="DKR_0001").variation_stock_l, Decimal("600"))
+        out2 = StringIO()
+        call_command("fuel_post_deploy", stdout=out2)
+        self.assertIn("à jour", out2.getvalue())
+        self.assertNotIn("recalcul.", out2.getvalue())
+
+    def test_dry_run_changes_nothing(self):
+        from fuel_tracking.models import FuelStockBalance
+        self.stocks(1000, 400)
+        SB.compute_balances(self.start, self.end, site_ids=["DKR_0001"])
+        FuelStockBalance.objects.update(variation_stock_l=None)
+        call_command("fuel_post_deploy", "--dry-run", stdout=StringIO())
+        self.assertIsNone(FuelStockBalance.objects.get(site_id="DKR_0001").variation_stock_l)
+
+    def test_pilotage_tables_rebuilt_when_empty(self):
+        from pilotage_grid.models import PgInvoiceFact, PgSite
+        from pilotage_grid.services import store
+        from pilotage_grid.tests import calc_fixtures
+        p, s = calc_fixtures()
+        store.save_version("paiements", p)
+        store.save_version("sites", s)
+        PgInvoiceFact.objects.all().delete()
+        PgSite.objects.all().delete()
+        out = StringIO()
+        call_command("fuel_post_deploy", stdout=out)
+        self.assertGreater(PgSite.objects.count(), 0)
+        self.assertGreater(PgInvoiceFact.objects.count(), 0)
+        self.assertIn("reconstruction", out.getvalue())
