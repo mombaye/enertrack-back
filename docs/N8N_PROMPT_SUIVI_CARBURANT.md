@@ -50,9 +50,12 @@ Formats : `.xlsx`, `.xlsm`, `.xlsb`. **La source se déduit du dossier, la péri
 
 Si les fichiers sont déposés dans **Google Drive** plutôt que dans le dossier monté, **n8n n'a pas besoin d'écrire sur le serveur** : il télécharge le fichier depuis Drive et l'envoie **directement à l'API** (upload), qui répond tout de suite avec le résultat.
 
-**Arborescence Drive** (un dossier partagé `Suivi Carburant`, partagé avec le compte Google du credential n8n en lecture + écriture) :
+**Dossier Drive racine (déjà créé)** : https://drive.google.com/drive/u/0/folders/12PXpapzJhN-JYiwmPH8lQXXl-k0nmY4Z — **ID du dossier : `12PXpapzJhN-JYiwmPH8lQXXl-k0nmY4Z`** (à utiliser dans les nœuds Google Drive, option « By ID »).
+Ce dossier doit être **partagé avec le compte Google du credential n8n en lecture + écriture** (n8n y déplace les fichiers traités). Au premier lancement, n8n **liste d'abord les sous-dossiers existants** de ce dossier racine et affiche leurs noms : il fait correspondre chaque sous-dossier à une source par son nom (insensible à la casse/aux accents : contient `closing` → CLOSING, `loliforce` → LOLIFORCE, `scss` → SCSS, `target` → TARGET_FUEL). **Il crée les sous-dossiers manquants** (y compris `_traites` et `_rejetes`) et **ne déplace jamais rien tant que la correspondance n'est pas affichée et cohérente** ; en cas d'ambiguïté (plusieurs sous-dossiers possibles pour une source) il s'arrête et pose la question.
+
+**Arborescence cible** (sous le dossier racine ci-dessus) :
 ```
-Suivi Carburant/
+<dossier racine 12PXpapzJhN-JYiwmPH8lQXXl-k0nmY4Z>/
   1_Closing/   2_Loliforce/   3_SCSS/   4_Target_fuel/      ← l'utilisateur dépose ici
   _traites/    _rejetes/                                    ← n8n y DÉPLACE les fichiers après traitement
 ```
