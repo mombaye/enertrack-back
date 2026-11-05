@@ -932,7 +932,14 @@ def _process_target(batch, file_bytes: bytes, file_name: str) -> dict:
     return fuel_target.process_target_file(batch, file_bytes, file_name)
 
 
+def _process_terrain(batch, file_bytes: bytes, file_name: str) -> dict:
+    from fuel_tracking.services import terrain_monthly
+
+    return terrain_monthly.process_terrain_file(batch, file_bytes, file_name)
+
+
 PROCESSORS = {
+    "TERRAIN_MENSUEL": _process_terrain,
     "TARGET_FUEL": _process_target,
     "LOLIFORCE": process_guard_file,
     "SCSS": process_guard_file,

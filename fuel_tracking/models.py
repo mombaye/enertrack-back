@@ -1034,6 +1034,7 @@ class FuelImportBatch(models.Model):
         HISTORICAL_REFUELING = "HISTORICAL_REFUELING", "Historique refueling — source historique"
         TANK_MODELS = "TANK_MODELS", "Modèles de cuves — calculateur et conversion cm vers litres"
         TARGET_FUEL = "TARGET_FUEL", "Target fuel mensuel par site (Closing historique, onglet NR analyse variation conso fuel)"
+        TERRAIN_MENSUEL = "TERRAIN_MENSUEL", "Remontées terrain mensuelles — fichier complémentaire"
 
     class Status(models.TextChoices):
         RECEIVED = "RECEIVED", "Reçu"
@@ -1253,6 +1254,7 @@ class FuelStockObservation(models.Model):
         SCSS = "SCSS", "SCSS"
         SNOWFLAKE = "SNOWFLAKE", "Snowflake (information technique)"
         CLOSING = "CLOSING", "Closing"
+        TERRAIN_MENSUEL = "TERRAIN_MENSUEL", "Remontées terrain mensuelles"
 
     class Unit(models.TextChoices):
         L = "L", "Litres"
@@ -1349,6 +1351,7 @@ class FuelMovement(models.Model):
         ENOC = "ENOC", "ENOC"
         HISTORICAL_REFUELING = "HISTORICAL_REFUELING", "Historique refueling"
         CLOSING = "CLOSING", "Closing"
+        TERRAIN_MENSUEL = "TERRAIN_MENSUEL", "Remontées terrain mensuelles"
 
     class MovementType(models.TextChoices):
         DELIVERY = "DELIVERY", "Livraison confirmée"

@@ -1111,3 +1111,17 @@ class ClosingGapAndHealthTests(BalanceBase):
         from fuel_tracking.services import stock_import_pipeline as P
         self.assertEqual(P.INCOMING["target_fuel"], "TARGET_FUEL")
         self.assertIn("target_fuel", P.INCOMING)
+
+    def test_validation_prod_command_reports_checks_read_only(self):
+        from django.core.management import call_command
+        self.stocks(1000, 400)
+        SB.compute_balances(self.start, self.end, site_ids=["DKR_0001"])
+        before = (FuelStockBalance.objects.count(), FuelMovement.objects.count())
+        out = StringIO()
+        with mock.patch("fuel_tracking.services.cph_service.compute_period_summary", return_value=[]):
+            call_command("fuel_validation_prod", "--debut", str(self.start.date()), "--fin", str(self.end.date()), stdout=out)
+        txt = out.getvalue()
+        self.assertIn("PONCTIONS_SOMME_GLOBALE_ZERO", txt)
+        self.assertIn("[PASS] AUCUN_NULL_TRANSFORME_EN_ZERO", txt)
+        self.assertIn("[PASS] CERTIFIEE_VIDE_AVANT_VALIDATION", txt)
+        self.assertEqual(before, (FuelStockBalance.objects.count(), FuelMovement.objects.count()))   # lecture seule

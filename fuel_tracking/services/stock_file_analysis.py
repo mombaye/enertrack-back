@@ -38,6 +38,8 @@ def guess_source(sheets: list[dict], file_name: str) -> str | None:
     if "relevé en cm" in heads or "site gardé par" in heads:
         name = file_name.lower()
         return "SCSS" if "scss" in name else "LOLIFORCE" if "loli" in name else "LOLIFORCE_OU_SCSS"
+    if "site_id" in heads and ("stock_opening_value" in heads or "stock_closing_value" in heads):
+        return "TERRAIN_MENSUEL"
     if "n° ticket fms" in heads or "qtt initiale mesurée sur site (cm)" in heads:
         return "HISTORICAL_REFUELING"
     if "forme géométrique cuve" in heads or "id du site" in heads or CLOSING_SHEET.lower() in names:
@@ -176,6 +178,8 @@ IMPORT_SOURCE_LABEL = {
     "SCSS": "SCSS — relevés de stock terrain",
     "HISTORICAL_REFUELING": "Historique refueling — source historique",
     "TANK_MODELS": "Modèles de cuves — calculateur et conversion cm vers litres",
+    "TERRAIN_MENSUEL": "Remontées terrain mensuelles — fichier complémentaire",
+    "TARGET_FUEL": "Target fuel mensuel par site",
 }
 
 
