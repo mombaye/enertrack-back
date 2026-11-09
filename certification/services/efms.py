@@ -478,6 +478,19 @@ class EfmsService:
         entry = data.get(self._cache_entry_key(site_id, date_debut, date_fin), {})
         return entry.get("periode"), entry.get("30j"), entry.get("last_month_date")
 
+    def get_prefetched_entries(
+        self, cert_batch_id: int, site_id: str, date_debut: date, date_fin: date
+    ) -> tuple[Optional[dict], Optional[dict]]:
+        """
+        (entrée Grid, entrée ACM) préchargées pour cette facture, ou None si absente du cache.
+        Une entrée présente dont les valeurs sont None signifie « aucune donnée trouvée » :
+        réinterroger la source pour la même fenêtre redonnerait le même résultat.
+        """
+        k = self._cache_entry_key(site_id, date_debut, date_fin)
+        grid = (cache.get(self._cache_key_grid(cert_batch_id)) or {}).get(k)
+        acm = (cache.get(self._cache_key_acm(cert_batch_id)) or {}).get(k)
+        return grid, acm
+
     # ─────────────────────────────────────────────────────────────────────────
     # Fallbacks ponctuels (si cache absent — ne devrait pas arriver en prod)
     # ─────────────────────────────────────────────────────────────────────────

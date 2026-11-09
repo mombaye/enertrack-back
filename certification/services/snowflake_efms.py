@@ -11,7 +11,7 @@ Clés de cache Redis préfixées différemment pour ne pas entrer en collision
 avec EfmsService pendant la phase de comparaison.
 """
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Optional
 
@@ -21,6 +21,15 @@ from certification.services.efms import EfmsService, EfmsConnectionError, EfmsQu
 from certification.services.snowflake_service import SnowflakeService, SnowflakeConnectionError
 
 logger = logging.getLogger(__name__)
+
+
+def _as_date(v):
+    """DATE renvoyée par le connecteur (date, datetime ou texte ISO) → date."""
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    return date.fromisoformat(str(v)[:10])
 
 
 class SnowflakeEfmsService(EfmsService):
@@ -54,13 +63,202 @@ class SnowflakeEfmsService(EfmsService):
     # PREFETCH BULK
     # ─────────────────────────────────────────────────────────────────────────
 
+    # Paires (site, période) par requête groupée : ~1 900 factures → 4 lots × 3 requêtes.
+    BULK_PAIRS_PER_QUERY = 500
+
     def prefetch_batch(
         self,
         cert_batch_id: int,
         groups: list[tuple[list[str], date, date]],
     ) -> None:
         """
-        `groups` : liste de (site_ids, date_debut, date_fin) — un groupe par
+        Précharge Grid/ACM de toutes les factures du batch en quelques requêtes groupées.
+
+        Avant : 7 requêtes Snowflake PAR période distincte, exécutées l'une après l'autre
+        (fichier d'octobre 2026 : 114 périodes → ~800 requêtes, plus d'une heure avant le
+        premier calcul). Maintenant : 3 requêtes par lot de 500 paires (site, période), chaque
+        valeur restant calculée sur SA période exacte (mêmes filtres, mêmes fenêtres, même
+        conversion _delta_to_conso / _sum_to_conso). En cas d'échec de la voie groupée,
+        repli automatique sur l'ancienne voie période par période.
+        """
+        if not groups:
+            return
+        try:
+            acm_cache, grid_cache = self._prefetch_bulk(groups)
+        except EfmsConnectionError:
+            raise
+        except Exception as e:
+            logger.warning("[Snowflake-eFMS prefetch] voie groupée en échec (%s) — repli période par période", e)
+            return self._prefetch_batch_per_group(cert_batch_id, groups)
+
+        cache.set(self._cache_key_acm(cert_batch_id), acm_cache, timeout=self.CACHE_TTL)
+        cache.set(self._cache_key_grid(cert_batch_id), grid_cache, timeout=self.CACHE_TTL)
+        nb_acm = sum(1 for v in acm_cache.values() if v["periode"] or v["30j"])
+        nb_grid = sum(1 for v in grid_cache.values() if v["periode"] or v["30j"])
+        logger.info(
+            "[Snowflake-eFMS prefetch] Terminé (groupé) — %d paires site/période · ACM %d · Grid %d",
+            len(grid_cache), nb_acm, nb_grid,
+        )
+
+    def _prefetch_bulk(self, groups) -> tuple[dict, dict]:
+        """Voie groupée : une ligne VALUES par paire (site, période), jointe aux tables Snowflake."""
+        pairs = sorted({(sid, d1, d2) for site_ids, d1, d2 in groups for sid in site_ids if sid})
+        acm_cache: dict[str, dict] = {}
+        grid_cache: dict[str, dict] = {}
+        if not pairs:
+            return acm_cache, grid_cache
+
+        try:
+            conn = self.sf._connect()
+        except SnowflakeConnectionError as e:
+            raise EfmsConnectionError(f"Connexion Snowflake échouée: {e}") from e
+
+        db_schema = f"{self.sf.database}.{self.sf.schema}"
+        n = self.BULK_PAIRS_PER_QUERY
+        logger.info("[Snowflake-eFMS prefetch] %d paires site/période, %d période(s), lots de %d",
+                    len(pairs), len({(d1, d2) for _, d1, d2 in pairs}), n)
+        try:
+            cursor = conn.cursor()
+            for i in range(0, len(pairs), n):
+                chunk = pairs[i:i + n]
+                # Bornes calculées en Python (aucune arithmétique de dates côté SQL) :
+                # période [d1, d2] · 30 j [d2-29, d2] · fenêtre ±90 j [d1-90, d2+90].
+                rows = [(sid, d1, d2, d2 - timedelta(days=29), d1 - timedelta(days=90), d2 + timedelta(days=90))
+                        for sid, d1, d2 in chunk]
+                values_sql = ",".join(["(%s,%s,%s,%s,%s,%s)"] * len(rows))
+                params = tuple(x for r in rows for x in r)
+                sites = sorted({r[0] for r in rows})
+                site_ph = ",".join(["%s"] * len(sites))
+                lo = min(min(r[3], r[4]) for r in rows)
+                hi = max(r[5] for r in rows)
+                p_cte = (f"WITH p AS (SELECT c1 AS SITE_ID, CAST(c2 AS DATE) AS D1, CAST(c3 AS DATE) AS D2, "
+                         f"CAST(c4 AS DATE) AS D30, CAST(c5 AS DATE) AS F1, CAST(c6 AS DATE) AS F2 "
+                         f"FROM (VALUES {values_sql}) AS v(c1, c2, c3, c4, c5, c6))")
+
+                def win(lo_col, hi_col, expr, tbl):
+                    return f"CASE WHEN {tbl}.DATE >= p.{lo_col} AND {tbl}.DATE <= p.{hi_col} THEN {expr} END"
+
+                # ── ACM : index cumulatif, MAX-MIN par fenêtre (période, 30 j, ±90 j) ──
+                v_acm = "COALESCE(a.ACT_ENERGY_P, a.ACM_ENERGY_P)"
+                cursor.execute(f"""
+                    {p_cte}
+                    SELECT p.SITE_ID, p.D1, p.D2,
+                        MAX({win('D1', 'D2', v_acm, 'a')}), MIN({win('D1', 'D2', v_acm, 'a')}),
+                        COUNT({win('D1', 'D2', 'a.DATE', 'a')}),
+                        DATEDIFF('day', MIN({win('D1', 'D2', 'a.DATE', 'a')}), MAX({win('D1', 'D2', 'a.DATE', 'a')})),
+                        MAX({win('D30', 'D2', v_acm, 'a')}), MIN({win('D30', 'D2', v_acm, 'a')}),
+                        COUNT({win('D30', 'D2', 'a.DATE', 'a')}),
+                        DATEDIFF('day', MIN({win('D30', 'D2', 'a.DATE', 'a')}), MAX({win('D30', 'D2', 'a.DATE', 'a')})),
+                        MAX({win('F1', 'F2', v_acm, 'a')}) - MIN({win('F1', 'F2', v_acm, 'a')}),
+                        COUNT({win('F1', 'F2', 'a.DATE', 'a')}),
+                        DATEDIFF('day', MIN({win('F1', 'F2', 'a.DATE', 'a')}), MAX({win('F1', 'F2', 'a.DATE', 'a')}))
+                    FROM p
+                    JOIN {db_schema}.AC_METER a
+                      ON a.SITE_ID = p.SITE_ID
+                     AND a.DATE >= LEAST(p.D30, p.F1) AND a.DATE <= p.F2
+                    WHERE a.SITE_ID IN ({site_ph})
+                      AND a.DATE >= %s AND a.DATE <= %s
+                      AND {v_acm} IS NOT NULL AND {v_acm} > 0
+                    GROUP BY p.SITE_ID, p.D1, p.D2
+                """, params + tuple(sites) + (lo, hi))
+                acm_rows = {(r[0], _as_date(r[1]), _as_date(r[2])): r for r in cursor.fetchall()}
+
+                # ── Grid : conso journalière, SUM/COUNT par fenêtre + moyenne ±90 j ──
+                v_g = "g.GRID_ENERGY_CONSO_PER_DAY"
+                cursor.execute(f"""
+                    {p_cte}
+                    SELECT p.SITE_ID, p.D1, p.D2,
+                        SUM({win('D1', 'D2', v_g, 'g')}), COUNT({win('D1', 'D2', 'g.DATE', 'g')}),
+                        SUM({win('D30', 'D2', v_g, 'g')}), COUNT({win('D30', 'D2', 'g.DATE', 'g')}),
+                        AVG({win('F1', 'F2', v_g, 'g')}), COUNT({win('F1', 'F2', 'g.DATE', 'g')})
+                    FROM p
+                    JOIN {db_schema}.GRID_REPORT g
+                      ON g.SITE_ID = p.SITE_ID
+                     AND g.DATE >= LEAST(p.D30, p.F1) AND g.DATE <= p.F2
+                    WHERE g.SITE_ID IN ({site_ph})
+                      AND g.DATE >= %s AND g.DATE <= %s
+                      AND {v_g} IS NOT NULL AND {v_g} > 0.1
+                    GROUP BY p.SITE_ID, p.D1, p.D2
+                """, params + tuple(sites) + (lo, hi))
+                grid_rows = {(r[0], _as_date(r[1]), _as_date(r[2])): r for r in cursor.fetchall()}
+
+                need_lm = []
+                for sid, d1, d2 in chunk:
+                    key = (sid, d1, d2)
+                    nb_p = (d2 - d1).days + 1
+                    a = acm_rows.get(key)
+                    f_args = ((a[11], int(a[12]), int(a[13]) if a[13] is not None else 1)
+                              if a is not None and a[12] else (None, 0, 1))
+
+                    def _acm(mx, mn, cnt, span, nb_j):
+                        if not cnt:
+                            return self._delta_to_conso(None, None, 0, 1, nb_j, *f_args)
+                        return self._delta_to_conso(mx, mn, int(cnt), int(span or 0), nb_j, *f_args)
+
+                    acm_cache[self._cache_entry_key(sid, d1, d2)] = {
+                        "periode": _acm(a[3], a[4], a[5], a[6], nb_p) if a else _acm(None, None, 0, 0, nb_p),
+                        "30j": _acm(a[7], a[8], a[9], a[10], 30) if a else _acm(None, None, 0, 0, 30),
+                    }
+
+                    g = grid_rows.get(key)
+                    gf = (g[7], int(g[8] or 0)) if g is not None and g[8] else (None, 0)
+
+                    def _grid(total, cnt, nb_j):
+                        return self._sum_to_conso(total if cnt else None, int(cnt or 0), nb_j, *gf)
+
+                    conso_30j = _grid(g[5], g[6], 30) if g else _grid(None, 0, 30)
+                    grid_cache[self._cache_entry_key(sid, d1, d2)] = {
+                        "periode": _grid(g[3], g[4], nb_p) if g else _grid(None, 0, nb_p),
+                        "30j": conso_30j,
+                        "last_month_date": None,
+                    }
+                    if conso_30j is None:
+                        need_lm.append((sid, d1, d2))
+
+                # ── Dernier mois complet (uniquement là où le 30 j manque — seul usage de cette valeur) ──
+                lm_pairs = sorted({(sid, d1) for sid, d1, _ in need_lm})
+                lm_rows = {}
+                if lm_pairs:
+                    lm_values = ",".join(["(%s,%s)"] * len(lm_pairs))
+                    lm_sites = sorted({s for s, _ in lm_pairs})
+                    cursor.execute(f"""
+                        WITH p AS (SELECT c1 AS SITE_ID, CAST(c2 AS DATE) AS D1 FROM (VALUES {lm_values}) AS v(c1, c2))
+                        SELECT p.SITE_ID, p.D1, YEAR(g.DATE) AS yr, MONTH(g.DATE) AS mo,
+                               SUM(g.GRID_ENERGY_CONSO_PER_DAY) AS conso, COUNT(g.DATE) AS nb_jours
+                        FROM p
+                        JOIN {db_schema}.GRID_REPORT g ON g.SITE_ID = p.SITE_ID AND g.DATE < p.D1
+                        WHERE g.SITE_ID IN ({",".join(["%s"] * len(lm_sites))})
+                          AND g.GRID_ENERGY_CONSO_PER_DAY IS NOT NULL
+                          AND g.GRID_ENERGY_CONSO_PER_DAY > 0.1
+                        GROUP BY p.SITE_ID, p.D1, YEAR(g.DATE), MONTH(g.DATE)
+                        HAVING COUNT(g.DATE) >= {int(self.MIN_POINTS_EXTRAPOL)}
+                        QUALIFY ROW_NUMBER() OVER (PARTITION BY p.SITE_ID, p.D1 ORDER BY YEAR(g.DATE) DESC, MONTH(g.DATE) DESC) = 1
+                    """, tuple(x for pr in lm_pairs for x in pr) + tuple(lm_sites))
+                    lm_rows = {(r[0], _as_date(r[1])): r for r in cursor.fetchall()}
+
+                for sid, d1, d2 in need_lm:
+                    glm = lm_rows.get((sid, d1))
+                    if glm is None or glm[4] is None:
+                        continue
+                    entry = grid_cache[self._cache_entry_key(sid, d1, d2)]
+                    nb_j_lm = int(glm[5])
+                    if nb_j_lm >= self.MIN_DAYS_DENSE:
+                        entry["30j"] = Decimal(str(glm[4]))
+                    elif nb_j_lm >= self.MIN_POINTS_EXTRAPOL:
+                        entry["30j"] = Decimal(str(glm[4])) / Decimal(str(nb_j_lm)) * 30
+                    entry["last_month_date"] = date(int(glm[2]), int(glm[3]), 1)
+            return acm_cache, grid_cache
+        finally:
+            try: conn.close()
+            except Exception: pass
+
+    def _prefetch_batch_per_group(
+        self,
+        cert_batch_id: int,
+        groups: list[tuple[list[str], date, date]],
+    ) -> None:
+        """
+        Ancienne voie (repli) — `groups` : liste de (site_ids, date_debut, date_fin) — un groupe par
         période de facture DISTINCTE dans le batch, pas une seule fenêtre
         min(debuts)/max(fins) pour tout le batch. Sans ce regroupement par
         période réelle, un site facturé sur ~30 jours mais batché avec des

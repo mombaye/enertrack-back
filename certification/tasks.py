@@ -286,12 +286,19 @@ def certify_single_invoice(self, result_id: int) -> dict:
         date_fin   = invoice.date_fin_periode
 
         # ── Étape 5 : Source PRIMAIRE — Grid ─────────────────────────────────
+        # Une lecture de cache par source. Entrée présente mais vide = le préchargement a déjà interrogé
+        # Snowflake pour cette période exacte sans rien trouver : les requêtes de repli (mêmes fenêtres,
+        # mêmes filtres) redonneraient le même « rien », au prix de 3 connexions par facture.
+        grid_entry, acm_entry = (
+            efms.get_prefetched_entries(cert_batch_id, site_id, date_debut, date_fin)
+            if date_debut and date_fin else (None, None)
+        )
         grid_p, grid_30j, last_month = (
-            efms.get_conso_grid_cached(cert_batch_id, site_id, date_debut, date_fin)
-            if date_debut and date_fin else (None, None, None)
+            (grid_entry.get("periode"), grid_entry.get("30j"), grid_entry.get("last_month_date"))
+            if grid_entry else (None, None, None)
         )
 
-        if grid_p is None and grid_30j is None and date_debut and date_fin:
+        if grid_p is None and grid_30j is None and grid_entry is None and date_debut and date_fin:
             try:
                 grid_p, method = efms.get_conso_periode(site_id, date_debut, date_fin)
                 if grid_p is None:
@@ -313,8 +320,7 @@ def certify_single_invoice(self, result_id: int) -> dict:
 
             # Charger ACM informatif (Grid primaire mais ACM affiché)
             acm_p_info, acm_30j_info = (
-                efms.get_conso_acm_cached(cert_batch_id, site_id, date_debut, date_fin)
-                if date_debut and date_fin else (None, None)
+                (acm_entry.get("periode"), acm_entry.get("30j")) if acm_entry else (None, None)
             )
             if acm_p_info is not None or acm_30j_info is not None:
                 result.estim_conso_acm_periode = acm_p_info
@@ -323,11 +329,10 @@ def certify_single_invoice(self, result_id: int) -> dict:
         else:
             # ── Étape 5B : Fallback — ACM ─────────────────────────────────────
             acm_p, acm_30j = (
-                efms.get_conso_acm_cached(cert_batch_id, site_id, date_debut, date_fin)
-                if date_debut and date_fin else (None, None)
+                (acm_entry.get("periode"), acm_entry.get("30j")) if acm_entry else (None, None)
             )
 
-            if acm_p is None and acm_30j is None and date_debut and date_fin:
+            if acm_p is None and acm_30j is None and acm_entry is None and date_debut and date_fin:
                 try:
                     acm_p, acm_30j = efms.get_conso_acm(site_id, date_debut, date_fin)
                 except EfmsConnectionError as e:
