@@ -410,18 +410,74 @@ def finalize_certification_batch(results: list, cert_batch_id: int) -> dict:
     }
 
 
+def _contract_key(value):
+    """Clé de comparaison d'un numéro de contrat : « 22005301879 », « 22005301879.0 » et 22005301879 se valent."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if s.endswith(".0"):
+        s = s[:-2]
+    if s.isdigit():
+        s = s.lstrip("0") or "0"
+    return s or None
+
+
 def _sites_for_unlinked_invoices(invoices) -> dict:
-    """Contrat → Site (tous périmètres) pour les factures importées sans site rattaché."""
+    """Contrat → Site (tous périmètres) pour les factures importées sans site rattaché.
+
+    Sources, par ordre de priorité :
+      1. table contrat → site (ContractSiteLink) ;
+      2. numéro de contrat porté par la fiche site de la plateforme (core.Site.contract_number) ;
+      3. sites mis à jour dans Pilotage Grid (/pilotage-grid/sites : PgSite.contrat → site_key),
+         rattachés au site de la plateforme portant le même identifiant.
+    Un contrat introuvable partout reste « Inconnu » : on n'invente aucun rattachement.
+    """
     from billing.models import ContractSiteLink
-    contracts = {
-        c for c in invoices.filter(site__isnull=True).values_list("numero_compte_contrat", flat=True) if c
-    }
-    if not contracts:
+    from core.models import Site
+    from pilotage_grid.models import PgSite
+
+    wanted = {}
+    for c in invoices.filter(site__isnull=True).values_list("numero_compte_contrat", flat=True):
+        key = _contract_key(c)
+        if key:
+            wanted[key] = c
+    if not wanted:
         return {}
-    return {
-        link.numero_compte_contrat: link.site
-        for link in ContractSiteLink.objects.filter(numero_compte_contrat__in=contracts).select_related("site")
-    }
+
+    found: dict = {}   # clé contrat → Site
+    counts = {"contract_link": 0, "site_contract": 0, "pilotage_grid": 0}
+
+    for link in ContractSiteLink.objects.filter(numero_compte_contrat__in=list(wanted.values())).select_related("site"):
+        key = _contract_key(link.numero_compte_contrat)
+        if key in wanted and key not in found:
+            found[key] = link.site
+            counts["contract_link"] += 1
+
+    missing = set(wanted) - set(found)
+    if missing:
+        for site in Site.objects.exclude(contract_number__isnull=True).exclude(contract_number=""):
+            key = _contract_key(site.contract_number)
+            if key in missing and key not in found:
+                found[key] = site
+                counts["site_contract"] += 1
+
+    missing = set(wanted) - set(found)
+    numeric = [int(k) for k in missing if k.isdigit()]
+    if numeric:
+        pg_by_key = {}
+        for contrat, site_key in PgSite.objects.filter(contrat__in=numeric).values_list("contrat", "site_key"):
+            pg_by_key.setdefault(_contract_key(contrat), site_key)
+        sites = Site.objects.in_bulk(set(pg_by_key.values()), field_name="site_id")
+        for key, site_key in pg_by_key.items():
+            if key not in found and site_key in sites:
+                found[key] = sites[site_key]
+                counts["pilotage_grid"] += 1
+
+    logger.info(
+        "[launch] rattachement des factures sans site : %s contrats, résolus %s, toujours inconnus %s",
+        len(wanted), counts, len(set(wanted) - set(found)),
+    )
+    return {wanted[k]: site for k, site in found.items()}
 
 
 @shared_task(name="certification.launch_certification_batch")
