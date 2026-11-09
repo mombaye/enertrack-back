@@ -410,6 +410,20 @@ def finalize_certification_batch(results: list, cert_batch_id: int) -> dict:
     }
 
 
+def _sites_for_unlinked_invoices(invoices) -> dict:
+    """Contrat → Site (tous périmètres) pour les factures importées sans site rattaché."""
+    from billing.models import ContractSiteLink
+    contracts = {
+        c for c in invoices.filter(site__isnull=True).values_list("numero_compte_contrat", flat=True) if c
+    }
+    if not contracts:
+        return {}
+    return {
+        link.numero_compte_contrat: link.site
+        for link in ContractSiteLink.objects.filter(numero_compte_contrat__in=contracts).select_related("site")
+    }
+
+
 @shared_task(name="certification.launch_certification_batch")
 def launch_certification_batch(cert_batch_id: int) -> None:
     try:
@@ -430,10 +444,15 @@ def launch_certification_batch(cert_batch_id: int) -> None:
 
         result_ids    = []
         unknown_count = 0
+        sites_by_contract = _sites_for_unlinked_invoices(invoices)
 
         with transaction.atomic():
             for invoice in invoices:
-                if invoice.site_id is None:
+                # Périmètre certification = tous les sites du fichier connus de la table contrat→site.
+                # L'import ne rattache que les sites Aktivco/grid_fee (périmètre facturation, inchangé) ;
+                # ici on rattache aussi les autres. Seul un contrat absent de la table reste « Inconnu ».
+                site = invoice.site if invoice.site_id is not None else sites_by_contract.get(invoice.numero_compte_contrat)
+                if site is None:
                     CertificationResult.objects.create(
                         cert_batch=cert_batch, invoice=invoice,
                         site=None, status=CertificationResult.Status.UNKNOWN_CONTRACT,
@@ -443,7 +462,7 @@ def launch_certification_batch(cert_batch_id: int) -> None:
 
                 result, created = CertificationResult.objects.get_or_create(
                     cert_batch=cert_batch, invoice=invoice,
-                    defaults={"site": invoice.site, "status": CertificationResult.Status.PENDING_CERTIFICATION},
+                    defaults={"site": site, "status": CertificationResult.Status.PENDING_CERTIFICATION},
                 )
                 if not created and result.is_terminal:
                     continue

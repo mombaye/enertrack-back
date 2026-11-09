@@ -9,6 +9,7 @@ from django.utils import timezone
 from rest_framework import viewsets, mixins, status
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from billing.models import ImportBatch
@@ -245,6 +246,13 @@ class CertificationBatchViewSet(
         )
 
 
+class CertificationResultPagination(PageNumberPagination):
+    """20 par défaut (inchangé) ; ?page_size= permet à l'écran et à l'export de demander plus (max 500)."""
+    page_size = 20
+    page_size_query_param = "page_size"
+    max_page_size = 500
+
+
 class CertificationResultViewSet(
     mixins.ListModelMixin,
     mixins.RetrieveModelMixin,
@@ -252,11 +260,13 @@ class CertificationResultViewSet(
 ):
     serializer_class   = CertificationResultSerializer
     permission_classes = [IsAuthenticated]
+    pagination_class   = CertificationResultPagination
 
     def get_queryset(self):
+        # « -id » départage les résultats calculés au même instant : ordre stable d'une page à l'autre.
         qs = CertificationResult.objects.select_related(
             "cert_batch", "invoice", "site"
-        ).order_by("-computed_at")
+        ).order_by("-computed_at", "-id")
 
         cert_batch    = self.request.query_params.get("cert_batch")
         result_status = self.request.query_params.get("status")
