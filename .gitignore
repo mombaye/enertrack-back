@@ -26,3 +26,6 @@ data_imports/stan/*.xlsb
 !data_imports/pilotage_grid/pilotage_grid_initial.html
 celerybeat-schedule
 .demo/
+
+# Espaces de travail Claude Code (locaux, jamais versionnés)
+.claude/worktrees/
