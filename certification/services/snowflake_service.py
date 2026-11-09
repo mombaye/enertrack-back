@@ -54,6 +54,9 @@ class SnowflakeService:
         else:
             kwargs["password"] = self.password
 
+        from django.conf import settings as _st
+        kwargs["login_timeout"] = int(getattr(_st, "SNOWFLAKE_LOGIN_TIMEOUT", 60))
+        kwargs["network_timeout"] = int(getattr(_st, "SNOWFLAKE_NETWORK_TIMEOUT", 600))
         try:
             return snowflake.connector.connect(**kwargs)
         except Exception as e:

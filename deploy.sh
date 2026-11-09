@@ -8,7 +8,7 @@ git fetch origin "$BRANCH"
 git checkout "$BRANCH"
 git pull --ff-only origin "$BRANCH"
 echo "Version déployée : $(git log --oneline -1)"
-docker compose up -d --build web celery celery-beat
+docker compose up -d --build web celery celery-interactive celery-beat
 echo "Attente du service web…"
 for i in $(seq 1 30); do
   if docker compose exec -T web python manage.py check >/dev/null 2>&1; then

@@ -64,7 +64,7 @@ services:
       context: .
       dockerfile: docker/backend/Dockerfile
     restart: unless-stopped
-    command: celery -A enertrack_backend worker --loglevel=info --concurrency=4
+    command: celery -A enertrack_backend worker --loglevel=info --concurrency=4 -Q celery,interactive
     env_file:
       - .env
     volumes:
@@ -73,6 +73,26 @@ services:
       - media_data:/code/media
       # Registre stock carburant : la tâche planifiée traite incoming/ (voir service web).
       - "${FUEL_IMPORT_HOST_PATH:-/mnt/suivi_carburant_prod}:/mnt/Suivi_carburant_prod"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      web:
+        condition: service_started
+
+  # Worker dédié aux actions utilisateur (import facturation, certification) : jamais bloqué par les synchros Snowflake/ENOC.
+  celery-interactive:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    restart: unless-stopped
+    command: celery -A enertrack_backend worker --loglevel=info --concurrency=2 -Q interactive -n interactive@%h
+    env_file:
+      - .env
+    volumes:
+      - ./data_imports:/code/data_imports
+      - media_data:/code/media
     depends_on:
       db:
         condition: service_healthy

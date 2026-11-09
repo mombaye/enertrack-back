@@ -8,7 +8,7 @@ from unittest import mock
 
 from django.contrib.auth import get_user_model
 from django.core.management import call_command
-from django.test import override_settings
+from django.test import SimpleTestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -1125,3 +1125,19 @@ class ClosingGapAndHealthTests(BalanceBase):
         self.assertIn("[PASS] AUCUN_NULL_TRANSFORME_EN_ZERO", txt)
         self.assertIn("[PASS] CERTIFIEE_VIDE_AVANT_VALIDATION", txt)
         self.assertEqual(before, (FuelStockBalance.objects.count(), FuelMovement.objects.count()))   # lecture seule
+
+
+class CeleryRoutingTests(SimpleTestCase):
+    """Les actions utilisateur (import facturation, certification) ne doivent jamais attendre derrière les synchros planifiées."""
+
+    def test_user_actions_use_interactive_queue_and_syncs_have_time_limits(self):
+        from enertrack_backend.celery import app
+        route = lambda name: app.amqp.router.route({}, name)["queue"].name  # noqa: E731
+        self.assertEqual(route("billing.import_invoices"), "interactive")
+        self.assertEqual(route("certification.launch_certification_batch"), "interactive")
+        self.assertEqual(route("fuel_tracking.sync_fuel_consommation_current_month"), "celery")
+        app.loader.import_default_modules()
+        for n in ("sync_fuel_consommation_current_month", "sync_enoc_fuel_movements_current_month", "sync_fuel_stock_current", "sync_fuel_daily_facts_recent"):
+            t = app.tasks[f"fuel_tracking.{n}"]
+            self.assertTrue(t.time_limit and t.soft_time_limit and t.soft_time_limit < t.time_limit, n)    # une synchro bloquée ne garde plus un processus
+        self.assertEqual(app.conf.worker_prefetch_multiplier, 1)

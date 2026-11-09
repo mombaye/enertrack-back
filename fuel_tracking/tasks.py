@@ -69,7 +69,7 @@ def _prev_month(month_str: str) -> str:
     return f"{year}-{month - 1:02d}"
 
 
-@shared_task(bind=True, name="fuel_tracking.sync_fuel_consommation_current_month")
+@shared_task(bind=True, name="fuel_tracking.sync_fuel_consommation_current_month", soft_time_limit=600, time_limit=900)
 @_exclusive("sync_fuel_consommation", 1800)
 def sync_fuel_consommation_current_month(self):
     from django.core.management import call_command
@@ -84,7 +84,7 @@ def sync_fuel_consommation_current_month(self):
         )
 
 
-@shared_task(bind=True, name="fuel_tracking.sync_enoc_fuel_movements_current_month")
+@shared_task(bind=True, name="fuel_tracking.sync_enoc_fuel_movements_current_month", soft_time_limit=600, time_limit=900)
 @_exclusive("sync_enoc_fuel_movements", 1800)
 def sync_enoc_fuel_movements_current_month(self):
     from django.core.management import call_command
@@ -143,14 +143,14 @@ def _run_daily_facts_sync(days: int, label: str):
                 pass
 
 
-@shared_task(bind=True, name="fuel_tracking.sync_fuel_daily_facts_recent")
+@shared_task(bind=True, name="fuel_tracking.sync_fuel_daily_facts_recent", soft_time_limit=2400, time_limit=3000)
 def sync_fuel_daily_facts_recent(self):
     """Faits journaliers CPH (Snowflake, lecture seule) sur J-3 → aujourd'hui : les
     données GE/redresseur/AC_METER arrivent avec quelques jours de retard."""
     _run_daily_facts_sync(3, "J-3")
 
 
-@shared_task(bind=True, name="fuel_tracking.resync_fuel_daily_facts_nightly")
+@shared_task(bind=True, name="fuel_tracking.resync_fuel_daily_facts_nightly", soft_time_limit=9900, time_limit=10800)
 def resync_fuel_daily_facts_nightly(self):
     """Resynchro nocturne J-35 → aujourd'hui : rattrape les données arrivées en retard
     (dont la conso mesurée VW_FUEL_REPORT) sans aucune action manuelle."""
@@ -173,7 +173,7 @@ def check_cph_health_daily(self):
         logger.info("[fuel_cph][SANTE] OK %s", h["metrics"])
 
 
-@shared_task(bind=True, name="fuel_tracking.sync_fuel_stock_current")
+@shared_task(bind=True, name="fuel_tracking.sync_fuel_stock_current", soft_time_limit=600, time_limit=900)
 @_exclusive("sync_fuel_stock", 1800)
 def sync_fuel_stock_current(self):
     from django.core.management import call_command

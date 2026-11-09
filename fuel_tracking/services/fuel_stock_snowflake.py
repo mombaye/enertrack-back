@@ -47,6 +47,8 @@ def _connect():
             kwargs["private_key_file_pwd"] = settings.SNOWFLAKE_PRIVATE_KEY_PASSPHRASE
     else:
         kwargs["password"] = settings.SNOWFLAKE_PASSWORD
+    kwargs["login_timeout"] = int(getattr(settings, "SNOWFLAKE_LOGIN_TIMEOUT", 60))
+    kwargs["network_timeout"] = int(getattr(settings, "SNOWFLAKE_NETWORK_TIMEOUT", 600))
     return snowflake.connector.connect(**kwargs)
 
 

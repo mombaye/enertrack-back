@@ -207,6 +207,15 @@ CELERY_TASK_SERIALIZER = 'json'
 # chargés une fois par process) s'accumule pour de bon au lieu d'être
 # purgée. Valeurs de départ prudentes — à ajuster selon la RAM réellement
 # observée en prod (docker stats), pas des chiffres mesurés ici.
+# Une tâche en attente ne doit jamais rester bloquée derrière des synchros longues :
+#  - prefetch 1 : un processus ne « réserve » pas des tâches qu'il ne traitera qu'après la synchro en cours ;
+#  - les actions déclenchées par un utilisateur (import facturation, certification) passent par une file dédiée « interactive »,
+#    consommée par le worker principal ET par un worker dédié (service celery-interactive) — jamais derrière les synchros Snowflake/ENOC.
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+CELERY_TASK_ROUTES = {
+    "billing.*": {"queue": "interactive"},
+    "certification.*": {"queue": "interactive"},
+}
 CELERY_WORKER_MAX_TASKS_PER_CHILD = 100
 CELERY_WORKER_MAX_MEMORY_PER_CHILD = 500_000  # Ko (≈500 Mo)
 
@@ -310,6 +319,9 @@ SNOWFLAKE_PRIVATE_KEY_PATH = str(BASE_DIR / _sf_key_path) if _sf_key_path else "
 SNOWFLAKE_PRIVATE_KEY_PASSPHRASE = os.environ.get("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE", "")
 SNOWFLAKE_WAREHOUSE = os.environ.get("SNOWFLAKE_WAREHOUSE", "")
 SNOWFLAKE_ROLE      = os.environ.get("SNOWFLAKE_ROLE", "")
+# Délais de connexion : sans eux, une connexion Snowflake bloquée garde un processus Celery indéfiniment (file saturée, imports « en attente »).
+SNOWFLAKE_LOGIN_TIMEOUT = int(os.environ.get("SNOWFLAKE_LOGIN_TIMEOUT", "60"))
+SNOWFLAKE_NETWORK_TIMEOUT = int(os.environ.get("SNOWFLAKE_NETWORK_TIMEOUT", "600"))
 SNOWFLAKE_DATABASE  = os.environ.get("SNOWFLAKE_DATABASE", "DB_GFMS_ANALYTICS_PROD")
 SNOWFLAKE_SCHEMA    = os.environ.get("SNOWFLAKE_SCHEMA", "GOLD")
 
