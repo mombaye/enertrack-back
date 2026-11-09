@@ -5,6 +5,7 @@
 #   (3) CertificationResultViewSet : filtre flag_mesure_alert
 
 import logging
+from datetime import timedelta
 from django.utils import timezone
 from rest_framework import viewsets, mixins, status
 from rest_framework.decorators import action
@@ -26,12 +27,43 @@ from .services.snowflake_efms import SnowflakeEfmsService as EfmsService
 logger = logging.getLogger(__name__)
 
 
+# Au-delà de ce délai, une campagne encore « RUNNING » est considérée bloquée : on autorise sa suppression.
+STUCK_RUNNING_AFTER = timedelta(hours=2)
+
+
 class CertificationBatchViewSet(
     mixins.ListModelMixin,
     mixins.RetrieveModelMixin,
+    mixins.DestroyModelMixin,
     viewsets.GenericViewSet,
 ):
     permission_classes = [IsAuthenticated]
+
+    def destroy(self, request, *args, **kwargs):
+        """Supprime une campagne de certification et ses résultats.
+
+        Les factures importées sont conservées : la campagne peut être relancée depuis le même import.
+        Refusé (409) pendant un calcul en cours, sauf campagne bloquée depuis plus de 2 h.
+        """
+        cert_batch = self.get_object()
+        if (cert_batch.status == CertificationBatch.Status.RUNNING
+                and timezone.now() - cert_batch.launched_at < STUCK_RUNNING_AFTER):
+            return Response(
+                {"detail": "Certification en cours : attendez la fin du calcul avant de la supprimer."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        logger.info(
+            "[certification] campagne #%s (%s, %s résultats) supprimée par %s",
+            cert_batch.id, cert_batch.echeance_label, cert_batch.total, request.user,
+        )
+        cert_batch.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=["get"], url_path="summary")
+    def summary(self, request, pk=None):
+        """Résumé d'une campagne : statuts, montants, rattachement des sites, factures à traiter en priorité."""
+        from .services.summary import build_summary
+        return Response(build_summary(self.get_object()))
 
     def get_queryset(self):
         qs = CertificationBatch.objects.select_related(

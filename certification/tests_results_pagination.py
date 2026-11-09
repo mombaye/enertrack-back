@@ -122,3 +122,52 @@ class LaunchScopePilotageGridTests(TestCase):
         self.assertEqual(r["F5"].status, CertificationResult.Status.PENDING_CERTIFICATION)
         self.assertIsNone(r["F6"].site_id)
         self.assertEqual(r["F6"].status, CertificationResult.Status.UNKNOWN_CONTRACT)
+
+
+class CampaignDeleteAndSummaryTests(TestCase):
+    def setUp(self):
+        from decimal import Decimal
+        from core.models import Site
+
+        self.client = APIClient()
+        self.client.force_authenticate(get_user_model().objects.create_user(username="s", password="x"))
+        batch = ImportBatch.objects.create(source_filename="octobre.xlsx")
+        self.batch = batch
+        self.cert = CertificationBatch.objects.create(import_batch=batch, status=CertificationBatch.Status.DONE,
+                                                      echeance_year=2026, echeance_month=11)
+        site = Site.objects.create(site_id="DKR_9001", name="S1")
+        S = CertificationResult.Status
+        for n, st, ttc, s in [("F1", S.CERTIFIED_FMS, "1000", site), ("F2", S.NEEDS_REVIEW, "5000", site),
+                              ("F3", S.MESURE_A_VERIFIER, None, site), ("F4", S.UNKNOWN_CONTRACT, "200", None)]:
+            inv = SonatelInvoice.objects.create(batch=batch, numero_compte_contrat=f"C{n}", numero_facture=n,
+                                                montant_ttc=Decimal(ttc) if ttc else None, site=s)
+            CertificationResult.objects.create(cert_batch=self.cert, invoice=inv, site=s, status=st)
+
+    def test_summary(self):
+        d = self.client.get(f"/api/certification/batches/{self.cert.id}/summary/").json()
+        self.assertEqual(d["total"], 4)
+        self.assertEqual(d["groups"]["certified"]["count"], 1)
+        self.assertEqual(d["groups"]["certified"]["pct"], 25.0)
+        self.assertEqual(d["groups"]["to_review"]["count"], 2)
+        self.assertEqual(d["groups"]["to_review"]["montant_ttc"], 5000.0)
+        self.assertEqual(d["montant_ttc_total"], 6200.0)
+        self.assertEqual(d["factures_sans_montant"], 1)  # absent ≠ 0
+        self.assertEqual(d["coverage"]["sites_rattaches"], 1)
+        self.assertEqual(d["unknown_contracts_sample"], ["CF4"])
+        self.assertEqual([r["numero_facture"] for r in d["top_to_review"]][0], "F2")
+
+    def test_delete_keeps_imported_invoices(self):
+        resp = self.client.delete(f"/api/certification/batches/{self.cert.id}/")
+        self.assertEqual(resp.status_code, 204)
+        self.assertFalse(CertificationBatch.objects.filter(pk=self.cert.id).exists())
+        self.assertFalse(CertificationResult.objects.filter(cert_batch_id=self.cert.id).exists())
+        self.assertEqual(SonatelInvoice.objects.filter(batch=self.batch).count(), 4)
+
+    def test_delete_refused_while_running_unless_stuck(self):
+        from datetime import timedelta
+        from django.utils import timezone
+
+        CertificationBatch.objects.filter(pk=self.cert.id).update(status=CertificationBatch.Status.RUNNING)
+        self.assertEqual(self.client.delete(f"/api/certification/batches/{self.cert.id}/").status_code, 409)
+        CertificationBatch.objects.filter(pk=self.cert.id).update(launched_at=timezone.now() - timedelta(hours=3))
+        self.assertEqual(self.client.delete(f"/api/certification/batches/{self.cert.id}/").status_code, 204)
