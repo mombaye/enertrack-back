@@ -84,3 +84,18 @@ class ImportDispatchViewTests(TestCase):
         batch = ImportBatch.objects.get(pk=resp.data["batch"]["id"])
         self.assertEqual(batch.task_id, "task-1")
         self.assertEqual(batch.task_status, ImportBatch.TaskStatus.PENDING)
+
+
+class BeatScheduleExpiryTests(SimpleTestCase):
+    """Une tâche planifiée qui n'a pas pu démarrer à temps expire au lieu de s'empiler dans la file."""
+
+    def test_every_periodic_task_expires_before_its_next_run(self):
+        from django.conf import settings
+
+        self.assertTrue(settings.CELERY_BEAT_SCHEDULE)
+        for name, entry in settings.CELERY_BEAT_SCHEDULE.items():
+            expires = entry.get("options", {}).get("expires")
+            self.assertIsNotNone(expires, name)
+            self.assertGreater(expires, 0, name)
+            if name.endswith("-5min"):
+                self.assertLess(expires, 5 * 60, name)

@@ -284,6 +284,25 @@ CELERY_BEAT_SCHEDULE = {
     },
 }
 
+# Expiration des tâches planifiées : une synchro qui n'a pas pu démarrer avant la suivante est abandonnée
+# (la suivante couvre la même fenêtre — mois en cours / jours récents), au lieu de s'empiler.
+# Constaté en prod le 2026-11-09 : 20 432 tâches en attente dans la file « celery », workers saturés par
+# les synchros 5 min, et les ~1 900 sous-tâches d'une campagne de certification bloquées derrière (1 % pendant des heures).
+_BEAT_EXPIRES_S = {
+    'fuel-consommation-sync-5min': 4 * 60,
+    'fuel-enoc-sync-5min': 4 * 60,
+    'fuel-stock-sync-5min': 4 * 60,
+    'stan-auto-import-15min': 14 * 60,
+    'fuel-stock-registry-incoming-15min': 14 * 60,
+    'financial-conso-sync-30min': 28 * 60,
+    'fuel-daily-facts-sync-hourly': 55 * 60,
+    'fuel-daily-facts-resync-nightly': 6 * 3600,
+    'fuel-balances-nightly': 6 * 3600,
+    'fuel-cph-health-daily': 6 * 3600,
+}
+for _name, _entry in CELERY_BEAT_SCHEDULE.items():
+    _entry.setdefault('options', {}).setdefault('expires', _BEAT_EXPIRES_S.get(_name, 3600))
+
 # Cache Redis (DB 1, distincte du broker Celery en DB 0) — utilisé notamment pour
 # mettre en cache les lectures vers des sources externes lentes (Mongo ENOC,
 # Snowflake) afin que l'utilisateur ne ressente pas leur latence réseau.
