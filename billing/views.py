@@ -1,3 +1,4 @@
+import logging
 # views.py / services.py ✅ PATCH COMPLET — calcul données cibles + prorata + agrégat
 from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from datetime import datetime, date as _date, datetime as _dt
@@ -605,6 +606,30 @@ def _build_monthly_payloads(inv: SonatelInvoice):
     return payloads
 
 
+logger = logging.getLogger(__name__)
+
+
+def _enqueue_or_fail(batch, task, args):
+    """Envoie la tâche d'import sur une file réellement écoutée par un worker.
+
+    Sans worker disponible, le lot passe en FAILURE avec un message clair (503) au lieu de
+    rester « En file d'attente… » indéfiniment. Retourne (result, None) ou (None, Response).
+    """
+    from enertrack_backend.task_dispatch import NoWorkerAvailable, enqueue
+    try:
+        return enqueue(task, args=args, preferred="interactive"), None
+    except NoWorkerAvailable as exc:
+        logger.error("[billing-import] lot #%s non lancé : %s", batch.id, exc)
+        message = ("Le service de traitement des imports est arrêté : le fichier est reçu "
+                   "mais n'a pas pu être traité. Contactez l'administrateur puis réimportez.")
+        batch.task_status = ImportBatch.TaskStatus.FAILURE
+        batch.task_message = message
+        batch.task_updated_at = timezone.now()
+        batch.save(update_fields=["task_status", "task_message", "task_updated_at"])
+        return None, Response({"detail": message, "batch_id": batch.id},
+                              status=status.HTTP_503_SERVICE_UNAVAILABLE)
+
+
 # ----------------------------
 # ImportBatchViewSet.import_file ✅ (calcul données cibles avant upsert)
 # ----------------------------
@@ -654,7 +679,9 @@ class ImportBatchViewSet(viewsets.GenericViewSet, mixins.ListModelMixin):
         )
     
         from .tasks import import_invoices_task
-        result = import_invoices_task.delay(batch.id, storage_key, str(echeance))
+        result, unavailable = _enqueue_or_fail(batch, import_invoices_task, (batch.id, storage_key, str(echeance)))
+        if unavailable:
+            return unavailable
         batch.task_id = result.id
         batch.save(update_fields=["task_id"])
     
@@ -725,7 +752,9 @@ class ImportBatchViewSet(viewsets.GenericViewSet, mixins.ListModelMixin):
         )
 
         from .tasks import import_status_update_task
-        result = import_status_update_task.delay(batch.id, storage_key, target_status)
+        result, unavailable = _enqueue_or_fail(batch, import_status_update_task, (batch.id, storage_key, target_status))
+        if unavailable:
+            return unavailable
         batch.task_id = result.id
         batch.save(update_fields=["task_id"])
 

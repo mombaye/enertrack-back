@@ -191,7 +191,21 @@ class CertificationBatchViewSet(
                 ]
             )
 
-        task = launch_certification_batch.delay(cert_batch.id)
+        from enertrack_backend.task_dispatch import NoWorkerAvailable, enqueue
+        try:
+            task = enqueue(launch_certification_batch, args=(cert_batch.id,), preferred="interactive")
+        except NoWorkerAvailable as exc:
+            # Sans worker, la campagne resterait « en attente » indéfiniment : on le dit tout de suite.
+            logger.error("[certification] campagne #%s non lancée : %s", cert_batch.id, exc)
+            cert_batch.status = CertificationBatch.Status.FAILED
+            cert_batch.finished_at = timezone.now()
+            cert_batch.save(update_fields=["status", "finished_at"])
+            return Response(
+                {"detail": "Le service de traitement est arrêté : certification non lancée. "
+                           "Contactez l'administrateur puis relancez.",
+                 "cert_batch_id": cert_batch.id},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
         cert_batch.celery_task_id = task.id
         cert_batch.save(update_fields=["celery_task_id"])
 

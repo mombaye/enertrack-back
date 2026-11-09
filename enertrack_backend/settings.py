@@ -212,7 +212,12 @@ CELERY_TASK_SERIALIZER = 'json'
 #  - les actions déclenchées par un utilisateur (import facturation, certification) passent par une file dédiée « interactive »,
 #    consommée par le worker principal ET par un worker dédié (service celery-interactive) — jamais derrière les synchros Snowflake/ENOC.
 CELERY_WORKER_PREFETCH_MULTIPLIER = 1
+# Les ~1 800 sous-tâches d'une campagne de certification (une par facture) partent sur la file par défaut :
+# dans « interactive », elles passaient devant les imports suivants, restés « En file d'attente… ».
+# (Les noms exacts priment sur les motifs « * ».)
 CELERY_TASK_ROUTES = {
+    "certification.certify_single_invoice": {"queue": "celery"},
+    "certification.finalize_certification_batch": {"queue": "celery"},
     "billing.*": {"queue": "interactive"},
     "certification.*": {"queue": "interactive"},
 }

@@ -496,9 +496,14 @@ def launch_certification_batch(cert_batch_id: int) -> None:
             except Exception as e:
                 logger.warning("[launch] Prefetch échoué (%s)", e)
 
+        # Sous-tâches sur une file réellement écoutée (« celery » via CELERY_TASK_ROUTES,
+        # sinon repli « interactive ») : jamais devant les imports de l'utilisateur, jamais orphelines.
+        from enertrack_backend.task_dispatch import pick_queue
+        queue = pick_queue("celery", fallbacks=("interactive",))
+        options = {"queue": queue} if queue else {}
         chord(
-            group([certify_single_invoice.s(rid) for rid in result_ids]),
-            finalize_certification_batch.s(cert_batch_id),
+            group([certify_single_invoice.s(rid).set(**options) for rid in result_ids]),
+            finalize_certification_batch.s(cert_batch_id).set(**options),
         ).apply_async()
 
     except Exception as exc:
