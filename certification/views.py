@@ -59,6 +59,33 @@ class CertificationBatchViewSet(
         cert_batch.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
+    @action(detail=True, methods=["post"], url_path="resume")
+    def resume(self, request, pk=None):
+        """Reprend une campagne arrêtée ou bloquée : seules les factures encore « En attente » sont calculées.
+
+        Rien n'est supprimé. Refusé (409) pendant un calcul réellement en cours (lancé ou repris il y a moins de 2 h).
+        """
+        from enertrack_backend.task_dispatch import NoWorkerAvailable, enqueue
+        from .tasks import resume_certification_batch
+
+        cert_batch = self.get_object()
+        if (cert_batch.status in (CertificationBatch.Status.RUNNING, CertificationBatch.Status.PENDING)
+                and timezone.now() - cert_batch.launched_at < STUCK_RUNNING_AFTER):
+            return Response({"detail": "Calcul en cours : la reprise sera possible s'il reste bloqué plus de 2 h."},
+                            status=status.HTTP_409_CONFLICT)
+        pending = cert_batch.results.filter(status=CertificationResult.Status.PENDING_CERTIFICATION).count()
+        try:
+            task = enqueue(resume_certification_batch, args=(cert_batch.id,), preferred="interactive")
+        except NoWorkerAvailable as exc:
+            logger.error("[certification] reprise #%s impossible : %s", cert_batch.id, exc)
+            return Response({"detail": "Le service de traitement est arrêté : reprise impossible. Contactez l'administrateur."},
+                            status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        logger.info("[certification] campagne #%s (%s) reprise par %s — %d facture(s) en attente",
+                    cert_batch.id, cert_batch.echeance_label, request.user, pending)
+        CertificationBatch.objects.filter(pk=cert_batch.id).update(celery_task_id=task.id)
+        return Response({"cert_batch_id": cert_batch.id, "pending": pending, "celery_task_id": task.id},
+                        status=status.HTTP_202_ACCEPTED)
+
     @action(detail=True, methods=["get"], url_path="summary")
     def summary(self, request, pk=None):
         """Résumé d'une campagne : statuts, montants, rattachement des sites, factures à traiter en priorité."""

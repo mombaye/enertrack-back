@@ -74,3 +74,68 @@ class PrefetchFallbackTests(TestCase):
         self.assertEqual(calls, [])
         self.assertEqual(self.result.conso_fms_periode, Decimal("880"))
         self.assertEqual(self.result.estim_conso_acm_periode, Decimal("870"))
+
+
+class ResumeCampaignTests(TestCase):
+    """Reprise d'une campagne arrêtée : rien n'est supprimé, seules les factures en attente sont relancées."""
+
+    def setUp(self):
+        from django.contrib.auth import get_user_model
+        from rest_framework.test import APIClient
+
+        self.client = APIClient()
+        self.client.force_authenticate(get_user_model().objects.create_user(username="r", password="x"))
+        site = Site.objects.create(site_id="DKR_0202", name="S")
+        batch = ImportBatch.objects.create(source_filename="octobre.xlsx")
+        self.cert = CertificationBatch.objects.create(import_batch=batch, status=CertificationBatch.Status.FAILED)
+        S = CertificationResult.Status
+        self.ids = {}
+        for n, st, s in [("F1", S.CERTIFIED_FMS, site), ("F2", S.PENDING_CERTIFICATION, site),
+                         ("F3", S.PENDING_CERTIFICATION, site), ("F4", S.UNKNOWN_CONTRACT, None)]:
+            inv = SonatelInvoice.objects.create(batch=batch, numero_compte_contrat=f"C{n}", numero_facture=n, site=s,
+                                                date_debut_periode=date(2026, 9, 1), date_fin_periode=date(2026, 9, 30))
+            self.ids[n] = CertificationResult.objects.create(cert_batch=self.cert, invoice=inv, site=s, status=st).id
+
+    def _resume(self):
+        with mock.patch("enertrack_backend.task_dispatch.consumed_queues", return_value={"celery", "interactive"}), \
+             mock.patch("certification.tasks.resume_certification_batch.apply_async") as aa:
+            aa.return_value = mock.Mock(id="t1")
+            return self.client.post(f"/api/certification/batches/{self.cert.id}/resume/"), aa
+
+    def test_endpoint_queues_resume_and_keeps_everything(self):
+        resp, aa = self._resume()
+        self.assertEqual(resp.status_code, 202)
+        self.assertEqual(resp.json()["pending"], 2)
+        aa.assert_called_once()
+        self.assertEqual(CertificationResult.objects.filter(cert_batch=self.cert).count(), 4)
+
+    def test_refused_while_really_running(self):
+        CertificationBatch.objects.filter(pk=self.cert.id).update(status=CertificationBatch.Status.RUNNING)
+        resp, aa = self._resume()
+        self.assertEqual(resp.status_code, 409)
+        aa.assert_not_called()
+
+    def test_task_dispatches_only_pending(self):
+        from certification.tasks import resume_certification_batch
+
+        with mock.patch("certification.tasks._prefetch_and_dispatch") as disp:
+            out = resume_certification_batch(self.cert.id)
+        self.assertEqual(out["resumed"], 2)
+        self.assertEqual(sorted(disp.call_args[0][1]), sorted([self.ids["F2"], self.ids["F3"]]))
+        self.cert.refresh_from_db()
+        self.assertEqual(self.cert.status, CertificationBatch.Status.RUNNING)
+        self.assertEqual(self.cert.certified_fms, 1)
+        self.assertEqual(self.cert.unknown_contract, 1)
+        self.assertEqual(CertificationResult.objects.filter(cert_batch=self.cert).count(), 4)
+
+    def test_nothing_pending_marks_done(self):
+        from certification.tasks import resume_certification_batch
+
+        CertificationResult.objects.filter(cert_batch=self.cert, status=CertificationResult.Status.PENDING_CERTIFICATION) \
+            .update(status=CertificationResult.Status.FMS_UNAVAILABLE)
+        with mock.patch("certification.tasks._prefetch_and_dispatch") as disp:
+            resume_certification_batch(self.cert.id)
+        disp.assert_not_called()
+        self.cert.refresh_from_db()
+        self.assertEqual(self.cert.status, CertificationBatch.Status.DONE)
+        self.assertEqual(self.cert.fms_unavailable, 2)

@@ -485,6 +485,54 @@ def _sites_for_unlinked_invoices(invoices) -> dict:
     return {wanted[k]: site for k, site in found.items()}
 
 
+def _prefetch_and_dispatch(cert_batch, result_ids: list[int]) -> None:
+    """Précharge Grid/ACM des factures à calculer puis envoie une sous-tâche par facture (chord → finalisation).
+    Commun au lancement et à la reprise d'une campagne."""
+    cert_batch_id = cert_batch.id
+    site_ids_with_dates = (
+        CertificationResult.objects.filter(id__in=result_ids)
+        .select_related("invoice", "site")
+        .values_list("site__site_id", "invoice__date_debut_periode", "invoice__date_fin_periode")
+    )
+
+    # Groupe par période EXACTE (pas une seule enveloppe min/max pour tout
+    # le batch) : un batch mélange en pratique des factures de périodes très
+    # différentes (constaté : jusqu'à ~9 mois d'écart entre factures d'un
+    # même batch), donc une enveloppe globale ferait calculer la "conso
+    # période" ACM/Grid de chaque site sur une fenêtre bien plus large que
+    # sa propre facture — écarts constatés jusqu'à ×6 sur la conso ACM.
+    # Les sites qui partagent la même période exacte restent regroupés en
+    # une seule requête bulk Snowflake (pas de perte de l'optimisation).
+    period_groups: dict[tuple, set] = {}
+    for site_id, d_debut, d_fin in site_ids_with_dates:
+        if not site_id or not d_debut or not d_fin:
+            continue
+        period_groups.setdefault((d_debut, d_fin), set()).add(site_id)
+
+    if period_groups:
+        try:
+            efms = EfmsService(cert_batch=cert_batch)
+            efms.prefetch_batch(
+                cert_batch_id=cert_batch_id,
+                groups=[
+                    (list(site_ids), d_debut, d_fin)
+                    for (d_debut, d_fin), site_ids in period_groups.items()
+                ],
+            )
+        except Exception as e:
+            logger.warning("[launch] Prefetch échoué (%s)", e)
+
+    # Sous-tâches sur une file réellement écoutée (« celery » via CELERY_TASK_ROUTES,
+    # sinon repli « interactive ») : jamais devant les imports de l'utilisateur, jamais orphelines.
+    from enertrack_backend.task_dispatch import pick_queue
+    queue = pick_queue("celery", fallbacks=("interactive",))
+    options = {"queue": queue} if queue else {}
+    chord(
+        group([certify_single_invoice.s(rid).set(**options) for rid in result_ids]),
+        finalize_certification_batch.s(cert_batch_id).set(**options),
+    ).apply_async()
+
+
 @shared_task(name="certification.launch_certification_batch")
 def launch_certification_batch(cert_batch_id: int) -> None:
     try:
@@ -543,51 +591,47 @@ def launch_certification_batch(cert_batch_id: int) -> None:
 
         CertificationBatch.objects.filter(pk=cert_batch_id).update(total=len(result_ids) + unknown_count)
 
-        site_ids_with_dates = (
-            CertificationResult.objects.filter(id__in=result_ids)
-            .select_related("invoice", "site")
-            .values_list("site__site_id", "invoice__date_debut_periode", "invoice__date_fin_periode")
-        )
-
-        # Groupe par période EXACTE (pas une seule enveloppe min/max pour tout
-        # le batch) : un batch mélange en pratique des factures de périodes très
-        # différentes (constaté : jusqu'à ~9 mois d'écart entre factures d'un
-        # même batch), donc une enveloppe globale ferait calculer la "conso
-        # période" ACM/Grid de chaque site sur une fenêtre bien plus large que
-        # sa propre facture — écarts constatés jusqu'à ×6 sur la conso ACM.
-        # Les sites qui partagent la même période exacte restent regroupés en
-        # une seule requête bulk Snowflake (pas de perte de l'optimisation).
-        period_groups: dict[tuple, set] = {}
-        for site_id, d_debut, d_fin in site_ids_with_dates:
-            if not site_id or not d_debut or not d_fin:
-                continue
-            period_groups.setdefault((d_debut, d_fin), set()).add(site_id)
-
-        if period_groups:
-            try:
-                efms = EfmsService(cert_batch=cert_batch)
-                efms.prefetch_batch(
-                    cert_batch_id=cert_batch_id,
-                    groups=[
-                        (list(site_ids), d_debut, d_fin)
-                        for (d_debut, d_fin), site_ids in period_groups.items()
-                    ],
-                )
-            except Exception as e:
-                logger.warning("[launch] Prefetch échoué (%s)", e)
-
-        # Sous-tâches sur une file réellement écoutée (« celery » via CELERY_TASK_ROUTES,
-        # sinon repli « interactive ») : jamais devant les imports de l'utilisateur, jamais orphelines.
-        from enertrack_backend.task_dispatch import pick_queue
-        queue = pick_queue("celery", fallbacks=("interactive",))
-        options = {"queue": queue} if queue else {}
-        chord(
-            group([certify_single_invoice.s(rid).set(**options) for rid in result_ids]),
-            finalize_certification_batch.s(cert_batch_id).set(**options),
-        ).apply_async()
+        _prefetch_and_dispatch(cert_batch, result_ids)
 
     except Exception as exc:
         logger.exception(f"[launch] Erreur critique batch #{cert_batch_id}: {exc}")
         cert_batch.status = CertificationBatch.Status.FAILED
         cert_batch.save(update_fields=["status"])
         raise
+
+@shared_task(name="certification.resume_certification_batch")
+def resume_certification_batch(cert_batch_id: int) -> dict:
+    """
+    Reprend une campagne arrêtée ou bloquée SANS rien supprimer : seuls les résultats encore
+    « En attente » sont (re)calculés ; ceux déjà calculés et les contrats inconnus sont conservés.
+    S'il ne reste rien à calculer, la campagne passe simplement à « Terminée » (compteurs recalculés).
+    """
+    try:
+        cert_batch = CertificationBatch.objects.get(id=cert_batch_id)
+    except CertificationBatch.DoesNotExist:
+        return {"error": "batch_not_found"}
+
+    pending = list(
+        cert_batch.results.filter(status=CertificationResult.Status.PENDING_CERTIFICATION)
+        .exclude(site__isnull=True).values_list("id", flat=True)
+    )
+    cert_batch.refresh_counters()  # progression = résultats déjà calculés, recomptés depuis la base
+    if not pending:
+        cert_batch.status = CertificationBatch.Status.DONE
+        cert_batch.finished_at = cert_batch.finished_at or timezone.now()
+        cert_batch.save(update_fields=["status", "finished_at"])
+        logger.info("[resume] campagne #%s : rien à recalculer → terminée", cert_batch_id)
+        return {"cert_batch_id": cert_batch_id, "resumed": 0}
+
+    # launched_at repart de maintenant : le délai « bloquée » (2 h) se compte depuis la reprise.
+    CertificationBatch.objects.filter(pk=cert_batch_id).update(
+        status=CertificationBatch.Status.RUNNING, finished_at=None, launched_at=timezone.now())
+    cert_batch.refresh_from_db()
+    logger.info("[resume] campagne #%s : %d facture(s) en attente relancée(s)", cert_batch_id, len(pending))
+    try:
+        _prefetch_and_dispatch(cert_batch, pending)
+    except Exception as exc:
+        logger.exception("[resume] Erreur critique batch #%s: %s", cert_batch_id, exc)
+        CertificationBatch.objects.filter(pk=cert_batch_id).update(status=CertificationBatch.Status.FAILED)
+        raise
+    return {"cert_batch_id": cert_batch_id, "resumed": len(pending)}
