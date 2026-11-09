@@ -687,33 +687,42 @@ def compute_day(ctx: SiteContext, d: date, fact: dict | None, sources_eval: dict
         row["conso_l"] = D0
         return row
 
-    cap = (POWER_CAP_RATIO * ctx.curve.prp_kva * power_factor
-           if ctx.curve is not None and ctx.curve.prp_kva is not None and ctx.curve.prp_kva > D0 else None)
-    pw = ge_power(ctx, fact, runtime_h, runtime_source, ac_ref, cap)
-    row.update(p_ge_kw=pw["p_ge_kw"], power_source=pw["source"], power_detail=pw["detail"],
-               p_dc_input_kw=pw.get("p_dc_input_kw"), p_ac_aux_kw=pw.get("p_ac_aux_kw"),
-               power_method=pw["method"], power_trace=pw["trace"], power_raw=pw["raw"],
-               power_rejection_codes=pw["rejection_codes"], power_cap_kw=cap)
-    # ── Cascade de médianes §8.3 : repli si ge_power() n'a pas de puissance ──────
-    if pw["p_ge_kw"] is None and pw.get("code") != MC_PUISSANCE_HORS_LIMITE and power_samples is not None:
+    # ── Puissance GE via cascade de médianes §8.3 ───────────────────────────────
+    # C'est LE mécanisme de puissance (§8.2 + §8.3) : médiane du jour (= valeur
+    # du jour si elle existe) → du mois civil → de la période sélectionnée →
+    # INDISPONIBLE (NULL, jamais 0).  "la puissance GE ne vient JAMAIS de DSE,
+    # ni de la production GE" — cph_power_v2.py docstring.
+    pw = {"p_ge_kw": None, "source": None, "code": None, "reason": None,
+          "rejection_codes": [], "rejections": []}
+    if power_samples is not None:
         spec = _spec_from_ctx(ctx)
         p_start = period_start or d
         p_end = period_end or d
         pw2 = _PW2.resolve_power(spec, power_samples, d, p_start, p_end, th=_DAILY_FACTS_THRESHOLDS)
         if pw2.p_ge_kw is not None:
             p_dec = Decimal(str(pw2.p_ge_kw))
-            row.update(
-                p_ge_kw=p_dec,
-                power_source=pw2.source,
-                power_detail=(
-                    f"Médiane §8.3 ({pw2.source}) · {pw2.n_mesures} mesures"
-                    f" sur {pw2.jours_distincts} jour(s)"
-                    + (f" · dispersion excessive" if pw2.dispersion_excessive else "")
-                ),
-                power_method=pw2.source,
+            detail = (
+                f"Médiane §8.3 ({pw2.source}) · {pw2.n_mesures} mesures"
+                f" sur {pw2.jours_distincts} jour(s)"
+                + (" · dispersion excessive" if pw2.dispersion_excessive else "")
             )
-            pw = {**pw, "p_ge_kw": p_dec, "source": pw2.source, "code": None,
-                  "reason": None, "rejection_codes": pw.get("rejection_codes", [])}
+            row.update(p_ge_kw=p_dec, power_source=pw2.source, power_detail=detail,
+                       power_method=pw2.source)
+            pw.update(p_ge_kw=p_dec, source=pw2.source)
+        elif pw2.motif == "PUISSANCE_AU_DELA_105_PCT":
+            pw.update(code=MC_PUISSANCE_HORS_LIMITE,
+                      reason=f"{MC_PUISSANCE_HORS_LIMITE} : cascade §8.3 — puissance dépasse 105 % × kVA × 0,8",
+                      rejection_codes=[MC_PUISSANCE_HORS_LIMITE])
+        else:
+            motif_detail = (" ; ".join(
+                f"{t['niveau']} : {t.get('motif', '')}" for t in pw2.tentatives
+            ) or pw2.motif or "aucun niveau qualifié")
+            pw.update(code=MC_PUISSANCE_INDISPONIBLE,
+                      reason=f"{MC_PUISSANCE_INDISPONIBLE} : cascade §8.3 — {motif_detail}",
+                      rejection_codes=[MC_PUISSANCE_INDISPONIBLE])
+    else:
+        pw.update(code=MC_PUISSANCE_INDISPONIBLE,
+                  reason=f"{MC_PUISSANCE_INDISPONIBLE} : aucun échantillon fourni à la cascade §8.3")
 
     missing = []
     if pw["p_ge_kw"] is None:
