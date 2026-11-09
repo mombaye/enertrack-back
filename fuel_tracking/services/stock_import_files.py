@@ -639,6 +639,12 @@ CLOSING_EXTRA = ("nom du site", "site name", "nombre de ge installé [ex: 1,2,3 
 
 
 def process_closing_file(batch, file_bytes: bytes, file_name: str) -> dict:
+    """
+    Import Closing complet :
+    1. Feuille « Synthese conso fuel »  → cuves + stocks initial/final (FuelStockObservation, source CLOSING).
+    2. Feuille « NR analyse variation conso fuel » → targets mensuels (FuelSiteTarget), si présente.
+       Un import Closing peut donc remplacer un import TARGET_FUEL séparé.
+    """
     resolver = R.SiteResolver()
     stats = {"cuves_creees": 0, "cuves_mises_a_jour": 0, "statuts": {}, "codes": {}}
     found = False
@@ -648,6 +654,16 @@ def process_closing_file(batch, file_bytes: bytes, file_name: str) -> dict:
     if not found:
         raise ValueError("Feuille « Synthese conso fuel » introuvable : fichier closing non reconnu.")
     stats["stocks_closing"] = _process_closing_stocks(batch, file_bytes, file_name, resolver)
+
+    # Import du target depuis l'onglet dédié du même fichier Closing, si présent.
+    # Pas d'erreur si l'onglet est absent : certains Closings anciens ne l'ont pas.
+    try:
+        from fuel_tracking.services import fuel_target as FT
+        stats["targets_closing"] = FT.process_target_file(batch, file_bytes, file_name)
+    except ValueError as exc:
+        # Onglet absent → information seulement, pas un échec de l'import Closing
+        stats["targets_closing"] = {"skipped": True, "reason": str(exc)}
+
     return stats
 
 

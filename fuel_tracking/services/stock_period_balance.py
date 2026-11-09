@@ -584,6 +584,14 @@ def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, pro
         "stock_final_l": Decimal(str(fin["litres"])) if fin else None, "source_stock_final": fin["source"] if fin else None,
         "date_stock_final": t1 if fin else None, "stock_final_detail": fin or {},
         **comps, "consommation_reelle_l": conso, "variation_stock_l": variation, "conso_journaliere_l": conso_j,
+        # conso_closing_l : champ first-class extrait du Closing, indépendant du calcul bilan.
+        # NULL si aucun Closing importé pour la période (ne jamais substituer à consommation_reelle_l).
+        "conso_closing_l": (
+            Decimal(str(closing_ref["conso_closing_l"]))
+            if closing_ref and closing_ref.get("conso_closing_l") is not None
+            else None
+        ),
+        "source_conso_closing": "CLOSING" if closing_ref and closing_ref.get("conso_closing_l") is not None else None,
         "statut_bilan": statut, "resultat_bilan": statut, "cause_principale": cause, "score_confiance": score, "score_detail": detail,
         "reserves": list(dict.fromkeys(reserves)), "estimation": any(x and x["estimation"] for x in (ini, fin)),
         "age_stock_initial_j": ini["age_jours"] if ini else None, "age_stock_final_j": fin["age_jours"] if fin else None,

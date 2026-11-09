@@ -117,9 +117,22 @@ def _gap(a, b):
 
 
 def _closing_of(b) -> dict | None:
+    """
+    Retourne un dict {"conso_closing_l": <valeur>} pour le bilan b.
+
+    Priorité :
+    1. Champ first-class b.conso_closing_l (migration 0057+) — source la plus fiable.
+    2. Fallback legacy : lecture dans stock_initial_detail / stock_final_detail JSON
+       (bilans calculés avant la migration 0057, ou recalcul en attente).
+    """
+    # 1. Champ first-class (préféré)
+    if b is not None and getattr(b, "conso_closing_l", None) is not None:
+        return {"conso_closing_l": b.conso_closing_l}
+
+    # 2. Fallback legacy JSON
     for d in ((b.stock_initial_detail or {}), (b.stock_final_detail or {})):
         ref = d.get("reference_closing")
-        if ref:
+        if ref and ref.get("conso_closing_l") is not None:
             return ref
     for d in ((b.stock_initial_detail or {}), (b.stock_final_detail or {})):
         ctx = d.get("source_context") or {}

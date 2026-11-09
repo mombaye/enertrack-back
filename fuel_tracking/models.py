@@ -1713,6 +1713,18 @@ class FuelStockBalance(models.Model):
                                                 help_text="Truck / Eydon et autres livraisons externes (hors Carte Total).")
     consommation_reelle_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
     variation_stock_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True, help_text="Résultat mathématique du bilan (peut être négatif : alors anomalie, jamais certifiable). NULL si non calculable.")
+    conso_closing_l = models.DecimalField(
+        max_digits=14, decimal_places=3, null=True, blank=True,
+        help_text=(
+            "Consommation Closing : valeur extraite du fichier Closing mensuel de l'opérateur "
+            "(onglet 'NR analyse variation conso fuel'). NULL si aucun Closing importé pour la période. "
+            "Ne jamais substituer à variation_stock_l — ce sont deux mesures indépendantes."
+        ),
+    )
+    source_conso_closing = models.CharField(
+        max_length=32, null=True, blank=True,
+        help_text="Source de conso_closing_l : 'CLOSING' si importé via FuelImportBatch.",
+    )
     conso_journaliere_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True,
                                               help_text="Consommation réelle / jours entre les deux relevés (référence commande).")
 
