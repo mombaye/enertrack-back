@@ -27,7 +27,26 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
+from fuel_tracking.services import cph_power_v2 as _PW2
+
 RULE_VERSION = "CPH-PRP-50HZ-2026-10-02"  # chaîne de repli puissance tracée
+
+# Sources puissance issues de la cascade de médianes (cph_power_v2)
+PW_MEDIANE_JOUR = _PW2.SRC_JOUR
+PW_MEDIANE_MOIS = _PW2.SRC_MOIS
+PW_MEDIANE_PERIODE = _PW2.SRC_PERIODE
+
+# Seuils adaptés aux agrégats journaliers (1 valeur/jour, pas des intervalles 5 min).
+# Les seuils d'origine (min_month=30, min_period=30) supposent de la mesure sub-journalière.
+# Ici : 1 jour = 1 mesure → on abaisse pour rester cohérent avec les données disponibles.
+_DAILY_FACTS_THRESHOLDS = _PW2.Thresholds(
+    min_day=1,         # 1 agrégat journalier suffit pour la médiane du jour
+    min_month=5,       # ≥ 5 jours distincts dans le mois civil
+    min_month_days=5,
+    min_period=3,      # ≥ 3 jours distincts dans la période sélectionnée
+    min_period_days=3,
+    dispersion_ratio=2.0,
+)
 
 D0 = Decimal("0")
 MIN_AVAILABILITY = Decimal("0.5")
@@ -363,6 +382,51 @@ def select_daily_runtime(day: date, sources_eval: dict) -> tuple[Decimal | None,
     return None, None, motifs
 
 
+# ─── Conversion FuelSiteDailyFacts → cph_power_v2.Sample ────────────────────
+
+def _build_power_samples(site_id: str, facts: dict, kind: str | None) -> list[_PW2.Sample]:
+    """
+    Construit la liste de _PW2.Sample à partir des faits journaliers de la période.
+    Utilisée par la cascade de médianes (§8.3) comme repli quand ge_power() échoue.
+
+    Règles :
+    - OUTDOOR : p_dc_kw = p_dc_ge_tracker_kw (si dispo) ou p_dc_rect_active_kw
+                efficiency = eff_ge_tracker ou eff_rect_active
+    - INDOOR  : p_grid_kw = ac_active_power_avg_w / 1000
+    - Les deux champs sont fournis pour INDOOR_SOLAIRE (médiane combinée §8.3).
+    - Un fait sans aucune mesure de puissance est silencieusement ignoré.
+    - Données d'un autre site : impossible ici, les faits proviennent du même site.
+    """
+    samples: list[_PW2.Sample] = []
+    for d, fact in facts.items():
+        if fact is None:
+            continue
+        p_dc = _dec(fact.get("p_dc_ge_tracker_kw")) or _dec(fact.get("p_dc_rect_active_kw"))
+        eff = _dec(fact.get("eff_ge_tracker")) or _dec(fact.get("eff_rect_active"))
+        ac_w = _dec(fact.get("ac_active_power_avg_w"))
+        p_grid = ac_w / Decimal("1000") if ac_w is not None and ac_w > D0 else None
+        if p_dc is None and p_grid is None:
+            continue
+        samples.append(_PW2.Sample(
+            site_id=site_id,
+            at=d,
+            p_dc_kw=float(p_dc) if p_dc is not None else None,
+            efficiency=float(eff) if eff is not None else None,
+            p_grid_kw=float(p_grid) if p_grid is not None else None,
+        ))
+    return samples
+
+
+def _spec_from_ctx(ctx: SiteContext) -> _PW2.SiteSpec:
+    """Traduit SiteContext en _PW2.SiteSpec pour la cascade de médianes."""
+    typology = _PW2.OUTDOOR
+    if ctx.kind == "INDOOR":
+        # Heuristique solaire : non implémentée au niveau SiteContext — traité INDOOR simple.
+        typology = _PW2.INDOOR
+    nominal = float(ctx.ge_kva) if ctx.ge_kva is not None and ctx.ge_kva > D0 else None
+    return _PW2.SiteSpec(site_id=ctx.site_id, typology=typology, nominal_kva=nominal)
+
+
 # ─── Puissance GE (instruction §5) ───────────────────────────────────────────
 
 def dc_input_during_ge(ctx: SiteContext, fact: dict) -> tuple[Decimal | None, str | None, str | None]:
@@ -592,7 +656,10 @@ def apply_curve(curve: Curve, p_ge_kw: Decimal, power_factor: Decimal = NOMINAL_
 
 
 def compute_day(ctx: SiteContext, d: date, fact: dict | None, sources_eval: dict, ac_ref: dict | None,
-                power_factor: Decimal = NOMINAL_POWER_FACTOR) -> dict:
+                power_factor: Decimal = NOMINAL_POWER_FACTOR,
+                power_samples: list | None = None,
+                period_start: date | None = None,
+                period_end: date | None = None) -> dict:
     runtime_h, runtime_source, runtime_motifs = select_daily_runtime(d, sources_eval)
     raw = {src: sources_eval[src]["values"][d] for src in RUNTIME_PRIORITY}
     row = {
@@ -627,6 +694,27 @@ def compute_day(ctx: SiteContext, d: date, fact: dict | None, sources_eval: dict
                p_dc_input_kw=pw.get("p_dc_input_kw"), p_ac_aux_kw=pw.get("p_ac_aux_kw"),
                power_method=pw["method"], power_trace=pw["trace"], power_raw=pw["raw"],
                power_rejection_codes=pw["rejection_codes"], power_cap_kw=cap)
+    # ── Cascade de médianes §8.3 : repli si ge_power() n'a pas de puissance ──────
+    if pw["p_ge_kw"] is None and pw.get("code") != MC_PUISSANCE_HORS_LIMITE and power_samples is not None:
+        spec = _spec_from_ctx(ctx)
+        p_start = period_start or d
+        p_end = period_end or d
+        pw2 = _PW2.resolve_power(spec, power_samples, d, p_start, p_end, th=_DAILY_FACTS_THRESHOLDS)
+        if pw2.p_ge_kw is not None:
+            p_dec = Decimal(str(pw2.p_ge_kw))
+            row.update(
+                p_ge_kw=p_dec,
+                power_source=pw2.source,
+                power_detail=(
+                    f"Médiane §8.3 ({pw2.source}) · {pw2.n_mesures} mesures"
+                    f" sur {pw2.jours_distincts} jour(s)"
+                    + (f" · dispersion excessive" if pw2.dispersion_excessive else "")
+                ),
+                power_method=pw2.source,
+            )
+            pw = {**pw, "p_ge_kw": p_dec, "source": pw2.source, "code": None,
+                  "reason": None, "rejection_codes": pw.get("rejection_codes", [])}
+
     missing = []
     if pw["p_ge_kw"] is None:
         status = DAY_PUISSANCE_HORS_PLAFOND if pw["code"] == MC_PUISSANCE_HORS_LIMITE else DAY_PUISSANCE_ABSENTE
@@ -821,7 +909,13 @@ def compute_site_period(ctx: SiteContext, facts: dict, start: date, end: date,
     days = list(daterange(start, end))
     sources_eval = evaluate_runtime_sources(ctx, facts, days)
     ac_ref = indoor_ac_reference(ctx, facts, start, end, settings) if ctx.kind == "INDOOR" else None
-    day_rows = {d: compute_day(ctx, d, facts.get(d), sources_eval, ac_ref, settings.nominal_power_factor) for d in days}
+    # Cascade de médianes §8.3 : construire le pool de samples une seule fois pour la période.
+    power_samples = _build_power_samples(ctx.site_id, facts, ctx.kind)
+    day_rows = {
+        d: compute_day(ctx, d, facts.get(d), sources_eval, ac_ref, settings.nominal_power_factor,
+                       power_samples=power_samples, period_start=start, period_end=end)
+        for d in days
+    }
     if settings.data_until is not None:
         for d, r in day_rows.items():
             if d > settings.data_until and d not in facts and r["status"] == DAY_RUNTIME_ABSENT:
