@@ -40,21 +40,16 @@ class CertificationBatchViewSet(
     permission_classes = [IsAuthenticated]
 
     def destroy(self, request, *args, **kwargs):
-        """Supprime une campagne de certification et ses résultats.
+        """Supprime une campagne de certification et ses résultats, y compris pendant un calcul (qui s'arrête alors).
 
         Les factures importées sont conservées : la campagne peut être relancée depuis le même import.
-        Refusé (409) pendant un calcul en cours, sauf campagne bloquée depuis plus de 2 h.
+        Calcul en cours : les sous-tâches encore en file ne trouvent plus leur résultat et se terminent aussitôt
+        (certify_single_invoice / finalize gèrent l'absence), rien n'est recréé.
         """
         cert_batch = self.get_object()
-        if (cert_batch.status == CertificationBatch.Status.RUNNING
-                and timezone.now() - cert_batch.launched_at < STUCK_RUNNING_AFTER):
-            return Response(
-                {"detail": "Certification en cours : attendez la fin du calcul avant de la supprimer."},
-                status=status.HTTP_409_CONFLICT,
-            )
         logger.info(
-            "[certification] campagne #%s (%s, %s résultats) supprimée par %s",
-            cert_batch.id, cert_batch.echeance_label, cert_batch.total, request.user,
+            "[certification] campagne #%s (%s, %s, %s résultats) supprimée par %s",
+            cert_batch.id, cert_batch.echeance_label, cert_batch.status, cert_batch.total, request.user,
         )
         cert_batch.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)

@@ -163,11 +163,28 @@ class CampaignDeleteAndSummaryTests(TestCase):
         self.assertFalse(CertificationResult.objects.filter(cert_batch_id=self.cert.id).exists())
         self.assertEqual(SonatelInvoice.objects.filter(batch=self.batch).count(), 4)
 
-    def test_delete_refused_while_running_unless_stuck(self):
-        from datetime import timedelta
-        from django.utils import timezone
-
+    def test_delete_allowed_while_running(self):
         CertificationBatch.objects.filter(pk=self.cert.id).update(status=CertificationBatch.Status.RUNNING)
-        self.assertEqual(self.client.delete(f"/api/certification/batches/{self.cert.id}/").status_code, 409)
-        CertificationBatch.objects.filter(pk=self.cert.id).update(launched_at=timezone.now() - timedelta(hours=3))
         self.assertEqual(self.client.delete(f"/api/certification/batches/{self.cert.id}/").status_code, 204)
+        self.assertEqual(SonatelInvoice.objects.filter(batch=self.batch).count(), 4)
+
+    def test_in_flight_calculation_after_delete_recreates_nothing(self):
+        from unittest import mock
+
+        from certification.tasks import certify_single_invoice
+
+        rid = CertificationResult.objects.filter(cert_batch=self.cert, status=CertificationResult.Status.NEEDS_REVIEW).first().id
+        real_get = CertificationResult.objects.select_related("invoice", "site", "cert_batch").get(id=rid)
+
+        class Gone:
+            def __init__(self, cert_batch=None):
+                CertificationBatch.objects.filter(pk=real_get.cert_batch_id).delete()  # suppression pendant le calcul
+            def get_prefetched_entries(self, *a): return None, None
+            def get_conso_periode(self, *a): return None, "none"
+            def get_conso_last_complete_month(self, *a): return None, None
+            def get_conso_acm(self, *a): return None, None
+
+        with mock.patch("certification.tasks.EfmsService", Gone):
+            out = certify_single_invoice(rid)
+        self.assertEqual(out["status"], "CANCELLED")
+        self.assertFalse(CertificationResult.objects.filter(pk=rid).exists())

@@ -21,7 +21,7 @@ import logging
 from decimal import Decimal, InvalidOperation
 
 from celery import shared_task, chord, group
-from django.db import transaction
+from django.db import DatabaseError, transaction
 from django.db.models import F
 from django.utils import timezone
 
@@ -368,7 +368,15 @@ def certify_single_invoice(self, result_id: int) -> dict:
         except Exception as exc8:
             result.montant_check_error = f"Erreur étape 8: {exc8}"
 
-        result.save()
+        # force_update : si la campagne a été supprimée pendant le calcul, ne jamais recréer le résultat.
+        try:
+            with transaction.atomic():  # point de sauvegarde : l'échec n'invalide pas la transaction englobante
+                result.save(force_update=True)
+        except DatabaseError:
+            if not CertificationResult.objects.filter(pk=result_id).exists():
+                logger.info("[certify] #%d : campagne supprimée pendant le calcul — abandon", result_id)
+                return {"result_id": result_id, "status": "CANCELLED"}
+            raise
         _increment_batch_counter(cert_batch_id, result.status)
 
         logger.info(
