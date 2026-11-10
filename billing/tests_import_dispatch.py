@@ -99,3 +99,28 @@ class BeatScheduleExpiryTests(SimpleTestCase):
             self.assertGreater(expires, 0, name)
             if name.endswith("-5min"):
                 self.assertLess(expires, 5 * 60, name)
+
+
+class ScheduledTasksAreBoundedTests(SimpleTestCase):
+    """Chaque tâche planifiée a une limite de temps : une exécution bloquée ne peut plus garder un processus des heures
+    (2026-11-09 : 4 synchros financières bloquées occupaient tout le worker, certification figée à 1 %)."""
+
+    def test_every_scheduled_task_has_a_hard_time_limit(self):
+        from django.conf import settings
+
+        from enertrack_backend.celery import app
+
+        app.loader.import_default_modules()
+        for name, entry in settings.CELERY_BEAT_SCHEDULE.items():
+            task = app.tasks[entry["task"]]
+            self.assertTrue(task.time_limit, f"{name} ({entry['task']}) sans time_limit")
+
+    def test_financial_sync_does_not_overlap(self):
+        from unittest import mock
+
+        from financial.tasks import sync_financial_conso_auto
+
+        with mock.patch("django.core.cache.cache.add", return_value=False), \
+             mock.patch("django.core.management.call_command") as cc:
+            sync_financial_conso_auto()
+        cc.assert_not_called()

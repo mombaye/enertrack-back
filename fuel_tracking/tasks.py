@@ -157,7 +157,7 @@ def resync_fuel_daily_facts_nightly(self):
     _run_daily_facts_sync(35, "J-35")
 
 
-@shared_task(bind=True, name="fuel_tracking.check_cph_health_daily")
+@shared_task(bind=True, name="fuel_tracking.check_cph_health_daily", soft_time_limit=25 * 60, time_limit=30 * 60)
 def check_cph_health_daily(self):
     """Contrôle quotidien : chaque anomalie est journalisée en ERROR (alerting sur les logs)."""
     from fuel_tracking.services.cph_health import cph_health
@@ -184,7 +184,10 @@ def sync_fuel_stock_current(self):
         logger.exception("[fuel_tracking] Échec sync_fuel_stock planifiée")
 
 
-@shared_task(bind=True, name="fuel_tracking.auto_import_stan_periodic")
+# Toutes les 15 min : une seule exécution à la fois, arrêt forcé d'une exécution qui ne se termine pas
+# (sinon elle garde un processus du worker indéfiniment — cf. synchro financière, 2026-11-09).
+@shared_task(bind=True, name="fuel_tracking.auto_import_stan_periodic", soft_time_limit=55 * 60, time_limit=60 * 60)
+@_exclusive("auto_import_stan", 65 * 60)
 def auto_import_stan_periodic(self):
     """Détecte un nouveau fichier Stan dans data_imports/stan/ et l'importe.
 
@@ -199,7 +202,8 @@ def auto_import_stan_periodic(self):
         logger.exception("[fuel_tracking] Échec auto_import_stan planifiée")
 
 
-@shared_task(bind=True, name="fuel_tracking.process_fuel_import_incoming")
+@shared_task(bind=True, name="fuel_tracking.process_fuel_import_incoming", soft_time_limit=55 * 60, time_limit=60 * 60)
+@_exclusive("process_fuel_import_incoming", 65 * 60)
 def process_fuel_import_incoming(self):
     """Registre stock : traite les fichiers déposés dans FUEL_IMPORT_ROOT/incoming/{loliforce,scss,closing,modeles_cuves}."""
     from fuel_tracking.services.stock_import_pipeline import root, scan_incoming
@@ -214,7 +218,7 @@ def process_fuel_import_incoming(self):
         logger.exception("[fuel_tracking] Échec traitement des fichiers du registre stock")
 
 
-@shared_task(bind=True, name="fuel_tracking.auto_compute_stock_balances")
+@shared_task(bind=True, name="fuel_tracking.auto_compute_stock_balances", soft_time_limit=170 * 60, time_limit=180 * 60)
 @_exclusive("auto_compute_stock_balances", 3 * 3600)
 def auto_compute_stock_balances(self):
     """
