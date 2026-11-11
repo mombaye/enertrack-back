@@ -2,7 +2,7 @@
 
 from django.urls import path
 
-from fuel_tracking.views_bi import BiConsoView, BiCphView, BiStockView
+from fuel_tracking.views_bi import BiConsoView, BiCphView, BiExportView, BiStockView
 
 from fuel_tracking.views import (
     FuelCommandeEstimationView,
@@ -58,6 +58,7 @@ urlpatterns = [
     path("bi/conso/", BiConsoView.as_view(), name="fuel-bi-conso"),
     path("bi/stock/", BiStockView.as_view(), name="fuel-bi-stock"),
     path("bi/cph/", BiCphView.as_view(), name="fuel-bi-cph"),
+    path("bi/export/<str:kind>/", BiExportView.as_view(), name="fuel-bi-export"),
     path("consommation/dashboard/", FuelConsommationDashboardView.as_view(), name="fuel-consommation-dashboard"),
     path("consommation/", FuelConsommationListView.as_view(), name="fuel-consommation"),
     path("stock/", FuelStockListView.as_view(), name="fuel-stock"),

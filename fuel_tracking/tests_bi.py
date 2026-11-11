@@ -11,7 +11,9 @@ from fuel_tracking.models import FuelConsommationMonthly, FuelStockSnapshot
 
 def api():
     c = APIClient()
-    c.force_authenticate(get_user_model().objects.create_user("bi", "bi@x.sn", "p", role="analyst"))
+    U = get_user_model()
+    u = U.objects.filter(username="bi").first() or U.objects.create_user("bi", "bi@x.sn", "p", role="analyst")
+    c.force_authenticate(u)
     return c
 
 
@@ -37,7 +39,7 @@ class BiConsoTests(TestCase):
         self.assertEqual(k["l_kwh"], 0.3)                      # ratio des sommes, B (sans conso) exclu du dénominateur
         self.assertEqual(b["deltas"]["conso_mesuree_l"], 20.0)  # vs 2026-09
         self.assertEqual(b["top_conso"][0]["site_id"], "A")
-        self.assertEqual(b["top_ecart_enoc"][0]["ecart_l"], -180.0)
+        self.assertEqual(b["top_ecart_enoc"][0]["ecart_enoc_l"], -180.0)
 
     def test_country_filter(self):
         b = api().get("/api/fuel-tracking/bi/conso/", {"from_month": "2026-10", "to_month": "2026-10", "country": "ML"}).json()
@@ -82,3 +84,60 @@ class BiCphTests(TestCase):
 
     def test_period_too_long_is_rejected(self):
         self.assertEqual(api().get("/api/fuel-tracking/bi/cph/", {"start": "2026-01-01", "end": "2026-10-31"}).status_code, 400)
+
+
+class BiConsoTargetTests(TestCase):
+    def test_target_compared_on_measured_months_only(self):
+        from fuel_tracking.models import FuelSiteTarget
+        conso("2026-10", "A", country="SN", conso_snowflake_l=D("130"), nb_jours_data=10)
+        conso("2026-10", "B", country="SN", conso_snowflake_l=None)
+        FuelSiteTarget.objects.create(site_id="A", target_mensuel_l=D("100"), is_active=True)
+        FuelSiteTarget.objects.create(site_id="B", target_mensuel_l=D("100"), is_active=True)
+        b = api().get("/api/fuel-tracking/bi/conso/", {"from_month": "2026-10", "to_month": "2026-10"}).json()
+        k = b["kpis"]
+        self.assertEqual(k["l_site_jour"], 13.0)               # 130 L / 10 jours mesurés
+        self.assertEqual(k["nb_sites_target"], 1)              # B sans conso : pas comparé, pas « 0 L »
+        self.assertEqual(k["ecart_target_pct"], 30.0)
+        self.assertEqual(k["nb_sites_au_dessus_target"], 1)
+        self.assertEqual(b["top_target"][0]["site_id"], "A")
+        self.assertNotIn("sites", b)
+
+
+class BiExportTests(TestCase):
+    XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+    def _wb(self, resp):
+        from io import BytesIO
+        from openpyxl import load_workbook
+        self.assertEqual(resp.status_code, 200, getattr(resp, "content", b"")[:300])
+        self.assertEqual(resp["Content-Type"], self.XLSX)
+        return load_workbook(BytesIO(resp.content))
+
+    def test_conso_export_has_all_sites_and_blank_for_absent(self):
+        for i in range(15):
+            conso("2026-10", f"S{i:02d}", country="SN", conso_snowflake_l=D(100 + i))
+        conso("2026-10", "VIDE", country="SN", conso_snowflake_l=None)
+        wb = self._wb(api().get("/api/fuel-tracking/bi/export/conso/", {"from_month": "2026-10", "to_month": "2026-10"}))
+        self.assertEqual(wb.sheetnames, ["Synthèse", "Mensuel", "Par pays", "Par typologie", "Sites"])
+        ws = wb["Sites"]
+        self.assertEqual(ws.max_row, 17)                       # en-tête + 16 sites (pas seulement le Top 10)
+        last = [c.value for c in ws[17]]
+        self.assertEqual(last[0], "VIDE")
+        self.assertIsNone(last[6])                             # conso absente = cellule vide, jamais 0
+
+    def test_stock_cph_commande_estimation_exports(self):
+        from fuel_tracking.models import FuelSuiviCommandeSite
+        FuelStockSnapshot.objects.create(site_id="A", has_genset=True, stock_snowflake_l=100, capacity_snowflake_l=1000, stock_snowflake_pct=10)
+        self.assertEqual(self._wb(api().get("/api/fuel-tracking/bi/export/stock/"))["Sites"].max_row, 2)
+        FuelSuiviCommandeSite.objects.create(month_year="2026-10", site_id="A", commande_avec_marge_l=D("500"))
+        self.assertEqual(self._wb(api().get("/api/fuel-tracking/bi/export/commande/"))["Sites"]["J2"].value, 500.0)
+        self._wb(api().get("/api/fuel-tracking/bi/export/estimation/"))
+        rows = [{"site_id": "A", "perimetre": "GE", "cph_status": "COMPLET", "conso_theorique_l": D("100"), "runtime_total_h": D("10"),
+                 "charge_moy": D("0.5"), "cph_moy_l_h": D("10"), "comparaison": {"conso_mesuree_l": D("130")}}]
+        with mock.patch("fuel_tracking.services.cph_service.compute_period_summary", return_value=rows):
+            ws = self._wb(api().get("/api/fuel-tracking/bi/export/cph/", {"start": "2026-10-01", "end": "2026-10-31"}))["Sites"]
+        self.assertEqual(ws["Q2"].value, 30.0)                 # écart mesuré − CPH en litres
+
+    def test_unknown_and_bad_period(self):
+        self.assertEqual(api().get("/api/fuel-tracking/bi/export/xyz/").status_code, 404)
+        self.assertEqual(api().get("/api/fuel-tracking/bi/export/cph/", {"start": "2026-01-01", "end": "2026-12-31"}).status_code, 400)
