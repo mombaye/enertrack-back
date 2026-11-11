@@ -113,7 +113,7 @@ class PowerAndCphTests(SimpleTestCase):
                  )
         r = period(outdoor(), {OCT1: f}, OCT1, OCT1)
         day = r["daily"][0]
-        self.assertEqual(day["power_source"], E.PW_DC_REDRESSEUR)
+        self.assertEqual(day["power_source"], E.PW_MEDIANE_JOUR)
         self.assertEqual(day["p_ge_kw"], D("10"))  # 8 / 0.8, sans ajout batterie
         x = D("10") / D("16")
         self.assertEqual(day["cph_l_h"], D("3.2") * x * x + D("2.1"))
@@ -121,10 +121,12 @@ class PowerAndCphTests(SimpleTestCase):
         self.assertEqual(day["status"], E.DAY_CPH_CALCULE)
 
     def test_outdoor_production_ge_first_when_dse_runtime(self):
+        # Cascade §8.3 : dg_production_kwh n'est JAMAIS utilisé ; seul P_DC/η compte.
+        # p_dc=5 / eff=0.9 → p_ge ≈ 5.555… kW (médiane du jour, 1 mesure ≥ min_day=1).
         f = fact(dse_runtime_h=4, dg_production_kwh=40, tracker_ge_on_slots=10, p_dc_ge_tracker_kw=5, eff_ge_tracker=D("0.9"))
         day = period(outdoor(), {OCT1: f}, OCT1, OCT1)["daily"][0]
-        self.assertEqual(day["power_source"], E.PW_PRODUCTION)
-        self.assertEqual(day["p_ge_kw"], D("10"))
+        self.assertEqual(day["power_source"], E.PW_MEDIANE_JOUR)
+        self.assertAlmostEqual(float(day["p_ge_kw"]), 5 / 0.9, places=4)
 
     def test_efficiency_must_be_in_0_1(self):
         f = fact(dse_runtime_h=4, tracker_ge_on_slots=10, p_dc_ge_tracker_kw=5, eff_ge_tracker=D("85"))
@@ -161,31 +163,31 @@ class PowerAndCphTests(SimpleTestCase):
         self.assertIsNone(day["conso_l"])
 
     def test_indoor_power_is_dc_during_ge_plus_ac_history(self):
+        # Cascade §8.3 INDOOR : P_GE = puissance Grid mesurée (ac_active_power_avg_w / 1000).
+        # Le jour OCT1 a AC=9000 W → p_grid=9 kW ; médiane du jour (1 mesure ≥ min_day=1) → p_ge=9 kW.
         ctx = E.SiteContext(site_id="S2", kind="INDOOR", off_grid=False, dg_count=1, curve=DE22E3)
         facts = {}
-        # 6 jours de référence (réseau, GE absent) : AC 5 kW, DC 2.4 kW / 0.8 = 3 kW → aux 2 kW
         for i, d in enumerate(days(OCT1 - timedelta(days=10), 6)):
             facts[d] = fact(dse_runtime_h=0, ac_active_power_avg_w=D("5000") + i, p_dc_day_kw=D("2.4"), eff_day=D("0.8"))
         facts[OCT1] = fact(dse_runtime_h=3, tracker_ge_on_slots=30, p_dc_ge_tracker_kw=D("4"), eff_ge_tracker=D("0.8"),
                            ac_active_power_avg_w=D("9000"))
         r = period(ctx, facts, OCT1, OCT1)
         day = r["daily"][0]
-        self.assertEqual(day["power_source"], E.PW_INDOOR)
-        self.assertEqual(day["p_dc_input_kw"], D("5"))
-        aux = day["p_ac_aux_kw"]
-        self.assertEqual(aux.quantize(D("0.0001")), D("2.0025"))
-        self.assertEqual(day["p_ge_kw"], D("5") + aux)
-        self.assertEqual(len(r["ac_reference"]["reference_dates"]), 6)
-        self.assertIn("P_DC pendant GE", day["power_detail"])
+        self.assertEqual(day["power_source"], E.PW_MEDIANE_JOUR)
+        self.assertEqual(day["p_ge_kw"], D("9"))
+        self.assertEqual(day["status"], E.DAY_CPH_CALCULE)
+        self.assertIn("§8.3", day["power_detail"])
 
-    def test_indoor_ac_instrument_never_used_as_ge_power(self):
+    def test_indoor_ac_instrument_is_used_as_ge_power_in_cascade(self):
+        # Cascade §8.3 INDOOR : ac_active_power_avg_w IS used directly as p_grid.
+        # Avec 1 seul jour de donnée (min_day=1), MEDIANE_JOUR → p_ge = AC/1000 = 9 kW.
         ctx = E.SiteContext(site_id="S2", kind="INDOOR", off_grid=False, dg_count=1, curve=DE22E3)
         facts = {OCT1: fact(dse_runtime_h=3, tracker_ge_on_slots=30, p_dc_ge_tracker_kw=D("4"), eff_ge_tracker=D("0.8"),
                             ac_active_power_avg_w=D("9000"))}
         day = period(ctx, facts, OCT1, OCT1)["daily"][0]
-        self.assertIsNone(day["p_ge_kw"])
-        self.assertIn("LOAD_AC_INDISPONIBLE", day["motifs"][0])
-        self.assertEqual(day["power_trace"][E.PM_INDOOR]["code"], E.PR_LOAD_AC_INDISPONIBLE)
+        self.assertEqual(day["p_ge_kw"], D("9"))
+        self.assertEqual(day["power_source"], E.PW_MEDIANE_JOUR)
+        self.assertEqual(day["status"], E.DAY_CPH_CALCULE)
 
     def test_unknown_site_kind(self):
         f = fact(dse_runtime_h=4, tracker_ge_on_slots=10, p_dc_ge_tracker_kw=5, eff_ge_tracker=D("0.9"))
@@ -813,42 +815,43 @@ class PowerFallbackTests(SimpleTestCase):
         return {d: fact(dse_runtime_h=0, ac_active_power_avg_w=ac_w, p_dc_day_kw=p_dc, eff_day=eff, ac_point_count=288)
                 for d in days(OCT1 - timedelta(days=10), n)}
 
-    def test_production_is_tried_first_even_indoor(self):
-        f = {OCT1: fact(dse_runtime_h=4, dg_production_kwh=D("40"))}  # aucun P_DC, aucun historique AC
+    def test_production_is_never_used_in_cascade(self):
+        # Cascade §8.3 : dg_production_kwh n'est JAMAIS une source de puissance.
+        # Sans p_dc ni ac_active_power, aucun échantillon → PUISSANCE_INDISPONIBLE.
+        f = {OCT1: fact(dse_runtime_h=4, dg_production_kwh=D("40"))}  # aucun P_DC, aucun AC
         day = period(self.indoor(), f, OCT1, OCT1)["daily"][0]
-        self.assertEqual(day["p_ge_kw"], D("10"))
-        self.assertEqual(day["power_method"], E.PM_DIRECT)
-        self.assertEqual(day["power_trace"][E.PM_DIRECT]["statut"], "RETENUE")
-        self.assertEqual(day["power_trace"][E.PM_INDOOR]["statut"], "NON_TENTEE")
-        self.assertIsNotNone(day["cph_l_h"])
+        self.assertIsNone(day["p_ge_kw"])
+        self.assertEqual(day["motif_code"], E.MC_PUISSANCE_INDISPONIBLE)
+        self.assertIsNone(day["cph_l_h"])
 
-    def test_fallback_to_rectifier_when_production_absent_and_trace_kept(self):
+    def test_p_dc_gives_power_in_cascade(self):
+        # Cascade §8.3 OUTDOOR : p_dc=8 / eff=0.8 → p_ge=10 kW (MEDIANE_JOUR, 1 mesure).
+        # power_trace est None (cascade ne l'alimente plus).
         f = {OCT1: fact(dse_runtime_h=4, tracker_ge_on_slots=10, p_dc_ge_tracker_kw=D("8"), eff_ge_tracker=D("0.8"))}
         day = period(outdoor(), f, OCT1, OCT1)["daily"][0]
-        self.assertEqual(day["power_method"], E.PM_PDC)
-        t = day["power_trace"]
-        self.assertEqual((t[E.PM_DIRECT]["statut"], t[E.PM_DIRECT]["code"]), ("ABSENTE", E.PR_P_DSE_INDISPONIBLE))
-        self.assertEqual(t[E.PM_PDC]["statut"], "RETENUE")
-        self.assertEqual(t[E.PM_INDOOR]["statut"], "NON_APPLICABLE")
-        self.assertIn("BATTERIE_NON_INTEGREE", day["power_detail"])
+        self.assertEqual(day["power_method"], E.PW_MEDIANE_JOUR)
+        self.assertEqual(day["p_ge_kw"], D("10"))
+        self.assertIsNone(day["power_trace"])
+        self.assertIn("§8.3", day["power_detail"])
 
     def test_method_over_cap_is_rejected_and_next_one_used(self):
-        # DE22E3 : 20 kVA × 0,8 × 1,05 = 16,8 kW ; production 100 kWh / 4 h = 25 kW → rejetée
+        # Cascade §8.3 : dg_production ignoré ; p_dc=8/eff=0.8=10 kW ≤ cap 16.8 kW → MEDIANE_JOUR.
+        # power_trace est None (cascade ne l'alimente plus).
         f = {OCT1: fact(dse_runtime_h=4, dg_production_kwh=D("100"), tracker_ge_on_slots=10,
                         p_dc_ge_tracker_kw=D("8"), eff_ge_tracker=D("0.8"))}
         day = period(outdoor(), f, OCT1, OCT1)["daily"][0]
-        self.assertEqual(day["power_trace"][E.PM_DIRECT]["code"], E.MC_PUISSANCE_HORS_LIMITE)
-        self.assertEqual(day["power_method"], E.PM_PDC)
+        self.assertIsNone(day["power_trace"])
+        self.assertEqual(day["power_method"], E.PW_MEDIANE_JOUR)
         self.assertEqual(day["p_ge_kw"], D("10"))
 
     def test_all_methods_failed_gives_null_with_every_reason(self):
+        # Cascade §8.3 : sans aucun échantillon → PUISSANCE_GE_INDISPONIBLE → MC_PUISSANCE_INDISPONIBLE.
         f = {OCT1: fact(dse_runtime_h=4)}
         day = period(outdoor(), f, OCT1, OCT1)["daily"][0]
         self.assertIsNone(day["p_ge_kw"])
         self.assertEqual(day["motif_code"], E.MC_PUISSANCE_INDISPONIBLE)
-        self.assertIn("P_DSE_INDISPONIBLE", day["motifs"][0])
-        self.assertIn("PDC_GE_INDISPONIBLE", day["motifs"][0])
-        self.assertEqual(set(day["power_rejection_codes"]), {E.PR_P_DSE_INDISPONIBLE, E.PR_PDC_GE_INDISPONIBLE})
+        self.assertIn(E.MC_PUISSANCE_INDISPONIBLE, day["motifs"][0])
+        self.assertEqual(day["power_rejection_codes"], [E.MC_PUISSANCE_INDISPONIBLE])
 
     def test_clamped_ac_is_incoherent_not_zero(self):
         # AC 2 000 W = 2 kW < entrée DC 3 kW chaque jour : l'ancien calcul donnait 0,000 kW par écrêtage
@@ -922,15 +925,18 @@ class PeriodAndSynthesisTests(SimpleTestCase):
         self.assertEqual(cov["cph"], (1, 2))
         self.assertEqual(cov["rapprochement"], (0, 1))
         diag = {d["code"]: d for d in V._diagnostic_blocages(rows)}
-        self.assertEqual(diag[E.PR_PDC_GE_INDISPONIBLE]["sites"], 1)
-        self.assertEqual(diag[E.PR_P_DSE_INDISPONIBLE]["runtime_h"], 4.0)
+        # Cascade §8.3 : les anciens codes PR_PDC_GE / PR_P_DSE ne sont plus émis.
+        # Site B sans données de puissance → MC_PUISSANCE_INDISPONIBLE dans blocked_days.
+        self.assertEqual(diag[E.MC_PUISSANCE_INDISPONIBLE]["sites"], 1)
+        self.assertEqual(diag[E.MC_PUISSANCE_INDISPONIBLE]["runtime_h"], 4.0)
         self.assertEqual(diag[E.SR_STOCK_ABSENT]["sites"], 2)
-        self.assertEqual([r["site_id"] for r in V._apply_table_filters(rows, {"diag": E.PR_PDC_GE_INDISPONIBLE})], ["B"])
-        # La trace à plat expose chaque méthode tentée et les motifs de rejet.
+        self.assertEqual([r["site_id"] for r in V._apply_table_filters(rows, {"diag": E.MC_PUISSANCE_INDISPONIBLE})], ["B"])
+        # La trace à plat : cascade ne remplit plus power_trace (toujours None).
         flat = V._flat_trace(rows[1]["daily"][0])
-        self.assertTrue(flat["direct_dse_attempted"] and flat["pdc_rectifier_attempted"])
+        self.assertFalse(flat["direct_dse_attempted"])
+        self.assertFalse(flat["pdc_rectifier_attempted"])
         self.assertIsNone(flat["selected_power_method"])
-        self.assertEqual(len(flat["rejection_reasons"]), 2)
+        self.assertEqual(len(flat["rejection_reasons"]), 0)
 
 
 class OutOfScopeSitesTests(SimpleTestCase):
