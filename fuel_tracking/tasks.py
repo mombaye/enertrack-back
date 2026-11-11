@@ -69,8 +69,11 @@ def _prev_month(month_str: str) -> str:
     return f"{year}-{month - 1:02d}"
 
 
-@shared_task(bind=True, name="fuel_tracking.sync_fuel_consommation_current_month", soft_time_limit=600, time_limit=900)
-@_exclusive("sync_fuel_consommation", 1800)
+# M-1 + M (Snowflake, ENOC, snapshot stock mensuel) : nettement plus de 15 min en prod. Constaté le 2026-11-11 :
+# avec 10/15 min, chaque exécution était tuée avant la fin → aucun run SUCCESS, voyant Snowflake rouge. 40/45 min,
+# verrou 50 min (une seule exécution à la fois ; la planification toutes les 5 min est ignorée pendant ce temps).
+@shared_task(bind=True, name="fuel_tracking.sync_fuel_consommation_current_month", soft_time_limit=40 * 60, time_limit=45 * 60)
+@_exclusive("sync_fuel_consommation", 50 * 60)
 def sync_fuel_consommation_current_month(self):
     from django.core.management import call_command
 

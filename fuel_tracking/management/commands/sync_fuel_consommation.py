@@ -15,6 +15,9 @@ Usage:
     python manage.py sync_fuel_consommation --from-month 2026-01 --to-month 2026-07
     python manage.py sync_fuel_consommation --month 2026-07 --dry-run
 """
+import time
+
+from celery.exceptions import SoftTimeLimitExceeded
 from django.core.management import call_command
 from django.core.management.base import BaseCommand
 from django.db import transaction
@@ -72,6 +75,7 @@ class Command(BaseCommand):
         self.stdout.write(f"  Snowflake  : {FUEL_DATABASE}.{FUEL_SCHEMA} + {FUEL_REPORT_DATABASE}.{FUEL_SCHEMA} (VW_FUEL_REPORT)")
         self.stdout.write("═" * 80 + "\n")
 
+        self._t0 = time.monotonic()
         sync_run = None
         if not dry_run:
             # Synchros restées RUNNING depuis > 1 h = processus tué ou bloqué : on les clôture en échec (traçabilité honnête).
@@ -85,6 +89,26 @@ class Command(BaseCommand):
                 status=FuelConsommationSyncRun.Status.RUNNING,
             )
 
+        # Toute sortie anormale (exception, dépassement de la limite de temps Celery) est enregistrée
+        # sur le run : sinon il restait RUNNING, puis « interrompue » une heure plus tard, sans cause.
+        try:
+            self._sync(sync_run, from_month, to_month, dry_run)
+        except BaseException as e:
+            if sync_run is not None and sync_run.status == FuelConsommationSyncRun.Status.RUNNING:
+                if isinstance(e, SoftTimeLimitExceeded):
+                    reason = (f"Délai dépassé : synchronisation arrêtée au bout de "
+                              f"{int(time.monotonic() - self._t0)} s (limite de la tâche planifiée).")
+                else:
+                    reason = f"Échec : {type(e).__name__}: {e}"[:1000]
+                FuelConsommationSyncRun.objects.filter(pk=sync_run.pk).update(
+                    status=FuelConsommationSyncRun.Status.FAILED, finished_at=timezone.now(), error_message=reason,
+                )
+            raise
+
+    def _step(self, label):
+        self.stdout.write(f"  [{int(time.monotonic() - self._t0)} s] {label}")
+
+    def _sync(self, sync_run, from_month, to_month, dry_run):
         # Référentiel GE ENOC (sites.nb_ge + ge_assets INSTALLED) — pas
         # dépendant du mois, une seule lecture pour toute la commande.
         # Si ENOC est injoignable, on continue avec Snowflake seul (le flag
@@ -93,6 +117,8 @@ class Command(BaseCommand):
             genset_ref_enoc = fetch_genset_reference()
             self.stdout.write(f"  Référentiel GE ENOC : {len(genset_ref_enoc)} site(s), "
                                f"{sum(1 for v in genset_ref_enoc.values() if v['has_genset'])} avec GE.\n")
+        except SoftTimeLimitExceeded:
+            raise
         except Exception as e:
             self.stdout.write(self.style.WARNING(f"  Référentiel GE ENOC indisponible ({e}) — Snowflake seul utilisé.\n"))
             genset_ref_enoc = {}
@@ -106,9 +132,11 @@ class Command(BaseCommand):
             month_year = f"{year:04d}-{mo:02d}"
             self.stdout.write(f"\n── {month_year} ──")
 
-            self.stdout.write("  Requête Snowflake (VW_FUEL_REPORT / GE_PROD_KWH / capteur)...")
+            self._step("Requête Snowflake (VW_FUEL_REPORT / GE_PROD_KWH / capteur)...")
             try:
                 snowflake_data = fetch_monthly_consumption(year, mo)
+            except SoftTimeLimitExceeded:
+                raise
             except Exception as e:
                 self.stdout.write(self.style.ERROR(f"  Erreur Snowflake pour {month_year} : {e}"))
                 last_error = str(e)
@@ -133,8 +161,11 @@ class Command(BaseCommand):
 
             # Conso ESTIMÉE (pas mesurée) depuis les relevés de niveau ENOC —
             # voir les réserves dans enoc_mongo_service.fetch_estimated_consumption.
+            self._step("Estimation ENOC (relevés de niveau)...")
             try:
                 conso_estimee_by_site = fetch_estimated_consumption(year, mo)
+            except SoftTimeLimitExceeded:
+                raise
             except Exception as e:
                 self.stdout.write(self.style.WARNING(f"  Estimation ENOC (relevés de niveau) indisponible : {e}"))
                 conso_estimee_by_site = {}
@@ -261,13 +292,17 @@ class Command(BaseCommand):
             total_updated += updated
 
             # Snapshot stock fin de mois (M) — affiché dans l'onglet Stock.
+            self._step("Snapshot stock mensuel...")
             try:
                 call_command("sync_fuel_stock", month=f"{year}-{mo:02d}")
                 self.stdout.write(f"  Stock mensuel {year}-{mo:02d} synchronisé.")
+            except SoftTimeLimitExceeded:
+                raise
             except Exception as e:
                 self.stdout.write(self.style.WARNING(f"  Sync stock mensuel échoué ({e})."))
 
         if not dry_run:
+            self._step("Fin.")
             self.stdout.write(self.style.SUCCESS(f"\n  Terminé — {total_created} créée(s), {total_updated} mise(s) à jour au total.\n"))
             sync_run.sites_fetched = total_sites_fetched
             sync_run.finished_at = timezone.now()
