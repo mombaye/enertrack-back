@@ -377,7 +377,7 @@ def fetch_estimated_consumption(year: int, month: int) -> dict[str, dict]:
         client.close()
 
 
-def fetch_stock_readings() -> dict[str, dict]:
+def fetch_stock_readings(as_of=None) -> dict[str, dict]:
     """
     Dernier relevé de niveau de cuve PAR SITE — pour l'onglet Suivis Stock,
     distinct de fetch_estimated_consumption (qui calcule un DELTA entre 2
@@ -388,8 +388,12 @@ def fetch_stock_readings() -> dict[str, dict]:
     level_liters=0 ET level_cm=None écartés (valeur par défaut probable de
     l'import historique, pas une vraie mesure — voir KLD_0001 par exemple).
 
+    `as_of` (date) : ne retient que les relevés faits ce jour-là ou avant — snapshot fin de mois archivé
+    (sans ça, le snapshot de septembre prenait un relevé d'octobre/novembre).
+
     Retourne {site_id: {"stock_enoc_l": float, "date": str}}.
     """
+    as_of_iso = as_of.isoformat() if as_of else None
     client = _connect()
     try:
         db = client[settings.ENOC_MONGO_DB_NAME]
@@ -404,6 +408,8 @@ def fetch_stock_readings() -> dict[str, dict]:
             date_str = doc.get("date_releve")
             if not site_id or not date_str or site_id in result:
                 continue  # déjà vu un relevé plus récent pour ce site (tri desc)
+            if as_of_iso and str(date_str)[:10] > as_of_iso:
+                continue
             tanks = doc.get("tanks") or []
             liters = [
                 t.get("level_liters") for t in tanks
@@ -412,7 +418,7 @@ def fetch_stock_readings() -> dict[str, dict]:
             ]
             if not liters:
                 continue
-            result[site_id] = {"stock_enoc_l": sum(liters), "date": date_str}
+            result[site_id] = {"stock_enoc_l": sum(liters), "date": str(date_str)}
 
         return result
     finally:

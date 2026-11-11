@@ -157,7 +157,7 @@ def reference_consumptions(site_id: str, start: date, end: date) -> dict:
         rows = compute_period(start, end, site_ids=[site_id], include_out_of_scope=False)
         r = next((x for x in rows if x.get("site_id") == site_id), None)
         if r:
-            out.update(conso_theorique_cph_l=_f(r.get("conso_theorique_l")), conso_instrumentee_snowflake_l=_f(r.get("conso_mesuree_l")),
+            out.update(conso_theorique_cph_l=_f(r.get("conso_theorique_l")), conso_instrumentee_snowflake_l=_f((r.get("comparaison") or {}).get("conso_mesuree_l")),
                        statut_cph=r.get("cph_status") or r.get("statut_cph"))
         else:
             out["motif"] = "Site hors périmètre du calcul CPH (pas de GE confirmé ou pas de données)."

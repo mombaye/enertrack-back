@@ -283,7 +283,7 @@ def _row(cph: dict | None, b, d_from: date, d_to: date, days: int, target, thres
                 "ecart_l": ecart_cp, "ecart_pct": pct_cp, "pct_na": na_cp, "motif_code": ((cph or {}).get("motif_cph") or {}).get("code"),
                 "runtime_h": _f((cph or {}).get("runtime_total_h"), 1), "runtime_source": (cph or {}).get("runtime_source_main"),
                 "runtime_disponibilite": _f((cph or {}).get("runtime_source_availability"), 2), "power_source": (cph or {}).get("power_source_main"),
-                "charge_pct": _f((cph or {}).get("charge_moy_pct"), 1), "cph_l_h": _f((cph or {}).get("cph_moy_l_h"), 2),
+                "charge_pct": _f((cph or {})["charge_moy"] * 100 if (cph or {}).get("charge_moy") is not None else None, 1), "cph_l_h": _f((cph or {}).get("cph_moy_l_h"), 2),
                 "niveau_mediane": None, "nb_mesures": None},          # renseignés avec la cascade de médianes (étape CPH)
         "certification": {"valeur_l": certif["valeur_l"], "par": certif["par"], "date": certif["date"], "commentaire": certif["commentaire"], "niveau": certif["niveau"]},
         "hors_referentiel": bool((cph or {}).get("hors_referentiel")),

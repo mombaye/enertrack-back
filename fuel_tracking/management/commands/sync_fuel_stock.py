@@ -70,8 +70,11 @@ class Command(BaseCommand):
                 self.stdout.write(f"  {len(genset_ref_enoc)} site(s), "
                                    f"{sum(1 for v in genset_ref_enoc.values() if v['has_genset'])} avec GE.")
             except Exception as e:
-                self.stdout.write(self.style.WARNING(f"  Référentiel GE ENOC indisponible ({e}) — Snowflake seul utilisé."))
-                genset_ref_enoc = {}
+                # Panne ENOC passagère : on garde les valeurs ENOC déjà en base au lieu de les écraser par
+                # « pas de GE » (sinon les sites dont le GE n'est connu que d'ENOC sortaient du périmètre carburant).
+                genset_ref_enoc = self._previous_enoc_genset(snapshot_year, snapshot_month)
+                self.stdout.write(self.style.WARNING(
+                    f"  Référentiel GE ENOC indisponible ({e}) — valeurs précédentes conservées ({len(genset_ref_enoc)} site(s))."))
 
             self.stdout.write("  Requête Snowflake (VW_FUEL_REPORT, dernier relevé/site sur 30j)...")
             snowflake_data = fetch_stock_snapshot(as_of_date=as_of_date)
@@ -80,10 +83,12 @@ class Command(BaseCommand):
 
             self.stdout.write("  Relevés de niveau ENOC (dernier par site)...")
             try:
-                enoc_stock = fetch_stock_readings()
+                # Snapshot fin de mois : dernier relevé AU PLUS TARD le dernier jour du mois (pas le relevé du jour).
+                enoc_stock = fetch_stock_readings(as_of=as_of_date)
             except Exception as e:
-                self.stdout.write(self.style.WARNING(f"  Stock ENOC indisponible : {e}"))
-                enoc_stock = {}
+                enoc_stock = self._previous_enoc_stock(snapshot_year, snapshot_month)
+                self.stdout.write(self.style.WARNING(
+                    f"  Stock ENOC indisponible ({e}) — valeurs précédentes conservées ({len(enoc_stock)} site(s))."))
             self.stdout.write(f"  {len(enoc_stock)} site(s) avec un relevé de stock ENOC.")
 
             enoc_only_ge_sites = {
@@ -182,3 +187,23 @@ class Command(BaseCommand):
                 sync_run.save()
             self.stdout.write(self.style.ERROR(f"\n  Erreur sync stock carburant : {exc}\n"))
             raise
+
+    @staticmethod
+    def _previous_rows(snapshot_year, snapshot_month):
+        qs = FuelStockSnapshot.objects.all()
+        if snapshot_year:
+            return qs.filter(snapshot_year=snapshot_year, snapshot_month=snapshot_month)
+        return qs.filter(snapshot_year__isnull=True)
+
+    def _previous_enoc_genset(self, snapshot_year, snapshot_month):
+        return {
+            r["site_id"]: {"has_genset": r["has_genset_enoc"], "nb_ge": r["nb_ge_enoc"]}
+            for r in self._previous_rows(snapshot_year, snapshot_month).values("site_id", "has_genset_enoc", "nb_ge_enoc")
+        }
+
+    def _previous_enoc_stock(self, snapshot_year, snapshot_month):
+        return {
+            r["site_id"]: {"stock_enoc_l": r["stock_enoc_l"], "date": r["stock_enoc_date"].isoformat() if r["stock_enoc_date"] else None}
+            for r in self._previous_rows(snapshot_year, snapshot_month)
+            .filter(stock_enoc_l__isnull=False).values("site_id", "stock_enoc_l", "stock_enoc_date")
+        }

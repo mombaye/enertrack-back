@@ -30,7 +30,8 @@ def _grid(raw) -> str:
     s = str(raw or "").upper().replace("-", "").replace(" ", "")
     if not s:
         return UNKNOWN
-    if "OFF" in s:
+    # Mêmes valeurs que cph_engine.is_off_grid : "NON"/"NONE" contiennent "ON" et passaient pour du réseau.
+    if "OFF" in s or s in ("NO", "NON", "NONE", "0", "FALSE"):
         return "Off-grid"
     if "ON" in s or "GRID" in s or "SECTEUR" in s:
         return "Grid"

@@ -714,7 +714,8 @@ def reconciliation(start, end, country=None, zone=None) -> list[dict]:
     for b in balances:
         r = cph.get(b.site_id) or {}
         real = b.consommation_reelle_l
-        instr, theo = r.get("conso_mesuree_l"), r.get("conso_theorique_l")
+        # La conso mesurée est sous r["comparaison"] (pas au premier niveau) : elle était toujours vide ici.
+        instr, theo = (r.get("comparaison") or {}).get("conso_mesuree_l"), r.get("conso_theorique_l")
         motif = []
         if real is None:
             motif.append("Consommation stock non calculée : aucun écart.")

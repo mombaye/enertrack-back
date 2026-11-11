@@ -120,16 +120,26 @@ class Command(BaseCommand):
         except SoftTimeLimitExceeded:
             raise
         except Exception as e:
-            self.stdout.write(self.style.WARNING(f"  Référentiel GE ENOC indisponible ({e}) — Snowflake seul utilisé.\n"))
-            genset_ref_enoc = {}
+            # Panne ENOC passagère : valeurs ENOC déjà en base conservées mois par mois (voir plus bas) plutôt
+            # qu'écrasées par « pas de GE » — sinon les sites dont le GE n'est connu que d'ENOC sortaient du périmètre.
+            self.stdout.write(self.style.WARNING(f"  Référentiel GE ENOC indisponible ({e}) — valeurs précédentes conservées.\n"))
+            genset_ref_enoc = None
 
         total_created = 0
         total_updated = 0
         total_sites_fetched = 0
         last_error = None
+        failed_months = []
+        genset_ref_unavailable = genset_ref_enoc is None
 
         for year, mo in months_between(from_month, to_month):
             month_year = f"{year:04d}-{mo:02d}"
+            if genset_ref_unavailable:
+                genset_ref_enoc = {
+                    r["site_id"]: {"has_genset": r["has_genset_enoc"], "nb_ge": r["nb_ge_enoc"]}
+                    for r in FuelConsommationMonthly.objects.filter(month_year=month_year)
+                    .values("site_id", "has_genset_enoc", "nb_ge_enoc")
+                }
             self.stdout.write(f"\n── {month_year} ──")
 
             self._step("Requête Snowflake (VW_FUEL_REPORT / GE_PROD_KWH / capteur)...")
@@ -140,6 +150,7 @@ class Command(BaseCommand):
             except Exception as e:
                 self.stdout.write(self.style.ERROR(f"  Erreur Snowflake pour {month_year} : {e}"))
                 last_error = str(e)
+                failed_months.append(month_year)
                 continue
             self.stdout.write(f"  {len(snowflake_data)} site(s) avec données Snowflake.")
             total_sites_fetched += len(snowflake_data)
@@ -167,8 +178,13 @@ class Command(BaseCommand):
             except SoftTimeLimitExceeded:
                 raise
             except Exception as e:
-                self.stdout.write(self.style.WARNING(f"  Estimation ENOC (relevés de niveau) indisponible : {e}"))
-                conso_estimee_by_site = {}
+                conso_estimee_by_site = {
+                    r["site_id"]: {"conso_estimee_l": r["conso_estimee_enoc_l"], "nb_releves": r["conso_estimee_nb_releves"]}
+                    for r in FuelConsommationMonthly.objects.filter(month_year=month_year, conso_estimee_enoc_l__isnull=False)
+                    .values("site_id", "conso_estimee_enoc_l", "conso_estimee_nb_releves")
+                }
+                self.stdout.write(self.style.WARNING(
+                    f"  Estimation ENOC (relevés de niveau) indisponible ({e}) — valeurs précédentes conservées."))
             self.stdout.write(f"  {len(conso_estimee_by_site)} site(s) avec conso ESTIMÉE (relevés de niveau ENOC).")
 
             # Sites que ENOC signale avec GE mais que Snowflake ne connaît pas
@@ -306,8 +322,12 @@ class Command(BaseCommand):
             self.stdout.write(self.style.SUCCESS(f"\n  Terminé — {total_created} créée(s), {total_updated} mise(s) à jour au total.\n"))
             sync_run.sites_fetched = total_sites_fetched
             sync_run.finished_at = timezone.now()
-            if total_sites_fetched > 0:
+            if total_sites_fetched > 0 and not failed_months:
                 sync_run.status = FuelConsommationSyncRun.Status.SUCCESS
+            elif total_sites_fetched > 0:
+                # Un mois a échoué (souvent le mois en cours) : ne pas afficher « connecté » alors qu'il n'est plus rafraîchi.
+                sync_run.status = FuelConsommationSyncRun.Status.FAILED
+                sync_run.error_message = f"Snowflake en échec pour {', '.join(failed_months)} : {last_error}"[:1000]
             else:
                 sync_run.status = FuelConsommationSyncRun.Status.FAILED
                 sync_run.error_message = last_error or "Aucune donnée Snowflake récupérée pour la période demandée."

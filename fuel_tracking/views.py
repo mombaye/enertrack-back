@@ -168,7 +168,7 @@ class FuelConsommationListView(APIView):
             orphan_qs = orphan_qs.filter(started_at__gt=last_sf_run.started_at)
         sf_orphans = orphan_qs.count()
         sf_orphan_since = orphan_qs.order_by("started_at").values_list("started_at", flat=True).first()
-        last_enoc_run = FuelEnocSyncRun.objects.order_by("-started_at").first()
+        last_enoc_run = FuelEnocSyncRun.objects.exclude(status=FuelEnocSyncRun.Status.RUNNING).order_by("-started_at").first()
 
         # Date de la donnée elle-même (pas l'heure d'exécution de la synchro,
         # qui ne dit rien sur la fraîcheur réelle de la source) — ex: la
@@ -927,7 +927,8 @@ class FuelCommandeEstimationView(APIView):
             }
 
         stock_by_site = {
-            s.site_id: s for s in FuelStockSnapshot.objects.filter(site_id__in=by_site.keys(), has_genset=True)
+            # Stock COURANT uniquement : les snapshots fin de mois archivés (snapshot_year renseigné) sont dans la même table.
+            s.site_id: s for s in FuelStockSnapshot.objects.filter(site_id__in=by_site.keys(), has_genset=True, snapshot_year__isnull=True)
         }
 
         last_ops_month = FuelSuiviCommandeSite.objects.order_by("-month_year").values_list("month_year", flat=True).first()
@@ -1040,8 +1041,8 @@ class FuelStockListView(APIView):
 
         from fuel_tracking.models import FuelStockSnapshot, FuelStockSyncRun, FuelEnocSyncRun
 
-        last_sf_run = FuelStockSyncRun.objects.order_by("-started_at").first()
-        last_enoc_run = FuelEnocSyncRun.objects.order_by("-started_at").first()
+        last_sf_run = FuelStockSyncRun.objects.exclude(status=FuelStockSyncRun.Status.RUNNING).order_by("-started_at").first()
+        last_enoc_run = FuelEnocSyncRun.objects.exclude(status=FuelEnocSyncRun.Status.RUNNING).order_by("-started_at").first()
         sources = {
             "snowflake": {
                 "connected": bool(last_sf_run and last_sf_run.status == FuelStockSyncRun.Status.SUCCESS),
@@ -1060,7 +1061,9 @@ class FuelStockListView(APIView):
         from fuel_tracking.services.site_referential import in_referential, referential_upper_ids, restrict
 
         ref_ids = referential_upper_ids()
-        qs, sites_hors_referentiel = restrict(FuelStockSnapshot.objects.all().order_by("site_id"), ref_ids)
+        # Stock COURANT uniquement : les snapshots fin de mois (M-1, M) archivés toutes les 5 min par la synchro conso
+        # sont dans la même table — sans ce filtre chaque site apparaissait jusqu'à 3 fois et tous les compteurs triplaient.
+        qs, sites_hors_referentiel = restrict(FuelStockSnapshot.objects.filter(snapshot_year__isnull=True).order_by("site_id"), ref_ids)
 
         search = (request.query_params.get("search") or "").strip()
         if search:

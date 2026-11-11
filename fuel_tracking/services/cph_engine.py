@@ -321,17 +321,22 @@ def source_value(source: str, fact: dict | None, ctx: SiteContext) -> tuple[Deci
     raise ValueError(source)
 
 
-def evaluate_runtime_sources(ctx: SiteContext, facts: dict, days: list[date]) -> dict:
+def evaluate_runtime_sources(ctx: SiteContext, facts: dict, days: list[date], data_until: date | None = None) -> dict:
     """
     Disponibilité de chaque source sur la période = jours avec une valeur
     valide (0 compris) / jours de la période — jamais de COALESCE à 0.
+    Les jours postérieurs à la dernière donnée Snowflake (`data_until`) ne sont
+    pas encore publiés : ils ne comptent pas au dénominateur (sinon, le 11 du
+    mois, 10 jours valides / 30 = 33 % et toutes les sources étaient rejetées).
     Retourne {source: {availability, days_valid, exploitable, rejection}}.
     """
-    n = len(days)
+    published = [d for d in days if d <= data_until] if data_until is not None else days
+    published = published or days
+    n = len(published)
     out = {}
     for src in RUNTIME_PRIORITY:
         vals = {d: source_value(src, facts.get(d), ctx)[0] for d in days}
-        valid = sum(1 for v in vals.values() if v is not None)
+        valid = sum(1 for d in published if vals[d] is not None)
         availability = Decimal(valid) / Decimal(n) if n else D0
         rejection = None
         if src == RT_REDRESSEUR and ctx.off_grid is not True:
@@ -933,7 +938,7 @@ def rapprochement_calc_status(rec: dict | None) -> str:
 def compute_site_period(ctx: SiteContext, facts: dict, start: date, end: date,
                         observations: list[Observation], settings: EngineSettings) -> dict:
     days = list(daterange(start, end))
-    sources_eval = evaluate_runtime_sources(ctx, facts, days)
+    sources_eval = evaluate_runtime_sources(ctx, facts, days, settings.data_until)
     ac_ref = indoor_ac_reference(ctx, facts, start, end, settings) if ctx.kind == "INDOOR" else None
     # Cascade de médianes §8.3 : construire le pool de samples une seule fois pour la période.
     power_samples = _build_power_samples(ctx.site_id, facts, ctx.kind)

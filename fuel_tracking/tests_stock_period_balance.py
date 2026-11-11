@@ -404,13 +404,14 @@ class MvpBalanceTests(BalanceBase):
         self.stocks(500, 300)
         self.stocks(800, None, site="DKR_0002")
         self.compute(("DKR_0001", "DKR_0002"))
-        cph = [{"site_id": "DKR_0001", "conso_mesuree_l": Decimal("150"), "conso_theorique_l": Decimal("250")},
-               {"site_id": "DKR_0002", "conso_mesuree_l": Decimal("90"), "conso_theorique_l": None}]
+        # Forme réelle des lignes du moteur CPH : la conso mesurée est sous "comparaison" (pas au premier niveau).
+        cph = [{"site_id": "DKR_0001", "comparaison": {"conso_mesuree_l": Decimal("150")}, "conso_theorique_l": Decimal("250")},
+               {"site_id": "DKR_0002", "comparaison": {"conso_mesuree_l": Decimal("90")}, "conso_theorique_l": None}]
         with mock.patch("fuel_tracking.services.cph_service.compute_period_summary", return_value=cph):
             rows = {r["site_id"]: r for r in SB.reconciliation(self.start, self.end)}
         a, b = rows["DKR_0001"], rows["DKR_0002"]
         with mock.patch("fuel_tracking.services.cph_service.compute_period_summary",
-                        return_value=[{"site_id": "DKR_0001", "conso_mesuree_l": Decimal("0.5"), "conso_theorique_l": Decimal("0.8")}]):
+                        return_value=[{"site_id": "DKR_0001", "comparaison": {"conso_mesuree_l": Decimal("0.5")}, "conso_theorique_l": Decimal("0.8")}]):
             tiny = {r["site_id"]: r for r in SB.reconciliation(self.start, self.end)}["DKR_0001"]
         self.assertEqual((tiny["ecart_reel_theorique_l"], tiny["ecart_reel_theorique_pct"], tiny["ecart_reel_instrumentee_pct"]), (199.2, None, None))
         self.assertIn("quasi nulle", tiny["motif"])
