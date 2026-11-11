@@ -889,8 +889,11 @@ class FuelCommandeEstimationView(APIView):
 
         from fuel_tracking.services.site_referential import restrict
 
+        from fuel_tracking.views_bi import scope_q
+
+        # Périmètre Sénégal (demande métier 2026-11) : mêmes sites que les vues BI.
         rows, _ = restrict(FuelConsommationMonthly.objects.filter(
-            month_year__in=available_months, has_genset=True,
+            scope_q(), month_year__in=available_months, has_genset=True,
         ))
         rows = rows.values(
             "site_id", "site_name", "month_year", "year", "month",
