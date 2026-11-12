@@ -282,6 +282,11 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'fuel_tracking.process_fuel_import_incoming',
         'schedule': crontab(minute='7,22,37,52'),
     },
+    # Santé des sources (lecture seule des journaux) : toute source en retard / échec est journalisée en ERROR.
+    'fuel-sources-health-hourly': {
+        'task': 'fuel_tracking.check_fuel_sources_hourly',
+        'schedule': crontab(minute=29),
+    },
 }
 
 # Expiration des tâches planifiées : une synchro qui n'a pas pu démarrer avant la suivante est abandonnée
@@ -294,6 +299,7 @@ _BEAT_EXPIRES_S = {
     'fuel-stock-sync-5min': 4 * 60,
     'stan-auto-import-15min': 14 * 60,
     'fuel-stock-registry-incoming-15min': 14 * 60,
+    'fuel-sources-health-hourly': 55 * 60,
     'financial-conso-sync-30min': 28 * 60,
     'fuel-daily-facts-sync-hourly': 55 * 60,
     'fuel-daily-facts-resync-nightly': 6 * 3600,
@@ -415,6 +421,9 @@ FUEL_CPH_SFC_MAX_L_KWH = os.environ.get("FUEL_CPH_SFC_MAX_L_KWH", "0.50")
 
 # Surveillance CPH : données périmées au-delà de N jours, couverture minimale, part max d'alertes L/kWh.
 FUEL_CPH_STALE_AFTER_DAYS = os.environ.get("FUEL_CPH_STALE_AFTER_DAYS", "3")
+# Base Snowflake de la vue VW_FUEL_REPORT (conso mesurée par capteur). Aujourd'hui publiée en DEV seulement ;
+# passer à DB_GFMS_ANALYTICS_PROD dès que l'admin Snowflake l'y publie, sans modifier le code.
+FUEL_REPORT_DATABASE = os.environ.get("FUEL_REPORT_DATABASE", "DB_GFMS_ANALYTICS_DEV")
 FUEL_CPH_MIN_COVERAGE = os.environ.get("FUEL_CPH_MIN_COVERAGE", "0.5")
 FUEL_CPH_MAX_SFC_ALERT_SHARE = os.environ.get("FUEL_CPH_MAX_SFC_ALERT_SHARE", "0.2")
 

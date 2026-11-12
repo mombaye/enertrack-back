@@ -14,7 +14,7 @@ from fuel_tracking.services.fuel_daily_facts_snowflake import ANALYTICS, PROD, _
 
 COLUMNS = {
     f"{ANALYTICS}.SITE_ESCO_CURRENT": ["DATA_ID", "SITE_ID", "COUNTRY", "SITE_NAME", "GRID_SUPPLY_MODIFIED", "DG_COUNT"],
-    f"{ANALYTICS}.GENSET_REPORT": ["DATA_ID", "REPORT_DATE", "DG_RUNTIME_CONTROLLER", "DG_RUNTIME_CALCULATED", "DG_PRODUCTION_KWH"],
+    f"{ANALYTICS}.GENSET_REPORT": ["DATA_ID", "DATE", "DG_RUNTIME_CONTROLLER", "DG_RUNTIME_CALCULATED", "DG_PRODUCTION_KWH"],
     f"{PROD}.GFMS_DATA_TRACKER_NC": ["ID", "TIMESTAMP", "DG_TOTAL_RUNNING_TIME_MINUTES", "LOAD_POWER"],
     f"{PROD}.RECTIFIER_EFFICIENCY_STATUS": ["ID", "TIMESTAMP", "P_DC", "P_AC_ACTIVE_POWER", "V_DC_VOLTAGE", "I_DC_CURRENT", "RECTIFIER_EFFICIENCY", "RECTIFIER_STATUS"],
     f"{ANALYTICS}.AC_METER": ["DATA_ID", "DATE", "ACT_ACTIVE_POWER_AVG", "ACT_ENERGY_P"],
@@ -72,12 +72,12 @@ class Command(BaseCommand):
                 SELECT COUNT(*), COUNT(DG_RUNTIME_CONTROLLER), COUNT_IF(DG_RUNTIME_CONTROLLER = 0),
                        COUNT_IF(DG_RUNTIME_CONTROLLER NOT BETWEEN 0 AND 24), COUNT(DG_PRODUCTION_KWH),
                        APPROX_PERCENTILE(DG_PRODUCTION_KWH, 0.5)
-                FROM {ANALYTICS}.GENSET_REPORT WHERE REPORT_DATE BETWEEN %(s)s AND %(e)s""", p) or []:
+                FROM {ANALYTICS}.GENSET_REPORT WHERE DATE BETWEEN %(s)s AND %(e)s""", p) or []:
                 self.stdout.write(f"  lignes={r[0]} DSE non NULL={r[1]} DSE=0={r[2]} DSE hors 0-24={r[3]} "
                                   f"production non NULL={r[4]} médiane production={r[5]}")
-            for r in self.q(cur, f"SELECT COUNT(*) FROM (SELECT DATA_ID, REPORT_DATE FROM {ANALYTICS}.GENSET_REPORT "
-                                 "WHERE REPORT_DATE BETWEEN %(s)s AND %(e)s GROUP BY 1, 2 HAVING COUNT(*) > 1)", p) or []:
-                self.stdout.write(f"  doublons (DATA_ID, REPORT_DATE) : {r[0]}")
+            for r in self.q(cur, f"SELECT COUNT(*) FROM (SELECT DATA_ID, DATE FROM {ANALYTICS}.GENSET_REPORT "
+                                 "WHERE DATE BETWEEN %(s)s AND %(e)s GROUP BY 1, 2 HAVING COUNT(*) > 1)", p) or []:
+                self.stdout.write(f"  doublons (DATA_ID, DATE) : {r[0]}")
 
             self.stdout.write("\n== RECTIFIER_EFFICIENCY_STATUS (unités) ==")
             for r in self.q(cur, f"""

@@ -236,3 +236,24 @@ def auto_compute_stock_balances(self):
     except Exception:
         logger.exception("[fuel_tracking] Échec du calcul automatique des bilans de stock")
         return None
+
+
+@shared_task(bind=True, name="fuel_tracking.check_fuel_sources_hourly", soft_time_limit=5 * 60, time_limit=6 * 60)
+def check_fuel_sources_hourly(self):
+    """
+    Santé des sources (lecture seule des journaux de la plateforme) : chaque source qui n'est pas OK est journalisée
+    en ERROR (WARNING pour PARTIEL) afin que la supervision des logs alerte. Aucune donnée n'est modifiée.
+    """
+    from fuel_tracking.services.source_status import OK, PARTIEL, sources_status
+
+    try:
+        st = sources_status()
+    except Exception:
+        logger.exception("[fuel_tracking] Échec du contrôle de santé des sources")
+        return None
+    for r in st["sources"]:
+        if r["etat"] == OK:
+            continue
+        log = logger.warning if r["etat"] == PARTIEL else logger.error
+        log("[fuel_sources] %s %s · dernier succès %s · %s", r["etat"], r["libelle"], r["dernier_succes"] or "aucun", r["erreur"] or "")
+    return {"etat_global": st["etat_global"], "a_traiter": st["a_traiter"]}
