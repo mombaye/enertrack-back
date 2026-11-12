@@ -850,6 +850,37 @@ def compute_stock(params) -> dict:
     }
 
 
+class BiStockEvolutionView(APIView):
+    """GET /api/fuel-tracking/bi/stock/evolution/?zone=&mois=12 — stock de fin de mois sur les derniers mois."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from fuel_tracking.models import FuelStockSyncRun
+        from fuel_tracking.services.stock_history import stock_evolution
+
+        try:
+            n = int(request.query_params.get("mois") or 12)
+        except ValueError:
+            return Response({"detail": "Paramètre « mois » invalide."}, status=400)
+        zone = request.query_params.get("zone") or None
+        d = stock_evolution(n, zone)
+        last = next((m for m in reversed(d["months"]) if m["stock_l"] is not None), None)
+        per = [f"{SCOPE_LABEL}, sites avec groupe électrogène", f"Zone : {zone}" if zone else "Toutes zones", f"{len(d['months'])} derniers mois"]
+        d["explain"] = {"evolution": _x(
+            "Évolution du stock", "Pour chaque mois : somme, site par site, du dernier relevé de stock valide daté dans le mois "
+            "(capteur, relevé terrain / gardiennage / ENOC, ou stock final de la Synthèse). Remplissage = stock ÷ capacité des mêmes sites.", [
+                _v("Dernier mois avec relevés", last["month"] if last else None), _v("Stock", last["stock_l"] if last else None, "L"),
+                _v("Sites relevés ce mois-là", last["nb_sites_releves"] if last else None), _v("Remplissage", last["remplissage_pct"] if last else None, "%"),
+                _v("Sites GE du périmètre", last["nb_sites_ge"] if last else None)],
+            [SRC_STOCK, "Capteur : snapshots de fin de mois archivés ; mois en cours : dernier relevé"], per,
+            [{"label": "Sites sans relevé dans le mois : non comptés ce mois-là (ni 0 L, ni report du mois précédent)",
+              "nb": (last["nb_sites_ge"] - last["nb_sites_releves"]) if last else 0}],
+            _last_sync(FuelStockSyncRun),
+            "Le total en litres dépend du nombre de sites relevés chaque mois : comparer les mois avec le remplissage, "
+            "qui reste juste quand la couverture change.")}
+        return Response(d)
+
+
 class BiStockView(APIView):
     permission_classes = [IsAuthenticated]
 
