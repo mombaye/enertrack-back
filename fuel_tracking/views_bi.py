@@ -682,8 +682,10 @@ def _site_zones():
                 .order_by("month_year").values_list("site_id", "zone_fichier"))
 
 
-def compute_stock(params) -> dict:
-    from fuel_tracking.models import FuelConsommationMonthly, FuelStockSnapshot, FuelStockSyncRun
+def stock_sites(params):
+    """Sites GE du périmètre avec stock capteur, capacité, conso mesurée par jour et autonomie.
+    Partagé par Suivi Stock et le plan de ravitaillement : mêmes chiffres sur les deux écrans."""
+    from fuel_tracking.models import FuelConsommationMonthly, FuelStockSnapshot
 
     all_ge = FuelStockSnapshot.objects.filter(snapshot_year__isnull=True, has_genset=True)
     qs = all_ge.filter(scope_q())
@@ -691,20 +693,6 @@ def compute_stock(params) -> dict:
     zones = sorted({zones_map[s] for s in qs.values_list("site_id", flat=True) if s in zones_map})
     if params.get("zone"):
         qs = qs.filter(site_id__in=[s for s, z in zones_map.items() if z == params["zone"]])
-
-    a = qs.aggregate(
-        nb_sites=Count("id"),
-        nb_stock_connu=Count("id", filter=Q(stock_snowflake_l__isnull=False) | Q(stock_enoc_l__isnull=False)),
-        nb_stock_capteur=Count("id", filter=Q(stock_snowflake_l__isnull=False)),
-        stock_l=Sum("stock_snowflake_l"), capacite_l=Sum("capacity_snowflake_l", filter=Q(stock_snowflake_l__isnull=False)),
-        critique=Count("id", filter=Q(stock_snowflake_pct__lt=15)),
-        alerte=Count("id", filter=Q(stock_snowflake_pct__gte=15, stock_snowflake_pct__lt=40)),
-        moyen=Count("id", filter=Q(stock_snowflake_pct__gte=40, stock_snowflake_pct__lt=70)),
-        bon=Count("id", filter=Q(stock_snowflake_pct__gte=70)),
-        sans_pct=Count("id", filter=Q(stock_snowflake_pct__isnull=True)),
-    )
-    last_date = qs.exclude(stock_snowflake_date__isnull=True).order_by("-stock_snowflake_date") \
-        .values_list("stock_snowflake_date", flat=True).first()
 
     # Autonomie = stock actuel ÷ conso mesurée moyenne par jour mesuré du mois de référence (dernier mois complet).
     months = list(FuelConsommationMonthly.objects.order_by("-month_year").values_list("month_year", flat=True).distinct()[:2])
@@ -729,6 +717,30 @@ def compute_stock(params) -> dict:
             "conso_jour_l": round(d, 1) if d else None,
             "autonomie_j": round(float(r["stock_snowflake_l"]) / d, 1) if d and r["stock_snowflake_l"] is not None else None,
         })
+
+    return {"all_ge": all_ge, "qs": qs, "zones": zones, "zones_map": zones_map, "ref_month": ref_month, "today": today, "sites": sites}
+
+
+def compute_stock(params) -> dict:
+    from fuel_tracking.models import FuelStockSyncRun
+
+    base = stock_sites(params)
+    all_ge, qs, zones, zones_map = base["all_ge"], base["qs"], base["zones"], base["zones_map"]
+    ref_month, today, sites = base["ref_month"], base["today"], base["sites"]
+
+    a = qs.aggregate(
+        nb_sites=Count("id"),
+        nb_stock_connu=Count("id", filter=Q(stock_snowflake_l__isnull=False) | Q(stock_enoc_l__isnull=False)),
+        nb_stock_capteur=Count("id", filter=Q(stock_snowflake_l__isnull=False)),
+        stock_l=Sum("stock_snowflake_l"), capacite_l=Sum("capacity_snowflake_l", filter=Q(stock_snowflake_l__isnull=False)),
+        critique=Count("id", filter=Q(stock_snowflake_pct__lt=15)),
+        alerte=Count("id", filter=Q(stock_snowflake_pct__gte=15, stock_snowflake_pct__lt=40)),
+        moyen=Count("id", filter=Q(stock_snowflake_pct__gte=40, stock_snowflake_pct__lt=70)),
+        bon=Count("id", filter=Q(stock_snowflake_pct__gte=70)),
+        sans_pct=Count("id", filter=Q(stock_snowflake_pct__isnull=True)),
+    )
+    last_date = qs.exclude(stock_snowflake_date__isnull=True).order_by("-stock_snowflake_date") \
+        .values_list("stock_snowflake_date", flat=True).first()
 
     with_pct = [s for s in sites if s["remplissage_pct"] is not None]
     with_auto = [s for s in sites if s["autonomie_j"] is not None]
@@ -1239,7 +1251,7 @@ def _export_estimation(request):
 class BiExportView(APIView):
     """GET /api/fuel-tracking/bi/export/<kind>/ — classeur Excel complet (toutes les lignes, pas seulement le Top 10)."""
     permission_classes = [IsAuthenticated]
-    KINDS = ("conso", "stock", "cph", "commande", "estimation")
+    KINDS = ("conso", "stock", "cph", "commande", "estimation", "ravitaillement")
 
     def get(self, request, kind):
         p = request.query_params
@@ -1254,6 +1266,9 @@ class BiExportView(APIView):
                 return _export_commande(p)
             if kind == "estimation":
                 return _export_estimation(request)
+            if kind == "ravitaillement":
+                from fuel_tracking.views_ravitaillement import export_plan
+                return export_plan(p)
         except (_BadPeriod, ValueError) as e:
             return Response({"detail": str(e)}, status=400)
         return Response({"detail": "Export inconnu.", "exports": self.KINDS}, status=404)
