@@ -45,7 +45,8 @@ SRC_KWH = "Snowflake · GE_PROD_KWH : énergie produite par le groupe électrog�
 SRC_ENOC = "ENOC (MongoDB) : quantités ajoutées lors des ravitaillements, quantité > 0"
 SRC_TARGET = "Targets carburant par site (Fuel Manager), targets actifs"
 SRC_GE = "Périmètre GE : fichier Stan (facturation avec GE), à défaut Snowflake / ENOC / Base GE"
-SRC_STOCK = "Snowflake · dernier relevé du niveau de cuve par site (stock et capacité)"
+SRC_STOCK = ("Dernier relevé de stock de chaque site, le plus récent parmi : capteur Snowflake, relevés terrain / gardiennage / ENOC "
+             "validés, stock final validé de la Synthèse (Closing)")
 SRC_CPH = "Moteur CPH EnerTrack : CPH (L/h) de l'abaque du GE × heures de marche (Snowflake), selon la charge"
 
 
@@ -582,18 +583,23 @@ def compute_site(site_id: str, params) -> dict:
              for r in FuelSiteDailyFacts.objects.filter(site_id__iexact=sid, date__gte=d_from, date__lte=d_to).order_by("date")
              .values("date", "measured_conso_l", "dg_on_runtime_h", "dg_production_kwh", "fuel_raw_points")]
 
+    from fuel_tracking.services.current_stock import current_stock
+
     st = FuelStockSnapshot.objects.filter(site_id__iexact=sid, snapshot_year__isnull=True).values(
-        "stock_snowflake_l", "capacity_snowflake_l", "stock_snowflake_pct", "stock_snowflake_date", "stock_enoc_l", "stock_enoc_date").first()
+        "site_id", "stock_snowflake_l", "capacity_snowflake_l", "stock_snowflake_date", "stock_enoc_l", "stock_enoc_date").first()
     ref_row = next((m for m in reversed(monthly) if m["l_jour"] is not None), None)
     stock = None
     if st:
         today = timezone.localdate()
-        stock = {"stock_l": _f(st["stock_snowflake_l"]), "capacite_l": _f(st["capacity_snowflake_l"]), "remplissage_pct": _f(st["stock_snowflake_pct"]),
-                 "date": st["stock_snowflake_date"], "age_releve_j": (today - st["stock_snowflake_date"]).days if st["stock_snowflake_date"] else None,
+        c = current_stock([st]).get(st["site_id"]) or {}
+        sl, cap = c.get("stock_l"), c.get("capacite_l")
+        stock = {"stock_l": _f(sl), "capacite_l": _f(cap), "remplissage_pct": _f(sl / cap * 100) if sl is not None and cap else None,
+                 "date": c.get("date"), "age_releve_j": (today - c["date"]).days if c.get("date") else None,
+                 "source_stock": c.get("source"), "source_stock_label": c.get("source_label"), "stock_estime": bool(c.get("estime")),
+                 "origine_stock": c.get("origine"),
                  "stock_enoc_l": _f(st["stock_enoc_l"]), "date_enoc": st["stock_enoc_date"],
                  "conso_jour_l": ref_row["l_jour"] if ref_row else None, "mois_reference": ref_row["month"] if ref_row else None,
-                 "autonomie_j": round(float(st["stock_snowflake_l"]) / ref_row["l_jour"], 1)
-                 if ref_row and ref_row["l_jour"] and st["stock_snowflake_l"] is not None else None}
+                 "autonomie_j": round(float(sl) / ref_row["l_jour"], 1) if ref_row and ref_row["l_jour"] and sl is not None else None}
 
     enoc = [{"date": r["operation_date"], "type": r["operation_type"], "statut": r["status"], "demande_l": _f(r["requested_quantity_liters"]),
              "approuve_l": _f(r["approved_quantity_liters"]), "ajoute_l": _f(r["quantity_added_liters"]),
@@ -628,8 +634,8 @@ def compute_site(site_id: str, params) -> dict:
         ], [SRC_CAPTEUR, SRC_TARGET], per, [], maj_conso, None if tgt is not None else "Pas de target actif pour ce site : écart non calculable."),
     }
     if stock:
-        explain["stock_l"] = _x("Stock en cuve", "Dernier relevé capteur du niveau de cuve.", [
-            _v("Stock", stock["stock_l"], "L"), _v("Capacité", stock["capacite_l"], "L"), _v("Remplissage", stock["remplissage_pct"], "%"),
+        explain["stock_l"] = _x("Stock en cuve", "Relevé de stock le plus récent du site (capteur, terrain ou Synthèse).", [
+            _v("Stock", stock["stock_l"], "L"), _v("Source", stock["source_stock_label"]), _v("Origine selon la Synthèse", stock["origine_stock"]), _v("Capacité", stock["capacite_l"], "L"), _v("Remplissage", stock["remplissage_pct"], "%"),
             _v("Date du relevé", stock["date"]), _v("Stock déclaré ENOC", stock["stock_enoc_l"], "L"),
         ], [SRC_STOCK], [f"Site {sid}", "Stock actuel (indépendant de la période)"], [], _last_sync(FuelStockSyncRun),
             "Relevé de plus de 7 jours : le stock peut ne plus être réel." if (stock["age_releve_j"] or 0) > 7 else None)
@@ -683,7 +689,7 @@ def _site_zones():
 
 
 def stock_sites(params):
-    """Sites GE du périmètre avec stock capteur, capacité, conso mesurée par jour et autonomie.
+    """Sites GE du périmètre avec stock retenu (relevé le plus récent, services/current_stock), capacité, conso mesurée par jour et autonomie.
     Partagé par Suivi Stock et le plan de ravitaillement : mêmes chiffres sur les deux écrans."""
     from fuel_tracking.models import FuelConsommationMonthly, FuelStockSnapshot
 
@@ -703,19 +709,27 @@ def stock_sites(params):
                 .values_list("site_id", "conso_snowflake_l", "nb_jours_data"):
             daily[sid] = float(c) / (j or _days_in(ref_month))
 
+    from fuel_tracking.services.current_stock import current_stock
+
     today = timezone.localdate()
+    snaps = list(qs.values("site_id", "site_name", "typology", "stock_snowflake_l", "capacity_snowflake_l",
+                           "stock_snowflake_date", "stock_enoc_l", "stock_enoc_date"))
+    cur = current_stock(snaps)
     sites = []
-    for r in qs.values("site_id", "site_name", "typology", "stock_snowflake_l", "capacity_snowflake_l",
-                       "stock_snowflake_pct", "stock_snowflake_date", "stock_enoc_l", "stock_enoc_date"):
+    for r in snaps:
         d = daily.get(r["site_id"])
+        c = cur.get(r["site_id"]) or {}
+        stock, cap = c.get("stock_l"), c.get("capacite_l")
         sites.append({
             "site_id": r["site_id"], "site_name": r["site_name"], "zone": zones_map.get(r["site_id"]), "typologie": r["typology"],
-            "stock_l": _f(r["stock_snowflake_l"]), "capacite_l": _f(r["capacity_snowflake_l"]),
-            "remplissage_pct": _f(r["stock_snowflake_pct"]), "date": r["stock_snowflake_date"],
-            "age_releve_j": (today - r["stock_snowflake_date"]).days if r["stock_snowflake_date"] else None,
+            "stock_l": _f(stock), "capacite_l": _f(cap), "capacite_source": c.get("capacite_source"),
+            "remplissage_pct": _f(stock / cap * 100) if stock is not None and cap else None, "date": c.get("date"),
+            "age_releve_j": (today - c["date"]).days if c.get("date") else None,
+            "source_stock": c.get("source"), "source_stock_label": c.get("source_label"),
+            "stock_estime": bool(c.get("estime")), "origine_stock": c.get("origine"),
             "stock_enoc_l": _f(r["stock_enoc_l"]), "date_enoc": r["stock_enoc_date"],
             "conso_jour_l": round(d, 1) if d else None,
-            "autonomie_j": round(float(r["stock_snowflake_l"]) / d, 1) if d and r["stock_snowflake_l"] is not None else None,
+            "autonomie_j": round(float(stock) / d, 1) if d and stock is not None else None,
         })
 
     return {"all_ge": all_ge, "qs": qs, "zones": zones, "zones_map": zones_map, "ref_month": ref_month, "today": today, "sites": sites}
@@ -728,19 +742,22 @@ def compute_stock(params) -> dict:
     all_ge, qs, zones, zones_map = base["all_ge"], base["qs"], base["zones"], base["zones_map"]
     ref_month, today, sites = base["ref_month"], base["today"], base["sites"]
 
-    a = qs.aggregate(
-        nb_sites=Count("id"),
-        nb_stock_connu=Count("id", filter=Q(stock_snowflake_l__isnull=False) | Q(stock_enoc_l__isnull=False)),
-        nb_stock_capteur=Count("id", filter=Q(stock_snowflake_l__isnull=False)),
-        stock_l=Sum("stock_snowflake_l"), capacite_l=Sum("capacity_snowflake_l", filter=Q(stock_snowflake_l__isnull=False)),
-        critique=Count("id", filter=Q(stock_snowflake_pct__lt=15)),
-        alerte=Count("id", filter=Q(stock_snowflake_pct__gte=15, stock_snowflake_pct__lt=40)),
-        moyen=Count("id", filter=Q(stock_snowflake_pct__gte=40, stock_snowflake_pct__lt=70)),
-        bon=Count("id", filter=Q(stock_snowflake_pct__gte=70)),
-        sans_pct=Count("id", filter=Q(stock_snowflake_pct__isnull=True)),
-    )
-    last_date = qs.exclude(stock_snowflake_date__isnull=True).order_by("-stock_snowflake_date") \
-        .values_list("stock_snowflake_date", flat=True).first()
+    # Agrégats calculés sur le stock retenu par site (relevé le plus récent, toutes sources) : mêmes chiffres que les lignes.
+    known = [s for s in sites if s["stock_l"] is not None]
+    pcts = [s["remplissage_pct"] for s in sites if s["remplissage_pct"] is not None]
+    with_cap = [s for s in known if s["capacite_l"]]
+    a = {
+        "nb_sites": len(sites),
+        "nb_stock_connu": sum(1 for s in sites if s["stock_l"] is not None or s["stock_enoc_l"] is not None),
+        "nb_stock_capteur": len(known),
+        "stock_l": sum(s["stock_l"] for s in known) if known else None,
+        "capacite_l": sum(s["capacite_l"] for s in with_cap) if with_cap else None,
+        "critique": sum(1 for p in pcts if p < 15), "alerte": sum(1 for p in pcts if 15 <= p < 40),
+        "moyen": sum(1 for p in pcts if 40 <= p < 70), "bon": sum(1 for p in pcts if p >= 70),
+        "sans_pct": len(sites) - len(pcts),
+    }
+    last_date = max((s["date"] for s in sites if s["date"]), default=None)
+    stock_cap = sum(s["stock_l"] for s in with_cap) if with_cap else None
 
     with_pct = [s for s in sites if s["remplissage_pct"] is not None]
     with_auto = [s for s in sites if s["autonomie_j"] is not None]
@@ -766,7 +783,7 @@ def compute_stock(params) -> dict:
         "nb_sites": a["nb_sites"], "nb_stock_connu": a["nb_stock_connu"],
         "stock_connu_pct": round(a["nb_stock_connu"] / a["nb_sites"] * 100, 1) if a["nb_sites"] else None,
         "stock_total_l": _f(a["stock_l"]), "capacite_l": _f(a["capacite_l"]),
-        "remplissage_pct": round(float(a["stock_l"]) / float(a["capacite_l"]) * 100, 1) if a["stock_l"] is not None and a["capacite_l"] else None,
+        "remplissage_pct": round(stock_cap / a["capacite_l"] * 100, 1) if stock_cap is not None and a["capacite_l"] else None,
         "nb_critique": a["critique"], "nb_alerte": a["alerte"], "nb_autonomie_moins_3j": nb_auto3,
         "autonomie_mediane_j": mediane, "nb_releves_anciens": anciens,
         "derniere_mesure": last_date, "mois_reference_autonomie": ref_month,
@@ -776,12 +793,12 @@ def compute_stock(params) -> dict:
     if params.get("zone"):
         per.append(f"Zone : {params['zone']}")
     excl_other = {"label": "Sites d'un autre pays, exclus", "nb": all_ge.count() - all_ge.filter(scope_q()).count()}
-    excl_unknown = {"label": "Sites sans relevé capteur exploitable : non comptés (pas « 0 L »)", "nb": a["sans_pct"]}
+    excl_unknown = {"label": "Sites sans relevé de stock exploitable : non comptés (pas « 0 L »)", "nb": a["sans_pct"]}
     auto_src = f"Conso mesurée de {ref_month} (Snowflake VW_FUEL_REPORT) ÷ jours mesurés du mois"
     explain = {
-        "stock_total_l": _x("Stock en cuve", "Somme des derniers relevés de stock capteur des sites.", [
+        "stock_total_l": _x("Stock en cuve", "Somme du dernier relevé de stock de chaque site (capteur, terrain ou Synthèse, le plus récent).", [
             _v("Stock total", kpis["stock_total_l"], "L"), _v("Capacité des cuves relevées", kpis["capacite_l"], "L"),
-            _v("Remplissage global", kpis["remplissage_pct"], "%"), _v("Sites au stock capteur connu", a["nb_stock_capteur"]),
+            _v("Remplissage global", kpis["remplissage_pct"], "%"), _v("Sites au stock connu", a["nb_stock_capteur"]), _v("Dont stock estimé (Synthèse)", sum(1 for s in sites if s["stock_estime"])),
             _v("Relevé le plus récent", last_date),
         ], [SRC_STOCK], per, [excl_other, excl_unknown], maj),
         "nb_critique": _x("Cuves sous 15 %", "Sites dont le dernier relevé est inférieur à 15 % de la capacité de la cuve.", [
@@ -798,7 +815,7 @@ def compute_stock(params) -> dict:
         "stock_connu_pct": _x("Stock connu", "Sites ayant un stock relevé (capteur ou ENOC) ÷ sites GE.", [
             _v("Sites GE", a["nb_sites"]), _v("Stock connu", a["nb_stock_connu"]), _v("Dont capteur", a["nb_stock_capteur"]),
         ], [SRC_STOCK, "ENOC : dernier stock déclaré"], per, [excl_other], maj),
-        "nb_releves_anciens": _x("Relevés de plus de 7 jours", "Sites dont le dernier relevé capteur date de plus de 7 jours.", [
+        "nb_releves_anciens": _x("Relevés de plus de 7 jours", "Sites dont le dernier relevé de stock (toutes sources) date de plus de 7 jours.", [
             _v("Sites concernés", anciens), _v("Sites avec un relevé", sum(1 for s in sites if s["age_releve_j"] is not None)),
         ], [SRC_STOCK], per, [], maj, "Pour ces sites, le stock affiché peut ne plus être réel : à confirmer sur place."),
     }
@@ -1131,10 +1148,10 @@ def _export_stock(p):
     k = d["kpis"]
     wb = Workbook()
     _summary_sheet(wb, "Suivi carburant — Stock actuel", [
-        ("Zone", p.get("zone") or "Toutes"), ("Dernier relevé capteur", str(k.get("derniere_mesure") or "—")),
+        ("Zone", p.get("zone") or "Toutes"), ("Dernier relevé", str(k.get("derniere_mesure") or "—")),
         ("Mois de référence de l'autonomie", k.get("mois_reference_autonomie") or "—"),
     ], [
-        ("Stock total capteur, L", k.get("stock_total_l"), "L", "stock_total_l"), ("Remplissage global, %", k.get("remplissage_pct"), "pct"),
+        ("Stock total, L", k.get("stock_total_l"), "L", "stock_total_l"), ("Remplissage global, %", k.get("remplissage_pct"), "pct"),
         ("Sites GE", k.get("nb_sites"), "int"), ("Sites au stock connu, %", k.get("stock_connu_pct"), "pct", "stock_connu_pct"),
         ("Cuves sous 15 %", k.get("nb_critique"), "int", "nb_critique"), ("Cuves entre 15 et 40 %", k.get("nb_alerte"), "int"),
         ("Autonomie médiane, jours", k.get("autonomie_mediane_j"), "dec1", "autonomie_mediane_j"),
@@ -1143,7 +1160,9 @@ def _export_stock(p):
     ], d.get("explain"))
     _sheet(wb, "Sites", [
         ("Site", "site_id", "txt", 12), ("Nom", "site_name", "txt", 26), ("Zone", "zone", "txt", 10), ("Typologie", "typologie", "txt", 14),
-        ("Stock capteur (L)", "stock_l", "L", 13), ("Capacité (L)", "capacite_l", "L", 12), ("Remplissage %", "remplissage_pct", "pct", 12),
+        ("Stock (L)", "stock_l", "L", 13), ("Source du stock", "source_stock_label", "txt", 12),
+        ("Stock estimé", lambda r: "Oui" if r["stock_estime"] else "", "txt", 9), ("Origine (Synthèse)", "origine_stock", "txt", 22),
+        ("Capacité (L)", "capacite_l", "L", 12), ("Remplissage %", "remplissage_pct", "pct", 12),
         ("Date relevé", "date", "date", 12), ("Âge du relevé (j)", "age_releve_j", "int", 11),
         ("Stock ENOC (L)", "stock_enoc_l", "L", 12), ("Date ENOC", "date_enoc", "date", 12),
         ("Conso / jour (L)", "conso_jour_l", "dec1", 11), ("Autonomie (j)", "autonomie_j", "dec1", 11),
@@ -1251,7 +1270,7 @@ def _export_estimation(request):
 class BiExportView(APIView):
     """GET /api/fuel-tracking/bi/export/<kind>/ — classeur Excel complet (toutes les lignes, pas seulement le Top 10)."""
     permission_classes = [IsAuthenticated]
-    KINDS = ("conso", "stock", "cph", "commande", "estimation", "ravitaillement")
+    KINDS = ("conso", "stock", "cph", "commande", "estimation", "ravitaillement", "sites")
 
     def get(self, request, kind):
         p = request.query_params
@@ -1269,6 +1288,9 @@ class BiExportView(APIView):
             if kind == "ravitaillement":
                 from fuel_tracking.views_ravitaillement import export_plan
                 return export_plan(p)
+            if kind == "sites":
+                from fuel_tracking.views_sites_table import export_site_table
+                return export_site_table(p)
         except (_BadPeriod, ValueError) as e:
             return Response({"detail": str(e)}, status=400)
         return Response({"detail": "Export inconnu.", "exports": self.KINDS}, status=404)

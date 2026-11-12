@@ -707,7 +707,9 @@ def _process_closing_stocks(batch, file_bytes: bytes, file_name: str, resolver) 
             event_id = "CL:" + fingerprint("CLOSING", site_id, d, kind, value)
             context = {"type": "closing_periode", "periode": [r["date_initiale"].isoformat(), r["date_finale"].isoformat()],
                        "livre_l": r["livre_l"], "rajout_retrait_l": r["rajout_retrait_l"], "vole_l": r["vole_l"], "vidange_l": r["vidange_l"],
-                       "conso_closing_l": _ref, "formule_coherente": coherent}
+                       "conso_closing_l": _ref, "formule_coherente": coherent,
+                       # Origine du stock selon la Synthèse (« Relevés de Terrain Technicien », « Estimation Energy Desk »…)
+                       "origine_stock": r.get(f"origine_{kind}"), "fiabilisation": r.get("fiabilisation") if kind == "final" else None}
             if event_id in existing:
                 Obs.objects.filter(pk=existing[event_id]).update(source_context=context)  # complète le contexte d'un stock déjà importé
                 stats["doublons"] += 1

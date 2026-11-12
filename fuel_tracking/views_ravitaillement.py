@@ -71,7 +71,7 @@ def compute_plan(params) -> dict:
     for s in sites:
         if s["stock_l"] is None:
             nb_sans_stock += 1
-            hors_plan.append({**_ident(s), "motif": "Pas de stock capteur : niveau inconnu"})
+            hors_plan.append({**_ident(s), "motif": "Aucun relevé de stock exploitable (capteur, terrain ou Synthèse) : niveau inconnu"})
             continue
         if not s["conso_jour_l"]:
             nb_sans_conso += 1
@@ -94,6 +94,7 @@ def compute_plan(params) -> dict:
         plan.append({
             **_ident(s),
             "stock_releve_l": s["stock_l"], "date_releve": s["date"], "age_releve_j": s["age_releve_j"],
+            "source_stock": s.get("source_stock_label"), "stock_source_estime": bool(s.get("stock_estime")),
             "releve_ancien": s["age_releve_j"] is None or s["age_releve_j"] > RELEVE_ANCIEN_J,
             "stock_estime_l": round(stock_now), "capacite_l": cap, "conso_jour_l": s["conso_jour_l"],
             "jours_avant_rupture": round(jours_rupture, 1),
@@ -125,7 +126,7 @@ def compute_plan(params) -> dict:
     regle = (f"Stock estimé aujourd'hui ÷ conso mesurée par jour ({ref_month or '—'}) = jours avant rupture ; "
              f"à livrer {securite} jour(s) avant la rupture ; quantité pour remplir la cuve à {cible} %.")
     per = {"zone": params.get("zone") or "Toutes", "horizon": f"{horizon} jours, du {today:%d/%m} au {end:%d/%m}"}
-    excl = [{"label": "Sites sans stock capteur", "nb": nb_sans_stock},
+    excl = [{"label": "Sites sans relevé de stock exploitable", "nb": nb_sans_stock},
             {"label": f"Sites sans conso mesurée en {ref_month or 'mois de référence'}", "nb": nb_sans_conso}]
     kpis = {
         "nb_sites": len(plan), "nb_urgent": len(urgent), "quantite_l": litres, "nb_sans_quantite": sans_qte,
@@ -146,7 +147,7 @@ def compute_plan(params) -> dict:
             _v("Total", litres, "L"), _v("Sites sans quantité calculable", sans_qte),
         ], [SRC_STOCK], per, excl + [{"label": "Sites du plan à la capacité de cuve inconnue (quantité non calculée)", "nb": sans_qte}], maj),
         "nb_hors_plan": _x("Sites hors plan", "Sites GE dont la date de rupture ne peut pas être calculée.", [
-            _v("Sans stock capteur", nb_sans_stock), _v("Sans conso mesurée", nb_sans_conso),
+            _v("Sans relevé de stock", nb_sans_stock), _v("Sans conso mesurée", nb_sans_conso),
         ], [SRC_STOCK], per, None, maj),
     }
     return {
@@ -195,6 +196,7 @@ def export_plan(params):
         ("Quantité à livrer (L)", "quantite_l", "L", 14), ("Motif si non calculée", "quantite_motif", "txt", 26),
         ("Rupture estimée", "date_rupture", "date", 13), ("Jours avant rupture", "jours_avant_rupture", "dec1", 11),
         ("Stock relevé (L)", "stock_releve_l", "L", 12), ("Date du relevé", "date_releve", "date", 12),
+        ("Source du relevé", "source_stock", "txt", 11), ("Stock source estimé", lambda r: "Oui" if r["stock_source_estime"] else "", "txt", 9),
         ("Relevé ancien (> 7 j)", lambda r: "Oui" if r["releve_ancien"] else "", "txt", 11),
         ("Stock estimé aujourd'hui (L)", "stock_estime_l", "L", 14), ("Capacité (L)", "capacite_l", "L", 12),
         ("Conso / jour (L)", "conso_jour_l", "dec1", 11),

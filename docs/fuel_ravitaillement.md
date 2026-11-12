@@ -12,8 +12,19 @@ Paramètres : `zone`, `month` (mois de référence de la conso), `horizon` (1–
 
 ## Règles (valeurs par défaut à valider avec le métier)
 
-Mêmes données que Suivi Stock (`views_bi.stock_sites`) : stock capteur au dernier relevé, capacité de cuve, conso
+Mêmes données que Suivi Stock (`views_bi.stock_sites`) : stock retenu (voir ci-dessous), capacité de cuve, conso
 mesurée moyenne par jour du mois de référence.
+
+## Stock retenu par site (`services/current_stock.py`)
+
+Le relevé **le plus récent** parmi : relevés terrain / gardiennage / ENOC validés (`stock_registry.fuel_stock_retained`),
+capteur Snowflake (snapshot), stock final **validé** de la Synthèse importée par la Configuration. Même jour : terrain >
+capteur > Synthèse. Un stock de Synthèse dont l'origine (colonne « Source Données de stock Final ») contient
+« Estimation » est marqué estimé. Relevé à valider, rejeté ou en cm non converti : jamais retenu. Un stock capteur sans
+date n'est retenu qu'à défaut de relevé daté. Capacité : cuves validées, sinon capacité capteur.
+
+L'origine du stock n'est lue que pour les Synthèses importées après ce changement (les lots déjà importés n'ont pas la
+colonne : stock non marqué « estimé », origine vide).
 
 - stock estimé aujourd'hui = stock relevé − conso/jour × jours depuis le relevé (jamais sous 0) — c'est une estimation,
   affichée à côté du stock relevé et de sa date ;
