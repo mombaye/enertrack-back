@@ -31,6 +31,7 @@ ECART_SEUIL_PCT = 20
 SOUS_CHARGE_PCT = 30
 L_KWH_MAX = 0.30
 MIN_KWH = 100
+MIN_PREV_L = 100
 ALERTES = {
     "ECART_CPH": f"Écart mesuré / estimé > {ECART_SEUIL_PCT} %",
     "L_KWH_HAUT": f"Rendement > {L_KWH_MAX:.2f} L/kWh".replace(".", ","),
@@ -39,6 +40,8 @@ ALERTES = {
     "AUTONOMIE_3J": "Autonomie < 3 jours",
     "RELEVE_ANCIEN": "Relevé de stock > 7 jours",
 }
+# Alertes propres à chaque partie de l'écran : Suivi Conso et Suivi Stock affichent chacun les leurs.
+VUES = {"conso": ("ECART_CPH", "L_KWH_HAUT", "AU_DESSUS_TARGET", "SOUS_CHARGE"), "stock": ("AUTONOMIE_3J", "RELEVE_ANCIEN")}
 SORTS = ("site_id", "zone", "runtime_h", "cph_l_h", "charge_pct", "conso_mesuree_l", "conso_estimee_l", "ecart_pct", "ecart_l",
          "l_jour", "l_kwh", "evolution_pct", "ecart_target_pct", "stock_l", "autonomie_j", "enoc_livre_l", "nb_alertes")
 
@@ -90,7 +93,8 @@ def build_rows(month: str) -> tuple[list[dict], dict]:
         jours = m.get("nb_jours_data") or 0
         l_jour = round(meas / jours, 1) if meas is not None and jours else None
         p_meas = float(pv["conso_snowflake_l"]) if pv.get("conso_snowflake_l") else None
-        p_ljour = p_meas / pv["nb_jours_data"] if p_meas and pv.get("nb_jours_data") else None
+        # Mois précédent sous 100 L : base trop faible, un pourcentage serait trompeur (ex. +29 900 %).
+        p_ljour = p_meas / pv["nb_jours_data"] if p_meas and p_meas >= MIN_PREV_L and pv.get("nb_jours_data") else None
         theo = _f(c.get("conso_theorique_l"))
         rt = _f(c.get("runtime_total_h"))
         kwh = _f(m.get("ge_prod_kwh"))
@@ -154,7 +158,7 @@ def _filter(rows, params):
     return rows
 
 
-def _kpis(rows, meta, month):
+def _kpis(rows, meta, month, alertes=ALERTES):
     from fuel_tracking.models import FuelConsommationSyncRun, FuelDailyFactsSyncRun
 
     meas = [r for r in rows if r["conso_mesuree_l"] is not None]
@@ -201,8 +205,8 @@ def _kpis(rows, meta, month):
         "cph_moyen_l_h": _x("CPH moyen", "Conso estimée totale ÷ running time total, sur les sites au CPH calculé (moyenne pondérée par les heures).", [
             _v("Conso estimée", _f(sum(r["conso_estimee_l"] for r in cph_both)), "L"), _v("Running time", _f(cph_rt), "h"),
             _v("Résultat", k["cph_moyen_l_h"], "L/h")], [SRC_CPH], per, [], maj_cph, cph_note),
-        "nb_sites_alerte": _x("Sites en alerte", "Sites ayant au moins une alerte parmi : " + " ; ".join(ALERTES.values()) + ".", [
-            _v(lab, sum(1 for r in rows if code in r["alertes"])) for code, lab in ALERTES.items()], [SRC_CAPTEUR, SRC_CPH, SRC_TARGET, SRC_STOCK], per, [], maj_c),
+        "nb_sites_alerte": _x("Sites en alerte", "Sites ayant au moins une alerte parmi : " + " ; ".join(alertes.values()) + ".", [
+            _v(lab, sum(1 for r in rows if code in r["alertes"])) for code, lab in alertes.items()], [SRC_CAPTEUR, SRC_CPH, SRC_TARGET, SRC_STOCK], per, [], maj_c),
     }
     return k, x
 
@@ -212,8 +216,16 @@ def compute_site_table(params, paginate=True) -> dict:
     if not month:
         return {"month": None, "kpis": None, "explain": {}, "rows": [], "total": 0, "page": 1, "page_size": 50, "filters": {"zones": [], "alertes": ALERTES}}
     rows, meta = build_rows(month)
+    vue = params.get("vue") or ""
+    if vue and vue not in VUES:
+        raise _BadPeriod(f"Vue inconnue : {vue}.")
+    alertes = {c: ALERTES[c] for c in VUES[vue]} if vue else ALERTES
+    if vue:
+        for r in rows:
+            r["alertes"] = [a for a in r["alertes"] if a in alertes]
+            r["nb_alertes"] = len(r["alertes"])
     rows = _filter(rows, params)
-    k, x = _kpis(rows, meta, month)
+    k, x = _kpis(rows, meta, month, alertes)
     sort = params.get("sort") or "nb_alertes"
     if sort not in SORTS:
         raise _BadPeriod(f"Tri inconnu : {sort}.")
@@ -223,7 +235,7 @@ def compute_site_table(params, paginate=True) -> dict:
     total = len(rows)
     out = {"month": month, "periode": {"start": meta["start"], "end": meta["end"], "nb_jours": meta["nb_jours"]},
            "cph_disponible": meta["cph_disponible"], "kpis": k, "explain": x, "total": total,
-           "filters": {"zones": meta["zones"], "alertes": ALERTES}, "seuils": {"ecart_pct": ECART_SEUIL_PCT, "l_kwh": L_KWH_MAX,
+           "filters": {"zones": meta["zones"], "alertes": alertes}, "vue": vue or None, "seuils": {"ecart_pct": ECART_SEUIL_PCT, "l_kwh": L_KWH_MAX,
                                                                                 "sous_charge_pct": SOUS_CHARGE_PCT, "tolerance_target_pct": meta["tolerance_target_pct"]}}
     if not paginate:
         return {**out, "rows": rows}

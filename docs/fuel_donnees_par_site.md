@@ -1,13 +1,20 @@
-# Données par site — module Carburant
+# Détail par site — module Carburant
 
-Écran Suivi Carburant → Données par site : une ligne par site GE pour un mois.
+Une ligne par site GE pour un mois, en deux parties (décision du 2026-11-12, pas de rubrique séparée) :
+
+- **Suivi Conso → Détail par site** (`vue=conso`) : KPI conso estimée, écart mesuré / estimé, running time, CPH moyen,
+  sites en alerte conso ; colonnes conso, activité GE, comparaisons ; alertes écart CPH, L/kWh, target, sous-charge.
+- **Suivi Stock → Détail par site** (`vue=stock`) : stock retenu, conso par jour, autonomie, livraisons ; alertes
+  autonomie < 3 jours et relevé > 7 jours.
+
+L'ancienne adresse `/modules/suivi-carburant/donnees-par-site` ouvre Suivi Conso.
 
 | Méthode | Adresse | Rôle |
 | --- | --- | --- |
 | GET | `/api/fuel-tracking/bi/sites-table/` | KPI + lignes paginées (`page`, `page_size` ≤ 200), tri serveur (`sort`, `desc`) |
 | GET | `/api/fuel-tracking/bi/export/sites/` | classeur Excel, toutes les lignes, mêmes filtres |
 
-Filtres : `month` (AAAA-MM, défaut : dernier mois complet), `zone`, `q` (identifiant ou nom), `alerte`.
+Filtres : `vue` (`conso` ou `stock`), `month` (AAAA-MM, défaut : dernier mois complet), `zone`, `q` (identifiant ou nom), `alerte`.
 
 | Groupe | Colonnes | Source |
 | --- | --- | --- |

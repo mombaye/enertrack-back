@@ -83,6 +83,7 @@ class SiteTableTests(TestCase):
         conso("2026-10", "S2", conso_snowflake_l=D("310"), nb_jours_data=31)
         conso("2026-10", "S3", conso_snowflake_l=None)
         conso("2026-09", "S1", conso_snowflake_l=D("600"), nb_jours_data=30)
+        conso("2026-09", "S2", conso_snowflake_l=D("2"), nb_jours_data=30)   # base trop faible : pas de %
         FuelStockSnapshot.objects.create(site_id="S1", has_genset=True, stock_snowflake_l=40, capacity_snowflake_l=1000, stock_snowflake_date=TODAY)
 
     def test_table_and_kpis(self, _cph, _r):
@@ -97,6 +98,8 @@ class SiteTableTests(TestCase):
         self.assertEqual((s1["ecart_pct"], s1["l_jour"], s1["l_kwh"], s1["evolution_pct"]), (50.0, 30.0, 0.45, 50.0))
         self.assertEqual(set(s1["alertes"]), {"ECART_CPH", "L_KWH_HAUT", "SOUS_CHARGE", "AUTONOMIE_3J"})
         self.assertEqual(s1["source_stock"], "Capteur")
+        self.assertIsNone(r["S2"]["evolution_pct"])
+        self.assertEqual(r["S2"]["conso_prec_l"], 2.0)
         self.assertIsNone(r["S3"]["conso_mesuree_l"])                    # absent, pas 0
         self.assertIsNone(r["S3"]["conso_estimee_l"])
         self.assertEqual([x["site_id"] for x in b["rows"]], ["S1", "S2", "S3"])
@@ -109,6 +112,16 @@ class SiteTableTests(TestCase):
         self.assertEqual([x["site_id"] for x in b["rows"]], ["S1", "S2", "S3"])  # inconnu en fin
         self.assertEqual(c.get("/api/fuel-tracking/bi/sites-table/", {"sort": "xx"}).status_code, 400)
         self.assertEqual(c.get("/api/fuel-tracking/bi/sites-table/", {"month": "2026-13"}).status_code, 400)
+
+    def test_vue_limits_alerts(self, _cph, _r):
+        c = api()
+        b = c.get("/api/fuel-tracking/bi/sites-table/", {"month": "2026-10", "vue": "stock"}).json()
+        s1 = next(x for x in b["rows"] if x["site_id"] == "S1")
+        self.assertEqual(s1["alertes"], ["AUTONOMIE_3J"])
+        self.assertEqual(set(b["filters"]["alertes"]), {"AUTONOMIE_3J", "RELEVE_ANCIEN"})
+        b = c.get("/api/fuel-tracking/bi/sites-table/", {"month": "2026-10", "vue": "conso"}).json()
+        self.assertNotIn("AUTONOMIE_3J", next(x for x in b["rows"] if x["site_id"] == "S1")["alertes"])
+        self.assertEqual(c.get("/api/fuel-tracking/bi/sites-table/", {"vue": "xx"}).status_code, 400)
 
     def test_cph_down_still_renders(self, cph, _r):
         cph.side_effect = RuntimeError("down")
