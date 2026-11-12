@@ -298,6 +298,9 @@ def _filter(rows: list[dict], p) -> list[dict]:
         if v:
             rows = [r for r in rows if (str(getter(r) or "")).lower() == v]
 
+    if (p.get("perimetre") or "").strip().lower() == "senegal":
+        from fuel_tracking.views_bi import in_scope  # même règle que les vues BI (pays vide inclus)
+        rows = [r for r in rows if in_scope(r["country"])]
     eq(p.get("pays"), lambda r: r["country"])
     eq(p.get("zone"), lambda r: r["zone"])
     eq(p.get("typologie"), lambda r: r["typologie"])
