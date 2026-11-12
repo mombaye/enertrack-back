@@ -257,3 +257,11 @@ def check_fuel_sources_hourly(self):
         log = logger.warning if r["etat"] == PARTIEL else logger.error
         log("[fuel_sources] %s %s · dernier succès %s · %s", r["etat"], r["libelle"], r["dernier_succes"] or "aucun", r["erreur"] or "")
     return {"etat_global": st["etat_global"], "a_traiter": st["a_traiter"]}
+
+
+@shared_task(bind=True, name="fuel_tracking.process_config_upload", soft_time_limit=25 * 60, time_limit=30 * 60)
+def process_config_upload(self, ticket: str):
+    """Traite un fichier envoyé depuis la rubrique Configuration (voir views_config)."""
+    from fuel_tracking.views_config import run_pending_upload
+
+    return run_pending_upload(ticket)

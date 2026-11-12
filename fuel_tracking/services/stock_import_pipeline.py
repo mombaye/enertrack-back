@@ -40,8 +40,24 @@ def root() -> Path:
     return Path(getattr(settings, "FUEL_IMPORT_ROOT", "/mnt/Suivi_carburant_prod"))
 
 
-def ensure_dirs() -> Path:
+def media_root() -> Path:
+    """Stockage des fichiers envoyés depuis l'interface (page Configuration) quand le répertoire partagé n'est pas
+    monté : volume persistant media de la plateforme, jamais le disque éphémère du conteneur."""
+    return Path(getattr(settings, "MEDIA_ROOT", "media")) / "fuel_imports"
+
+
+def storage_root() -> Path:
+    """Répertoire partagé s'il est monté, sinon le volume media persistant."""
     r = root()
+    return r if r.is_dir() else media_root()
+
+
+def storage_label() -> str:
+    return "REPERTOIRE_PARTAGE" if root().is_dir() else "VOLUME_PLATEFORME"
+
+
+def ensure_dirs() -> Path:
+    r = storage_root()
     for sub in [f"incoming/{d}" for d in INCOMING] + ["processing", "accepted", "rejected", "archive"]:
         (r / sub).mkdir(parents=True, exist_ok=True)
     return r

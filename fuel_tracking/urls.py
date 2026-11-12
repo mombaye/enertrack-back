@@ -2,6 +2,8 @@
 
 from django.urls import path
 
+from fuel_tracking.views_config import ConfigAccessView, ConfigFilesView
+
 from fuel_tracking.views_bi import BiConsoSourcesView, BiSiteSearchView, BiSiteView, BiConsoView, BiCphView, BiExportView, BiStockView
 
 from fuel_tracking.views import (
@@ -97,6 +99,8 @@ urlpatterns = [
     path("stock/rapports/<str:kind>/", StockReportView.as_view(), name="fuel-stock-report"),
     path("stock/imports/traiter-dossier/", ImportProcessIncomingView.as_view(), name="fuel-stock-imports-process"),
     path("stock/imports/", ImportBatchListView.as_view(), name="fuel-stock-imports"),
+    path("configuration/acces/", ConfigAccessView.as_view(), name="fuel-config-access"),
+    path("configuration/fichiers/", ConfigFilesView.as_view(), name="fuel-config-files"),
     path("stock/imports/<int:pk>/lignes/", ImportBatchRowsView.as_view(), name="fuel-stock-import-lignes"),
     path("stock/imports/<int:pk>/relancer/", ImportBatchRelaunchView.as_view(), name="fuel-stock-import-relancer"),
     path("stock/gardiennage/", GuardScopeView.as_view(), name="fuel-stock-gardiennage"),
