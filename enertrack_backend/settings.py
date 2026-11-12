@@ -429,10 +429,10 @@ FUEL_CPH_STALE_AFTER_DAYS = os.environ.get("FUEL_CPH_STALE_AFTER_DAYS", "3")
 # Base Snowflake de la vue VW_FUEL_REPORT (conso mesurée par capteur). Aujourd'hui publiée en DEV seulement ;
 # passer à DB_GFMS_ANALYTICS_PROD dès que l'admin Snowflake l'y publie, sans modifier le code.
 FUEL_REPORT_DATABASE = os.environ.get("FUEL_REPORT_DATABASE", "DB_GFMS_ANALYTICS_DEV")
-# Page Configuration du module Carburant : code d'accès à 6 chiffres, comparé à son EMPREINTE (jamais stocké en clair).
-# Pour changer le code : générer une empreinte avec `python manage.py shell -c "from django.contrib.auth.hashers import
-# make_password; print(make_password('NOUVEAU_CODE'))"` et la mettre dans FUEL_CONFIG_CODE_HASH (environnement du serveur).
-FUEL_CONFIG_CODE_HASH = os.environ.get("FUEL_CONFIG_CODE_HASH", "pbkdf2_sha256$1000000$KJewnGGEW9vHH6qJbjxglJ$4oCrYkYiTZwJ6eeB4imsCT7K1dtBRXm6ZInhywV33ZE=")
+# Page Configuration du module Carburant : code d'accès UNIQUE et FIXE (décision métier du 2026-11-12), comparé à son
+# EMPREINTE (jamais stocké en clair). Volontairement non modifiable par variable d'environnement : tout autre code est refusé.
+# Le changer = modifier cette empreinte dans le code (revue + déploiement).
+FUEL_CONFIG_CODE_HASH = "pbkdf2_sha256$1000000$KJewnGGEW9vHH6qJbjxglJ$4oCrYkYiTZwJ6eeB4imsCT7K1dtBRXm6ZInhywV33ZE="
 FUEL_CONFIG_TOKEN_TTL_S = int(os.environ.get("FUEL_CONFIG_TOKEN_TTL_S", "7200"))
 FUEL_CONFIG_MAX_ATTEMPTS = int(os.environ.get("FUEL_CONFIG_MAX_ATTEMPTS", "5"))
 FUEL_CONFIG_LOCK_S = int(os.environ.get("FUEL_CONFIG_LOCK_S", "900"))

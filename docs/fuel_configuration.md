@@ -17,14 +17,9 @@ Types acceptés : `CLOSING` (Synthèse / Closing mensuel), `TARGET_FUEL`, `SCSS`
   (ajouté à `CORS_ALLOW_HEADERS`).
 - La vraie protection reste la connexion EnerTrack : un code à 6 chiffres seul est faible.
 
-Changer le code (sans modifier le code source) :
-
-```bash
-python manage.py shell -c "from django.contrib.auth.hashers import make_password; print(make_password('NOUVEAU_CODE'))"
-```
-
-puis mettre la valeur obtenue dans `FUEL_CONFIG_CODE_HASH` de l'environnement du serveur et redémarrer `web`.
-Attention : l'empreinte contient des `$` ; dans un fichier `.env` lu par Docker Compose, les doubler (`$$`).
+Le code est **unique et fixe** (décision du 2026-11-12) : tout autre code est refusé. Il n'est volontairement pas
+modifiable par variable d'environnement (une variable `FUEL_CONFIG_CODE_HASH` dans `.env` est ignorée). Le changer
+demande de modifier l'empreinte dans `enertrack_backend/settings.py`, avec revue et déploiement.
 
 ## API
 
@@ -60,7 +55,6 @@ Si le répertoire `FUEL_IMPORT_ROOT` est monté, il reste utilisé. Sinon, les f
 
 | Variable | Défaut | Rôle |
 | --- | --- | --- |
-| `FUEL_CONFIG_CODE_HASH` | empreinte du code convenu | Empreinte du code d'accès |
 | `FUEL_CONFIG_TOKEN_TTL_S` | 7200 | Durée du jeton (s) |
 | `FUEL_CONFIG_MAX_ATTEMPTS` | 5 | Essais faux avant blocage |
 | `FUEL_CONFIG_LOCK_S` | 900 | Durée du blocage (s) |

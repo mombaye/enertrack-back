@@ -145,3 +145,32 @@ class ConfigAccessTests(TestCase):
         self.assertEqual(r.status_code, 400)
         r = self.c.post("/api/fuel-tracking/configuration/fichiers/", {"file": SimpleUploadedFile("a.csv", b"x"), "source_type": "SCSS"}, HTTP_X_FUEL_CONFIG_TOKEN=t)
         self.assertEqual(r.status_code, 400)
+
+
+@override_settings(CACHES=LOCMEM, FUEL_CONFIG_MAX_ATTEMPTS=50)
+class FixedConfigCodeTests(TestCase):
+    """Empreinte RÉELLE (settings, sans substitution) : un seul code accepté, tout autre refusé."""
+
+    def setUp(self):
+        from django.core.cache import cache
+
+        cache.clear()
+        u = get_user_model().objects.create_user(username="fixe", email="fixe@test.local", password="x-pass-000")
+        self.c = APIClient()
+        self.c.force_authenticate(u)
+
+    def test_hash_is_fixed_in_code_and_not_read_from_environment(self):
+        import inspect
+
+        from django.conf import settings
+        from enertrack_backend import settings as S
+
+        self.assertTrue(settings.FUEL_CONFIG_CODE_HASH.startswith("pbkdf2_sha256$"))
+        src = inspect.getsource(S)
+        self.assertNotIn('environ.get("FUEL_CONFIG_CODE_HASH"', src)
+        self.assertNotIn("getenv(\"FUEL_CONFIG_CODE_HASH\"", src)
+
+    def test_other_codes_are_refused(self):
+        for code in ("000000", "123456", "999999", "041213", "141212", "", "04121", "0412120"):
+            r = self.c.post("/api/fuel-tracking/configuration/acces/", {"code": code}, format="json")
+            self.assertEqual(r.status_code, 403, code)
