@@ -73,6 +73,16 @@ def _pct_change(cur, prev):
     return round((float(cur) - float(prev)) / float(prev) * 100, 1)
 
 
+# Septembre 2026 est le début du suivi : aucune comparaison avec une période qui commence avant
+# (pas d'écart « septembre vs août »). Les écarts commencent avec octobre comparé à septembre.
+DEBUT_SUIVI = "2026-09"
+
+
+def _comparable(prev_months: list[str]) -> list[str]:
+    """Période précédente retenue seulement si elle est entièrement dans le suivi (sinon aucune comparaison)."""
+    return prev_months if prev_months and min(prev_months) >= DEBUT_SUIVI else []
+
+
 def _shift_month(month: str, delta: int) -> str:
     y, m = int(month[:4]), int(month[5:7])
     idx = y * 12 + (m - 1) + delta
@@ -264,7 +274,9 @@ def compute_conso(params) -> dict:
     span = len(months) or 1
     period = base.filter(month_year__in=months)
     single = from_month == to_month
-    prev_months = [] if single else [m for m in all_months if _shift_month(from_month, -span) <= m < from_month]
+    # Fenêtre précédente de même longueur, uniquement si elle commence au début du suivi ou après.
+    prev_start = _shift_month(from_month, -span)
+    prev_months = [] if single or prev_start < DEBUT_SUIVI else [m for m in all_months if prev_start <= m < from_month]
     prev = base.filter(month_year__in=prev_months)
 
     targets, tolerance = active_targets(), tolerance_pct()
@@ -545,7 +557,7 @@ def compute_site(site_id: str, params) -> dict:
     single = from_month == to_month
     span = (int(to_month[:4]) * 12 + int(to_month[5:7])) - (int(from_month[:4]) * 12 + int(from_month[5:7])) + 1
     months = [_shift_month(from_month, i) for i in range(span)]
-    prev_months = [] if single else [_shift_month(from_month, -span + i) for i in range(span)]
+    prev_months = [] if single else _comparable([_shift_month(from_month, -span + i) for i in range(span)])
 
     targets, tolerance = active_targets(), tolerance_pct()
     tgt = targets.get(sid.upper())

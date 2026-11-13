@@ -20,7 +20,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from fuel_tracking.views_bi import (SCOPE_LABEL, SRC_CAPTEUR, SRC_STOCK, SRC_TARGET, _BadPeriod, _days_in, _f, _last_sync,
+from fuel_tracking.views_bi import (DEBUT_SUIVI, SCOPE_LABEL, SRC_CAPTEUR, SRC_STOCK, SRC_TARGET, _BadPeriod, _days_in, _f, _last_sync,
                                     _month_bounds, _site_zones, _v, _x, scope_q, stock_sites)
 
 log = logging.getLogger(__name__)
@@ -73,8 +73,10 @@ def build_rows(month: str) -> tuple[list[dict], dict]:
     mrows = {r["site_id"]: r for r in FuelConsommationMonthly.objects.filter(scope_q(), month_year=month, has_genset=True).values(
         "site_id", "site_name", "typology", "typology_fichier", "configuration_fichier", "site_type_fichier", "pge_kva_fichier",
         "conso_snowflake_l", "nb_jours_data", "ge_prod_kwh", "enoc_qte_ajoutee_l", "enoc_nb_demandes")}
-    prev = {r["site_id"]: r for r in FuelConsommationMonthly.objects.filter(month_year=_prev_month(month), site_id__in=list(mrows))
-            .values("site_id", "conso_snowflake_l", "nb_jours_data")}
+    # Pas de comparaison avec un mois antérieur au début du suivi (septembre 2026 n'a pas de « mois précédent »).
+    prev = {} if _prev_month(month) < DEBUT_SUIVI else {
+        r["site_id"]: r for r in FuelConsommationMonthly.objects.filter(month_year=_prev_month(month), site_id__in=list(mrows))
+        .values("site_id", "conso_snowflake_l", "nb_jours_data")}
 
     cph, cph_ok = {}, True
     try:

@@ -224,9 +224,17 @@ class BiSiteTests(TestCase):
         self.assertEqual(b["kpis"]["l_kwh"], 0.25)
         oct_ = b["monthly"][1]
         self.assertIsNone(oct_["conso_mesuree_l"])
-        self.assertEqual(b["deltas"]["conso_mesuree_l"], 11.1)              # vs 2026-07/08 (90 L)
+        # Juillet-août sont avant le début du suivi (septembre 2026) : aucune comparaison.
+        self.assertIsNone(b["deltas"]["conso_mesuree_l"])
+        self.assertEqual(b["previous_months"], [])
         self.assertEqual(b["stock"]["autonomie_j"], 20.0)                   # 80 L ÷ 4 L/jour (septembre)
         self.assertEqual(b["explain"]["conso_mesuree_l"]["valeurs"][0]["valeur"], 100.0)
+
+    def test_comparaison_seulement_dans_le_suivi(self):
+        from fuel_tracking.views_bi import _comparable
+        self.assertEqual(_comparable(["2026-08", "2026-09"]), [])           # touche août : pas d'écart
+        self.assertEqual(_comparable(["2026-09", "2026-10"]), ["2026-09", "2026-10"])
+        self.assertEqual(_comparable([]), [])
 
     def test_site_single_month_and_scope(self):
         b = api().get("/api/fuel-tracking/bi/sites/DKR_0012/", {"month": "2026-09"}).json()
