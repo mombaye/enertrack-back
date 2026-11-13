@@ -23,9 +23,7 @@ logger = logging.getLogger(__name__)
 
 FUEL_DATABASE = "DB_GFMS_PROD"
 FUEL_SCHEMA = "GOLD"
-from fuel_tracking.services.snowflake_names import fuel_report_database
-
-FUEL_REPORT_DATABASE = fuel_report_database()
+FUEL_REPORT_DATABASE = "DB_GFMS_ANALYTICS_DEV"
 
 COUNTRY_SCOPE = "Senegal"
 WINDOW_DAYS = 30

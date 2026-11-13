@@ -24,13 +24,11 @@ from decimal import Decimal
 
 from django.conf import settings
 
-from fuel_tracking.services.snowflake_names import fuel_report_database
-
 logger = logging.getLogger(__name__)
 
 PROD = "DB_GFMS_PROD.GOLD"
 ANALYTICS = "DB_GFMS_ANALYTICS_PROD.GOLD"
-FUEL_REPORT = f"{fuel_report_database()}.GOLD"  # VW_FUEL_REPORT (réglage FUEL_REPORT_DATABASE)
+FUEL_REPORT = "DB_GFMS_ANALYTICS_DEV.GOLD"  # VW_FUEL_REPORT (cf. fuel_consommation_snowflake.py)
 DATA_ID_CHUNK = 200
 
 # Unités — À CONFIRMER avec `manage.py diagnose_cph_sources` avant la mise en
@@ -79,13 +77,13 @@ def fetch_inventory(country: str) -> list[dict]:
 DAILY_FACTS_SQL = """
 WITH
 genset AS (
-    SELECT DATA_ID AS data_id, DATE AS day,
+    SELECT DATA_ID AS data_id, REPORT_DATE AS day,
            IFF(MIN(DG_RUNTIME_CONTROLLER) = MAX(DG_RUNTIME_CONTROLLER), MAX(DG_RUNTIME_CONTROLLER), NULL) AS dse_h,
            IFF(MIN(DG_RUNTIME_CALCULATED) = MAX(DG_RUNTIME_CALCULATED), MAX(DG_RUNTIME_CALCULATED), NULL) AS dg_on_h,
            IFF(MIN(DG_PRODUCTION_KWH) = MAX(DG_PRODUCTION_KWH), MAX(DG_PRODUCTION_KWH), NULL) AS prod_kwh
     FROM {analytics}.GENSET_REPORT
-    WHERE DATE >= %(d_start)s AND DATE <= %(d_end)s AND DATA_ID IN ({ids})
-    GROUP BY DATA_ID, DATE
+    WHERE REPORT_DATE >= %(d_start)s AND REPORT_DATE <= %(d_end)s AND DATA_ID IN ({ids})
+    GROUP BY DATA_ID, REPORT_DATE
 ),
 tracker_iv AS (
     SELECT ID AS data_id, "TIMESTAMP" AS ts, CAST("TIMESTAMP" AS DATE) AS day,
@@ -184,58 +182,23 @@ LEFT JOIN fuel f ON f.data_id = u.data_id AND f.day = u.day
 """
 
 
-# Compteur horaire indisponible (vue GFMS_DATA_TRACKER_NC en erreur côté Snowflake) : mêmes colonnes, aucune
-# ligne → tracker_h / covered_min / ge_on_slots restent NULL (absent, jamais 0) et les autres sources passent.
-NO_TRACKER_CTES = """tracker_daily AS (
-    SELECT NULL::NUMBER AS data_id, NULL::DATE AS day, NULL::FLOAT AS tracker_h,
-           NULL::NUMBER AS covered_min, NULL::NUMBER AS ge_on_slots
-    WHERE FALSE
-),
-tracker_on_slots AS (
-    SELECT NULL::NUMBER AS data_id, NULL::TIMESTAMP_NTZ AS slot WHERE FALSE
-),
-"""
-
-
-def build_daily_facts_sql(data_ids: list[int], with_tracker: bool = True) -> str:
+def build_daily_facts_sql(data_ids: list[int]) -> str:
     # DATA_ID sont des entiers issus de Snowflake (jamais une saisie utilisateur).
     ids = ",".join(str(int(d)) for d in data_ids)
     statuses = ",".join(f"'{s}'" for s in RECTIFIER_ACTIVE_STATUSES)
-    sql = DAILY_FACTS_SQL
-    if not with_tracker:
-        a, b = sql.index("tracker_iv AS ("), sql.index("rect_slots AS (")
-        sql = sql[:a] + NO_TRACKER_CTES + sql[b:]
-    return sql.format(analytics=ANALYTICS, prod=PROD, fuel_report=FUEL_REPORT, ids=ids, active_statuses=statuses)
+    return DAILY_FACTS_SQL.format(analytics=ANALYTICS, prod=PROD, fuel_report=FUEL_REPORT, ids=ids, active_statuses=statuses)
 
 
-def tracker_status(cur) -> str | None:
-    """None si GFMS_DATA_TRACKER_NC est lisible, sinon le message d'erreur Snowflake (lecture seule, aucune ligne lue)."""
-    try:
-        cur.execute(f"SELECT 1 FROM {PROD}.GFMS_DATA_TRACKER_NC LIMIT 0")
-        return None
-    except Exception as e:  # erreur de compilation de la vue, droit manquant…
-        return str(e).splitlines()[0][:300]
-
-
-def fetch_daily_facts(data_ids: list[int], d_start: date, d_end: date, country: str | None = None,
-                      warnings: list | None = None) -> list[dict]:
-    """Faits journaliers. Si le compteur horaire est illisible, la synchro continue sans lui et l'avertissement
-    est ajouté à `warnings` (l'appelant le journalise dans le run) : jamais un échec silencieux ni un 0."""
+def fetch_daily_facts(data_ids: list[int], d_start: date, d_end: date, country: str | None = None) -> list[dict]:
     rows: list[dict] = []
     if not data_ids:
         return rows
     conn = _connect()
     try:
         cur = conn.cursor()
-        tracker_err = tracker_status(cur)
-        if tracker_err:
-            msg = f"Compteur horaire GFMS_DATA_TRACKER_NC illisible, heures compteur laissées absentes : {tracker_err}"
-            logger.warning("[fuel_daily_facts] %s", msg)
-            if warnings is not None and msg not in warnings:
-                warnings.append(msg)
         for i in range(0, len(data_ids), DATA_ID_CHUNK):
             chunk = data_ids[i:i + DATA_ID_CHUNK]
-            cur.execute(build_daily_facts_sql(chunk, with_tracker=tracker_err is None), {
+            cur.execute(build_daily_facts_sql(chunk), {
                 "d_start": d_start, "d_end": d_end, "country": country,
                 "p_dc_div": float(P_DC_TO_KW_DIVISOR), "eff_div": float(EFFICIENCY_TO_RATIO_DIVISOR),
             })

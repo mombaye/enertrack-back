@@ -2,11 +2,7 @@
 
 from django.urls import path
 
-from fuel_tracking.views_ravitaillement import BiRavitaillementView
-from fuel_tracking.views_sites_table import BiSiteTableView
-from fuel_tracking.views_config import ConfigAccessView, ConfigFilesView
-
-from fuel_tracking.views_bi import BiConsoSourcesView, BiSiteSearchView, BiSiteView, BiConsoView, BiCphView, BiExportView, BiStockEvolutionView, BiStockView
+from fuel_tracking.views_bi import BiConsoSourcesView, BiSiteSearchView, BiSiteView, BiConsoView, BiCphView, BiExportView, BiStockView
 
 from fuel_tracking.views import (
     FuelCommandeEstimationView,
@@ -64,10 +60,7 @@ urlpatterns = [
     path("bi/sites/<str:site_id>/", BiSiteView.as_view(), name="fuel-bi-site"),
     path("bi/conso/sources/", BiConsoSourcesView.as_view(), name="fuel-bi-conso-sources"),
     path("bi/stock/", BiStockView.as_view(), name="fuel-bi-stock"),
-    path("bi/stock/evolution/", BiStockEvolutionView.as_view(), name="fuel-bi-stock-evolution"),
     path("bi/cph/", BiCphView.as_view(), name="fuel-bi-cph"),
-    path("bi/sites-table/", BiSiteTableView.as_view(), name="fuel-bi-sites-table"),
-    path("bi/ravitaillement/", BiRavitaillementView.as_view(), name="fuel-bi-ravitaillement"),
     path("bi/export/<str:kind>/", BiExportView.as_view(), name="fuel-bi-export"),
     path("consommation/dashboard/", FuelConsommationDashboardView.as_view(), name="fuel-consommation-dashboard"),
     path("consommation/", FuelConsommationListView.as_view(), name="fuel-consommation"),
@@ -104,8 +97,6 @@ urlpatterns = [
     path("stock/rapports/<str:kind>/", StockReportView.as_view(), name="fuel-stock-report"),
     path("stock/imports/traiter-dossier/", ImportProcessIncomingView.as_view(), name="fuel-stock-imports-process"),
     path("stock/imports/", ImportBatchListView.as_view(), name="fuel-stock-imports"),
-    path("configuration/acces/", ConfigAccessView.as_view(), name="fuel-config-access"),
-    path("configuration/fichiers/", ConfigFilesView.as_view(), name="fuel-config-files"),
     path("stock/imports/<int:pk>/lignes/", ImportBatchRowsView.as_view(), name="fuel-stock-import-lignes"),
     path("stock/imports/<int:pk>/relancer/", ImportBatchRelaunchView.as_view(), name="fuel-stock-import-relancer"),
     path("stock/gardiennage/", GuardScopeView.as_view(), name="fuel-stock-gardiennage"),

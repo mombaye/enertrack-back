@@ -557,12 +557,6 @@ class MvpImportTests(TmpRootMixin, BalanceBase):
         b = P.process_bytes(self.closing_file(), "closing_aout.xlsx", "CLOSING", origin="UPLOAD")
         st = b.summary["stocks_closing"]
         self.assertEqual((st["stocks_importes"], st["sans_carburant_ignores"], st["sites_inconnus"], st["formule_incoherente_a_valider"]), (4, 2, 1, 2))
-        # Chaque ligne du fichier est conservée telle quelle (même site inconnu, même site sans GE) pour le KPI « Consommation Closing ».
-        lignes = b.summary["lignes_closing"]
-        self.assertEqual([(x["site"], x["site_id"], x["fin"], x["conso_l"]) for x in lignes],
-                         [("DKR_0001", "DKR_0001", "2026-08-31", 400.0), ("DKR_0002", "DKR_0002", "2026-08-31", 500.0),
-                          ("DKR_0003", "DKR_0003", "2026-08-31", 0.0), ("XXX_9999", None, "2026-08-31", 50.0)])
-        self.assertNotIn("lignes", st)
         obs = {(o.site_id, o.observation_datetime.date().isoformat()): o for o in Obs.objects.filter(source_type="CLOSING")}
         ok = obs[("DKR_0001", "2026-08-01")]
         self.assertEqual((float(ok.level_liters), ok.tank_id, ok.validation_status, ok.reading_quality_status), (500.0, "SITE", "VALIDATED", "LITRE_DIRECT"))

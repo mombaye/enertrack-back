@@ -28,7 +28,7 @@ from fuel_tracking.services.stock_period_balance import RULE_VERSION, alert_code
 LABELS = {
     "variation": "Variation de stock (L)",
     "closing": "Consommation Closing (L)",
-    "instrumentee": "Consommation Snowflake (L)",
+    "instrumentee": "Consommation instrumentée Snowflake (L)",
     "cph_complete": "Consommation théorique CPH complète (L)",
     "cph_partielle": "Consommation théorique CPH partielle (L)",
     "certifiee": "Consommation réelle certifiée (L)",
@@ -298,9 +298,6 @@ def _filter(rows: list[dict], p) -> list[dict]:
         if v:
             rows = [r for r in rows if (str(getter(r) or "")).lower() == v]
 
-    if (p.get("perimetre") or "").strip().lower() == "senegal":
-        from fuel_tracking.views_bi import in_scope  # même règle que les vues BI (pays vide inclus)
-        rows = [r for r in rows if in_scope(r["country"])]
     eq(p.get("pays"), lambda r: r["country"])
     eq(p.get("zone"), lambda r: r["zone"])
     eq(p.get("typologie"), lambda r: r["typologie"])
@@ -309,13 +306,6 @@ def _filter(rows: list[dict], p) -> list[dict]:
     eq(p.get("source_runtime"), lambda r: r["cph"]["runtime_source"] or "AUCUNE")
     eq(p.get("source_puissance"), lambda r: r["cph"]["power_source"] or "AUCUNE")
     eq(p.get("source_target"), lambda r: r["target"]["source"] or "AUCUNE")
-    typology = (p.get("typology") or "").strip()
-    if typology and rows:
-        # Même vocabulaire que les graphiques de Suivi Conso (typologie du fichier, sinon Snowflake).
-        from fuel_tracking.views_bi import site_ids_for_typology
-        per = rows[0].get("periode") or {}
-        ids = site_ids_for_typology(typology, str(per.get("debut") or "")[:7], str(per.get("fin") or "")[:7])
-        rows = [r for r in rows if (r["site_id"] or "").upper() in ids]
     site = (p.get("site") or "").strip().lower()
     if site:
         rows = [r for r in rows if site in r["site_id"].lower() or site in (r["site_name"] or "").lower()]
@@ -397,74 +387,6 @@ def closing_base_sites() -> set[str]:
     return {s.upper() for s in Obs.objects.filter(source_type="CLOSING").values_list("site_id", flat=True).distinct() if s}
 
 
-def closing_file_lines(d_from: date, d_to: date) -> list[dict] | None:
-    """
-    Lignes du fichier Closing, EXACTEMENT comme dans le fichier (colonne « qtité cons considéréé (l) », tous les sites,
-    même non reconnus dans Gestion des sites), pour les lignes dont la période Closing se termine entre d_from et d_to.
-    Une ligne sans date finale prend le mois le plus fréquent de son fichier. Plusieurs versions du Closing pour un même
-    mois : la dernière importée remplace les précédentes. None si aucun Closing importé ne porte ces lignes
-    (fichiers importés avant cette version : à relancer).
-    """
-    import calendar as _cal
-    from collections import Counter
-
-    from fuel_tracking.models import FuelImportBatch as B
-
-    lo = d_from.replace(day=1).isoformat()
-    hi = d_to.replace(day=_cal.monthrange(d_to.year, d_to.month)[1]).isoformat()
-    by_month: dict[str, list[dict]] = {}
-    found = False
-    for summary in (B.objects.filter(source_type="CLOSING", status__in=(B.Status.ACCEPTED, B.Status.VALIDATION_REQUIRED))
-                    .order_by("received_at", "pk").values_list("summary", flat=True)):
-        lines = (summary or {}).get("lignes_closing")
-        if not lines:
-            continue
-        found = True
-        months = Counter(str(x["fin"])[:7] for x in lines if x.get("fin"))
-        dominant = months.most_common(1)[0][0] if months else None
-        per_month: dict[str, list[dict]] = {}
-        for x in lines:
-            m = str(x["fin"])[:7] if x.get("fin") else dominant
-            if m:
-                per_month.setdefault(m, []).append(x)
-        by_month.update(per_month)   # version la plus récente du fichier pour chaque mois
-    if not found:
-        return None
-    return [x for m, xs in sorted(by_month.items()) if lo[:7] <= m <= hi[:7] for x in xs]
-
-
-def closing_declared(d_from: date, d_to: date) -> dict[str, dict]:
-    """
-    Conso Closing par site (identifiant reconnu, en majuscules) telle que dans le fichier. Repli pour les Closing importés
-    avant la conservation des lignes : valeur du contexte des stocks importés (ligne dont la période se termine dans la période).
-    """
-    import calendar as _cal
-
-    from fuel_tracking.models import FuelStockObservation as Obs
-
-    lines = closing_file_lines(d_from, d_to)
-    out: dict[str, dict] = {}
-    if lines is not None:
-        for x in lines:
-            if x.get("site_id") and x.get("conso_l") is not None:
-                out[x["site_id"].upper()] = {"conso_l": _f(x["conso_l"]), "periode": [x.get("debut"), x.get("fin")]}
-        return out
-    lo = d_from.replace(day=1)
-    hi = d_to.replace(day=_cal.monthrange(d_to.year, d_to.month)[1])
-    start, end = day_bounds(lo, hi)
-    for sid, ctx in (Obs.objects.filter(source_type="CLOSING", observation_datetime__gte=start, observation_datetime__lte=end)
-                     .order_by("pk").values_list("site_id", "source_context")):
-        ctx = ctx or {}
-        per = ctx.get("periode") or []
-        val = ctx.get("conso_closing_l")
-        if ctx.get("type") != "closing_periode" or len(per) != 2 or val is None or not sid:
-            continue
-        if not (lo.isoformat() <= str(per[1])[:10] <= hi.isoformat()):
-            continue
-        out[sid.upper()] = {"conso_l": _f(val), "periode": [str(per[0])[:10], str(per[1])[:10]]}
-    return out
-
-
 def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) -> dict:
     """Calcule le tableau de comparaison unique pour la période EXACTE [d_from 00:00:00 ; d_to 23:59:59]."""
     from fuel_tracking.services.cph_health import freshness
@@ -480,30 +402,6 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
     targets = TG.active_targets()
     ids = sorted(set(balances) | {s for s, r in cph_by_site.items() if r.get("perimetre", "GE") == "GE"})
     rows = [_row(cph_by_site.get(sid), balances.get(sid), d_from, d_to, days, targets.get(sid.upper()), {}) for sid in ids]
-    # Closing : valeur du bilan quand ses deux stocks viennent de la même ligne de Closing (écart calculable),
-    # sinon valeur déclarée dans le fichier pour la ligne du site qui se termine dans la période (affichée, sans écart).
-    # Fichier conservé ligne à ligne : la valeur affichée est TOUJOURS celle du fichier (absente du fichier = absente).
-    file_lines = closing_file_lines(d_from, d_to)
-    declared = closing_declared(d_from, d_to)
-    for r in rows:
-        cl = r["closing"]
-        dec = declared.get(r["site_id"].upper())
-        if file_lines is not None:
-            same_period = cl["conso_l"] is not None          # le bilan repose sur les deux stocks de cette ligne de Closing
-            cl["conso_l"], cl["source"] = (dec["conso_l"], "fichier") if dec else (None, None)
-            cl["periode_closing"] = dec["periode"] if dec else None
-            if same_period and dec:
-                cl["ecart_l"] = _gap(r["stock"]["variation_l"], cl["conso_l"])
-                cl["ecart_pct"], cl["pct_na"] = _pct(cl["ecart_l"], cl["conso_l"])
-            else:                                            # périodes différentes : pas d'écart
-                cl["ecart_l"] = cl["ecart_pct"] = cl["pct_na"] = None
-            continue
-        if cl["conso_l"] is not None:
-            cl["source"] = "bilan"
-            continue
-        cl["source"] = "fichier" if dec else None
-        if dec:
-            cl["conso_l"], cl["periode_closing"] = dec["conso_l"], dec["periode"]
     # Correspondance avec la base du fichier Closing : un site sans correspondance est AFFICHÉ mais jamais utilisé dans les totaux et indicateurs.
     base = closing_base_sites()
     for r in rows:
@@ -525,13 +423,7 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
     last = fr["facts_last_date"]
     non_couverts = max(0, min(days, (d_to - last).days)) if last else days
     uniq = lambda f: sorted({f(r) for r in rows if f(r)})  # noqa: E731
-    fichier = None
-    if file_lines is not None:
-        vals = [x for x in file_lines if x.get("conso_l") is not None]
-        fichier = {"total_l": round(sum(float(x["conso_l"]) for x in vals), 1) if vals else None, "sites": len(vals),
-                   "lignes": len(file_lines), "sites_non_reconnus": sum(1 for x in vals if not x.get("site_id"))}
     return {
-        "closing_fichier": fichier,
         "fraicheur": {
             "snowflake_derniere_date": last.isoformat() if last else None, "age_jours": fr["facts_age_days"], "seuil_jours": fr["stale_after_days"],
             "perime": bool(fr["facts_stale"]), "synchro_en_echec": bool(fr["last_sync_failed"]), "erreur_synchro": fr["last_sync_error"],

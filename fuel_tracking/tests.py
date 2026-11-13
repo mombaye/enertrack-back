@@ -586,46 +586,6 @@ class DailyFactsSqlTests(SimpleTestCase):
         self.assertIn("QUALITY_STATUS = 'OK' AND VALID_POINT_COUNT >= 2 AND DROP_DETECTED = TRUE", sql)
         self.assertNotIn("INSERT", sql.upper().replace("INSERTED", ""))
 
-    def test_genset_report_is_read_by_its_date_column(self):
-        # GENSET_REPORT n'a pas de colonne REPORT_DATE (DESCRIBE du 2026-11-12) : la requête échouait en entier.
-        from fuel_tracking.services.fuel_daily_facts_snowflake import build_daily_facts_sql
-        sql = build_daily_facts_sql([1])
-        self.assertNotIn("REPORT_DATE", sql)
-        self.assertIn("WHERE DATE >= %(d_start)s AND DATE <= %(d_end)s AND DATA_ID IN (1)", sql)
-
-    def test_without_tracker_the_query_skips_the_view_and_keeps_its_columns_null(self):
-        from fuel_tracking.services.fuel_daily_facts_snowflake import build_daily_facts_sql
-        sql = build_daily_facts_sql([1, 2], with_tracker=False)
-        self.assertNotIn("GFMS_DATA_TRACKER_NC", sql)
-        self.assertIn("NULL::FLOAT AS tracker_h", sql)
-        self.assertIn("td.tracker_h, td.covered_min, td.ge_on_slots", sql)
-        self.assertIn("RECTIFIER_EFFICIENCY_STATUS", sql)
-        self.assertIn("GFMS_DATA_TRACKER_NC", build_daily_facts_sql([1, 2]))
-
-    def test_unreadable_tracker_is_reported_never_silent(self):
-        from unittest import mock
-        from fuel_tracking.services import fuel_daily_facts_snowflake as SF
-        cur = mock.MagicMock()
-        executed = []
-
-        def execute(sql, params=None):
-            executed.append(sql)
-            if "LIMIT 0" in sql:
-                raise Exception("002057 (42601): SQL compilation error:\nView definition is invalid")
-        cur.execute.side_effect = execute
-        cur.fetchall.return_value = []
-        conn = mock.MagicMock()
-        conn.cursor.return_value = cur
-        warnings = []
-        with mock.patch.object(SF, "_connect", return_value=conn):
-            rows = SF.fetch_daily_facts([1], date(2026, 11, 10), date(2026, 11, 11), "Senegal", warnings=warnings)
-        self.assertEqual(rows, [])
-        self.assertEqual(len(warnings), 1)
-        self.assertIn("GFMS_DATA_TRACKER_NC illisible", warnings[0])
-        self.assertIn("002057", warnings[0])
-        self.assertNotIn("GFMS_DATA_TRACKER_NC", executed[-1])
-        conn.close.assert_called_once()
-
 
 class BlocageNoCphTests(SimpleTestCase):
     def test_ge_off_days_do_not_hide_a_missing_cph(self):

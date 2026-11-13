@@ -79,7 +79,6 @@ class BiStockTests(TestCase):
         self.assertEqual(b["kpis"]["nb_sites"], 2)
         self.assertEqual(b["kpis"]["nb_critique"], 1)
         self.assertEqual(b["top_critique"][0]["autonomie_j"], 10.0)   # 100 L / (310 L / 31 j)
-        self.assertEqual(b["kpis"]["couverture_j"], 10.0)             # seul A a une conso par jour : B non compté
         self.assertEqual(b["distribution_remplissage"][-1]["nb_sites"], 1)  # B inconnu
         self.assertEqual(b["explain"]["stock_total_l"]["exclusions"][0]["nb"], 1)  # M (Mali) exclu et compté
 
@@ -149,9 +148,6 @@ class BiExportTests(TestCase):
         from fuel_tracking.models import FuelSuiviCommandeSite
         FuelStockSnapshot.objects.create(site_id="A", has_genset=True, stock_snowflake_l=100, capacity_snowflake_l=1000, stock_snowflake_pct=10)
         self.assertEqual(self._wb(api().get("/api/fuel-tracking/bi/export/stock/"))["Sites"].max_row, 2)
-        dist = api().get("/api/fuel-tracking/bi/stock/").json()["distribution_source"]
-        self.assertEqual(sum(b["nb_sites"] for b in dist), 1)   # chaque site GE compté une fois, sous l'origine de son stock retenu
-        self.assertIsNone(api().get("/api/fuel-tracking/bi/stock/").json()["kpis"]["couverture_j"])  # aucune conso par jour : non calculable, pas 0
         FuelSuiviCommandeSite.objects.create(month_year="2026-10", site_id="A", commande_avec_marge_l=D("500"))
         self.assertEqual(self._wb(api().get("/api/fuel-tracking/bi/export/commande/"))["Sites"]["J2"].value, 500.0)
         self._wb(api().get("/api/fuel-tracking/bi/export/estimation/"))
@@ -201,44 +197,6 @@ class BiMonthAndSourcesTests(TestCase):
         self.assertIsNotNone(b["motif"])
 
 
-    def test_liste_sites_snowflake(self):
-        # La liste du KPI « Consommation Snowflake » reprend exactement les sites comptés : mesure disponible, fichier Closing, Sénégal.
-        ins = lambda ok, l: {"disponible": ok, "conso_l": l, "jours_mesure": 30 if ok else 2, "jours": 31, "couverture_pct": 96.8 if ok else 6.5}
-        rows = [{"site_id": "A", "site_name": "a", "zone": "DKR", "country": "SN", "correspondance": {"utilise": True}, "instrumentee": ins(True, D("50"))},
-                {"site_id": "B", "site_name": "b", "zone": "DKR", "country": "SN", "correspondance": {"utilise": True}, "instrumentee": ins(True, D("90"))},
-                {"site_id": "C", "site_name": "c", "zone": "DKR", "country": "SN", "correspondance": {"utilise": True}, "instrumentee": ins(False, None)},
-                {"site_id": "H", "site_name": "h", "zone": "DKR", "country": "SN", "correspondance": {"utilise": False}, "instrumentee": ins(True, D("10"))}]
-        v = {"total_l": 1.0, "sites": 2, "negatives": 0}
-        k = {"sites": 3, "variation": v, "closing": v, "instrumentee": v, "cph_complete": v, "cph_partielle": {"total_l": None, "sites": 0}}
-        build = {"rows": rows, "periode": {"sites_avec_bilan": 1}, "fraicheur": {}}
-        with mock.patch("fuel_tracking.services.conso_comparison.build", return_value=build), \
-                mock.patch("fuel_tracking.services.conso_comparison._kpis", return_value=k):
-            b = api().get("/api/fuel-tracking/bi/conso/sources/", {"month": "2026-10", "liste": "instrumentee"}).json()
-            sans = api().get("/api/fuel-tracking/bi/conso/sources/", {"month": "2026-10"}).json()
-        self.assertEqual([x["site_id"] for x in b["liste_sites"]], ["B", "A"])   # C sans mesure, H hors Closing : exclus ; tri par conso
-        self.assertEqual(b["liste_sites"][0]["conso_l"], 90.0)
-        self.assertNotIn("liste_sites", sans)                                    # seulement sur demande
-
-    def test_sources_follow_typology(self):
-        # Typologie au sens des graphiques (fichier, sinon Snowflake) : seuls les sites de cette typologie entrent dans les KPIs.
-        conso("2026-10", "T1", country="SN", typology_fichier="Rural")
-        conso("2026-10", "T2", country="SN", typology_fichier="Urbain")
-        rows = [{"site_id": "T1", "country": "SN", "correspondance": {"utilise": True}},
-                {"site_id": "T2", "country": "SN", "correspondance": {"utilise": True}}]
-        seen = {}
-
-        def fake_kpis(rs):
-            seen["ids"] = [r["site_id"] for r in rs]
-            v = {"total_l": 1.0, "sites": len(rs), "negatives": 0}
-            return {"sites": len(rs), "variation": v, "closing": v, "instrumentee": v, "cph_complete": v, "cph_partielle": {"total_l": None, "sites": 0}}
-        build = {"rows": rows, "periode": {"sites_avec_bilan": 1}, "fraicheur": {}}
-        with mock.patch("fuel_tracking.services.conso_comparison.build", return_value=build), \
-                mock.patch("fuel_tracking.services.conso_comparison._kpis", side_effect=fake_kpis):
-            b = api().get("/api/fuel-tracking/bi/conso/sources/", {"month": "2026-10", "typology": "Rural"}).json()
-        self.assertEqual(seen["ids"], ["T1"])
-        self.assertIn("Typologie : Rural", b["explain"]["variation"]["perimetre"])
-
-
 class BiSiteTests(TestCase):
     def setUp(self):
         conso("2026-08", "DKR_0012", site_name="Médina", country="Senegal", zone_fichier="DKR", conso_snowflake_l=D("90"), nb_jours_data=30)
@@ -266,17 +224,9 @@ class BiSiteTests(TestCase):
         self.assertEqual(b["kpis"]["l_kwh"], 0.25)
         oct_ = b["monthly"][1]
         self.assertIsNone(oct_["conso_mesuree_l"])
-        # Juillet-août sont avant le début du suivi (septembre 2026) : aucune comparaison.
-        self.assertIsNone(b["deltas"]["conso_mesuree_l"])
-        self.assertEqual(b["previous_months"], [])
+        self.assertEqual(b["deltas"]["conso_mesuree_l"], 11.1)              # vs 2026-07/08 (90 L)
         self.assertEqual(b["stock"]["autonomie_j"], 20.0)                   # 80 L ÷ 4 L/jour (septembre)
         self.assertEqual(b["explain"]["conso_mesuree_l"]["valeurs"][0]["valeur"], 100.0)
-
-    def test_comparaison_seulement_dans_le_suivi(self):
-        from fuel_tracking.views_bi import _comparable
-        self.assertEqual(_comparable(["2026-08", "2026-09"]), [])           # touche août : pas d'écart
-        self.assertEqual(_comparable(["2026-09", "2026-10"]), ["2026-09", "2026-10"])
-        self.assertEqual(_comparable([]), [])
 
     def test_site_single_month_and_scope(self):
         b = api().get("/api/fuel-tracking/bi/sites/DKR_0012/", {"month": "2026-09"}).json()
@@ -312,95 +262,3 @@ class BiSiteTests(TestCase):
         self.assertIsNone(b["kpis"]["instrumentee"]["total_l"])             # couverture insuffisante : non calculable, pas 0
         self.assertEqual(b["site"]["cph"]["statut"], "PARTIEL")
         self.assertIn("non calculable", b["explain"]["cph_complete"]["note"])
-
-
-class BiZoneFallbackTests(TestCase):
-    """Région renseignée sur un seul mois (fichier de référence) : les mois suivants reprennent la dernière région connue du site."""
-
-    def setUp(self):
-        conso("2026-08", "A", country="SN", zone_fichier="DKR", conso_snowflake_l=D("50"))
-        conso("2026-09", "A", country="SN", conso_snowflake_l=D("100"))
-        conso("2026-09", "B", country="SN", conso_snowflake_l=D("40"))      # aucune région connue
-
-    def test_region_reprise_et_filtre(self):
-        b = api().get("/api/fuel-tracking/bi/conso/", {"from_month": "2026-09", "to_month": "2026-09"}).json()
-        labels = {z["label"]: z for z in b["by_zone"]}
-        self.assertEqual(labels["DKR"]["conso_mesuree_l"], 100.0)
-        self.assertIn("Non renseigné", labels)                               # B : jamais inventée
-        f = api().get("/api/fuel-tracking/bi/conso/", {"from_month": "2026-09", "to_month": "2026-09", "zone": "DKR"}).json()
-        self.assertEqual(f["kpis"]["conso_mesuree_l"], 100.0)
-
-
-class ClosingDeclaredTests(TestCase):
-    """Consommation Closing : valeur déclarée dans le fichier pour la ligne du site qui se termine dans la période."""
-
-    def _obs(self, site, d, kind, periode, conso_l, n=[0]):
-        from datetime import datetime
-
-        from django.utils import timezone
-        from fuel_tracking.models import FuelStockObservation
-
-        n[0] += 1
-        ctx = {"type": "closing_periode", "periode": periode, "conso_closing_l": conso_l}
-        return FuelStockObservation.objects.create(
-            source_type="CLOSING", source_event_id=f"CL:decl{n[0]}", site_id=site, level_liters=D("100"), level_unit="L",
-            observation_datetime=timezone.make_aware(datetime.combine(d, datetime.min.time())), validation_status="VALIDATED",
-            conversion_status="VALID", source_context=ctx)
-
-    def test_une_valeur_par_ligne_periode_finissant_dans_le_mois(self):
-        from datetime import date
-
-        from fuel_tracking.services.conso_comparison import closing_declared
-
-        self._obs("SN_1", date(2026, 8, 27), "initial", ["2026-08-27", "2026-09-26"], 210.0)
-        self._obs("SN_1", date(2026, 9, 26), "final", ["2026-08-27", "2026-09-26"], 210.0)   # même ligne : comptée une fois
-        self._obs("SN_2", date(2026, 10, 3), "final", ["2026-09-05", "2026-10-03"], 99.0)    # se termine en octobre : exclue
-        self._obs("sn_3", date(2026, 9, 30), "final", ["2026-09-01", "2026-09-30"], None)    # pas de conso déclarée : absente, jamais 0
-        d = closing_declared(date(2026, 9, 1), date(2026, 9, 30))
-        self.assertEqual(set(d), {"SN_1"})
-        self.assertEqual(d["SN_1"]["conso_l"], 210.0)
-        self.assertEqual(d["SN_1"]["periode"], ["2026-08-27", "2026-09-26"])
-        self.assertEqual(set(closing_declared(date(2026, 10, 1), date(2026, 10, 31))), {"SN_2"})
-
-
-class ClosingFileLinesTests(TestCase):
-    """Le KPI « Consommation Closing » reprend le fichier tel quel : toutes ses lignes, colonne conso considérée."""
-
-    def _batch(self, lines, h, status="ACCEPTED"):
-        from fuel_tracking.models import FuelImportBatch
-
-        return FuelImportBatch.objects.create(source_type="CLOSING", file_name="Closing.xlsb", file_hash=h * 64, status=status,
-                                              summary={"codes": {}, "lignes_closing": lines})
-
-    def test_lignes_du_mois_derniere_version(self):
-        from datetime import date
-
-        from fuel_tracking.services.conso_comparison import closing_declared, closing_file_lines
-
-        self.assertIsNone(closing_file_lines(date(2026, 9, 1), date(2026, 9, 30)))            # aucun fichier conservé : repli
-        self._batch([{"site": "SN_1", "site_id": "SN_1", "debut": "2026-08-27", "fin": "2026-09-26", "conso_l": 100.0}], "a")
-        self._batch([{"site": "SN_1", "site_id": "SN_1", "debut": "2026-08-27", "fin": "2026-09-26", "conso_l": 210.0},
-                     {"site": "XX_9", "site_id": None, "debut": "2026-08-30", "fin": "2026-09-29", "conso_l": 40.0},
-                     {"site": "SN_2", "site_id": "SN_2", "debut": None, "fin": None, "conso_l": 5.5},
-                     {"site": "SN_3", "site_id": "SN_3", "debut": "2026-09-01", "fin": "2026-09-30", "conso_l": None}], "b")
-        self._batch([{"site": "SN_1", "site_id": "SN_1", "debut": "2026-08-01", "fin": "2026-08-31", "conso_l": 999.0}], "c", status="REJECTED")
-        lines = closing_file_lines(date(2026, 9, 1), date(2026, 9, 30))
-        self.assertEqual(len(lines), 4)                                                       # version la plus récente seulement
-        self.assertEqual(sum(x["conso_l"] for x in lines if x["conso_l"] is not None), 255.5)  # site non reconnu compté, sans date = mois du fichier
-        d = closing_declared(date(2026, 9, 1), date(2026, 9, 30))
-        self.assertEqual(d["SN_1"]["conso_l"], 210.0)
-        self.assertNotIn("SN_3", d)                                                           # absente dans le fichier : absente, jamais 0
-        self.assertEqual(closing_file_lines(date(2026, 8, 1), date(2026, 8, 31)), [])         # lot rejeté ignoré
-
-    def test_kpi_sans_filtre_total_exact_du_fichier(self):
-        rows = [{"site_id": "SN_1", "country": "SN", "correspondance": {"utilise": True}}]
-        v = {"total_l": 10.0, "sites": 1, "negatives": 0}
-        k = {"sites": 1, "variation": v, "closing": dict(v), "instrumentee": v, "cph_complete": v, "cph_partielle": {"total_l": None, "sites": 0}}
-        build = {"rows": rows, "periode": {"sites_avec_bilan": 1}, "fraicheur": {},
-                 "closing_fichier": {"total_l": 255.5, "sites": 3, "lignes": 4, "sites_non_reconnus": 1}}
-        with mock.patch("fuel_tracking.services.conso_comparison.build", return_value=build), \
-                mock.patch("fuel_tracking.services.conso_comparison._kpis", side_effect=lambda rs: {**k, "closing": dict(v)}):
-            b = api().get("/api/fuel-tracking/bi/conso/sources/", {"month": "2026-09"}).json()
-            z = api().get("/api/fuel-tracking/bi/conso/sources/", {"month": "2026-09", "zone": "DKR"}).json()
-        self.assertEqual(b["kpis"]["closing"], {"total_l": 255.5, "sites": 3})
-        self.assertEqual(z["kpis"]["closing"]["total_l"], 10.0)                               # filtre : sites du périmètre filtré

@@ -70,11 +70,6 @@ def _first_idx(header: list[str], prefix: str, lo: int = 0, hi: int | None = Non
     return None
 
 
-def _txt(v):
-    v = str(v).strip() if v is not None else ""
-    return v[:120] if v and v.lower() not in ("n.a", "n.a.", "na", "-") else None
-
-
 def closing_stock_rows(rows) -> tuple[list[dict], dict]:
     """
     Lit la feuille de synthèse du Closing en tenant compte des en-têtes répétés :
@@ -104,9 +99,6 @@ def closing_stock_rows(rows) -> tuple[list[dict], dict]:
                     "date_finale": i1, "stock_final": _first_idx(header, "qtité laissée à la date du relevé", i1 + 1, i_end),
                     "conso_closing": _first_idx(header, "qtité cons considéréé", i1 + 1, i_end),
                     "conso_niveau": _first_idx(header, "qtité consommée sur la période de relevé niveau fuel", i1 + 1, i_end),
-                    "origine_initial": _first_idx(header, "source données de stock initial"),
-                    "origine_final": _first_idx(header, "source données de stock final"),
-                    "fiabilisation": _first_idx(header, "etat de fiabilisation"),
                 }
             continue
         if not row:
@@ -123,8 +115,6 @@ def closing_stock_rows(rows) -> tuple[list[dict], dict]:
             "vole_l": F.parse_number(get("vole")), "vidange_l": F.parse_number(get("vidange")),
             "conso_closing_l": F.parse_number(get("conso_closing")), "conso_niveau_l": F.parse_number(get("conso_niveau")),
             "nb_ge": F.parse_number(get("nb_ge")),
-            "origine_initial": _txt(get("origine_initial")), "origine_final": _txt(get("origine_final")),
-            "fiabilisation": _txt(get("fiabilisation")),
         })
     diag = {k: (None if v is None else (header[v] if header and v < len(header) else None)) for k, v in (h_idx or {}).items()} if header else None
     return out, {"colonnes_utilisees": diag, "en_tete_trouve": header is not None}

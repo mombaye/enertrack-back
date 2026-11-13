@@ -160,10 +160,10 @@ class Command(BaseCommand):
                   f"médiane {_v(med, 1)} · moyenne {_v(avg, 1)} · max {_v(mx, 1)} (W){tag}")
             w(self.style.MIGRATE_HEADING("\n7. Snowflake GENSET_REPORT (lecture seule) — production et runtime DSE"))
             cur.execute(
-                f"""SELECT DATE, COUNT(*), MAX(DG_RUNTIME_CONTROLLER), MAX(DG_RUNTIME_CALCULATED), MAX(DG_PRODUCTION_KWH)
+                f"""SELECT REPORT_DATE, COUNT(*), MAX(DG_RUNTIME_CONTROLLER), MAX(DG_RUNTIME_CALCULATED), MAX(DG_PRODUCTION_KWH)
                     FROM {ANALYTICS}.GENSET_REPORT
-                    WHERE DATA_ID = %(id)s AND DATE >= %(s)s AND DATE <= %(e)s
-                    GROUP BY DATE ORDER BY DATE""",
+                    WHERE DATA_ID = %(id)s AND REPORT_DATE >= %(s)s AND REPORT_DATE <= %(e)s
+                    GROUP BY REPORT_DATE ORDER BY REPORT_DATE""",
                 {"id": r["data_id"], "s": start, "e": end})
             for d, n, dse, dgon, prod in cur.fetchall():
                 w(f"  {d} · lignes {n} · DSE {_v(dse, 2)} · Day DG On {_v(dgon, 2)} · production {_v(prod, 3)} kWh")

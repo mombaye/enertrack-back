@@ -50,11 +50,8 @@ def health(top: int = 60) -> dict:
     enoc_sites = {s.upper() for s in FuelEnocMovement.objects.values_list("site_id", flat=True).distinct() if s} if hasattr(FuelEnocMovement, "site_id") else set()
     sf_last = FuelSiteDailyFacts.objects.aggregate(v=Max("date"))["v"]
 
-    from fuel_tracking.services.source_status import sources_status
-
     return {
         "generated_at": now.isoformat(),
-        "etat_sources": sources_status(now),
         "sources": {
             "closing": _batch("CLOSING"),
             "gardiennage": {"loliforce": _batch("LOLIFORCE"), "scss": _batch("SCSS"),

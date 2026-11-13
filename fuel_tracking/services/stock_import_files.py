@@ -654,9 +654,6 @@ def process_closing_file(batch, file_bytes: bytes, file_name: str) -> dict:
     if not found:
         raise ValueError("Feuille « Synthese conso fuel » introuvable : fichier closing non reconnu.")
     stats["stocks_closing"] = _process_closing_stocks(batch, file_bytes, file_name, resolver)
-    # Copie EXACTE de la colonne « qtité cons considéréé (l) » de chaque ligne du fichier (tous les sites, même non reconnus) :
-    # sert au KPI « Consommation Closing », qui doit reprendre le fichier tel quel.
-    stats["lignes_closing"] = stats["stocks_closing"].pop("lignes", [])
 
     # Import du target depuis l'onglet dédié du même fichier Closing, si présent.
     # Pas d'erreur si l'onglet est absent : certains Closings anciens ne l'ont pas.
@@ -688,10 +685,6 @@ def _process_closing_stocks(batch, file_bytes: bytes, file_name: str, resolver) 
     data = []
     for _name, rows in iter_sheets(file_bytes, file_name, only={CLOSING_SHEET}):
         data, _diag = closing_stock_rows(rows)
-    stats["lignes"] = [{"site": r["site"], "site_id": resolver.resolve(r["site"]),
-                        "debut": r["date_initiale"].isoformat() if r["date_initiale"] else None,
-                        "fin": r["date_finale"].isoformat() if r["date_finale"] else None,
-                        "conso_l": r["conso_closing_l"]} for r in data]
     site_ids = {resolver.resolve(r["site"]) for r in data} - {None}
     tanks = R.site_tanks(site_ids)
     existing = dict(Obs.objects.filter(source_type="CLOSING", site_id__in=site_ids).values_list("source_event_id", "pk"))
@@ -714,9 +707,7 @@ def _process_closing_stocks(batch, file_bytes: bytes, file_name: str, resolver) 
             event_id = "CL:" + fingerprint("CLOSING", site_id, d, kind, value)
             context = {"type": "closing_periode", "periode": [r["date_initiale"].isoformat(), r["date_finale"].isoformat()],
                        "livre_l": r["livre_l"], "rajout_retrait_l": r["rajout_retrait_l"], "vole_l": r["vole_l"], "vidange_l": r["vidange_l"],
-                       "conso_closing_l": _ref, "formule_coherente": coherent,
-                       # Origine du stock selon la Synthèse (« Relevés de Terrain Technicien », « Estimation Energy Desk »…)
-                       "origine_stock": r.get(f"origine_{kind}"), "fiabilisation": r.get("fiabilisation") if kind == "final" else None}
+                       "conso_closing_l": _ref, "formule_coherente": coherent}
             if event_id in existing:
                 Obs.objects.filter(pk=existing[event_id]).update(source_context=context)  # complète le contexte d'un stock déjà importé
                 stats["doublons"] += 1

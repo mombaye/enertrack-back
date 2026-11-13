@@ -45,7 +45,6 @@ class Command(BaseCommand):
 
         run = None if dry else FuelDailyFactsSyncRun.objects.create(date_from=d_start, date_to=d_end)
         written = 0
-        warnings: list[str] = []
         try:
             for country in countries:
                 inventory = SF.fetch_inventory(country)
@@ -62,7 +61,7 @@ class Command(BaseCommand):
                 self.stdout.write(f"  {len(ge_rows)} DATA_ID avec GE retenus")
 
                 for w_start, w_end in SF.date_windows(d_start, d_end):
-                    facts = SF.fetch_daily_facts(list(site_by_data_id), w_start, w_end, country, warnings=warnings)
+                    facts = SF.fetch_daily_facts(list(site_by_data_id), w_start, w_end, country)
                     self.stdout.write(f"  {w_start} → {w_end} : {len(facts)} ligne(s) site/jour")
                     if dry:
                         continue
@@ -82,13 +81,9 @@ class Command(BaseCommand):
                 run.finished_at = timezone.now()
                 run.save()
             raise
-        for w in warnings:
-            self.stdout.write(self.style.WARNING(f"AVERTISSEMENT : {w}"))
         if run:
             run.status = FuelDailyFactsSyncRun.Status.SUCCESS
             run.rows_written = written
             run.finished_at = timezone.now()
-            # Succès partiel visible dans le journal des synchros (une source manquante n'est jamais silencieuse).
-            run.error_message = ("AVERTISSEMENT : " + " | ".join(warnings)) if warnings else None
             run.save()
         self.stdout.write(self.style.SUCCESS(f"Terminé — {written} ligne(s) écrite(s)." if not dry else "DRY RUN — rien écrit."))
