@@ -806,6 +806,9 @@ def compute_stock(params) -> dict:
     nb_auto3 = sum(1 for s in with_auto if s["autonomie_j"] < 3)
     mediane = sorted(s["autonomie_j"] for s in with_auto)[len(with_auto) // 2] if with_auto else None
     anciens = sum(1 for s in sites if s["age_releve_j"] is not None and s["age_releve_j"] > 7)
+    # Couverture globale (Dashboard) : stock des sites dont l'autonomie est calculable ÷ leur conso par jour cumulée.
+    cov_stock = sum(float(s["stock_l"]) for s in with_auto)
+    cov_jour = sum(float(s["conso_jour_l"]) for s in with_auto)
     kpis = {
         "nb_sites": a["nb_sites"], "nb_stock_connu": a["nb_stock_connu"],
         "stock_connu_pct": round(a["nb_stock_connu"] / a["nb_sites"] * 100, 1) if a["nb_sites"] else None,
@@ -813,6 +816,7 @@ def compute_stock(params) -> dict:
         "remplissage_pct": round(stock_cap / a["capacite_l"] * 100, 1) if stock_cap is not None and a["capacite_l"] else None,
         "nb_critique": a["critique"], "nb_alerte": a["alerte"], "nb_autonomie_moins_3j": nb_auto3,
         "autonomie_mediane_j": mediane, "nb_releves_anciens": anciens,
+        "couverture_j": round(cov_stock / cov_jour, 1) if cov_jour else None,
         "derniere_mesure": last_date, "mois_reference_autonomie": ref_month,
     }
     maj = _last_sync(FuelStockSyncRun)
@@ -839,6 +843,11 @@ def compute_stock(params) -> dict:
             _v("Médiane", mediane, "jours"), _v("Sites pris en compte", len(with_auto)),
         ], [SRC_STOCK, auto_src], per, [{"label": "Sites sans autonomie calculable", "nb": len(sites) - len(with_auto)}], maj,
             "La médiane n'est pas tirée vers le haut par quelques très grosses cuves, contrairement à une moyenne."),
+        "couverture_j": _x("Couverture stock", "Stock des sites dont la conso par jour est connue ÷ somme de leurs conso par jour.", [
+            _v("Couverture", kpis["couverture_j"], "jours"), _v("Stock pris en compte", round(cov_stock, 1) if with_auto else None, "L"),
+            _v("Conso par jour cumulée", round(cov_jour, 1) if with_auto else None, "L"), _v("Sites pris en compte", len(with_auto)),
+        ], [SRC_STOCK, auto_src], per, [{"label": "Sites sans conso par jour ou sans stock : non comptés", "nb": len(sites) - len(with_auto)}], maj,
+            "Nombre de jours que le stock total tiendrait au rythme de conso actuel, tous sites confondus."),
         "stock_connu_pct": _x("Stock connu", "Sites ayant un stock relevé (capteur ou ENOC) ÷ sites GE.", [
             _v("Sites GE", a["nb_sites"]), _v("Stock connu", a["nb_stock_connu"]), _v("Dont capteur", a["nb_stock_capteur"]),
         ], [SRC_STOCK, "ENOC : dernier stock déclaré"], per, [excl_other], maj),

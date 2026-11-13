@@ -79,6 +79,7 @@ class BiStockTests(TestCase):
         self.assertEqual(b["kpis"]["nb_sites"], 2)
         self.assertEqual(b["kpis"]["nb_critique"], 1)
         self.assertEqual(b["top_critique"][0]["autonomie_j"], 10.0)   # 100 L / (310 L / 31 j)
+        self.assertEqual(b["kpis"]["couverture_j"], 10.0)             # seul A a une conso par jour : B non compté
         self.assertEqual(b["distribution_remplissage"][-1]["nb_sites"], 1)  # B inconnu
         self.assertEqual(b["explain"]["stock_total_l"]["exclusions"][0]["nb"], 1)  # M (Mali) exclu et compté
 
@@ -150,6 +151,7 @@ class BiExportTests(TestCase):
         self.assertEqual(self._wb(api().get("/api/fuel-tracking/bi/export/stock/"))["Sites"].max_row, 2)
         dist = api().get("/api/fuel-tracking/bi/stock/").json()["distribution_source"]
         self.assertEqual(sum(b["nb_sites"] for b in dist), 1)   # chaque site GE compté une fois, sous l'origine de son stock retenu
+        self.assertIsNone(api().get("/api/fuel-tracking/bi/stock/").json()["kpis"]["couverture_j"])  # aucune conso par jour : non calculable, pas 0
         FuelSuiviCommandeSite.objects.create(month_year="2026-10", site_id="A", commande_avec_marge_l=D("500"))
         self.assertEqual(self._wb(api().get("/api/fuel-tracking/bi/export/commande/"))["Sites"]["J2"].value, 500.0)
         self._wb(api().get("/api/fuel-tracking/bi/export/estimation/"))
