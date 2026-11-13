@@ -201,6 +201,24 @@ class BiMonthAndSourcesTests(TestCase):
         self.assertIsNotNone(b["motif"])
 
 
+    def test_liste_sites_snowflake(self):
+        # La liste du KPI « Consommation Snowflake » reprend exactement les sites comptés : mesure disponible, fichier Closing, Sénégal.
+        ins = lambda ok, l: {"disponible": ok, "conso_l": l, "jours_mesure": 30 if ok else 2, "jours": 31, "couverture_pct": 96.8 if ok else 6.5}
+        rows = [{"site_id": "A", "site_name": "a", "zone": "DKR", "country": "SN", "correspondance": {"utilise": True}, "instrumentee": ins(True, D("50"))},
+                {"site_id": "B", "site_name": "b", "zone": "DKR", "country": "SN", "correspondance": {"utilise": True}, "instrumentee": ins(True, D("90"))},
+                {"site_id": "C", "site_name": "c", "zone": "DKR", "country": "SN", "correspondance": {"utilise": True}, "instrumentee": ins(False, None)},
+                {"site_id": "H", "site_name": "h", "zone": "DKR", "country": "SN", "correspondance": {"utilise": False}, "instrumentee": ins(True, D("10"))}]
+        v = {"total_l": 1.0, "sites": 2, "negatives": 0}
+        k = {"sites": 3, "variation": v, "closing": v, "instrumentee": v, "cph_complete": v, "cph_partielle": {"total_l": None, "sites": 0}}
+        build = {"rows": rows, "periode": {"sites_avec_bilan": 1}, "fraicheur": {}}
+        with mock.patch("fuel_tracking.services.conso_comparison.build", return_value=build), \
+                mock.patch("fuel_tracking.services.conso_comparison._kpis", return_value=k):
+            b = api().get("/api/fuel-tracking/bi/conso/sources/", {"month": "2026-10", "liste": "instrumentee"}).json()
+            sans = api().get("/api/fuel-tracking/bi/conso/sources/", {"month": "2026-10"}).json()
+        self.assertEqual([x["site_id"] for x in b["liste_sites"]], ["B", "A"])   # C sans mesure, H hors Closing : exclus ; tri par conso
+        self.assertEqual(b["liste_sites"][0]["conso_l"], 90.0)
+        self.assertNotIn("liste_sites", sans)                                    # seulement sur demande
+
     def test_sources_follow_typology(self):
         # Typologie au sens des graphiques (fichier, sinon Snowflake) : seuls les sites de cette typologie entrent dans les KPIs.
         conso("2026-10", "T1", country="SN", typology_fichier="Rural")

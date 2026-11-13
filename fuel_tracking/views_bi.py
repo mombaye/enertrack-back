@@ -501,6 +501,14 @@ def compute_conso_sources(params) -> dict:
         out["kpis"][key] = {"total_l": v["total_l"], "sites": v["sites"]}
         out["explain"][key] = _x(SRC_TITRES[key], C.HELP[key], vals, SRC_ORIGINES[key], per, excl, None, note)
     out.update({"disponible": True, "sites": k["sites"], "sites_avec_bilan": data["periode"]["sites_avec_bilan"], "fraicheur": fr})
+    # Liste des sites comptés dans la mesure Snowflake (mêmes lignes que le nombre de sites du KPI), sur demande.
+    if (params.get("liste") or "").strip() == "instrumentee" and not site:
+        ins = [r for r in rows if r["instrumentee"]["disponible"]]
+        out["liste_sites"] = sorted(({
+            "site_id": r["site_id"], "site_name": r["site_name"], "zone": r["zone"],
+            "conso_l": _f(r["instrumentee"]["conso_l"]), "jours_mesure": r["instrumentee"]["jours_mesure"],
+            "jours": r["instrumentee"]["jours"], "couverture_pct": _f(r["instrumentee"]["couverture_pct"]),
+        } for r in ins), key=lambda x: (x["conso_l"] is None, -(x["conso_l"] or 0), x["site_id"]))
     return out
 
 
