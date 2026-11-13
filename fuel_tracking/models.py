@@ -447,8 +447,31 @@ class FuelConsommationMonthly(models.Model):
     #     couverts (07/08) — voir enoc_mongo_service.fetch_estimated_consumption.
     # Dans les deux cas : niveau début - niveau fin + ravitaillements ENOC
     # entre les deux dates, calculé dans sync_fuel_consommation.py.
+    #
+    # Niveaux bruts Snowflake (TANK_LEVEL_AVG) — conservés indépendamment du
+    # calcul de conso pour servir le stock effectif et l'audit :
+    #   niveau_debut : premier relevé du mois (état cuve en entrée de période)
+    #   niveau_fin   : DERNIER relevé = stock effectif détecté par le capteur,
+    #                  toujours exposé même quand la conso ne peut pas être calculée.
+    niveau_debut_snowflake_l = models.DecimalField(
+        max_digits=18, decimal_places=3, null=True, blank=True,
+        help_text="Premier relevé TANK_LEVEL_AVG du mois (litres).")
+    niveau_fin_snowflake_l = models.DecimalField(
+        max_digits=18, decimal_places=3, null=True, blank=True,
+        help_text="Dernier relevé TANK_LEVEL_AVG du mois = stock effectif détecté par le capteur (litres).")
     conso_estimee_snowflake_l = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
     conso_estimee_snowflake_nb_releves = models.IntegerField(null=True, blank=True)
+    # Motif quand conso_estimee_snowflake_l est NULL (non calculable) :
+    #   RAVITAILLEMENT_NON_ENOC_DETECTE  — niveau monte sans ravitaillement ENOC connu
+    #   INCOHERENCE_DELTA_NEGATIF        — niveau monte malgré ravitaillements ENOC comptés
+    #   INCOHERENCE_RAVIT_EXCESSIF       — ravitaillements ENOC > baisse de cuve
+    conso_estimee_sf_motif = models.CharField(
+        max_length=48, null=True, blank=True,
+        help_text="Motif quand conso_estimee_snowflake_l ne peut pas être calculée.")
+    # Volume détecté par le capteur mais absent d'ENOC (cas RAVITAILLEMENT_NON_ENOC_DETECTE).
+    ravitaillement_non_enoc_sf_l = models.DecimalField(
+        max_digits=18, decimal_places=3, null=True, blank=True,
+        help_text="Ravitaillement détecté par le capteur Snowflake non présent dans ENOC (litres).")
     conso_estimee_enoc_l = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
     conso_estimee_nb_releves = models.IntegerField(null=True, blank=True)
 

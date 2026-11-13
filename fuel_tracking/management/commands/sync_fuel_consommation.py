@@ -167,15 +167,41 @@ class Command(BaseCommand):
                 ecart = (conso_l - ajoutee_l) if (conso_l is not None and ajoutee_l is not None) else None
 
                 # Estimation Snowflake (delta niveau de cuve TANK_LEVEL_AVG +
-                # ravitaillements ENOC entre les 2 relevés) — un résultat
-                # négatif indique une incohérence, écarté plutôt qu'affiché.
+                # ravitaillements ENOC entre les 2 relevés).
+                #
+                # 4 cas possibles (jamais de None silencieux) :
+                #   cas 1 : delta ≥ 0 et conso_brute ≥ 0 → CONSOMMATION normale
+                #   cas 2 : delta < 0 et ravit_enoc = 0  → RAVITAILLEMENT_NON_ENOC_DETECTE
+                #           (niveau monte sans ravitaillement ENOC connu)
+                #   cas 3 : delta < 0 et ravit_enoc > 0  → INCOHERENCE_DELTA_NEGATIF
+                #           (niveau monte malgré ravitaillements ENOC comptés)
+                #   cas 4 : delta ≥ 0 mais conso_brute < 0 → INCOHERENCE_RAVIT_EXCESSIF
+                #           (ravitaillements ENOC > baisse de cuve)
+                # Dans tous les cas : niveau_fin = stock effectif détecté, toujours conservé.
                 niveau_debut = sf.get("niveau_debut")
                 niveau_fin = sf.get("niveau_fin")
                 conso_estimee_sf = None
+                conso_estimee_sf_motif = None
+                ravitaillement_non_enoc_sf = None
+
                 if niveau_debut is not None and niveau_fin is not None:
-                    conso_estimee_sf = (niveau_debut - niveau_fin) + (ajoutee_l or 0)
-                    if conso_estimee_sf < 0:
-                        conso_estimee_sf = None
+                    ravit_enoc = ajoutee_l or 0
+                    delta = niveau_debut - niveau_fin   # positif = cuve baisse = conso
+                    conso_brute = delta + ravit_enoc
+
+                    if delta < 0 and ravit_enoc == 0:
+                        # Cas 2 : niveau monte sans ENOC → ravitaillement non enregistré
+                        conso_estimee_sf_motif = "RAVITAILLEMENT_NON_ENOC_DETECTE"
+                        ravitaillement_non_enoc_sf = -delta   # volume ajouté non ENOC
+                    elif delta < 0:
+                        # Cas 3 : niveau monte malgré ravitaillements ENOC
+                        conso_estimee_sf_motif = "INCOHERENCE_DELTA_NEGATIF"
+                    elif conso_brute < 0:
+                        # Cas 4 : ravitaillements ENOC excessifs vs baisse de cuve
+                        conso_estimee_sf_motif = "INCOHERENCE_RAVIT_EXCESSIF"
+                    else:
+                        # Cas 1 : consommation normale
+                        conso_estimee_sf = conso_brute
 
                 has_genset_sf = bool(sf.get("has_genset"))
                 has_genset_enoc = bool(ge.get("has_genset"))
@@ -197,7 +223,11 @@ class Command(BaseCommand):
                     has_genset=has_genset_sf or has_genset_enoc,
                     conso_snowflake_l=conso_l,
                     nb_jours_data=sf.get("nb_jours_data") or 0,
+                    niveau_debut_snowflake_l=niveau_debut,
+                    niveau_fin_snowflake_l=niveau_fin,
                     conso_estimee_snowflake_l=conso_estimee_sf,
+                    conso_estimee_sf_motif=conso_estimee_sf_motif,
+                    ravitaillement_non_enoc_sf_l=ravitaillement_non_enoc_sf,
                     conso_estimee_snowflake_nb_releves=sf.get("niveau_nb_releves"),
                     conso_estimee_enoc_l=est.get("conso_estimee_l"),
                     conso_estimee_nb_releves=est.get("nb_releves"),
@@ -223,7 +253,10 @@ class Command(BaseCommand):
                 for obj in objects[:10]:
                     self.stdout.write(
                         f"    {obj.site_id} | conso={obj.conso_snowflake_l} L | "
-                        f"enoc_ajoutee={obj.enoc_qte_ajoutee_l} L | écart={obj.ecart_conso_vs_enoc_l}"
+                        f"niv_fin={obj.niveau_fin_snowflake_l} L | "
+                        f"conso_est_sf={obj.conso_estimee_snowflake_l} L"
+                        + (f" [{obj.conso_estimee_sf_motif}]" if obj.conso_estimee_sf_motif else "")
+                        + f" | enoc_ajoutee={obj.enoc_qte_ajoutee_l} L | écart={obj.ecart_conso_vs_enoc_l}"
                     )
                 self.stdout.write(self.style.WARNING(f"  DRY RUN — {len(objects)} ligne(s), rien écrit."))
                 continue
@@ -245,7 +278,9 @@ class Command(BaseCommand):
                         "site_name", "country", "typology", "site_type", "dg_count", "power_supply",
                         "has_genset_snowflake", "has_genset_enoc", "nb_ge_enoc", "has_genset",
                         "conso_snowflake_l", "nb_jours_data",
-                        "conso_estimee_snowflake_l", "conso_estimee_snowflake_nb_releves",
+                        "niveau_debut_snowflake_l", "niveau_fin_snowflake_l",
+                        "conso_estimee_snowflake_l", "conso_estimee_sf_motif", "ravitaillement_non_enoc_sf_l",
+                        "conso_estimee_snowflake_nb_releves",
                         "conso_estimee_enoc_l", "conso_estimee_nb_releves",
                         "conso_specifique_moy_l_kwh", "ge_prod_kwh", "sensor_status",
                         "quality_status", "raw_point_count", "valid_point_count",
