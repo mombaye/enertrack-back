@@ -388,7 +388,7 @@ def compute_conso(params) -> dict:
 
 SOURCES = ("variation", "closing", "instrumentee", "cph_complete")
 SRC_TITRES = {"variation": "Variation de stock", "closing": "Consommation Closing",
-              "instrumentee": "Conso capteur de niveau", "cph_complete": "CPH complète"}
+              "instrumentee": "Consommation Snowflake", "cph_complete": "CPH complète"}
 SRC_ORIGINES = {
     "variation": ["Bilans de stock EnerTrack : relevés de stock (Closing, gardiennage, terrain) et mouvements ENOC"],
     "closing": ["Fichier Closing importé (consommation déclarée par site)"],

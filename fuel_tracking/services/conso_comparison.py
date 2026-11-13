@@ -28,7 +28,7 @@ from fuel_tracking.services.stock_period_balance import RULE_VERSION, alert_code
 LABELS = {
     "variation": "Variation de stock (L)",
     "closing": "Consommation Closing (L)",
-    "instrumentee": "Conso capteur de niveau (L)",
+    "instrumentee": "Consommation Snowflake (L)",
     "cph_complete": "Consommation théorique CPH complète (L)",
     "cph_partielle": "Consommation théorique CPH partielle (L)",
     "certifiee": "Consommation réelle certifiée (L)",
