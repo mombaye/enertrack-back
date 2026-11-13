@@ -43,7 +43,8 @@ ALERTES = {
 # Alertes propres à chaque partie de l'écran : Suivi Conso et Suivi Stock affichent chacun les leurs.
 VUES = {"conso": ("ECART_CPH", "L_KWH_HAUT", "AU_DESSUS_TARGET", "SOUS_CHARGE"), "stock": ("AUTONOMIE_3J", "RELEVE_ANCIEN")}
 SORTS = ("site_id", "zone", "runtime_h", "cph_l_h", "charge_pct", "conso_mesuree_l", "conso_estimee_l", "ecart_pct", "ecart_l",
-         "l_jour", "l_kwh", "evolution_pct", "ecart_target_pct", "stock_l", "autonomie_j", "enoc_livre_l", "nb_alertes")
+         "l_jour", "l_kwh", "evolution_pct", "ecart_target_pct", "stock_l", "autonomie_j", "enoc_livre_l", "nb_alertes",
+         "capacite_l", "remplissage_pct", "date_stock")
 
 
 def _ref_month(params) -> str | None:

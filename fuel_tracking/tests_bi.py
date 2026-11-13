@@ -148,6 +148,8 @@ class BiExportTests(TestCase):
         from fuel_tracking.models import FuelSuiviCommandeSite
         FuelStockSnapshot.objects.create(site_id="A", has_genset=True, stock_snowflake_l=100, capacity_snowflake_l=1000, stock_snowflake_pct=10)
         self.assertEqual(self._wb(api().get("/api/fuel-tracking/bi/export/stock/"))["Sites"].max_row, 2)
+        dist = api().get("/api/fuel-tracking/bi/stock/").json()["distribution_source"]
+        self.assertEqual(sum(b["nb_sites"] for b in dist), 1)   # chaque site GE compté une fois, sous l'origine de son stock retenu
         FuelSuiviCommandeSite.objects.create(month_year="2026-10", site_id="A", commande_avec_marge_l=D("500"))
         self.assertEqual(self._wb(api().get("/api/fuel-tracking/bi/export/commande/"))["Sites"]["J2"].value, 500.0)
         self._wb(api().get("/api/fuel-tracking/bi/export/estimation/"))

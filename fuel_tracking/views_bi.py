@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import calendar
 import re
-from collections import defaultdict
+from collections import Counter, defaultdict
 from datetime import date, timedelta
 from io import BytesIO
 
@@ -862,6 +862,11 @@ def compute_stock(params) -> dict:
             {"label": label, "nb_sites": sum(1 for s in with_auto if s["autonomie_j"] >= lo and (hi is None or s["autonomie_j"] < hi))}
             for label, lo, hi in auto_buckets
         ],
+        # Origine du stock retenu par site (maquette « Origine du stock final ») : libellé de la source, « Estimation » si estimé.
+        "distribution_source": sorted(
+            ({"label": label, "nb_sites": n} for label, n in Counter(
+                "Estimation" if s["stock_estime"] else (s["source_stock_label"] or "Aucun relevé") for s in sites
+            ).items()), key=lambda x: -x["nb_sites"]),
         "distribution_age_releve": [
             {"label": label, "nb_sites": sum(1 for s in sites if s["age_releve_j"] is not None and s["age_releve_j"] >= lo and (hi is None or s["age_releve_j"] < hi))}
             for label, lo, hi in age_buckets
