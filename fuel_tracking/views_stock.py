@@ -543,7 +543,8 @@ def _batch(b):
         "origin": b.origin, "status": b.status, "status_message": b.status_message, "duplicate_of": b.duplicate_of_id,
         "relaunch_of": b.relaunch_of_id, "relaunch_reason": b.relaunch_reason, "rows_total": b.rows_total,
         "rows_accepted": b.rows_accepted, "rows_warning": b.rows_warning, "rows_rejected": b.rows_rejected,
-        "rows_pending": b.rows_pending, "rows_duplicate": b.rows_duplicate, "summary": b.summary,
+        "rows_pending": b.rows_pending, "rows_duplicate": b.rows_duplicate,
+        "summary": {k: v for k, v in (b.summary or {}).items() if k != "lignes_closing"},  # lignes du Closing : volumineuses, servent aux KPIs
         "received_at": b.received_at, "processed_at": b.processed_at,
         "received_by": getattr(b.received_by, "username", None),
         "declared_period_start": b.declared_period_start, "declared_period_end": b.declared_period_end, "mapping_version": b.mapping_version,

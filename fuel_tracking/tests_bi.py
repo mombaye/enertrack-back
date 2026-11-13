@@ -361,3 +361,46 @@ class ClosingDeclaredTests(TestCase):
         self.assertEqual(d["SN_1"]["conso_l"], 210.0)
         self.assertEqual(d["SN_1"]["periode"], ["2026-08-27", "2026-09-26"])
         self.assertEqual(set(closing_declared(date(2026, 10, 1), date(2026, 10, 31))), {"SN_2"})
+
+
+class ClosingFileLinesTests(TestCase):
+    """Le KPI « Consommation Closing » reprend le fichier tel quel : toutes ses lignes, colonne conso considérée."""
+
+    def _batch(self, lines, h, status="ACCEPTED"):
+        from fuel_tracking.models import FuelImportBatch
+
+        return FuelImportBatch.objects.create(source_type="CLOSING", file_name="Closing.xlsb", file_hash=h * 64, status=status,
+                                              summary={"codes": {}, "lignes_closing": lines})
+
+    def test_lignes_du_mois_derniere_version(self):
+        from datetime import date
+
+        from fuel_tracking.services.conso_comparison import closing_declared, closing_file_lines
+
+        self.assertIsNone(closing_file_lines(date(2026, 9, 1), date(2026, 9, 30)))            # aucun fichier conservé : repli
+        self._batch([{"site": "SN_1", "site_id": "SN_1", "debut": "2026-08-27", "fin": "2026-09-26", "conso_l": 100.0}], "a")
+        self._batch([{"site": "SN_1", "site_id": "SN_1", "debut": "2026-08-27", "fin": "2026-09-26", "conso_l": 210.0},
+                     {"site": "XX_9", "site_id": None, "debut": "2026-08-30", "fin": "2026-09-29", "conso_l": 40.0},
+                     {"site": "SN_2", "site_id": "SN_2", "debut": None, "fin": None, "conso_l": 5.5},
+                     {"site": "SN_3", "site_id": "SN_3", "debut": "2026-09-01", "fin": "2026-09-30", "conso_l": None}], "b")
+        self._batch([{"site": "SN_1", "site_id": "SN_1", "debut": "2026-08-01", "fin": "2026-08-31", "conso_l": 999.0}], "c", status="REJECTED")
+        lines = closing_file_lines(date(2026, 9, 1), date(2026, 9, 30))
+        self.assertEqual(len(lines), 4)                                                       # version la plus récente seulement
+        self.assertEqual(sum(x["conso_l"] for x in lines if x["conso_l"] is not None), 255.5)  # site non reconnu compté, sans date = mois du fichier
+        d = closing_declared(date(2026, 9, 1), date(2026, 9, 30))
+        self.assertEqual(d["SN_1"]["conso_l"], 210.0)
+        self.assertNotIn("SN_3", d)                                                           # absente dans le fichier : absente, jamais 0
+        self.assertEqual(closing_file_lines(date(2026, 8, 1), date(2026, 8, 31)), [])         # lot rejeté ignoré
+
+    def test_kpi_sans_filtre_total_exact_du_fichier(self):
+        rows = [{"site_id": "SN_1", "country": "SN", "correspondance": {"utilise": True}}]
+        v = {"total_l": 10.0, "sites": 1, "negatives": 0}
+        k = {"sites": 1, "variation": v, "closing": dict(v), "instrumentee": v, "cph_complete": v, "cph_partielle": {"total_l": None, "sites": 0}}
+        build = {"rows": rows, "periode": {"sites_avec_bilan": 1}, "fraicheur": {},
+                 "closing_fichier": {"total_l": 255.5, "sites": 3, "lignes": 4, "sites_non_reconnus": 1}}
+        with mock.patch("fuel_tracking.services.conso_comparison.build", return_value=build), \
+                mock.patch("fuel_tracking.services.conso_comparison._kpis", side_effect=lambda rs: {**k, "closing": dict(v)}):
+            b = api().get("/api/fuel-tracking/bi/conso/sources/", {"month": "2026-09"}).json()
+            z = api().get("/api/fuel-tracking/bi/conso/sources/", {"month": "2026-09", "zone": "DKR"}).json()
+        self.assertEqual(b["kpis"]["closing"], {"total_l": 255.5, "sites": 3})
+        self.assertEqual(z["kpis"]["closing"]["total_l"], 10.0)                               # filtre : sites du périmètre filtré

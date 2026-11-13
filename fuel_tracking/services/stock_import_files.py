@@ -654,6 +654,9 @@ def process_closing_file(batch, file_bytes: bytes, file_name: str) -> dict:
     if not found:
         raise ValueError("Feuille « Synthese conso fuel » introuvable : fichier closing non reconnu.")
     stats["stocks_closing"] = _process_closing_stocks(batch, file_bytes, file_name, resolver)
+    # Copie EXACTE de la colonne « qtité cons considéréé (l) » de chaque ligne du fichier (tous les sites, même non reconnus) :
+    # sert au KPI « Consommation Closing », qui doit reprendre le fichier tel quel.
+    stats["lignes_closing"] = stats["stocks_closing"].pop("lignes", [])
 
     # Import du target depuis l'onglet dédié du même fichier Closing, si présent.
     # Pas d'erreur si l'onglet est absent : certains Closings anciens ne l'ont pas.
@@ -685,6 +688,10 @@ def _process_closing_stocks(batch, file_bytes: bytes, file_name: str, resolver) 
     data = []
     for _name, rows in iter_sheets(file_bytes, file_name, only={CLOSING_SHEET}):
         data, _diag = closing_stock_rows(rows)
+    stats["lignes"] = [{"site": r["site"], "site_id": resolver.resolve(r["site"]),
+                        "debut": r["date_initiale"].isoformat() if r["date_initiale"] else None,
+                        "fin": r["date_finale"].isoformat() if r["date_finale"] else None,
+                        "conso_l": r["conso_closing_l"]} for r in data]
     site_ids = {resolver.resolve(r["site"]) for r in data} - {None}
     tanks = R.site_tanks(site_ids)
     existing = dict(Obs.objects.filter(source_type="CLOSING", site_id__in=site_ids).values_list("source_event_id", "pk"))

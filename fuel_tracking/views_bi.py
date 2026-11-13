@@ -478,6 +478,10 @@ def compute_conso_sources(params) -> dict:
     else:
         rows = [r for r in data["rows"] if r["correspondance"]["utilise"] and in_scope(r.get("country"))]
     k = C._kpis(rows)
+    # Sans filtre : « Consommation Closing » = total EXACT du fichier (toutes ses lignes, comme dans le fichier).
+    cf = data.get("closing_fichier")
+    if cf and not (site or zone or typology):
+        k["closing"] = {"total_l": cf["total_l"], "sites": cf["sites"]}
     per = [f"Site {site}" if site else f"{SCOPE_LABEL}, sites du fichier Closing (base de référence)", f"Période exacte : {d_from:%d/%m/%Y} → {d_to:%d/%m/%Y}"]
     if zone:
         per.append(f"Zone : {zone}")
@@ -502,6 +506,12 @@ def compute_conso_sources(params) -> dict:
             note = f"{fr.get('jours_non_couverts')} jour(s) de la période ne sont pas encore couverts par Snowflake (données jusqu'au {fr.get('snowflake_derniere_date') or '—'})."
         if key == "cph_complete":
             vals.append(_v("Sites en CPH partielle (non additionnés)", k["cph_partielle"]["sites"]))
+        if key == "closing":
+            if cf and not (site or zone or typology):
+                vals.append(_v("Lignes du fichier sans site reconnu (comptées, comme dans le fichier)", cf["sites_non_reconnus"]))
+                note = "Total repris tel quel du fichier Closing (colonne « qtité cons considérée »), pour toutes ses lignes."
+            elif cf is None and not site:
+                note = "Closing importé avant la conservation des lignes du fichier : relancer son import pour retrouver le total exact du fichier."
         if site and v["total_l"] is None:
             note = (note + " " if note else "") + "Pas de valeur pour ce site sur la période : non calculable (pas « 0 L »)."
         out["kpis"][key] = {"total_l": v["total_l"], "sites": v["sites"]}
