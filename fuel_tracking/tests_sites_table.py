@@ -110,6 +110,8 @@ class SiteTableTests(TestCase):
         self.assertEqual(b["total"], 1)
         b = c.get("/api/fuel-tracking/bi/sites-table/", {"month": "2026-10", "sort": "conso_estimee_l", "page_size": "10"}).json()
         self.assertEqual([x["site_id"] for x in b["rows"]], ["S1", "S2", "S3"])  # inconnu en fin
+        b = c.get("/api/fuel-tracking/bi/sites-table/", {"month": "2026-10", "sites": "s3, S1", "sort": "site_id", "desc": "0"}).json()
+        self.assertEqual([x["site_id"] for x in b["rows"]], ["S1", "S3"])  # liste exacte (page du tableau unique)
         self.assertEqual(c.get("/api/fuel-tracking/bi/sites-table/", {"sort": "xx"}).status_code, 400)
         self.assertEqual(c.get("/api/fuel-tracking/bi/sites-table/", {"month": "2026-13"}).status_code, 400)
 

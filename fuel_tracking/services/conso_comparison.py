@@ -309,6 +309,13 @@ def _filter(rows: list[dict], p) -> list[dict]:
     eq(p.get("source_runtime"), lambda r: r["cph"]["runtime_source"] or "AUCUNE")
     eq(p.get("source_puissance"), lambda r: r["cph"]["power_source"] or "AUCUNE")
     eq(p.get("source_target"), lambda r: r["target"]["source"] or "AUCUNE")
+    typology = (p.get("typology") or "").strip()
+    if typology and rows:
+        # Même vocabulaire que les graphiques de Suivi Conso (typologie du fichier, sinon Snowflake).
+        from fuel_tracking.views_bi import site_ids_for_typology
+        per = rows[0].get("periode") or {}
+        ids = site_ids_for_typology(typology, str(per.get("debut") or "")[:7], str(per.get("fin") or "")[:7])
+        rows = [r for r in rows if (r["site_id"] or "").upper() in ids]
     site = (p.get("site") or "").strip().lower()
     if site:
         rows = [r for r in rows if site in r["site_id"].lower() or site in (r["site_name"] or "").lower()]

@@ -122,6 +122,15 @@ def _conso_scope():
         typo=Coalesce("typology_fichier", "typology", Value(None)))
 
 
+def site_ids_for_typology(typology: str, from_month: str, to_month: str) -> set[str]:
+    """Sites d'une typologie sur la période, avec le même vocabulaire que les graphiques de Suivi Conso
+    (typologie du fichier, sinon Snowflake) : le filtre Typologie donne les mêmes sites partout sur la page."""
+    if from_month > to_month:
+        from_month, to_month = to_month, from_month
+    qs = _conso_scope().filter(typo=typology, month_year__gte=from_month, month_year__lte=to_month)
+    return {(s or "").upper() for s in qs.values_list("site_id", flat=True).distinct()}
+
+
 def _totals(qs):
     both = Q(conso_snowflake_l__isnull=False, ge_prod_kwh__isnull=False)
     a = qs.aggregate(
@@ -442,6 +451,10 @@ def compute_conso_sources(params) -> dict:
     zone = (params.get("zone") or "").strip()
     site = (params.get("site") or "").strip().upper()
     data = C.build(d_from, d_to, {"zone": zone} if zone else {}, with_cph_quality=False)
+    typology = (params.get("typology") or "").strip()
+    if typology:
+        ids = site_ids_for_typology(typology, from_month, to_month)
+        data["rows"] = [r for r in data["rows"] if (r["site_id"] or "").upper() in ids]
     if site:
         # Fiche site : le site seul, même hors fichier Closing (signalé), jamais un autre site.
         data["rows"] = [r for r in data["rows"] if (r["site_id"] or "").upper() == site]
@@ -462,6 +475,8 @@ def compute_conso_sources(params) -> dict:
     per = [f"Site {site}" if site else f"{SCOPE_LABEL}, sites du fichier Closing (base de référence)", f"Période exacte : {d_from:%d/%m/%Y} → {d_to:%d/%m/%Y}"]
     if zone:
         per.append(f"Zone : {zone}")
+    if typology:
+        per.append(f"Typologie : {typology}")
     hors_base = sum(1 for r in data["rows"] if not r["correspondance"]["utilise"] and in_scope(r.get("country")))
     autres = sum(1 for r in data["rows"] if not in_scope(r.get("country")))
     fr = data.get("fraicheur") or {}

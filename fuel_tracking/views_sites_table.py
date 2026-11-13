@@ -157,6 +157,10 @@ def _filter(rows, params):
         rows = [r for r in rows if q in r["site_id"].lower() or q in (r["site_name"] or "").lower()]
     if alerte:
         rows = [r for r in rows if alerte in r["alertes"]]
+    # Liste exacte de sites (ex. la page affichée du tableau unique de Suivi Conso).
+    sites = {x.strip().upper() for x in (params.get("sites") or "").split(",") if x.strip()}
+    if sites:
+        rows = [r for r in rows if r["site_id"].upper() in sites]
     return rows
 
 

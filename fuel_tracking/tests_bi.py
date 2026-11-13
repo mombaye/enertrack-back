@@ -197,6 +197,26 @@ class BiMonthAndSourcesTests(TestCase):
         self.assertIsNotNone(b["motif"])
 
 
+    def test_sources_follow_typology(self):
+        # Typologie au sens des graphiques (fichier, sinon Snowflake) : seuls les sites de cette typologie entrent dans les KPIs.
+        conso("2026-10", "T1", country="SN", typology_fichier="Rural")
+        conso("2026-10", "T2", country="SN", typology_fichier="Urbain")
+        rows = [{"site_id": "T1", "country": "SN", "correspondance": {"utilise": True}},
+                {"site_id": "T2", "country": "SN", "correspondance": {"utilise": True}}]
+        seen = {}
+
+        def fake_kpis(rs):
+            seen["ids"] = [r["site_id"] for r in rs]
+            v = {"total_l": 1.0, "sites": len(rs), "negatives": 0}
+            return {"sites": len(rs), "variation": v, "closing": v, "instrumentee": v, "cph_complete": v, "cph_partielle": {"total_l": None, "sites": 0}}
+        build = {"rows": rows, "periode": {"sites_avec_bilan": 1}, "fraicheur": {}}
+        with mock.patch("fuel_tracking.services.conso_comparison.build", return_value=build), \
+                mock.patch("fuel_tracking.services.conso_comparison._kpis", side_effect=fake_kpis):
+            b = api().get("/api/fuel-tracking/bi/conso/sources/", {"month": "2026-10", "typology": "Rural"}).json()
+        self.assertEqual(seen["ids"], ["T1"])
+        self.assertIn("Typologie : Rural", b["explain"]["variation"]["perimetre"])
+
+
 class BiSiteTests(TestCase):
     def setUp(self):
         conso("2026-08", "DKR_0012", site_name="Médina", country="Senegal", zone_fichier="DKR", conso_snowflake_l=D("90"), nb_jours_data=30)
