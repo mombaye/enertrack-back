@@ -229,7 +229,47 @@ def process_bytes(data: bytes, file_name: str, source_type: str, *, origin: str 
         except OSError:
             logger.exception("[stock_registry] rapport non écrit pour le lot %s", batch.pk)
     batch.save()
+    schedule_balance_recompute(batch)
     return batch
+
+
+def schedule_balance_recompute(batch) -> bool:
+    """
+    Lot accepté (ou en partie à valider) : recalcul des bilans de stock des mois touchés, lancé en arrière-plan
+    dès la fin de l'import au lieu d'attendre la tâche de nuit. Un seul recalcul en attente par série de mois.
+    Jamais bloquant : file indisponible → la tâche de nuit prendra le relais (journalisé).
+    """
+    from django.core.cache import cache
+
+    from fuel_tracking.models import FuelImportBatch as B
+    from fuel_tracking.services.auto_balances import TYPES_SANS_BILAN, months_for_period
+
+    if batch.status not in (B.Status.ACCEPTED, B.Status.VALIDATION_REQUIRED) or batch.source_type in TYPES_SANS_BILAN:
+        return False
+    months = [m.isoformat()[:7] for m, _ in months_for_period(batch.declared_period_start, batch.declared_period_end)]
+    if not months:
+        return False
+
+    def _send():
+        from fuel_tracking.tasks import recompute_balances_after_import
+
+        key = "fuel_tracking:balances_pending:" + ",".join(months)
+        try:
+            if cache.add(key, batch.pk, timeout=30 * 60) is False:
+                return  # même recalcul déjà en attente
+        except Exception:
+            pass
+        try:
+            recompute_balances_after_import.apply_async(args=[months, batch.pk], countdown=30)
+        except Exception:
+            logger.exception("[stock_registry] recalcul des bilans non lancé après le lot %s : la tâche de nuit le fera", batch.pk)
+            try:
+                cache.delete(key)
+            except Exception:
+                pass
+
+    transaction.on_commit(_send)
+    return True
 
 
 def scan_incoming(user=None) -> list:

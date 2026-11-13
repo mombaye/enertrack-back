@@ -238,6 +238,50 @@ def auto_compute_stock_balances(self):
         return None
 
 
+@shared_task(bind=True, name="fuel_tracking.recompute_balances_after_import", soft_time_limit=110 * 60, time_limit=120 * 60, max_retries=12)
+def recompute_balances_after_import(self, months: list[str], batch_id: int | None = None):
+    """
+    Recalcul des bilans de stock des mois touchés par un import accepté (lancé par stock_import_pipeline),
+    pour que le Dashboard en tienne compte sans attendre la nuit. Même calcul que la tâche de nuit ;
+    ne crée ni ne modifie aucune certification. Si la tâche de nuit ou un autre recalcul tourne : réessai plus tard.
+    """
+    import calendar
+    from datetime import date as _date
+
+    from django.core.cache import cache
+
+    from fuel_tracking.services.auto_balances import compute_months
+
+    pending = "fuel_tracking:balances_pending:" + ",".join(months)
+    lock = "fuel_tracking:lock:recompute_balances_after_import"
+    try:
+        busy = cache.get("fuel_tracking:lock:auto_compute_stock_balances") is not None or cache.add(lock, batch_id or 0, timeout=2 * 3600) is False
+    except Exception:
+        busy = False
+    if busy:
+        raise self.retry(countdown=10 * 60)
+    try:
+        cache.delete(pending)
+    except Exception:
+        pass
+    try:
+        periods = []
+        for m in months:
+            y, mo = int(m[:4]), int(m[5:7])
+            periods.append((_date(y, mo, 1), _date(y, mo, calendar.monthrange(y, mo)[1])))
+        res = compute_months(periods)
+        logger.info("[fuel_tracking] bilans recalculés après le lot %s : %s", batch_id, res)
+        return res
+    except Exception:
+        logger.exception("[fuel_tracking] échec du recalcul des bilans après le lot %s (la tâche de nuit le refera)", batch_id)
+        return None
+    finally:
+        try:
+            cache.delete(lock)
+        except Exception:
+            pass
+
+
 @shared_task(bind=True, name="fuel_tracking.check_fuel_sources_hourly", soft_time_limit=5 * 60, time_limit=6 * 60)
 def check_fuel_sources_hourly(self):
     """
