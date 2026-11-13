@@ -169,6 +169,24 @@ class ClosingSeptemberTests(TmpRootMixin, TestCase):
         self.assertEqual(round(sum(x["conso_l"] or 0 for x in lignes), 1), total)
         self.assertFalse(CL.synthese("2026-10")["disponible"])                                # octobre seul : motif précis, pas de total inventé
 
+    def test_lot_importe_avant_la_version_relu_automatiquement_au_deploiement(self):
+        b = self.imp()
+        total = round(sum(x["EK"] for x in LINES), 1)
+        type(b).objects.filter(pk=b.pk).update(status="VALIDATION_REQUIRED")               # comme le lot #135 en production
+        FuelClosingLine.objects.all().delete()                                              # lot importé avant la conservation ligne à ligne
+        s = CL.synthese("2026-09", "2026-10")
+        self.assertTrue(s["disponible"] and s["ancien_import"])                             # pas de « Closing absent » : la conso du fichier reste affichée
+        self.assertEqual(s["conso_closing"]["total_l"], total)
+        self.assertEqual(s["mois_avec_closing"], ["2026-09"])
+        res = CL.rattrapage_lots_anciens()
+        self.assertEqual(len(res), 1, res)
+        self.assertIn(f"lot #{b.pk}", res[0])
+        s = CL.synthese("2026-09", "2026-10")
+        self.assertFalse(s.get("ancien_import"))
+        self.assertEqual(s["conso_closing"]["total_l"], total)
+        self.assertIsNotNone(s["target"]["atteinte_pct"])
+        self.assertEqual(CL.rattrapage_lots_anciens(), [])                                  # idempotent : un fichier relu n'est plus relancé
+
     def test_missing_month_gives_reason_and_action_not_a_zero(self):
         s = CL.synthese("2026-09")
         self.assertFalse(s["disponible"])

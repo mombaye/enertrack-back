@@ -205,6 +205,71 @@ def _mois_de_a(debut: str, fin: str) -> list[str]:
     return out
 
 
+MOTIF_ANCIEN = ("Closing importé avant la nouvelle version : seule la consommation du fichier est disponible. Le lot est relu automatiquement "
+                "au déploiement (fuel_post_deploy) ; sinon, « Relancer » le lot dans Suivi Stock → Imports.")
+
+
+def _synthese_ancien_import(mois_liste: list[str]) -> dict | None:
+    """Closing importé avant la conservation ligne à ligne : la consommation du fichier (copie du lot) reste affichée, le reste est marqué « à relire »."""
+    from datetime import date
+    import calendar as _cal
+
+    from fuel_tracking.services.conso_comparison import closing_file_lines
+
+    lines, avec = [], []
+    for m in mois_liste:
+        y, mo = int(m[:4]), int(m[5:7])
+        xs = closing_file_lines(date(y, mo, 1), date(y, mo, _cal.monthrange(y, mo)[1]))
+        if xs:
+            avec.append(m)
+            lines.extend(xs)
+    if not lines:
+        return None
+    vals = [x for x in lines if x.get("conso_l") is not None]
+    total = round(sum(float(x["conso_l"]) for x in vals), 1) if vals else None
+    pos = sorted((x for x in vals if float(x["conso_l"]) > 0), key=lambda x: -float(x["conso_l"]))[:10]
+    return {
+        "mois": mois_liste[0], "mois_fin": mois_liste[-1], "mois_avec_closing": avec, "mois_sans_closing": [m for m in mois_liste if m not in avec],
+        "disponible": True, "ancien_import": True, "motif": MOTIF_ANCIEN,
+        "lignes": {"lues": len(lines), "id_reconnus": sum(1 for x in lines if x.get("site_id")), "id_non_reconnus": 0,
+                   "id_en_double": 0, "sans_region": 0, "sans_conso": len(lines) - len(vals)},
+        "controle": None,
+        "conso_closing": {"total_l": total, "sites": len(vals), "lignes": len(lines), "sites_conso_positive": len(pos)},
+        "top_sites": [{"site": x.get("site_id") or x.get("site"), "region": None, "conso_l": round(float(x["conso_l"]), 1), "jours": None} for x in pos],
+    }
+
+
+def rattrapage_lots_anciens(dry_run: bool = False) -> list[str]:
+    """
+    Lots Closing importés AVANT la conservation ligne à ligne (aucune FuelClosingLine pour ce fichier) : relance tracée depuis la copie d'archive,
+    une seule fois par fichier (empreinte). Idempotent : un fichier déjà relu n'est plus relancé. Jamais bloquant.
+    """
+    from pathlib import Path
+
+    from fuel_tracking.models import FuelClosingLine as L, FuelImportBatch as B
+    from fuel_tracking.services import stock_import_pipeline as P
+
+    faits = set(B.objects.filter(pk__in=L.objects.values("batch_id")).values_list("file_hash", flat=True))
+    out = []
+    for b in B.objects.filter(source_type="CLOSING", status__in=(B.Status.ACCEPTED, B.Status.VALIDATION_REQUIRED)).order_by("received_at", "pk"):   # du plus ancien au plus récent : le dernier fichier garde la main (target, version du mois)
+        if b.file_hash in faits:
+            continue
+        faits.add(b.file_hash)
+        src = Path(b.archive_path or b.stored_path or "")
+        if not src.is_file():
+            out.append(f"lot #{b.pk} {b.file_name} : copie d'archive introuvable — relance manuelle nécessaire")
+            continue
+        if dry_run:
+            out.append(f"lot #{b.pk} {b.file_name} : à relire (dry-run)")
+            continue
+        try:
+            n = P.relaunch(b, "Rattrapage automatique post-déploiement : lignes du Closing conservées (nouvelle version)")
+            out.append(f"lot #{b.pk} {b.file_name} : relu → lot #{n.pk} ({n.get_status_display()})")
+        except Exception as e:  # jamais bloquant
+            out.append(f"lot #{b.pk} {b.file_name} : relance impossible ({e})")
+    return out
+
+
 def synthese(mois: str, mois_fin: str | None = None) -> dict:
     """Agrégats du Closing d'un mois comptable, tels que dans le fichier (aucune valeur calculée hors des formules du fichier)."""
     from fuel_tracking.services.fuel_target import tolerance_pct
@@ -217,6 +282,9 @@ def synthese(mois: str, mois_fin: str | None = None) -> dict:
     sans = [m for m in mois_liste if not par_mois[m]]
     rows = [r for m in avec for r in par_mois[m]]
     if not rows:
+        ancien = _synthese_ancien_import(mois_liste)
+        if ancien is not None:
+            return ancien
         lib = mois if len(mois_liste) == 1 else f"{mois_liste[0]} → {mois_liste[-1]}"
         return {"mois": mois, "disponible": False,
                 "motif": f"Aucun fichier Closing importé pour {lib} (feuille « Synthese conso fuel »).",
