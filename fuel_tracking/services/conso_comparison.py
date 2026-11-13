@@ -447,25 +447,28 @@ def _closing_lines_legacy(d_from: date, d_to: date) -> list[dict] | None:
     import calendar as _cal
     from collections import Counter
 
-    from fuel_tracking.models import FuelImportBatch as B
+    from fuel_tracking.models import FuelClosingLine, FuelImportBatch as B
 
+    # Un lot dont les lignes sont conservées (FuelClosingLine) est lu UNIQUEMENT par son mois comptable : sa copie ancienne (répartie par date de
+    # relevé de chaque site) ne doit plus rattacher ses lignes d'octobre à octobre — c'est le même fichier, le même total.
+    migres = set(FuelClosingLine.objects.values_list("batch_id", flat=True).distinct())   # lots déjà lus par leurs lignes conservées
     lo = d_from.replace(day=1).isoformat()
     hi = d_to.replace(day=_cal.monthrange(d_to.year, d_to.month)[1]).isoformat()
     by_month: dict[str, list[dict]] = {}
     found = False
-    for summary in (B.objects.filter(source_type="CLOSING", status__in=(B.Status.ACCEPTED, B.Status.VALIDATION_REQUIRED))
-                    .order_by("received_at", "pk").values_list("summary", flat=True)):
+    for pk, summary in (B.objects.filter(source_type="CLOSING", status__in=(B.Status.ACCEPTED, B.Status.VALIDATION_REQUIRED))
+                        .order_by("received_at", "pk").values_list("pk", "summary")):
+        if pk in migres:
+            continue
         lines = (summary or {}).get("lignes_closing")
         if not lines:
             continue
         found = True
         months = Counter(str(x["fin"])[:7] for x in lines if x.get("fin"))
         dominant = months.most_common(1)[0][0] if months else None
-        per_month: dict[str, list[dict]] = {}
-        for x in lines:
-            m = str(x["fin"])[:7] if x.get("fin") else dominant
-            if m:
-                per_month.setdefault(m, []).append(x)
+        # Toutes les lignes d'un fichier appartiennent à SON mois comptable (le mois le plus fréquent des dates finales), jamais à la date de relevé
+        # propre à chaque site : même fichier, même total, que l'on regarde septembre ou septembre → octobre.
+        per_month: dict[str, list[dict]] = {dominant: list(lines)} if dominant else {}
         by_month.update(per_month)   # version la plus récente du fichier pour chaque mois
     if not found:
         return None
@@ -488,6 +491,10 @@ def closing_declared(d_from: date, d_to: date) -> dict[str, dict]:
             if x.get("site_id") and x.get("conso_l") is not None:
                 out[x["site_id"].upper()] = {"conso_l": _f(x["conso_l"]), "periode": [x.get("debut"), x.get("fin")]}
         return out
+    from fuel_tracking.models import FuelClosingLine, FuelImportBatch as B
+
+    if FuelClosingLine.objects.exists() or any((sm or {}).get("lignes_closing") for sm in B.objects.filter(source_type="CLOSING").values_list("summary", flat=True)):
+        return out        # des Closing sont conservés mais aucun ne porte cette période : pas de valeur « déclarée » reconstituée par date de relevé (même fichier = même total)
     lo = d_from.replace(day=1)
     hi = d_to.replace(day=_cal.monthrange(d_to.year, d_to.month)[1])
     start, end = day_bounds(lo, hi)

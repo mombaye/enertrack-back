@@ -144,6 +144,31 @@ class ClosingSeptemberTests(TmpRootMixin, TestCase):
         self.assertEqual(s["statuts"][2]["valeurs"][0]["valeur"], "Oui")
         self.assertEqual(s["statuts"][2]["a_verifier"], 7)                                  # « Oui » = à vérifier ; « Non » / « ok » / « n.a » ne signalent rien
 
+    def test_meme_fichier_septembre_octobre_meme_total_sans_closing_fantome_en_octobre(self):
+        from datetime import date
+
+        from fuel_tracking.services import conso_comparison as CC
+
+        from fuel_tracking.models import FuelImportBatch as B
+
+        # Import ANTÉRIEUR à cette version : lot dont le résumé garde l'ancienne copie des lignes, répartie par date de relevé de chaque site.
+        ancien = B.objects.create(source_type="CLOSING", file_name="ancien-septembre.xlsb", file_hash="a" * 64, status=B.Status.ACCEPTED, summary={"lignes_closing": [
+            {"site": "SIT_0001", "site_id": "SIT_0001", "debut": "2026-08-27", "fin": "2026-09-26", "conso_l": 100.0},
+            {"site": "SIT_0003", "site_id": "SIT_0003", "debut": "2026-09-03", "fin": "2026-10-03", "conso_l": 44.0}]})
+        self.imp()                                                                          # réimport du même fichier avec cette version
+        total = round(sum(x["EK"] for x in LINES), 1)
+        self.assertTrue(ancien.pk)
+        # Octobre n'a pas de fichier propre : la copie ancienne du lot de septembre ne rattache plus ses lignes « relevées en octobre » à octobre.
+        self.assertFalse(CC.closing_file_lines(date(2026, 10, 1), date(2026, 10, 31)))
+        p = CL.synthese("2026-09", "2026-10")
+        self.assertTrue(p["disponible"])
+        self.assertEqual(p["conso_closing"]["total_l"], total)
+        self.assertEqual((p["mois_avec_closing"], p["mois_sans_closing"]), (["2026-09"], ["2026-10"]))
+        self.assertEqual(CL.synthese("2026-09")["conso_closing"]["total_l"], total)          # même valeur que Suivi conso sur septembre
+        lignes = CC.closing_file_lines(date(2026, 9, 1), date(2026, 10, 31))
+        self.assertEqual(round(sum(x["conso_l"] or 0 for x in lignes), 1), total)
+        self.assertFalse(CL.synthese("2026-10")["disponible"])                                # octobre seul : motif précis, pas de total inventé
+
     def test_missing_month_gives_reason_and_action_not_a_zero(self):
         s = CL.synthese("2026-09")
         self.assertFalse(s["disponible"])

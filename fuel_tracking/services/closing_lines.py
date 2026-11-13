@@ -196,15 +196,31 @@ def _top_sites(rows, n=10) -> list:
              "jours": float(r.jours) if r.jours is not None else None} for r in pos[:n]]
 
 
-def synthese(mois: str) -> dict:
+def _mois_de_a(debut: str, fin: str) -> list[str]:
+    y, m = int(debut[:4]), int(debut[5:7])
+    out = []
+    while f"{y:04d}-{m:02d}" <= fin[:7]:
+        out.append(f"{y:04d}-{m:02d}")
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return out
+
+
+def synthese(mois: str, mois_fin: str | None = None) -> dict:
     """Agrégats du Closing d'un mois comptable, tels que dans le fichier (aucune valeur calculée hors des formules du fichier)."""
     from fuel_tracking.services.fuel_target import tolerance_pct
 
-    rows = lines_for_month(mois)
+    # Période : le fichier Closing d'un mois comptable (ex. septembre) vaut pour toute période qui le contient (septembre → octobre) ;
+    # les mois sans fichier sont listés, jamais comptés 0.
+    mois_liste = _mois_de_a(mois, mois_fin) if mois_fin and mois_fin > mois else [mois]
+    par_mois = {m: lines_for_month(m) for m in mois_liste}
+    avec = [m for m in mois_liste if par_mois[m]]
+    sans = [m for m in mois_liste if not par_mois[m]]
+    rows = [r for m in avec for r in par_mois[m]]
     if not rows:
+        lib = mois if len(mois_liste) == 1 else f"{mois_liste[0]} → {mois_liste[-1]}"
         return {"mois": mois, "disponible": False,
-                "motif": f"Aucun fichier Closing importé pour {mois} (feuille « Synthese conso fuel »).",
-                "action": {"libelle": f"Importer le Closing de {mois}", "cible": "suivi-stock/imports"}}
+                "motif": f"Aucun fichier Closing importé pour {lib} (feuille « Synthese conso fuel »).",
+                "action": {"libelle": f"Importer le Closing de {mois_liste[-1]}", "cible": "suivi-stock/imports"}}
     batch = rows[0].batch
     ge = [r for r in rows if r.nb_ge is not None and float(r.nb_ge) >= 1]
     conso = _tot(rows, "conso_closing_l")
@@ -224,7 +240,7 @@ def synthese(mois: str) -> dict:
     delta = None if ini["total_l"] is None or fin["total_l"] is None else round(ini["total_l"] - fin["total_l"], 1)
     variation = None if None in (ini["total_l"], liv["total_l"], fin["total_l"]) else round(ini["total_l"] + liv["total_l"] - fin["total_l"], 1)
     return {
-        "mois": mois, "disponible": True,
+        "mois": mois, "mois_fin": mois_liste[-1], "mois_avec_closing": avec, "mois_sans_closing": sans, "disponible": True,
         "fichier": {"lot": batch.id, "nom": batch.file_name, "importe_le": batch.received_at.isoformat() if batch.received_at else None},
         "lignes": {"lues": len(rows), "id_reconnus": sum(1 for r in rows if r.site_id), "id_non_reconnus": sum(1 for r in rows if not r.site_id),
                    "id_en_double": sum(1 for r in rows if r.id_en_double), "sans_region": sum(1 for r in rows if not r.region),

@@ -1402,7 +1402,12 @@ class BiClosingSyntheseView(APIView):
     def get(self, request):
         from fuel_tracking.services import closing_lines as CL
 
-        month = (request.query_params.get("month") or "").strip()
-        if len(month) != 7 or month[4] != "-":
-            return Response({"detail": "Paramètre month attendu (AAAA-MM)."}, status=400)
-        return Response(CL.synthese(month))
+        q = request.query_params
+        month = (q.get("from_month") or q.get("month") or "").strip()
+        fin = (q.get("to_month") or "").strip() or None
+        ok = lambda v: len(v) == 7 and v[4] == "-" and v[:4].isdigit() and v[5:].isdigit() and 1 <= int(v[5:]) <= 12
+        if not ok(month) or (fin is not None and not ok(fin)):
+            return Response({"detail": "Paramètre month (ou from_month / to_month) attendu au format AAAA-MM."}, status=400)
+        if fin and fin < month:
+            return Response({"detail": "to_month doit être postérieur à from_month."}, status=400)
+        return Response(CL.synthese(month, fin))
