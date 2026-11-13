@@ -134,6 +134,10 @@ class ClosingSeptemberTests(TmpRootMixin, TestCase):
         st = s["stock"]
         self.assertEqual(st["variation_stock_l"], round(st["initial_l"] + st["livraisons_l"] - st["final_l"], 1))     # AT + BF − CJ
         self.assertEqual(st["delta_stock_l"], round(st["initial_l"] - st["final_l"], 1))
+        self.assertEqual(round(sum(r["conso_l"] for r in s["par_region"]), 1), s["conso_closing"]["total_l"])  # aucune ligne écartée du graphique
+        tops = [t["conso_l"] for t in s["top_sites"]]
+        self.assertEqual(tops, sorted(tops, reverse=True))
+        self.assertTrue(all(v > 0 for v in tops) and len(tops) <= 10)
         self.assertEqual(s["target"]["sites"], 6)
         self.assertEqual(s["target"]["tolerance_pct"], 10)
         self.assertEqual(s["statuts"][2]["code"], "3")

@@ -176,6 +176,26 @@ def _tot(rows, attr):
     return {"total_l": round(sum(vals), 1) if vals else None, "sites": len(vals)}
 
 
+def _par_region(rows) -> list:
+    """Conso Closing par région du fichier ; les lignes sans région restent visibles (« Sans région »), jamais écartées."""
+    acc: dict = {}
+    for r in rows:
+        if r.conso_closing_l is None:
+            continue
+        k = (r.region or "").strip().upper() or "Sans région"
+        a = acc.setdefault(k, {"region": k, "conso_l": 0.0, "sites": 0})
+        a["conso_l"] += float(r.conso_closing_l)
+        a["sites"] += 1
+    return sorted(({**a, "conso_l": round(a["conso_l"], 1)} for a in acc.values()), key=lambda a: -a["conso_l"])
+
+
+def _top_sites(rows, n=10) -> list:
+    pos = [r for r in rows if r.conso_closing_l is not None and float(r.conso_closing_l) > 0]
+    pos.sort(key=lambda r: -float(r.conso_closing_l))
+    return [{"site": (r.site_id or r.site_raw), "region": (r.region or None), "conso_l": round(float(r.conso_closing_l), 1),
+             "jours": float(r.jours) if r.jours is not None else None} for r in pos[:n]]
+
+
 def synthese(mois: str) -> dict:
     """Agrégats du Closing d'un mois comptable, tels que dans le fichier (aucune valeur calculée hors des formules du fichier)."""
     from fuel_tracking.services.fuel_target import tolerance_pct
@@ -222,4 +242,6 @@ def synthese(mois: str) -> dict:
                    "atteinte_pct": round(c_sum / t_sum * 100, 1) if t_sum else None, "tolerance_pct": tol,
                    "sites_au_dessus": len(over), "source": "Fuel target [L/mois] du fichier Closing (Akt Inv. Senegal)"},
         "statuts": analyses,
+        "par_region": _par_region(rows),
+        "top_sites": _top_sites(rows),
     }
