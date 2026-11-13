@@ -31,6 +31,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from fuel_tracking.services.fuel_target import norm_site
+
 TOP_N = 10
 # En dessous, le ratio L/kWh d'un site est trop bruité pour un classement.
 MIN_KWH_FOR_RATIO = 100
@@ -204,7 +206,7 @@ def _per_site(period, targets, tolerance):
     out = []
     for r in rows:
         i = info.get(r["site_id"], {})
-        t = targets.get((r["site_id"] or "").upper())
+        t = targets.get(norm_site(r["site_id"]))
         # Target comparé seulement sur les mois où la conso est mesurée (target mensuel × mois mesurés).
         target_l = float(t.target_mensuel_l) * r["nb_mois"] if t is not None and r["nb_mois"] else None
         conso = float(r["conso"]) if r["conso"] is not None else None
@@ -260,7 +262,7 @@ def _daily(site_ids, months):
 
 def compute_conso(params) -> dict:
     from fuel_tracking.models import FuelConsommationSyncRun, FuelEnocSyncRun
-    from fuel_tracking.services.fuel_target import active_targets, tolerance_pct
+    from fuel_tracking.services.fuel_target import active_targets, norm_site, tolerance_pct
     from fuel_tracking.views import _effective_ge_q, _file_ge_site_ids
 
     scoped = _conso_scope()
@@ -301,7 +303,7 @@ def compute_conso(params) -> dict:
         # Target du mois : sites ayant à la fois une conso mesurée et un target actif.
         t_sum = c_sum = 0.0
         for sid, c in mq.filter(conso_snowflake_l__isnull=False).values_list("site_id", "conso_snowflake_l"):
-            tg = targets.get((sid or "").upper())
+            tg = targets.get(norm_site(sid))
             if tg is not None:
                 t_sum += float(tg.target_mensuel_l)
                 c_sum += float(c)
@@ -575,7 +577,7 @@ def compute_site(site_id: str, params) -> dict:
     """Toutes les données d'un site sur la période : identité, indicateurs, mois, jours, stock, ravitaillements ENOC.
     Mêmes règles que les vues globales (mesuré jamais additionné à l'estimé, null ≠ 0)."""
     from fuel_tracking.models import FuelConsommationSyncRun, FuelEnocMovement, FuelEnocSyncRun, FuelSiteDailyFacts, FuelStockSnapshot, FuelStockSyncRun
-    from fuel_tracking.services.fuel_target import active_targets, tolerance_pct
+    from fuel_tracking.services.fuel_target import active_targets, norm_site, tolerance_pct
     from fuel_tracking.views import _effective_ge_q, _file_ge_site_ids
 
     sid = (site_id or "").strip()
@@ -599,7 +601,7 @@ def compute_site(site_id: str, params) -> dict:
     prev_months = [] if single else _comparable([_shift_month(from_month, -span + i) for i in range(span)])
 
     targets, tolerance = active_targets(), tolerance_pct()
-    tgt = targets.get(sid.upper())
+    tgt = targets.get(norm_site(sid))
     cur_rows = _per_site(rows.filter(month_year__in=months), targets, tolerance)
     prev_rows = _per_site(rows.filter(month_year__in=prev_months), targets, tolerance) if prev_months else []
     cur = cur_rows[0] if cur_rows else None
@@ -1390,3 +1392,17 @@ class BiExportView(APIView):
         except (_BadPeriod, ValueError) as e:
             return Response({"detail": str(e)}, status=400)
         return Response({"detail": "Export inconnu.", "exports": self.KINDS}, status=404)
+
+
+
+class BiClosingSyntheseView(APIView):
+    """GET /api/fuel-tracking/bi/closing/synthese/?month=AAAA-MM — agrégats du fichier Closing du mois (tels que dans le fichier)."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from fuel_tracking.services import closing_lines as CL
+
+        month = (request.query_params.get("month") or "").strip()
+        if len(month) != 7 or month[4] != "-":
+            return Response({"detail": "Paramètre month attendu (AAAA-MM)."}, status=400)
+        return Response(CL.synthese(month))

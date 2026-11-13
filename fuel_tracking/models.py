@@ -1791,6 +1791,43 @@ class FuelStockBalanceCertification(models.Model):
         raise ValueError("Historique de certification non modifiable.")
 
 
+class FuelClosingLine(models.Model):
+    """
+    Une ligne du fichier Closing mensuel (feuille « Synthese conso fuel »), conservée TELLE QUE DANS LE FICHIER : toutes les lignes, y compris sites
+    inconnus, sans région ou en double (jamais écartées en silence). `mois` = mois comptable du FICHIER (« Dernier jour du mois de … »), pas la date de
+    relevé propre à chaque site : un site relevé début octobre appartient quand même au Closing de septembre.
+    """
+    batch = models.ForeignKey("FuelImportBatch", on_delete=models.CASCADE, related_name="closing_lines")
+    mois = models.CharField(max_length=7, db_index=True)
+    ligne = models.IntegerField()
+    site_raw = models.CharField(max_length=128)
+    site_id = models.CharField(max_length=64, null=True, blank=True, db_index=True, help_text="Identifiant reconnu dans Gestion des sites (majuscules) ; NULL = non reconnu.")
+    region = models.CharField(max_length=128, null=True, blank=True)
+    grid = models.CharField(max_length=32, null=True, blank=True)
+    nb_ge = models.DecimalField(max_digits=6, decimal_places=1, null=True, blank=True)
+    date_initiale = models.DateField(null=True, blank=True)
+    date_finale = models.DateField(null=True, blank=True)
+    jours = models.DecimalField(max_digits=6, decimal_places=1, null=True, blank=True)
+    stock_initial_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    total_livraison_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True, help_text="Total livraison du fichier (inclut les rajouts/retraits).")
+    rajout_retrait_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    vole_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    vidange_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True, help_text="Vidange / retrait client / fuite / écart conso théorique vs variation de stock.")
+    stock_final_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    conso_closing_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True, help_text="« Qtité cons considérée (L) » du fichier.")
+    conso_niveau_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    conso_capteur_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True, help_text="Estimation conso fuel sensor sur la période.")
+    estimation_mois_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    target_jour_l = models.DecimalField(max_digits=14, decimal_places=4, null=True, blank=True)
+    target_mois_l = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True)
+    analyses = models.JSONField(default=dict, blank=True, help_text="Analysis #1 à #9 du fichier, valeurs brutes.")
+    id_en_double = models.BooleanField(default=False, help_text="Identifiant déjà présent plus haut dans le fichier (ligne conservée comme dans le fichier).")
+
+    class Meta:
+        db_table = "fuel_closing_line"
+        indexes = [models.Index(fields=["mois", "batch"]), models.Index(fields=["site_id", "mois"])]
+
+
 class FuelSiteTarget(models.Model):
     """
     Target fuel MENSUEL par SITE (L/mois) — jamais déduit de la puissance GE, d'une courbe CPH, d'un target load ou d'un target énergie.

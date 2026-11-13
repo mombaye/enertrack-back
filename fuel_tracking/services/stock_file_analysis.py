@@ -7,6 +7,8 @@ fichier par fichier (sites distincts, reconnus / inconnus de Gestion des sites).
 """
 from __future__ import annotations
 
+import re
+
 import hashlib
 from datetime import date, datetime
 
@@ -75,6 +77,25 @@ def _txt(v):
     return v[:120] if v and v.lower() not in ("n.a", "n.a.", "na", "-") else None
 
 
+_RE_DERNIER_JOUR = re.compile(r"dernier jour du mois de")
+
+
+def _scan_closing_head(row, meta: dict) -> None:
+    """Lignes situées AVANT l'en-tête : mois comptable du fichier (« Dernier Jour du mois de SEPTEMBRE ») et bloc de KPI du fichier
+    (valeur suivie de son libellé). Sert à rattacher TOUTES les lignes au bon mois et à contrôler les totaux importés."""
+    for j, v in enumerate(row):
+        if isinstance(v, str):
+            t = F._norm(v)
+            if _RE_DERNIER_JOUR.search(t) and meta["mois_comptable"] is None:
+                for w in row[j + 1:]:
+                    d = F.excel_serial_to_date(w) if isinstance(w, (int, float)) else None
+                    if d:
+                        meta["mois_comptable"] = f"{d.year:04d}-{d.month:02d}"
+                        break
+            elif len(t) > 12 and j > 0 and isinstance(row[j - 1], (int, float)) and not isinstance(row[j - 1], bool):
+                meta["kpi_fichier"].setdefault(t[:160], float(row[j - 1]))
+
+
 def closing_stock_rows(rows) -> tuple[list[dict], dict]:
     """
     Lit la feuille de synthèse du Closing en tenant compte des en-têtes répétés :
@@ -84,10 +105,12 @@ def closing_stock_rows(rows) -> tuple[list[dict], dict]:
     Retourne (lignes par site, diagnostic de colonnes). Aucune écriture.
     """
     header, h_idx, out = None, None, []
+    meta = {"mois_comptable": None, "kpi_fichier": {}}
     for n, row in enumerate(rows, start=1):
         if header is None:
             if n > 60:
                 break
+            _scan_closing_head(row or [], meta)
             normed = [F._norm(v) for v in (row or [])]
             if "id du site" in normed and any(h.startswith("date de relevé initiale") for h in normed):
                 header, h_idx = normed, {}
@@ -104,6 +127,15 @@ def closing_stock_rows(rows) -> tuple[list[dict], dict]:
                     "date_finale": i1, "stock_final": _first_idx(header, "qtité laissée à la date du relevé", i1 + 1, i_end),
                     "conso_closing": _first_idx(header, "qtité cons considéréé", i1 + 1, i_end),
                     "conso_niveau": _first_idx(header, "qtité consommée sur la période de relevé niveau fuel", i1 + 1, i_end),
+                    # Format Closing 2026 : « Total Livraison » = livraisons AVEC rajouts/retraits (la colonne rajout/retrait est déjà dedans).
+                    "total_livraison": _first_idx(header, "total livraison"),
+                    "region": _first_idx(header, "région o&m"), "grid": _first_idx(header, "on grid"),
+                    "conso_capteur": _first_idx(header, "estimation conso fuel sensor sur la période"),
+                    "jours": _first_idx(header, "nbre jour cons"),
+                    "estimation_mois": _first_idx(header, "estimation consommation mois de"),
+                    "target_jour": _first_idx(header, "fuel target [l/jr]"),
+                    "target_mois": _first_idx(header, "fuel target [l/mois]"),
+                    **{f"analyse_{k}": _first_idx(header, f"analysis #{k}") for k in range(1, 10)},
                     "origine_initial": _first_idx(header, "source données de stock initial"),
                     "origine_final": _first_idx(header, "source données de stock final"),
                     "fiabilisation": _first_idx(header, "etat de fiabilisation"),
@@ -123,11 +155,26 @@ def closing_stock_rows(rows) -> tuple[list[dict], dict]:
             "vole_l": F.parse_number(get("vole")), "vidange_l": F.parse_number(get("vidange")),
             "conso_closing_l": F.parse_number(get("conso_closing")), "conso_niveau_l": F.parse_number(get("conso_niveau")),
             "nb_ge": F.parse_number(get("nb_ge")),
+            "total_livraison_l": F.parse_number(get("total_livraison")), "region": _txt(get("region")), "grid": _txt(get("grid")),
+            "conso_capteur_l": F.parse_number(get("conso_capteur")), "jours": F.parse_number(get("jours")),
+            "estimation_mois_l": F.parse_number(get("estimation_mois")),
+            "target_jour_l": F.parse_number(get("target_jour")), "target_mois_l": F.parse_number(get("target_mois")),
+            "analyses": {str(k): _txt(get(f"analyse_{k}")) if not isinstance(get(f"analyse_{k}"), (int, float)) else get(f"analyse_{k}") for k in range(1, 10)},
             "origine_initial": _txt(get("origine_initial")), "origine_final": _txt(get("origine_final")),
             "fiabilisation": _txt(get("fiabilisation")),
         })
     diag = {k: (None if v is None else (header[v] if header and v < len(header) else None)) for k, v in (h_idx or {}).items()} if header else None
-    return out, {"colonnes_utilisees": diag, "en_tete_trouve": header is not None}
+    return out, {"colonnes_utilisees": diag, "en_tete_trouve": header is not None, "mois_comptable": meta["mois_comptable"], "kpi_fichier": meta["kpi_fichier"]}
+
+
+def closing_calc(r: dict) -> float | None:
+    """Formule du fichier : stock initial + livraisons − volé − vidange/écart − stock final.
+    Format 2026 : « Total Livraison » contient déjà les rajouts/retraits (jamais ajoutés une seconde fois) ; ancien format : livré + rajout/retrait."""
+    if r["stock_initial_l"] is None or r["stock_final_l"] is None:
+        return None
+    liv = r.get("total_livraison_l")
+    mouv = liv if liv is not None else (r["livre_l"] or 0) + (r["rajout_retrait_l"] or 0)
+    return r["stock_initial_l"] + mouv - (r["vole_l"] or 0) - (r["vidange_l"] or 0) - r["stock_final_l"]
 
 
 def closing_formula(r: dict) -> tuple[float | None, float | None, bool | None]:
@@ -135,7 +182,7 @@ def closing_formula(r: dict) -> tuple[float | None, float | None, bool | None]:
     if r["stock_initial_l"] is None or r["stock_final_l"] is None:
         return None, None, None
     ref = r["conso_closing_l"] if r["conso_closing_l"] is not None else r["conso_niveau_l"]
-    calc = r["stock_initial_l"] + (r["livre_l"] or 0) + (r["rajout_retrait_l"] or 0) - (r["vole_l"] or 0) - (r["vidange_l"] or 0) - r["stock_final_l"]
+    calc = closing_calc(r)
     if ref is None:
         return calc, None, None
     return calc, ref, abs(calc - ref) <= max(20.0, 0.05 * abs(ref))
@@ -156,7 +203,7 @@ def closing_stock_preview(file_bytes: bytes, file_name: str, resolver) -> dict |
             ref = r["conso_closing_l"] if r["conso_closing_l"] is not None else r["conso_niveau_l"]
             if ref is None:
                 continue
-            calc = r["stock_initial_l"] + (r["livre_l"] or 0) + (r["rajout_retrait_l"] or 0) - (r["vole_l"] or 0) - (r["vidange_l"] or 0) - r["stock_final_l"]
+            calc = closing_calc(r)
             checked += 1
             tol = max(20.0, 0.05 * abs(ref))
             if abs(calc - ref) <= tol:
