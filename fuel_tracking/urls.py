@@ -6,7 +6,7 @@ from fuel_tracking.views_ravitaillement import BiRavitaillementView
 from fuel_tracking.views_sites_table import BiSiteTableView
 from fuel_tracking.views_config import ConfigAccessView, ConfigFilesView
 
-from fuel_tracking.views_bi import BiClosingSyntheseView, BiConsoSourcesView, BiSiteSearchView, BiSiteView, BiConsoView, BiCphView, BiExportView, BiStockEvolutionView, BiStockView
+from fuel_tracking.views_bi import BiConsoSourcesView, BiSiteSearchView, BiSiteView, BiConsoView, BiCphView, BiExportView, BiStockEvolutionView, BiStockView
 
 from fuel_tracking.views import (
     FuelCommandeEstimationView,
@@ -63,7 +63,6 @@ urlpatterns = [
     path("bi/sites/", BiSiteSearchView.as_view(), name="fuel-bi-sites"),
     path("bi/sites/<str:site_id>/", BiSiteView.as_view(), name="fuel-bi-site"),
     path("bi/conso/sources/", BiConsoSourcesView.as_view(), name="fuel-bi-conso-sources"),
-    path("bi/closing/synthese/", BiClosingSyntheseView.as_view(), name="fuel-bi-closing-synthese"),
     path("bi/stock/", BiStockView.as_view(), name="fuel-bi-stock"),
     path("bi/stock/evolution/", BiStockEvolutionView.as_view(), name="fuel-bi-stock-evolution"),
     path("bi/cph/", BiCphView.as_view(), name="fuel-bi-cph"),

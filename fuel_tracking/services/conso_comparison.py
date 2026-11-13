@@ -397,46 +397,7 @@ def closing_base_sites() -> set[str]:
     return {s.upper() for s in Obs.objects.filter(source_type="CLOSING").values_list("site_id", flat=True).distinct() if s}
 
 
-def _months_between(d_from: date, d_to: date) -> list[str]:
-    out, y, m = [], d_from.year, d_from.month
-    while (y, m) <= (d_to.year, d_to.month):
-        out.append(f"{y:04d}-{m:02d}")
-        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
-    return out
-
-
 def closing_file_lines(d_from: date, d_to: date) -> list[dict] | None:
-    """
-    Lignes du Closing, EXACTEMENT comme dans le fichier : TOUTES les lignes du fichier du mois comptable demandé, quelle que soit la date de relevé
-    propre à chaque site (un site relevé début octobre appartient au Closing de septembre). Source : FuelClosingLine (dernier import du mois) ;
-    repli sur l'ancienne copie du lot pour les Closing importés avant cette version. None si aucun Closing ne porte ces mois.
-    """
-    from fuel_tracking.services import closing_lines as CL
-
-    months = _months_between(d_from, d_to)
-    out, found = [], False
-    missing = []
-    for m in months:
-        rows = CL.lines_for_month(m)
-        if not rows:
-            missing.append(m)
-            continue
-        found = True
-        out.extend({"site": x.site_raw, "site_id": x.site_id, "debut": x.date_initiale.isoformat() if x.date_initiale else None,
-                    "fin": x.date_finale.isoformat() if x.date_finale else None, "conso_l": None if x.conso_closing_l is None else float(x.conso_closing_l),
-                    "mois": m, "ligne": x.ligne, "region": x.region, "id_en_double": x.id_en_double} for x in rows)
-    import calendar as _cal
-
-    for m in missing:                     # mois sans lignes conservées : repli sur l'ancienne copie du lot, mois par mois
-        y, mo = int(m[:4]), int(m[5:7])
-        legacy = _closing_lines_legacy(date(y, mo, 1), date(y, mo, _cal.monthrange(y, mo)[1]))
-        if legacy is not None:            # [] = des Closing conservés existent mais aucun ne porte ce mois (≠ None : aucun Closing conservé)
-            found = True
-            out.extend(legacy)
-    return out if found else None
-
-
-def _closing_lines_legacy(d_from: date, d_to: date) -> list[dict] | None:
     """
     Lignes du fichier Closing, EXACTEMENT comme dans le fichier (colonne « qtité cons considéréé (l) », tous les sites,
     même non reconnus dans Gestion des sites), pour les lignes dont la période Closing se termine entre d_from et d_to.
@@ -447,28 +408,25 @@ def _closing_lines_legacy(d_from: date, d_to: date) -> list[dict] | None:
     import calendar as _cal
     from collections import Counter
 
-    from fuel_tracking.models import FuelClosingLine, FuelImportBatch as B
+    from fuel_tracking.models import FuelImportBatch as B
 
-    # Un lot dont les lignes sont conservées (FuelClosingLine) est lu UNIQUEMENT par son mois comptable : sa copie ancienne (répartie par date de
-    # relevé de chaque site) ne doit plus rattacher ses lignes d'octobre à octobre — c'est le même fichier, le même total.
-    migres = set(FuelClosingLine.objects.values_list("batch_id", flat=True).distinct())   # lots déjà lus par leurs lignes conservées
     lo = d_from.replace(day=1).isoformat()
     hi = d_to.replace(day=_cal.monthrange(d_to.year, d_to.month)[1]).isoformat()
     by_month: dict[str, list[dict]] = {}
     found = False
-    for pk, summary in (B.objects.filter(source_type="CLOSING", status__in=(B.Status.ACCEPTED, B.Status.VALIDATION_REQUIRED))
-                        .order_by("received_at", "pk").values_list("pk", "summary")):
-        if pk in migres:
-            continue
+    for summary in (B.objects.filter(source_type="CLOSING", status__in=(B.Status.ACCEPTED, B.Status.VALIDATION_REQUIRED))
+                    .order_by("received_at", "pk").values_list("summary", flat=True)):
         lines = (summary or {}).get("lignes_closing")
         if not lines:
             continue
         found = True
         months = Counter(str(x["fin"])[:7] for x in lines if x.get("fin"))
         dominant = months.most_common(1)[0][0] if months else None
-        # Toutes les lignes d'un fichier appartiennent à SON mois comptable (le mois le plus fréquent des dates finales), jamais à la date de relevé
-        # propre à chaque site : même fichier, même total, que l'on regarde septembre ou septembre → octobre.
-        per_month: dict[str, list[dict]] = {dominant: list(lines)} if dominant else {}
+        per_month: dict[str, list[dict]] = {}
+        for x in lines:
+            m = str(x["fin"])[:7] if x.get("fin") else dominant
+            if m:
+                per_month.setdefault(m, []).append(x)
         by_month.update(per_month)   # version la plus récente du fichier pour chaque mois
     if not found:
         return None
@@ -491,10 +449,6 @@ def closing_declared(d_from: date, d_to: date) -> dict[str, dict]:
             if x.get("site_id") and x.get("conso_l") is not None:
                 out[x["site_id"].upper()] = {"conso_l": _f(x["conso_l"]), "periode": [x.get("debut"), x.get("fin")]}
         return out
-    from fuel_tracking.models import FuelClosingLine, FuelImportBatch as B
-
-    if FuelClosingLine.objects.exists() or any((sm or {}).get("lignes_closing") for sm in B.objects.filter(source_type="CLOSING").values_list("summary", flat=True)):
-        return out        # des Closing sont conservés mais aucun ne porte cette période : pas de valeur « déclarée » reconstituée par date de relevé (même fichier = même total)
     lo = d_from.replace(day=1)
     hi = d_to.replace(day=_cal.monthrange(d_to.year, d_to.month)[1])
     start, end = day_bounds(lo, hi)
@@ -525,7 +479,7 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
     balances = latest_balances_by_site(d_from, d_to)
     targets = TG.active_targets()
     ids = sorted(set(balances) | {s for s, r in cph_by_site.items() if r.get("perimetre", "GE") == "GE"})
-    rows = [_row(cph_by_site.get(sid), balances.get(sid), d_from, d_to, days, targets.get(TG.norm_site(sid)), {}) for sid in ids]
+    rows = [_row(cph_by_site.get(sid), balances.get(sid), d_from, d_to, days, targets.get(sid.upper()), {}) for sid in ids]
     # Closing : valeur du bilan quand ses deux stocks viennent de la même ligne de Closing (écart calculable),
     # sinon valeur déclarée dans le fichier pour la ligne du site qui se termine dans la période (affichée, sans écart).
     # Fichier conservé ligne à ligne : la valeur affichée est TOUJOURS celle du fichier (absente du fichier = absente).

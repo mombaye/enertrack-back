@@ -132,19 +132,12 @@ def classify(variation: float | None, target: float | None) -> str | None:
     return DANS if abs(pct) <= tolerance_pct() else AU_DESSUS if pct > 0 else SOUS
 
 
-def norm_site(v) -> str:
-    """Identifiant de site normalisé pour la jointure conso / target : sans espaces (dont insécables), en majuscules."""
-    return "".join(str(v or "").split()).upper()
-
-
 def active_targets() -> dict:
     from fuel_tracking.models import FuelSiteTarget as T
 
-    return {norm_site(t.site_id): t for t in T.objects.filter(is_active=True)}
+    return {t.site_id.upper(): t for t in T.objects.filter(is_active=True)}
 
 
 def confirmed_for(t, d_from: date, d_to: date) -> bool:
     """Confirmé par le Fuel Manager pour l'année de la période (les deux extrémités)."""
-    if t is not None and getattr(t, "source_target", None) == "CLOSING_AKT_INV":
-        return t.reference_year == d_from.year == d_to.year        # target du fichier mensuel de l'année en cours : pas un historique à confirmer
     return bool(t is not None and t.confirmed_year and t.confirmed_year == d_from.year == d_to.year)

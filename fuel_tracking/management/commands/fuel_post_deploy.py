@@ -2,8 +2,7 @@
 Tâches automatiques après chaque déploiement (lancées par l'entrypoint, idempotentes, sans effet si rien n'est à faire) :
 
   1. Pilotage Grid : reconstruit les tables relationnelles si les jeux de données existent mais que les tables sont vides.
-  2. Suivi Carburant : relit (relance tracée) les fichiers Closing importés avant la conservation ligne à ligne, une seule fois par fichier.
-  3. Suivi Carburant : recalcule les bilans de stock des périodes récentes qui datent de l'ancienne règle (sans « variation de stock »),
+  2. Suivi Carburant : recalcule les bilans de stock des périodes récentes qui datent de l'ancienne règle (sans « variation de stock »),
      pour que les variations négatives et les nouveaux champs soient disponibles sans commande manuelle.
 
     python manage.py fuel_post_deploy [--periodes 3] [--dry-run]
@@ -22,17 +21,7 @@ class Command(BaseCommand):
     def handle(self, *args, periodes, dry_run, **opts):
         w = self.stdout.write
         self._pilotage(w, dry_run)
-        self._closing(w, dry_run)
         self._bilans(w, periodes, dry_run)
-
-    def _closing(self, w, dry_run):
-        try:
-            from fuel_tracking.services import closing_lines as CL
-
-            res = CL.rattrapage_lots_anciens(dry_run=dry_run)
-            w("Closing : tous les fichiers sont lus ligne à ligne." if not res else "Closing : " + " ; ".join(res))
-        except Exception as e:  # ne jamais empêcher le démarrage du service
-            w(f"Closing : rattrapage impossible ({e}).")
 
     def _pilotage(self, w, dry_run):
         try:

@@ -38,21 +38,6 @@ from fuel_tracking.services import tank_conversion as TC
 # ── Lecture générique xlsx / xlsb ─────────────────────────────────────────────
 
 
-XLSB_MAX_EMPTY_ROWS = 3000   # une feuille .xlsb peut déclarer ~1 million de lignes vides : on s'arrête après une longue suite de lignes vides
-
-
-def _stop_after_empty(rows):
-    empty = 0
-    for r in rows:
-        if any(v is not None and v != "" for v in r):
-            empty = 0
-        else:
-            empty += 1
-            if empty >= XLSB_MAX_EMPTY_ROWS:
-                return
-        yield r
-
-
 def iter_sheets(file_bytes: bytes, file_name: str, only: set[str] | None = None):
     """Itère (nom_feuille, lignes) — lignes = listes de valeurs ; xlsb via pyxlsb, sinon openpyxl."""
     if file_name.lower().endswith(".xlsb"):
@@ -63,7 +48,7 @@ def iter_sheets(file_bytes: bytes, file_name: str, only: set[str] | None = None)
                 if only and name.strip() not in only:
                     continue
                 with wb.get_sheet(name) as sh:
-                    yield name, _stop_after_empty(([c.v for c in row] for row in sh.rows()))
+                    yield name, ([c.v for c in row] for row in sh.rows())
         return
     import openpyxl
 
@@ -669,11 +654,6 @@ def process_closing_file(batch, file_bytes: bytes, file_name: str) -> dict:
     if not found:
         raise ValueError("Feuille « Synthese conso fuel » introuvable : fichier closing non reconnu.")
     stats["stocks_closing"] = _process_closing_stocks(batch, file_bytes, file_name, resolver)
-    # Toutes les lignes du fichier, rattachées au mois comptable du fichier + contrôle des totaux (écart = avertissement visible).
-    from fuel_tracking.services import closing_lines as CL
-
-    closing_data, closing_diag = stats["stocks_closing"].pop("_data"), stats["stocks_closing"].pop("_diag")
-    stats["lignes_fichier"] = CL.save_lines(batch, closing_data, closing_diag, resolver)
     # Copie EXACTE de la colonne « qtité cons considéréé (l) » de chaque ligne du fichier (tous les sites, même non reconnus) :
     # sert au KPI « Consommation Closing », qui doit reprendre le fichier tel quel.
     stats["lignes_closing"] = stats["stocks_closing"].pop("lignes", [])
@@ -687,20 +667,7 @@ def process_closing_file(batch, file_bytes: bytes, file_name: str) -> dict:
         # Onglet absent → information seulement, pas un échec de l'import Closing
         stats["targets_closing"] = {"skipped": True, "reason": str(exc)}
 
-    # Target mensuel (FI) du fichier Closing lui-même, par site : prioritaire sur le target historique 2025 pour les sites présents dans le fichier.
-    if stats["lignes_fichier"].get("mois"):
-        stats["target_fichier"] = CL.targets_from_lines(batch, closing_data, stats["lignes_fichier"]["mois"], resolver)
-    ctrl = (stats["lignes_fichier"] or {}).get("controle") or {}
-    if ctrl and not ctrl.get("ok"):
-        stats["avertissements"] = [ctrl["avertissement"]]
     return stats
-
-
-def _livraisons_hors_rajout(r: dict):
-    """Livraisons du Closing hors rajouts/retraits : format 2026 « Total Livraison » − rajout/retrait ; ancien format : « Qtité totale livrée »."""
-    if r.get("total_livraison_l") is None:
-        return r["livre_l"]
-    return r["total_livraison_l"] - (r["rajout_retrait_l"] or 0)
 
 
 SITE_TOTAL = "SITE"  # tank_id d'un stock Closing : total du site (toutes cuves), jamais attribué à une cuve
@@ -721,7 +688,6 @@ def _process_closing_stocks(batch, file_bytes: bytes, file_name: str, resolver) 
     data = []
     for _name, rows in iter_sheets(file_bytes, file_name, only={CLOSING_SHEET}):
         data, _diag = closing_stock_rows(rows)
-    stats["_data"], stats["_diag"] = data, _diag
     stats["lignes"] = [{"site": r["site"], "site_id": resolver.resolve(r["site"]),
                         "debut": r["date_initiale"].isoformat() if r["date_initiale"] else None,
                         "fin": r["date_finale"].isoformat() if r["date_finale"] else None,
@@ -747,7 +713,7 @@ def _process_closing_stocks(batch, file_bytes: bytes, file_name: str, resolver) 
                 continue
             event_id = "CL:" + fingerprint("CLOSING", site_id, d, kind, value)
             context = {"type": "closing_periode", "periode": [r["date_initiale"].isoformat(), r["date_finale"].isoformat()],
-                       "livre_l": _livraisons_hors_rajout(r), "rajout_retrait_l": r["rajout_retrait_l"], "vole_l": r["vole_l"], "vidange_l": r["vidange_l"],
+                       "livre_l": r["livre_l"], "rajout_retrait_l": r["rajout_retrait_l"], "vole_l": r["vole_l"], "vidange_l": r["vidange_l"],
                        "conso_closing_l": _ref, "formule_coherente": coherent,
                        # Origine du stock selon la Synthèse (« Relevés de Terrain Technicien », « Estimation Energy Desk »…)
                        "origine_stock": r.get(f"origine_{kind}"), "fiabilisation": r.get("fiabilisation") if kind == "final" else None}
