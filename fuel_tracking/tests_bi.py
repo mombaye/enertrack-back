@@ -312,3 +312,52 @@ class BiSiteTests(TestCase):
         self.assertIsNone(b["kpis"]["instrumentee"]["total_l"])             # couverture insuffisante : non calculable, pas 0
         self.assertEqual(b["site"]["cph"]["statut"], "PARTIEL")
         self.assertIn("non calculable", b["explain"]["cph_complete"]["note"])
+
+
+class BiZoneFallbackTests(TestCase):
+    """Région renseignée sur un seul mois (fichier de référence) : les mois suivants reprennent la dernière région connue du site."""
+
+    def setUp(self):
+        conso("2026-08", "A", country="SN", zone_fichier="DKR", conso_snowflake_l=D("50"))
+        conso("2026-09", "A", country="SN", conso_snowflake_l=D("100"))
+        conso("2026-09", "B", country="SN", conso_snowflake_l=D("40"))      # aucune région connue
+
+    def test_region_reprise_et_filtre(self):
+        b = api().get("/api/fuel-tracking/bi/conso/", {"from_month": "2026-09", "to_month": "2026-09"}).json()
+        labels = {z["label"]: z for z in b["by_zone"]}
+        self.assertEqual(labels["DKR"]["conso_mesuree_l"], 100.0)
+        self.assertIn("Non renseigné", labels)                               # B : jamais inventée
+        f = api().get("/api/fuel-tracking/bi/conso/", {"from_month": "2026-09", "to_month": "2026-09", "zone": "DKR"}).json()
+        self.assertEqual(f["kpis"]["conso_mesuree_l"], 100.0)
+
+
+class ClosingDeclaredTests(TestCase):
+    """Consommation Closing : valeur déclarée dans le fichier pour la ligne du site qui se termine dans la période."""
+
+    def _obs(self, site, d, kind, periode, conso_l, n=[0]):
+        from datetime import datetime
+
+        from django.utils import timezone
+        from fuel_tracking.models import FuelStockObservation
+
+        n[0] += 1
+        ctx = {"type": "closing_periode", "periode": periode, "conso_closing_l": conso_l}
+        return FuelStockObservation.objects.create(
+            source_type="CLOSING", source_event_id=f"CL:decl{n[0]}", site_id=site, level_liters=D("100"), level_unit="L",
+            observation_datetime=timezone.make_aware(datetime.combine(d, datetime.min.time())), validation_status="VALIDATED",
+            conversion_status="VALID", source_context=ctx)
+
+    def test_une_valeur_par_ligne_periode_finissant_dans_le_mois(self):
+        from datetime import date
+
+        from fuel_tracking.services.conso_comparison import closing_declared
+
+        self._obs("SN_1", date(2026, 8, 27), "initial", ["2026-08-27", "2026-09-26"], 210.0)
+        self._obs("SN_1", date(2026, 9, 26), "final", ["2026-08-27", "2026-09-26"], 210.0)   # même ligne : comptée une fois
+        self._obs("SN_2", date(2026, 10, 3), "final", ["2026-09-05", "2026-10-03"], 99.0)    # se termine en octobre : exclue
+        self._obs("sn_3", date(2026, 9, 30), "final", ["2026-09-01", "2026-09-30"], None)    # pas de conso déclarée : absente, jamais 0
+        d = closing_declared(date(2026, 9, 1), date(2026, 9, 30))
+        self.assertEqual(set(d), {"SN_1"})
+        self.assertEqual(d["SN_1"]["conso_l"], 210.0)
+        self.assertEqual(d["SN_1"]["periode"], ["2026-08-27", "2026-09-26"])
+        self.assertEqual(set(closing_declared(date(2026, 10, 1), date(2026, 10, 31))), {"SN_2"})

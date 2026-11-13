@@ -23,8 +23,8 @@ from collections import Counter, defaultdict
 from datetime import date, timedelta
 from io import BytesIO
 
-from django.db.models import Count, F, Q, Sum, Value
-from django.db.models.functions import Coalesce
+from django.db.models import Count, F, OuterRef, Q, Subquery, Sum, Value
+from django.db.models.functions import Coalesce, NullIf
 from django.http import HttpResponse
 from django.utils import timezone
 from rest_framework.permissions import IsAuthenticated
@@ -118,8 +118,13 @@ def _last_sync(model):
 def _conso_scope():
     from fuel_tracking.models import FuelConsommationMonthly
 
+    # Région du site : celle de la ligne du mois, sinon la dernière connue pour ce site (fichier de référence) —
+    # la région n'est renseignée que sur certains mois ; sans ce repli, les mois suivants tombent en « Non renseigné ».
+    last_zone = (FuelConsommationMonthly.objects.filter(site_id=OuterRef("site_id")).exclude(zone_fichier__isnull=True)
+                 .exclude(zone_fichier="").order_by("-month_year").values("zone_fichier")[:1])
     return FuelConsommationMonthly.objects.filter(scope_q()).annotate(
-        typo=Coalesce("typology_fichier", "typology", Value(None)))
+        typo=Coalesce("typology_fichier", "typology", Value(None)),
+        zone_site=Coalesce(NullIf("zone_fichier", Value("")), Subquery(last_zone)))
 
 
 def site_ids_for_typology(typology: str, from_month: str, to_month: str) -> set[str]:
@@ -195,7 +200,7 @@ def _per_site(period, targets, tolerance):
         num=Sum("conso_snowflake_l", filter=both), den=Sum("ge_prod_kwh", filter=both),
         kwh=Sum("ge_prod_kwh"), nb_mois=Count("id", filter=Q(conso_snowflake_l__isnull=False)),
     )
-    info = {r["site_id"]: r for r in period.order_by("month_year").values("site_id", "site_name", "zone_fichier", "typo")}
+    info = {r["site_id"]: r for r in period.order_by("month_year").values("site_id", "site_name", "zone_site", "typo")}
     out = []
     for r in rows:
         i = info.get(r["site_id"], {})
@@ -205,7 +210,7 @@ def _per_site(period, targets, tolerance):
         conso = float(r["conso"]) if r["conso"] is not None else None
         ecart_t = round((conso - target_l) / target_l * 100, 1) if conso is not None and target_l else None
         out.append({
-            "site_id": r["site_id"], "site_name": i.get("site_name"), "zone": i.get("zone_fichier"), "typologie": i.get("typo"),
+            "site_id": r["site_id"], "site_name": i.get("site_name"), "zone": i.get("zone_site"), "typologie": i.get("typo"),
             "nb_mois_mesures": r["nb_mois"], "jours_mesures": r["jours"],
             "conso_mesuree_l": _f(conso), "l_site_jour": _ratio(r["conso"], r["jours"], 1),
             "enoc_ajoutee_l": _f(r["enoc"]), "nb_ravitaillements": r["nb_ravit"],
@@ -262,7 +267,7 @@ def compute_conso(params) -> dict:
     ge_q = _effective_ge_q(_file_ge_site_ids())
     base = scoped.filter(ge_q)
     all_months = list(base.order_by("month_year").values_list("month_year", flat=True).distinct())
-    zones = sorted({z for z in base.values_list("zone_fichier", flat=True).distinct() if z})
+    zones = sorted({z for z in base.values_list("zone_site", flat=True).distinct() if z})
     typologies = sorted({t for t in base.values_list("typo", flat=True).distinct() if t})
     if not all_months:
         return {"perimetre": SCOPE_LABEL, "months": [], "available_months": [], "filters": {"zones": [], "typologies": []}, "sites": []}
@@ -275,7 +280,7 @@ def compute_conso(params) -> dict:
     if (params.get("month") or "").strip():
         from_month = to_month = params["month"].strip()
     if params.get("zone"):
-        base = base.filter(zone_fichier=params["zone"])
+        base = base.filter(zone_site=params["zone"])
     if params.get("typology"):
         base = base.filter(typo=params["typology"])
 
@@ -333,10 +338,10 @@ def compute_conso(params) -> dict:
              "reference": lo == 0.25} for label, lo, hi in buckets]
 
     # Matrice zone × mois (L / site / jour mesuré).
-    by_zone = _breakdown(period, "zone_fichier")
-    cells = [{"zone": r["zone_fichier"] or "Non renseigné", "month": r["month_year"], "nb_sites": r["n"],
+    by_zone = _breakdown(period, "zone_site")
+    cells = [{"zone": r["zone_site"] or "Non renseigné", "month": r["month_year"], "nb_sites": r["n"],
               "l_site_jour": _ratio(r["c"], r["j"], 1)}
-             for r in period.filter(conso_snowflake_l__isnull=False).values("zone_fichier", "month_year")
+             for r in period.filter(conso_snowflake_l__isnull=False).values("zone_site", "month_year")
              .annotate(c=Sum("conso_snowflake_l"), j=Sum("nb_jours_data"), n=Count("site_id", distinct=True))]
     pareto = _pareto(sites)
 
@@ -412,7 +417,8 @@ SRC_TITRES = {"variation": "Variation de stock", "closing": "Consommation Closin
               "instrumentee": "Consommation Snowflake", "cph_complete": "CPH complète"}
 SRC_ORIGINES = {
     "variation": ["Bilans de stock EnerTrack : relevés de stock (Closing, gardiennage, terrain) et mouvements ENOC"],
-    "closing": ["Fichier Closing importé (consommation déclarée par site)"],
+    "closing": ["Fichier Closing importé : consommation déclarée par site, pour les lignes dont la période Closing se termine dans la période choisie "
+                "(chaque site a ses propres dates de relevé dans le fichier)"],
     "instrumentee": [SRC_CAPTEUR + " (faits journaliers)"],
     "cph_complete": [SRC_CPH],
 }
@@ -534,9 +540,9 @@ def search_sites(q: str, limit: int = 20) -> list[dict]:
         return []
     seen = {}
     for r in (_conso_scope().filter(Q(site_id__icontains=q) | Q(site_name__icontains=q)).order_by("-month_year")
-              .values("site_id", "site_name", "zone_fichier", "typo", "has_genset")[:2000]):
+              .values("site_id", "site_name", "zone_site", "typo", "has_genset")[:2000]):
         if r["site_id"] not in seen:
-            seen[r["site_id"]] = {"site_id": r["site_id"], "site_name": r["site_name"], "zone": r["zone_fichier"],
+            seen[r["site_id"]] = {"site_id": r["site_id"], "site_name": r["site_name"], "zone": r["zone_site"],
                                   "typologie": r["typo"], "has_genset": r["has_genset"]}
     ql = q.lower()
     rank = lambda s: (s["site_id"].lower() != ql, not s["site_id"].lower().startswith(ql), s["site_id"])  # noqa: E731
@@ -564,7 +570,7 @@ def compute_site(site_id: str, params) -> dict:
 
     sid = (site_id or "").strip()
     rows = _conso_scope().filter(site_id__iexact=sid)
-    last = rows.order_by("-month_year").values("site_id", "site_name", "zone_fichier", "typo", "country", "power_supply", "dg_count").first()
+    last = rows.order_by("-month_year").values("site_id", "site_name", "zone_site", "typo", "country", "power_supply", "dg_count").first()
     if last is None:
         raise _SiteNotFound(sid)
     sid = last["site_id"]
@@ -682,7 +688,7 @@ def compute_site(site_id: str, params) -> dict:
 
     return {
         "perimetre": SCOPE_LABEL,
-        "site": {"site_id": sid, "site_name": last["site_name"], "zone": last["zone_fichier"], "typologie": last["typo"],
+        "site": {"site_id": sid, "site_name": last["site_name"], "zone": last["zone_site"], "typologie": last["typo"],
                  "country": last["country"], "alimentation": last["power_supply"], "nb_ge": last["dg_count"], "has_genset": has_ge},
         "from_month": from_month, "to_month": to_month, "months": months, "mois_unique": single,
         "available_months": all_months, "previous_months": prev_months,

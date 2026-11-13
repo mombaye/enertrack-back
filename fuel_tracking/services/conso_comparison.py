@@ -397,6 +397,34 @@ def closing_base_sites() -> set[str]:
     return {s.upper() for s in Obs.objects.filter(source_type="CLOSING").values_list("site_id", flat=True).distinct() if s}
 
 
+def closing_declared(d_from: date, d_to: date) -> dict[str, dict]:
+    """
+    Consommation DÉCLARÉE dans le fichier Closing, par site, pour les lignes dont la période Closing se termine
+    entre d_from et d_to (fin de la période = date du stock final de la ligne). Chaque ligne du fichier a ses propres
+    dates de relevé : la valeur est reprise telle quelle, sans la rapporter au mois calendaire. Une ligne donne deux
+    observations (stock initial et final) : elle n'est comptée qu'une fois. Plusieurs versions du Closing : la dernière importée.
+    """
+    import calendar as _cal
+
+    from fuel_tracking.models import FuelStockObservation as Obs
+
+    lo = d_from.replace(day=1)
+    hi = d_to.replace(day=_cal.monthrange(d_to.year, d_to.month)[1])
+    start, end = day_bounds(lo, hi)
+    out: dict[str, dict] = {}
+    for sid, ctx in (Obs.objects.filter(source_type="CLOSING", observation_datetime__gte=start, observation_datetime__lte=end)
+                     .order_by("pk").values_list("site_id", "source_context")):
+        ctx = ctx or {}
+        per = ctx.get("periode") or []
+        val = ctx.get("conso_closing_l")
+        if ctx.get("type") != "closing_periode" or len(per) != 2 or val is None or not sid:
+            continue
+        if not (lo.isoformat() <= str(per[1])[:10] <= hi.isoformat()):
+            continue
+        out[sid.upper()] = {"conso_l": _f(val), "periode": [str(per[0])[:10], str(per[1])[:10]]}
+    return out
+
+
 def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) -> dict:
     """Calcule le tableau de comparaison unique pour la période EXACTE [d_from 00:00:00 ; d_to 23:59:59]."""
     from fuel_tracking.services.cph_health import freshness
@@ -412,6 +440,18 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
     targets = TG.active_targets()
     ids = sorted(set(balances) | {s for s, r in cph_by_site.items() if r.get("perimetre", "GE") == "GE"})
     rows = [_row(cph_by_site.get(sid), balances.get(sid), d_from, d_to, days, targets.get(sid.upper()), {}) for sid in ids]
+    # Closing : valeur du bilan quand ses deux stocks viennent de la même ligne de Closing (écart calculable),
+    # sinon valeur déclarée dans le fichier pour la ligne du site qui se termine dans la période (affichée, sans écart).
+    declared = closing_declared(d_from, d_to)
+    for r in rows:
+        cl = r["closing"]
+        if cl["conso_l"] is not None:
+            cl["source"] = "bilan"
+            continue
+        dec = declared.get(r["site_id"].upper())
+        cl["source"] = "fichier" if dec else None
+        if dec:
+            cl["conso_l"], cl["periode_closing"] = dec["conso_l"], dec["periode"]
     # Correspondance avec la base du fichier Closing : un site sans correspondance est AFFICHÉ mais jamais utilisé dans les totaux et indicateurs.
     base = closing_base_sites()
     for r in rows:
