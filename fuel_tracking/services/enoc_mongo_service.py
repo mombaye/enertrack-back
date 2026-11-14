@@ -307,13 +307,13 @@ def fetch_estimated_consumption(year: int, month: int) -> dict[str, dict]:
     try:
         db = client[settings.ENOC_MONGO_DB_NAME]
 
-        # Codes de demande validés par le fuel manager (status done/validated)
-        # + ensemble de TOUS les codes connus (pour distinguer "non validé"
-        # d'"aucune demande liée du tout").
-        validated_codes = set(
-            db.fuel_requests.distinct("request_code", {"status": {"$in": ["done", "validated"]}})
+        # MVP : on exclut uniquement les opérations liées à une demande
+        # explicitement rejetée (status=rejected). Les opérations pending,
+        # done, validated et sans demande liée sont toutes comptabilisées,
+        # ce qui évite de bloquer le calcul sur des validations manquantes.
+        rejected_codes = set(
+            db.fuel_requests.distinct("request_code", {"status": "rejected"})
         )
-        all_known_codes = set(db.fuel_requests.distinct("request_code"))
 
         readings_by_site: dict[str, list[tuple]] = {}
         cursor = db.fuel_level_readings.find({
@@ -355,10 +355,7 @@ def fetch_estimated_consumption(year: int, month: int) -> dict[str, dict]:
                 {"$match": {
                     "site_id": site_id,
                     "operation_date": {"$gte": first_date, "$lte": last_date},
-                    "$or": [
-                        {"request_code": {"$in": list(validated_codes)}},
-                        {"request_code": {"$nin": list(all_known_codes)}},
-                    ],
+                    "request_code": {"$nin": list(rejected_codes)},
                 }},
                 {"$group": {"_id": None, "total": {"$sum": "$quantity_added_liters"}}},
             ])
