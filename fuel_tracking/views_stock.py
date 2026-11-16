@@ -829,3 +829,56 @@ class ImportProcessIncomingView(APIView):
         restant = {sub: sum(1 for f in (Path(r) / "incoming" / sub).iterdir() if f.is_file() and not f.name.startswith((".", "~$"))) for sub in P.INCOMING}
         return Response({"traites": out, "nombre_traites": len(out), "restant_dans_incoming": restant,
                          "statuts": {st: sum(1 for x in out if x["status"] == st) for st in sorted({x["status"] for x in out})}})
+
+
+class ClosingUploadView(APIView):
+    """
+    Rubrique « Configuration » du Suivi Carburant — fichier de clôture (Closing).
+
+      GET  /api/fuel-tracking/configuration/closing/   derniers Closing reçus (statut, période, résultat) + fichiers en attente
+      POST /api/fuel-tracking/configuration/closing/   envoi du fichier (champ « file », .xlsb/.xlsx/.xlsm) — 202 : traitement en arrière-plan
+
+    Le fichier est déposé dans incoming/closing/ puis traité par le pipeline d'import existant (empreinte anti-doublon, archive,
+    rapport), et les bilans des mois couverts sont recalculés. Envoyer à nouveau le même fichier ne réimporte rien (doublon) mais
+    relance le recalcul des bilans.
+    """
+    parser_classes = [MultiPartParser, FormParser]
+
+    def get_permissions(self):
+        return [IsCphValidator()] if self.request.method == "POST" else [IsAuthenticated()]
+
+    def get(self, request):
+        from fuel_tracking.models import FuelImportBatch
+        from fuel_tracking.services.closing_upload import SOURCE_TYPE, pending_files
+
+        batches = FuelImportBatch.objects.filter(source_type=SOURCE_TYPE).select_related("received_by").order_by("-received_at")[:10]
+        out = []
+        for b in batches:
+            d = _batch(b)
+            stocks = (b.summary or {}).get("stocks_closing") or {}
+            d["stocks_importes"] = stocks.get("stocks_importes")
+            d["sites_inconnus"] = stocks.get("sites_inconnus")
+            d["formule_incoherente"] = stocks.get("formule_incoherente_a_valider")
+            out.append(d)
+        return Response({"lots": out, "en_attente": pending_files(), "peut_envoyer": getattr(request.user, "role", None) in VALIDATOR_ROLES})
+
+    def post(self, request):
+        from fuel_tracking.services import stock_import_pipeline as P
+        from fuel_tracking.services.closing_upload import save_upload
+        from fuel_tracking.tasks import process_closing_upload
+
+        f = request.FILES.get("file")
+        if f is None:
+            return Response({"detail": "Fichier manquant."}, status=400)
+        if not f.name.lower().endswith(P.ACCEPTED_EXT):
+            return Response({"detail": "Format accepté : .xlsb, .xlsx, .xlsm (fichier de clôture « Synthèse Conso Fuel »)."}, status=400)
+        try:
+            path = save_upload(f.read(), f.name)
+        except OSError as e:
+            return Response({"detail": f"Répertoire d'import indisponible ({e.__class__.__name__}) : vérifier le montage FUEL_IMPORT_ROOT."}, status=503)
+        try:
+            process_closing_upload.delay(str(path), request.user.pk)
+            message = "Fichier reçu : import et recalcul des bilans en cours (quelques minutes pour un Closing complet)."
+        except Exception:  # broker indisponible : le passage automatique (15 min) prendra le fichier dans incoming/closing/
+            message = "Fichier reçu : il sera importé au prochain passage automatique (15 min au plus)."
+        return Response({"fichier": path.name, "message": message}, status=202)

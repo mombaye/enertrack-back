@@ -218,6 +218,7 @@ CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 CELERY_TASK_ROUTES = {
     "certification.certify_single_invoice": {"queue": "celery"},
     "certification.finalize_certification_batch": {"queue": "celery"},
+    "fuel_tracking.process_closing_upload": {"queue": "interactive"},  # envoi du Closing depuis la rubrique Configuration
     "billing.*": {"queue": "interactive"},
     "certification.*": {"queue": "interactive"},
 }
@@ -445,3 +446,18 @@ FUEL_PRIORITY_TANK_SITES = [x.strip() for x in os.getenv("FUEL_PRIORITY_TANK_SIT
 ALLOW_GEOMETRIC_TANK_ESTIMATION_WITH_RESERVE = os.getenv("ALLOW_GEOMETRIC_TANK_ESTIMATION_WITH_RESERVE", "0").lower() in ("1", "true", "yes", "on")
 # Données préparées pour la future recommandation de commande (indicatif, aucune commande automatique).
 FUEL_ORDER_HORIZON_DAYS = int(os.getenv("FUEL_ORDER_HORIZON_DAYS", "30"))
+
+# ── Règles MVP Suivi Carburant (cahier des charges Consommation & Stock, 16/11/2026) ─────────────────────────
+# Aucune validation manuelle ne bloque le calcul : statuts ENOC en attente / « done » sans trace de validation / opérations
+# sans demande comptés (seuls rejeté et historique non vérifiable restent exclus) ; relevés non validés utilisables (sauf rejetés).
+FUEL_MVP_IGNORE_VALIDATION = os.getenv("FUEL_MVP_IGNORE_VALIDATION", "true").strip().lower() not in ("0", "false", "non", "no")
+# Stock initial : avant cette date, fichier de clôture (Closing) = historique ; à partir de cette date, stock final du bilan
+# précédent calculé par l'application (repli : dernier Closing connu, avec réserve).
+FUEL_APP_STOCK_START = os.getenv("FUEL_APP_STOCK_START", "2026-11-01")
+# Stock final : relevé le plus récent parmi ces sources (ordre = priorité à date égale). ENOC = niveaux avant / après ravitaillement.
+# ENOC_TERRAIN / ENOC_GARDIENNAGE : à ajouter dès que leurs collections Mongo sont raccordées.
+FUEL_FINAL_STOCK_SOURCES = [x.strip() for x in os.getenv("FUEL_FINAL_STOCK_SOURCES", "ENOC_TERRAIN,ENOC_GARDIENNAGE,ENOC").split(",") if x.strip()]
+# Mouvements issus des fichiers (Closing, terrain, gardiennage) : désactivés, seuls les mouvements ENOC sont comptés.
+FUEL_BALANCE_FILE_MOVEMENTS = os.getenv("FUEL_BALANCE_FILE_MOVEMENTS", "false").strip().lower() in ("1", "true", "yes", "on")
+# Rapprochement Closing / ENOC (complément, conflit, seuil FUEL_CLOSING_CONFLICT_REVIEW_L) : désactivé ; le Closing reste une mesure de contrôle.
+FUEL_BALANCE_CLOSING_CROSSCHECK = os.getenv("FUEL_BALANCE_CLOSING_CROSSCHECK", "false").strip().lower() in ("1", "true", "yes", "on")

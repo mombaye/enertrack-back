@@ -92,7 +92,8 @@ def closing_stock_rows(rows) -> tuple[list[dict], dict]:
                 h_idx = {
                     "site": header.index("id du site"), "nb_ge": _first_idx(header, "nombre de ge installé"),
                     "date_initiale": i0, "stock_initial": _first_idx(header, "qtité laissée à la date du relevé", i0 + 1, i1),
-                    "livre": _first_idx(header, "qtité totale livrée", i0 + 1, i1),
+                    # Format 2026 du Closing : « Total Livraison » remplace « Qtité totale livrée ».
+                    "livre": _first_idx(header, "qtité totale livrée", i0 + 1, i1) or _first_idx(header, "total livraison", i0 + 1, i1),
                     "rajout_retrait": _first_idx(header, "qté rajoutée ou retirée", i0 + 1, i1),
                     "vole": _first_idx(header, "qté volée", i0 + 1, i1),
                     "vidange": _first_idx(header, "qté vidangée", i0 + 1, i1),

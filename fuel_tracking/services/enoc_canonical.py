@@ -519,7 +519,12 @@ def status_settings() -> dict:
     validated = getattr(settings, "FUEL_ENOC_VALIDATED_STATUSES", None) or ("validated", "validee", "validée")
     return {"validated": {str(x).strip().lower() for x in validated} - {"done"},
             "done_is_executed": bool(getattr(settings, "FUEL_ENOC_DONE_IS_EXECUTED", True)),
-            "done_requires_validation": bool(getattr(settings, "FUEL_ENOC_DONE_REQUIRES_VALIDATION", True))}
+            "done_requires_validation": bool(getattr(settings, "FUEL_ENOC_DONE_REQUIRES_VALIDATION", True)),
+            "ignore_validation": bool(getattr(settings, "FUEL_MVP_IGNORE_VALIDATION", False))}
+
+
+# MVP (FUEL_MVP_IGNORE_VALIDATION) : la validation n'est plus exigée — seuls ces statuts métier restent inéligibles au stock.
+NEVER_ELIGIBLE = ("REJETEE", "HISTORIQUE_NON_VERIFIABLE")
 
 
 def map_status(c: dict) -> dict:
@@ -542,8 +547,15 @@ def map_status(c: dict) -> dict:
         prov = "ENOC_MONGO"
 
     def out(business, rule):
-        return {"source_provenance": prov, "business_status": business, "eligible_for_stock":
-                business in ("VALIDEE_EXECUTABLE", "VALIDEE_EXECUTEE"), "status_mapping_rule": f"{STATUS_MAPPING_VERSION} : {rule}"[:255]}
+        if cfg["ignore_validation"]:
+            eligible = business not in NEVER_ELIGIBLE
+            if eligible and business not in ("VALIDEE_EXECUTABLE", "VALIDEE_EXECUTEE"):
+                rule = f"{rule} ; MVP : validation non requise, éligible"
+        else:
+            eligible = business in ("VALIDEE_EXECUTABLE", "VALIDEE_EXECUTEE")
+        version = STATUS_MAPPING_VERSION + ("-mvp" if cfg["ignore_validation"] else "")
+        return {"source_provenance": prov, "business_status": business, "eligible_for_stock": eligible,
+                "status_mapping_rule": f"{version} : {rule}"[:255]}
 
     if raw in REJECTED_STATUSES:
         return out("REJETEE", f"« {raw} » → REJETEE")

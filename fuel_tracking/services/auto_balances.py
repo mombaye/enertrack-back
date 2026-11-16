@@ -24,7 +24,8 @@ def last_complete_months(n: int, today: date | None = None) -> list[tuple[date, 
 
 def compute_recent_months(n: int = 2, today: date | None = None) -> list[dict]:
     res = []
-    for start, end in last_complete_months(n, today):
+    # Du plus ancien au plus récent : le stock initial d'un mois reprend le stock final du bilan du mois précédent (règle MVP).
+    for start, end in reversed(last_complete_months(n, today)):
         s, e = day_bounds(start, end)
         rows = SB.compute_balances(s, e)
         res.append({"debut": start.isoformat(), "fin": end.isoformat(), "sites": len(rows), "calculables": sum(1 for r in rows if r.get("consommation_reelle_l") is not None)})

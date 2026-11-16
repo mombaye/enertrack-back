@@ -22,7 +22,7 @@ from django.conf import settings
 from fuel_tracking.services import fuel_target as TG
 from fuel_tracking.services import gap_explanation as GX
 from fuel_tracking.services.period_utils import day_bounds, latest_balances_by_site
-from fuel_tracking.services.stock_period_balance import RULE_VERSION, alert_codes_of
+from fuel_tracking.services.stock_period_balance import alert_codes_of, current_rule_version
 
 # ── Libellés et aides (définition · formule · unité · période · source · limites) ───────────────────────────────────────────────────
 LABELS = {
@@ -432,7 +432,7 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
         "periode": {"debut": d_from.isoformat(), "fin": d_to.isoformat(), "debut_dt": start.isoformat(), "fin_dt": end.isoformat(), "jours": days,
                     "libelle": f"{d_from:%d/%m/%Y} 00:00:00 → {d_to:%d/%m/%Y} 23:59:59",
                     "bilan_disponible": bool(balances), "sites_avec_bilan": len(balances),
-                    "sites_calculables": sum(1 for b in balances.values() if bilan_status(b) != NON_CALCULABLE), "regle": RULE_VERSION},
+                    "sites_calculables": sum(1 for b in balances.values() if bilan_status(b) != NON_CALCULABLE), "regle": current_rule_version()},
         "kpis": {**_kpis([r for r in rows if r["correspondance"]["utilise"]]),
                  "sans_correspondance": {"sites": sum(1 for r in rows if not r["correspondance"]["utilise"]), "base_closing_sites": len(base),
                                          "note": "Sites hors du fichier Closing : affichés, non utilisés dans les totaux."}},

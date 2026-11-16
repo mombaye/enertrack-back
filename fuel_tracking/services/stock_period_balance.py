@@ -34,10 +34,19 @@ from django.db.models import Q
 from django.utils import timezone
 
 RULE_VERSION = "bilan-v2"
+MVP_RULE_VERSION = "bilan-v3-mvp"  # règles du cahier des charges 16/11/2026 (FUEL_MVP_IGNORE_VALIDATION / FUEL_APP_STOCK_START / …)
+
+
+def current_rule_version() -> str:
+    """Version de règle effectivement appliquée (enregistrée sur chaque bilan) : permet de repérer les bilans à recalculer."""
+    return MVP_RULE_VERSION if bool(getattr(settings, "FUEL_MVP_IGNORE_VALIDATION", False)) or getattr(settings, "FUEL_APP_STOCK_START", None) \
+        else RULE_VERSION
 D0 = Decimal("0")
 SOURCE_RANK = {"CLOSING": 1, "LOLIFORCE": 2, "SCSS": 2, "ENOC": 3}
 SOURCE_LABEL = {"CLOSING": "Closing mensuel validé", "LOLIFORCE": "Gardiennage Loliforce validé", "SCSS": "Gardiennage SCSS validé",
-                "ENOC": "Relevé ENOC qualifié"}
+                "ENOC": "Relevé ENOC qualifié", "APP": "Stock final du bilan précédent (EnerTrack)",
+                "ENOC_TERRAIN": "Relevé terrain ENOC", "ENOC_GARDIENNAGE": "Relevé gardiennage ENOC"}
+APP_SOURCE = "APP"  # stock initial repris du stock final du bilan précédent (règle MVP, à partir de FUEL_APP_STOCK_START)
 MIN_REFERENCE_L = Decimal(20)  # sous ce seuil, une référence (CPH théorique, Snowflake) ne permet pas de calculer un pourcentage d'écart
 COMPONENTS = ("truck_l", "carte_total_l", "transferts_entrants_l", "transferts_sortants_l", "vols_l", "vidanges_l",
               "retraits_l", "rajouts_l", "livraisons_externes_l")
@@ -66,7 +75,22 @@ def cfg() -> dict:
         "reserve": int(getattr(settings, "FUEL_BALANCE_SCORE_RESERVE", 50)),
         "horizon_days": int(getattr(settings, "FUEL_ORDER_HORIZON_DAYS", 30)),
         "dup_qty_pct": float(getattr(settings, "FUEL_BALANCE_DUPLICATE_QTY_PCT", 2)),
+        # Règles MVP (cahier des charges 16/11/2026) — voir settings.py
+        "ignore_validation": bool(getattr(settings, "FUEL_MVP_IGNORE_VALIDATION", False)),
+        "app_stock_start": _parse_day(getattr(settings, "FUEL_APP_STOCK_START", None)),
+        "final_sources": [str(s).strip().upper() for s in (getattr(settings, "FUEL_FINAL_STOCK_SOURCES", None) or []) if str(s).strip()],
+        "file_movements": bool(getattr(settings, "FUEL_BALANCE_FILE_MOVEMENTS", True)),
+        "closing_crosscheck": bool(getattr(settings, "FUEL_BALANCE_CLOSING_CROSSCHECK", True)),
     }
+
+
+def _parse_day(v):
+    """AAAA-MM-JJ → date ; vide → None (règle désactivée)."""
+    if not v:
+        return None
+    if hasattr(v, "year"):
+        return v if not isinstance(v, datetime) else v.date()
+    return datetime.strptime(str(v).strip()[:10], "%Y-%m-%d").date()
 
 
 def _f(v):
@@ -87,7 +111,9 @@ def _candidate(o: dict, boundary, final: bool, c: dict) -> dict:
     t = o["observation_datetime"]
     quality = o.get("reading_quality_status")
     reason = None
-    certifiable_liters = o["level_liters"] is not None and o["conversion_status"] == "VALID" and o["validation_status"] == "VALIDATED"
+    # MVP : un relevé non (encore) validé est utilisable ; seul un relevé REJETÉ est écarté.
+    validated_ok = o["validation_status"] != "REJECTED" if c.get("ignore_validation") else o["validation_status"] == "VALIDATED"
+    certifiable_liters = o["level_liters"] is not None and o["conversion_status"] == "VALID" and validated_ok
     estimated = o.get("estimated_liters") is not None and o.get("estimation_mode") in ESTIMATE_MODES \
         and o["validation_status"] in ("PENDING", "VALIDATED")
     if certifiable_liters:
@@ -108,7 +134,8 @@ def _candidate(o: dict, boundary, final: bool, c: dict) -> dict:
         else:
             reason = f"conversion non retenue ({o['conversion_status']})"
     if reason is None and o["source_type"] == "ENOC" and not o.get("eligible_for_stock"):
-        reason = f"relevé ENOC non qualifié (statut {o.get('business_status') or 'inconnu'})"
+        if not c.get("ignore_validation") or o.get("business_status") in ("REJETEE", "HISTORIQUE_NON_VERIFIABLE"):
+            reason = f"relevé ENOC non qualifié (statut {o.get('business_status') or 'inconnu'})"
     age = (_day(boundary) - _day(t)).days
     if age == 0:
         tier = "EXACT"
@@ -149,6 +176,11 @@ def _select(obs: list[dict], boundary, final: bool, tanks: list, c: dict) -> tup
     group = lambda x: 0 if x["tier"] in ("EXACT", "FRAIS") else _tier_rank(x["tier"])  # noqa: E731
     key = lambda x: (group(x), 0 if x["certifiable"] else 1, _tier_rank(x["tier"]), x["rang_priorite"],  # noqa: E731
                      VALUE_RANK.get(x["mode_valeur"], 9), x["age_jours"])
+    if final and c.get("final_sources"):
+        # MVP : stock final = relevé le PLUS RÉCENT (≤ borne) parmi les sources ENOC ; à date égale, ordre de FUEL_FINAL_STOCK_SOURCES.
+        order = {s: i for i, s in enumerate(c["final_sources"])}
+        key = lambda x: (-datetime.fromisoformat(x["date"]).timestamp(), order.get(str(x["source"]).upper(), 99),  # noqa: E731
+                         VALUE_RANK.get(x["mode_valeur"], 9))
     usable.sort(key=key)
     cands.sort(key=lambda x: (_tier_rank(x["tier"]), x["age_jours"], x["rang_priorite"]))
     validated_tanks = [t for t in tanks if t.validated]
@@ -186,6 +218,61 @@ def _select(obs: list[dict], boundary, final: bool, tanks: list, c: dict) -> tup
             + (" (ESTIMATION, confiance faible)" if chosen["estimation"] else "")
             + (f" ; {len(usable) - 1} autre(s) candidat(s) utilisable(s) écarté(s) par la priorité" if len(usable) > 1 else ""))
     return chosen, cands, alerts
+
+
+# ── Règles MVP : origine des stocks ───────────────────────────────────────────────────────────────────────
+def _uses_app_initial(start, c: dict) -> bool:
+    """Vrai si le stock initial de la période vient de l'application (bilan précédent) et non plus du Closing."""
+    return bool(c.get("app_stock_start")) and _day(start) >= c["app_stock_start"]
+
+
+def _previous_final_stocks(site_ids, start, c: dict) -> dict:
+    """site_id → relevé « APP » (même forme qu'un fuel_stock_observation) construit depuis le stock final du dernier bilan enregistré
+    qui se termine avant `start`. Uniquement à partir de FUEL_APP_STOCK_START ; jamais recalculé, repris tel quel."""
+    from fuel_tracking.models import FuelStockBalance as B
+
+    if not site_ids or not _uses_app_initial(start, c):
+        return {}
+    out = {}
+    qs = (B.objects.filter(site_id__in=list(site_ids), observation_end__lt=start, stock_final_l__isnull=False, date_stock_final__isnull=False,
+                           date_stock_final__lte=start)
+          .order_by("site_id", "-observation_end", "-calculated_at"))
+    for b in qs:
+        if b.site_id in out:
+            continue
+        detail = b.stock_final_detail or {}
+        mode = detail.get("mode_valeur")
+        estimated = mode in ESTIMATE_MODES or detail.get("certifiable") is False
+        out[b.site_id] = {
+            "id": None, "site_id": b.site_id, "tank_id": "SITE", "source_type": APP_SOURCE, "observation_datetime": b.date_stock_final,
+            "level_raw": f"{b.stock_final_l} L (bilan #{b.pk})", "level_value": b.stock_final_l, "level_unit": "L", "level_cm": None,
+            "level_liters": None if estimated else b.stock_final_l, "conversion_method": "BILAN_PRECEDENT", "conversion_status": "VALID",
+            "conversion_rule": None, "tank_model_ref": None, "validation_status": "VALIDATED", "eligible_for_stock": True, "business_status": None,
+            "reading_quality_status": None if estimated else "LITRE_DIRECT", "confidence": detail.get("confiance"),
+            "estimated_liters": b.stock_final_l if estimated else None, "estimation_mode": (mode if mode in ESTIMATE_MODES else ESTIMATE_MODES[0]) if estimated else None,
+            "estimation_detail": None, "batch_id": None,
+            "source_context": {"type": "bilan_precedent", "bilan_id": b.pk, "source_origine": b.source_stock_final,
+                               "periode": [_iso(b.observation_start), _iso(b.observation_end)]},
+        }
+    return out
+
+
+def _closing_conso_reference(obs: list[dict], start, end, c: dict) -> dict | None:
+    """Conso déclarée au Closing (mesure de CONTRÔLE) pour la période : ligne de Closing dont la date de relevé finale tombe
+    dans [début, fin + tolérance de réserve]. Indépendante de l'origine des stocks retenus."""
+    lo, hi = _day(start), _day(end) + timedelta(days=c["reserve_days"])
+    best = None
+    for o in obs:
+        ctx = o.get("source_context") or {}
+        if o["source_type"] != "CLOSING" or ctx.get("type") != "closing_periode" or not ctx.get("periode"):
+            continue
+        try:
+            fin = datetime.fromisoformat(str(ctx["periode"][1])).date()
+        except ValueError:
+            continue
+        if lo <= fin <= hi and (best is None or fin > best[0]):
+            best = (fin, ctx)
+    return dict(best[1]) if best else None
 
 
 # ── Calcul ────────────────────────────────────────────────────────────────────────────────────────────────
@@ -238,8 +325,10 @@ def compute_balances(start, end, site_ids=None, persist=True) -> list[dict]:
 
     batch_ids = {o["batch_id"] for lst in obs_by_site.values() for o in lst if o.get("batch_id")}
     batches = dict(FuelImportBatch.objects.filter(pk__in=batch_ids).values_list("pk", "file_name"))
+    previous = _previous_final_stocks(site_ids, start, c)
     rows = [_site_balance(sid, start, end, c, obs_by_site.get(sid, []), enoc_by_site.get(sid, []), mv_by_site.get(sid, []),
-                          tanks.get(sid, []), sites.get(sid), profiles.get(sid, {}), unbalanced, batches) for sid in site_ids]
+                          tanks.get(sid, []), sites.get(sid), profiles.get(sid, {}), unbalanced, batches, previous.get(sid))
+            for sid in site_ids]
     if persist:
         _persist(rows, start, end)
     return rows
@@ -312,6 +401,12 @@ def _movements(site_id, enoc, movements, t0, t1, end, c, unbalanced):  # noqa: C
                 st["integrated"] += 1
                 counted.append({**base, "composante": comp, "quantite_l": _f(m.impact_stock_l), "contrepartie": m.counterpart_site_id})
             continue
+        if not c.get("file_movements", True):
+            # MVP : seuls les mouvements ENOC sont comptés ; ceux des fichiers restent visibles (traçabilité), sans effet sur le bilan.
+            if inside(when) and m.status != "REJECTED":
+                excluded.append({**base, "quantite_l": _f(m.quantity_l),
+                                 "motif": "Mouvement issu d'un fichier, non compté (règle MVP : mouvements ENOC uniquement)."})
+            continue
         if not inside(when):
             if when is None and m.retained_in_stock:
                 st["undated"] += 1
@@ -362,6 +457,11 @@ def effective_parameters() -> dict:
         "FUEL_BALANCE_FRESH_STOCK_DAYS": g("FUEL_BALANCE_FRESH_STOCK_DAYS", 3), "FUEL_BALANCE_RESERVE_STOCK_DAYS": g("FUEL_BALANCE_RESERVE_STOCK_DAYS", 14),
         "FUEL_BALANCE_SCORE_READY": g("FUEL_BALANCE_SCORE_READY", 80), "FUEL_BALANCE_SCORE_RESERVE": g("FUEL_BALANCE_SCORE_RESERVE", 50),
         "FUEL_ORDER_HORIZON_DAYS": g("FUEL_ORDER_HORIZON_DAYS", 30), "FUEL_PRIORITY_TANK_SITES": list(g("FUEL_PRIORITY_TANK_SITES", []) or []),
+        # Règles MVP (cahier des charges Consommation & Stock)
+        "FUEL_MVP_IGNORE_VALIDATION": bool(g("FUEL_MVP_IGNORE_VALIDATION", False)), "FUEL_APP_STOCK_START": g("FUEL_APP_STOCK_START", None),
+        "FUEL_FINAL_STOCK_SOURCES": list(g("FUEL_FINAL_STOCK_SOURCES", []) or []),
+        "FUEL_BALANCE_FILE_MOVEMENTS": bool(g("FUEL_BALANCE_FILE_MOVEMENTS", True)),
+        "FUEL_BALANCE_CLOSING_CROSSCHECK": bool(g("FUEL_BALANCE_CLOSING_CROSSCHECK", True)),
     }
 
 
@@ -477,12 +577,40 @@ def _score(c, ini, fin, st, major_alerts, has_movement_defects) -> tuple[int, li
     return sum(d["points"] for d in detail), detail
 
 
-def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, profile, unbalanced, batches=None) -> dict:  # noqa: C901
+def _initial_observations(obs: list[dict], start, c: dict, previous: dict | None, infos: list, reserves: list) -> list[dict]:
+    """Relevés candidats au stock INITIAL selon la règle MVP :
+      - période avant FUEL_APP_STOCK_START : fichier de clôture (Closing) uniquement, utilisé comme historique ;
+      - à partir de FUEL_APP_STOCK_START : stock final du bilan précédent (EnerTrack) ; à défaut, dernier Closing connu (avec réserve).
+    Sans FUEL_APP_STOCK_START (règle désactivée) : comportement historique, toutes les sources."""
+    if not c.get("app_stock_start"):
+        return obs
+    closing = [o for o in obs if o["source_type"] == "CLOSING"]
+    if not _uses_app_initial(start, c):
+        return closing
+    if previous is not None:
+        return [previous]
+    if closing:
+        reserves.append("Stock initial : aucun bilan précédent calculé par EnerTrack — repli sur le dernier stock du fichier de clôture (Closing).")
+    return closing
+
+
+def _final_observations(obs: list[dict], end, c: dict) -> list[dict]:
+    """Relevés candidats au stock FINAL : sources de FUEL_FINAL_STOCK_SOURCES uniquement (ENOC : terrain, gardiennage, ravitaillement)."""
+    window = [o for o in obs if o["observation_datetime"] <= end + timedelta(days=1)]
+    if not c.get("final_sources"):
+        return window
+    allowed = set(c["final_sources"])
+    return [o for o in window if str(o["source_type"]).upper() in allowed]
+
+
+def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, profile, unbalanced, batches=None,  # noqa: C901
+                  previous=None) -> dict:
     motifs, alerts, reserves, major, infos = [], [], [], [], []
     cause = None
-    ini, ini_cands, a1 = _select(obs, start, False, tanks, c)
-    fin, fin_cands, a2 = _select([o for o in obs if o["observation_datetime"] <= end + timedelta(days=1)], end, True, tanks, c)
+    ini, ini_cands, a1 = _select(_initial_observations(obs, start, c, previous, infos, reserves), start, False, tanks, c)
+    fin, fin_cands, a2 = _select(_final_observations(obs, end, c), end, True, tanks, c)
     alerts += a1 + a2
+    official = set(c.get("final_sources") or []) | ({APP_SOURCE, "CLOSING"} if c.get("app_stock_start") else set())
     if ini and fin and datetime.fromisoformat(fin["date"]) <= datetime.fromisoformat(ini["date"]):
         motifs.append("Le relevé final retenu n'est pas postérieur au relevé initial : bilan impossible.")
         fin, cause = None, "RELEVES_INCOHERENTS"
@@ -507,8 +635,12 @@ def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, pro
                 reserves.append(f"Stock {label} ancien de {x['age_jours']} j (4-{c['reserve_days']} j) : estimation avec réserve.")
             elif x["tier"] == "FRAIS" and x["age_jours"]:
                 infos.append(f"Stock {label} antérieur de {x['age_jours']} j à la borne (≤ {c['fresh_days']} j : exploitable normalement).")
-            if x["rang_priorite"] >= 3:
+            if x["rang_priorite"] >= 3 and str(x["source"]).upper() not in official:
                 reserves.append(f"Stock {label} issu de {x['source_libelle']} (source moins fiable).")
+            if x["source"] == APP_SOURCE:
+                ctx = x.get("contexte_source") or {}
+                infos.append(f"Stock {label} repris du stock final du bilan précédent #{ctx.get('bilan_id')} "
+                             f"(source d'origine : {ctx.get('source_origine') or 'inconnue'}).")
 
     t0 = datetime.fromisoformat(ini["date"]) if ini else start
     t1 = datetime.fromisoformat(fin["date"]) if fin else end
@@ -540,9 +672,15 @@ def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, pro
     # Closing / ENOC : quand les DEUX stocks viennent du même Closing, ses totaux de période (livré, rajouts/retraits, volé, vidangé) sont
     # comparés aux mouvements d'ENOC. Closing seul → il COMPLÈTE (estimation avec réserve) ; divergence → conflit tracé, jamais écrasé en silence.
     closing_ref = _closing_reference(ini, fin)
+    if not c.get("closing_crosscheck"):
+        # MVP : plus de rapprochement Closing / ENOC (ni complément, ni conflit) ; la conso du Closing reste une mesure de contrôle.
+        closing_ref = None
     if closing_ref:
         comps, counted, excluded = _closing_crosscheck(closing_ref, ini, fin, comps, counted, excluded, t1, c, batches or {},
                                                        alerts, reserves, major, motifs)
+    # Conso Closing (contrôle) : celle du rapprochement s'il a lieu, sinon la ligne de Closing de la période, quelle que soit l'origine des stocks.
+    control_ref = closing_ref or (_closing_conso_reference(obs, start, end, c) if not c.get("closing_crosscheck") else None)
+    if closing_ref:
         if closing_ref.get("_conflit_a_controler") and not cause:
             cause = "CONFLIT_ENOC_CLOSING"
 
@@ -587,11 +725,11 @@ def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, pro
         # conso_closing_l : champ first-class extrait du Closing, indépendant du calcul bilan.
         # NULL si aucun Closing importé pour la période (ne jamais substituer à consommation_reelle_l).
         "conso_closing_l": (
-            Decimal(str(closing_ref["conso_closing_l"]))
-            if closing_ref and closing_ref.get("conso_closing_l") is not None
+            Decimal(str(control_ref["conso_closing_l"]))
+            if control_ref and control_ref.get("conso_closing_l") is not None
             else None
         ),
-        "source_conso_closing": "CLOSING" if closing_ref and closing_ref.get("conso_closing_l") is not None else None,
+        "source_conso_closing": "CLOSING" if control_ref and control_ref.get("conso_closing_l") is not None else None,
         "statut_bilan": statut, "resultat_bilan": statut, "cause_principale": cause, "score_confiance": score, "score_detail": detail,
         "reserves": list(dict.fromkeys(reserves)), "estimation": any(x and x["estimation"] for x in (ini, fin)),
         "age_stock_initial_j": ini["age_jours"] if ini else None, "age_stock_final_j": fin["age_jours"] if fin else None,
@@ -601,7 +739,7 @@ def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, pro
         "motifs": motifs + list(dict.fromkeys(reserves)) + major + infos, "alertes": list(dict.fromkeys(alerts + major)),
         "candidats": {"initial": ini_cands[:20], "final": fin_cands[:20]},
         "mouvements": counted, "mouvements_exclus": excluded + [{**m, "motif": "Mouvement après le relevé final : non compté."} for m in after_final],
-        "periode_effective_debut": t0, "periode_effective_fin": t1, "rule_version": RULE_VERSION,
+        "periode_effective_debut": t0, "periode_effective_fin": t1, "rule_version": current_rule_version(),
     }
     out["proposition"] = _proposition(out, tanks, c)
     return out

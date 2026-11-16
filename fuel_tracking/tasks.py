@@ -221,6 +221,37 @@ def process_fuel_import_incoming(self):
         logger.exception("[fuel_tracking] Échec traitement des fichiers du registre stock")
 
 
+@shared_task(bind=True, name="fuel_tracking.process_closing_upload", soft_time_limit=110 * 60, time_limit=120 * 60, max_retries=30)
+def process_closing_upload(self, path: str, user_id: int | None = None):
+    """
+    Rubrique Configuration : traite le fichier de clôture envoyé depuis l'interface (déposé dans incoming/closing/) puis
+    recalcule les bilans des mois couverts. Partage le verrou du traitement du dossier d'import : si celui-ci tourne,
+    nouvel essai 2 min plus tard (le fichier n'est jamais traité deux fois — empreinte + déplacement du fichier).
+    """
+    from django.core.cache import cache
+
+    from fuel_tracking.services.closing_upload import process_saved
+
+    key = "fuel_tracking:lock:process_fuel_import_incoming"
+    try:
+        acquired = cache.add(key, timezone.now().isoformat(), timeout=65 * 60)
+    except Exception:
+        acquired = None
+    if acquired is False:
+        raise self.retry(countdown=120)
+    try:
+        return process_saved(path, user_id)
+    except Exception:
+        logger.exception("[fuel_tracking] Échec du traitement du Closing envoyé (%s)", path)
+        raise
+    finally:
+        if acquired:
+            try:
+                cache.delete(key)
+            except Exception:
+                pass
+
+
 @shared_task(bind=True, name="fuel_tracking.auto_compute_stock_balances", soft_time_limit=170 * 60, time_limit=180 * 60)
 @_exclusive("auto_compute_stock_balances", 3 * 3600)
 def auto_compute_stock_balances(self):
