@@ -222,7 +222,7 @@ def process_fuel_import_incoming(self):
 
 
 @shared_task(bind=True, name="fuel_tracking.process_closing_upload", soft_time_limit=110 * 60, time_limit=120 * 60, max_retries=30)
-def process_closing_upload(self, path: str, user_id: int | None = None):
+def process_closing_upload(self, path: str, user_id: int | None = None, mois: str | None = None):
     """
     Rubrique Configuration : traite le fichier de clôture envoyé depuis l'interface (déposé dans incoming/closing/) puis
     recalcule les bilans des mois couverts. Partage le verrou du traitement du dossier d'import : si celui-ci tourne,
@@ -240,7 +240,7 @@ def process_closing_upload(self, path: str, user_id: int | None = None):
     if acquired is False:
         raise self.retry(countdown=120)
     try:
-        return process_saved(path, user_id)
+        return process_saved(path, user_id, mois)
     except Exception:
         logger.exception("[fuel_tracking] Échec du traitement du Closing envoyé (%s)", path)
         raise
@@ -250,6 +250,23 @@ def process_closing_upload(self, path: str, user_id: int | None = None):
                 cache.delete(key)
             except Exception:
                 pass
+
+
+@shared_task(bind=True, name="fuel_tracking.recompute_after_closing_withdrawal", soft_time_limit=110 * 60, time_limit=120 * 60)
+def recompute_after_closing_withdrawal(self, batch_id: int, months: list[str]):
+    """Rubrique Configuration : après le retrait d'un fichier de clôture, recalcule les bilans des mois qu'il couvrait
+    (avancement enregistré sur le lot retiré, visible à l'écran)."""
+    from fuel_tracking.models import FuelImportBatch
+    from fuel_tracking.services.closing_upload import _month_range, parse_month, recompute_months
+
+    batch = FuelImportBatch.objects.filter(pk=batch_id).first()
+    if batch is None:
+        return None
+    try:
+        return recompute_months([_month_range(parse_month(m)) for m in months], track=[batch])
+    except Exception:
+        logger.exception("[fuel_tracking] Échec du recalcul après retrait du lot %s", batch_id)
+        raise
 
 
 @shared_task(bind=True, name="fuel_tracking.auto_compute_stock_balances", soft_time_limit=170 * 60, time_limit=180 * 60)

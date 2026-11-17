@@ -219,6 +219,7 @@ CELERY_TASK_ROUTES = {
     "certification.certify_single_invoice": {"queue": "celery"},
     "certification.finalize_certification_batch": {"queue": "celery"},
     "fuel_tracking.process_closing_upload": {"queue": "interactive"},  # envoi du Closing depuis la rubrique Configuration
+    "fuel_tracking.recompute_after_closing_withdrawal": {"queue": "interactive"},  # retrait d'un fichier (Configuration)
     "billing.*": {"queue": "interactive"},
     "certification.*": {"queue": "interactive"},
 }

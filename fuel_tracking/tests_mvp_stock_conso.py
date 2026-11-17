@@ -218,15 +218,18 @@ class ConfigurationClosingUploadTests(TmpRootMixin, MvpBase):
         self.manager = User.objects.create_user("mgr", "mgr@x.sn", "p", role="manager")
         self.analyst = User.objects.create_user("ana", "ana@x.sn", "p", role="analyst")
 
-    def upload(self, user, data, name="Esco Senegal - Synthese Conso Fuel Septembre 2026.xlsx"):
+    def upload(self, user, data, name="Esco Senegal - Synthese Conso Fuel Septembre 2026.xlsx", mois="2026-09"):
         self.client.force_authenticate(user)
-        return self.client.post("/api/fuel-tracking/configuration/closing/", {"file": SimpleUploadedFile(name, data)}, format="multipart")
+        payload = {"file": SimpleUploadedFile(name, data)}
+        if mois is not None:
+            payload["mois"] = mois
+        return self.client.post("/api/fuel-tracking/configuration/closing/", payload, format="multipart")
 
     def test_upload_imports_closing_and_recomputes_covered_months(self):
         first = (timezone.localdate().replace(day=1) - timedelta(days=1)).replace(day=1)   # 1er jour du dernier mois complet
         d1 = datetime.combine(first - timedelta(days=1), datetime.min.time())               # relevé initial : veille du mois
         d2 = datetime.combine(first + timedelta(days=20), datetime.min.time())
-        res = self.upload(self.manager, self.closing_bytes(d1, d2))
+        res = self.upload(self.manager, self.closing_bytes(d1, d2), mois=first.strftime("%Y-%m"))
         self.assertEqual(res.status_code, 202, res.content)
         b = FuelImportBatch.objects.get(source_type="CLOSING")
         self.assertEqual(b.summary["stocks_closing"]["stocks_importes"], 2, (b.status_message, b.summary))
@@ -457,7 +460,7 @@ class UploadStepTests(MvpBase):
 
         from fuel_tracking.views_stock import _upload_step
 
-        b = lambda status, dup=None: N(status=status, duplicate_of_id=dup)  # noqa: E731
+        b = lambda status, dup=None, summary=None: N(status=status, duplicate_of_id=dup, summary=summary or {})  # noqa: E731
         self.assertEqual(_upload_step(b("PROCESSING"), None), "IMPORT")
         self.assertEqual(_upload_step(b("ACCEPTED"), {"statut": "EN_COURS"}), "RECALCUL")
         self.assertEqual(_upload_step(b("ACCEPTED"), {"statut": "TERMINE"}), "TERMINE")
@@ -465,3 +468,56 @@ class UploadStepTests(MvpBase):
         self.assertEqual(_upload_step(b("FAILED"), None), "ECHEC")
         self.assertEqual(_upload_step(b("ACCEPTED"), {"statut": "ECHEC"}), "ECHEC")
         self.assertEqual(_upload_step(b("ACCEPTED"), None), "IMPORTE")
+        self.assertEqual(_upload_step(b("REJECTED", summary={"annulation": {}}), {"statut": "EN_COURS"}), "RETRAIT_RECALCUL")
+        self.assertEqual(_upload_step(b("REJECTED", summary={"annulation": {}}), {"statut": "TERMINE"}), "RETIRE")
+
+
+
+@override_settings(CELERY_TASK_ALWAYS_EAGER=True, CELERY_TASK_EAGER_PROPAGATES=True)
+class ConfigurationMonthAndWithdrawalTests(ConfigurationClosingUploadTests):
+    """Mois déclaré à l'import et retrait d'un fichier importé (rubrique Configuration)."""
+
+    def test_months_covered_capped_at_last_complete_month(self):  # déjà couvert par la classe parente
+        pass
+
+    def sept_file(self):
+        return self.closing_bytes(datetime(2026, 8, 31), datetime(2026, 9, 30))
+
+    def test_month_is_required_and_not_in_future(self):
+        self.assertEqual(self.upload(self.manager, self.sept_file(), mois=None).status_code, 400)
+        self.assertEqual(self.upload(self.manager, self.sept_file(), mois="septembre").status_code, 400)
+        self.assertEqual(self.upload(self.manager, self.sept_file(), mois="2099-01").status_code, 400)
+
+    def test_declared_month_stored_and_checked(self):
+        self.upload(self.manager, self.sept_file(), mois="2026-09")
+        lot = self.client.get("/api/fuel-tracking/configuration/closing/").json()["lots"][0]
+        self.assertEqual((lot["mois"], lot["declared_period_start"], lot["declared_period_end"]), ("2026-09", "2026-09-01", "2026-09-30"))
+        self.assertNotIn("avertissement", lot["controle_mois"])
+        self.assertEqual([m["debut"] for m in lot["recalcul_bilans"]["mois"]], ["2026-09-01", "2026-10-01"])  # mois + mois suivant
+
+    def test_wrong_month_is_flagged(self):
+        self.upload(self.manager, self.sept_file(), mois="2026-07")
+        lot = self.client.get("/api/fuel-tracking/configuration/closing/").json()["lots"][0]
+        self.assertIn("2026-09", lot["controle_mois"]["avertissement"])
+
+    def test_withdraw_then_reimport(self):
+        self.upload(self.manager, self.sept_file(), mois="2026-09")
+        b = FuelImportBatch.objects.get(source_type="CLOSING")
+        self.assertEqual(Obs.objects.filter(batch=b).count(), 2)
+        self.client.force_authenticate(self.analyst)
+        self.assertEqual(self.client.delete(f"/api/fuel-tracking/configuration/closing/{b.pk}/").status_code, 403)
+        self.client.force_authenticate(self.manager)
+        res = self.client.delete(f"/api/fuel-tracking/configuration/closing/{b.pk}/", {"motif": "mauvais mois"}, format="json")
+        self.assertEqual(res.status_code, 200, res.content)
+        body = res.json()
+        self.assertEqual((body["stocks_supprimes"], body["mois"]), (2, ["2026-09", "2026-10"]))
+        self.assertEqual(Obs.objects.filter(source_type="CLOSING").count(), 0)
+        lot = self.client.get("/api/fuel-tracking/configuration/closing/").json()["lots"][0]
+        self.assertEqual((lot["etape"], lot["annulation"]["par"], lot["annulation"]["motif"]), ("RETIRE", "mgr", "mauvais mois"))
+        self.assertEqual(lot["recalcul_bilans"]["statut"], "TERMINE")  # bilans recalculés après retrait
+        sept = FuelStockBalance.objects.get(site_id="DKR_0001", observation_start__date=date(2026, 9, 1))
+        self.assertIsNone(sept.stock_initial_l)                            # plus de stock du fichier retiré
+        self.assertEqual(self.client.delete(f"/api/fuel-tracking/configuration/closing/{b.pk}/").status_code, 400)  # déjà retiré
+        self.upload(self.manager, self.sept_file(), mois="2026-09")         # réimport du même fichier : accepté (pas un doublon)
+        self.assertEqual(Obs.objects.filter(source_type="CLOSING").count(), 2)
+        self.assertEqual(FuelImportBatch.objects.filter(source_type="CLOSING", duplicate_of__isnull=False).count(), 0)

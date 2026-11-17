@@ -65,7 +65,9 @@ def _unique(dest: Path) -> Path:
 def find_duplicate(file_hash: str):
     from fuel_tracking.models import FuelImportBatch as B
 
-    return B.objects.filter(file_hash=file_hash, duplicate_of__isnull=True).order_by("received_at").first()
+    # Un lot retiré depuis la rubrique Configuration (summary["annulation"]) ne bloque plus la réimportation du même fichier.
+    return (B.objects.filter(file_hash=file_hash, duplicate_of__isnull=True).exclude(summary__has_key="annulation")
+            .order_by("received_at").first())
 
 
 def write_report(batch, folder: Path) -> Path | None:

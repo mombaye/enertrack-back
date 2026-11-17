@@ -834,8 +834,11 @@ class ImportProcessIncomingView(APIView):
 def _upload_step(b, recalc) -> str:
     """Étape d'un import de fichier de clôture, pour le suivi à l'écran :
     IMPORT (lecture du fichier) → RECALCUL (bilans des mois couverts) → TERMINE ; ECHEC ; DOUBLON (fichier déjà reçu) ;
-    IMPORTE (lot importé sans recalcul suivi — dépôt direct dans le partage : recalcul au passage de nuit)."""
+    IMPORTE (lot importé sans recalcul suivi — dépôt direct dans le partage : recalcul au passage de nuit) ;
+    RETRAIT_RECALCUL / RETIRE (fichier retiré depuis la rubrique Configuration, puis bilans recalculés)."""
     st = (recalc or {}).get("statut")
+    if "annulation" in (b.summary or {}):
+        return "RETRAIT_RECALCUL" if st == "EN_COURS" else "RETIRE"
     if b.status in ("RECEIVED", "PROCESSING"):
         return "IMPORT"
     if st == "EN_COURS":
@@ -851,16 +854,33 @@ def _upload_step(b, recalc) -> str:
     return "IMPORTE"
 
 
+def _closing_lot(b) -> dict:
+    d = _batch(b)
+    summary = b.summary or {}
+    stocks = summary.get("stocks_closing") or {}
+    d["stocks_importes"] = stocks.get("stocks_importes")
+    d["sites_inconnus"] = stocks.get("sites_inconnus")
+    d["formule_incoherente"] = stocks.get("formule_incoherente_a_valider")
+    d["format"] = stocks.get("format") or "Closing"
+    d["mois"] = summary.get("mois_declare")
+    d["controle_mois"] = summary.get("controle_mois")
+    d["annulation"] = summary.get("annulation")
+    recalc = summary.get("recalcul_bilans") or None
+    d["recalcul_bilans"] = recalc
+    d["etape"] = _upload_step(b, recalc)
+    return d
+
+
 class ClosingUploadView(APIView):
     """
-    Rubrique « Configuration » du Suivi Carburant — fichier de clôture (Closing).
+    Rubrique « Configuration » du Suivi Carburant — fichiers de clôture (Closing, Output App Fuel).
 
-      GET  /api/fuel-tracking/configuration/closing/   derniers Closing reçus (statut, période, résultat) + fichiers en attente
-      POST /api/fuel-tracking/configuration/closing/   envoi du fichier (champ « file », .xlsb/.xlsx/.xlsm) — 202 : traitement en arrière-plan
+      GET  /api/fuel-tracking/configuration/closing/   derniers fichiers reçus (étape, mois, résultat) + fichiers en attente
+      POST /api/fuel-tracking/configuration/closing/   envoi du fichier (champ « file », .xlsb/.xlsx/.xlsm) et du mois qu'il
+                                                       couvre (champ « mois », AAAA-MM) — 202 : traitement en arrière-plan
 
     Le fichier est déposé dans incoming/closing/ puis traité par le pipeline d'import existant (empreinte anti-doublon, archive,
-    rapport), et les bilans des mois couverts sont recalculés. Envoyer à nouveau le même fichier ne réimporte rien (doublon) mais
-    relance le recalcul des bilans.
+    rapport), le mois déclaré est enregistré et contrôlé, puis les bilans du mois et du mois suivant sont recalculés.
     """
     parser_classes = [MultiPartParser, FormParser]
 
@@ -872,37 +892,65 @@ class ClosingUploadView(APIView):
         from fuel_tracking.services.closing_upload import SOURCE_TYPE, pending_files
 
         batches = FuelImportBatch.objects.filter(source_type=SOURCE_TYPE).select_related("received_by").order_by("-received_at")[:10]
-        out = []
-        for b in batches:
-            d = _batch(b)
-            stocks = (b.summary or {}).get("stocks_closing") or {}
-            d["stocks_importes"] = stocks.get("stocks_importes")
-            d["sites_inconnus"] = stocks.get("sites_inconnus")
-            d["formule_incoherente"] = stocks.get("formule_incoherente_a_valider")
-            d["format"] = stocks.get("format") or "Closing"
-            recalc = (b.summary or {}).get("recalcul_bilans") or None
-            d["recalcul_bilans"] = recalc
-            d["etape"] = _upload_step(b, recalc)
-            out.append(d)
-        return Response({"lots": out, "en_attente": pending_files(), "peut_envoyer": getattr(request.user, "role", None) in VALIDATOR_ROLES})
+        return Response({"lots": [_closing_lot(b) for b in batches], "en_attente": pending_files(),
+                         "peut_envoyer": getattr(request.user, "role", None) in VALIDATOR_ROLES})
 
     def post(self, request):
         from fuel_tracking.services import stock_import_pipeline as P
-        from fuel_tracking.services.closing_upload import save_upload
+        from fuel_tracking.services.closing_upload import parse_month, save_upload
         from fuel_tracking.tasks import process_closing_upload
 
         f = request.FILES.get("file")
         if f is None:
             return Response({"detail": "Fichier manquant."}, status=400)
         if not f.name.lower().endswith(P.ACCEPTED_EXT):
-            return Response({"detail": "Format accepté : .xlsb, .xlsx, .xlsm (fichier de clôture « Synthèse Conso Fuel »)."}, status=400)
+            return Response({"detail": "Format accepté : .xlsb, .xlsx, .xlsm (Closing « Synthèse Conso Fuel » ou Output App Fuel)."}, status=400)
+        mois = str(request.data.get("mois") or "").strip()
+        if not mois:
+            return Response({"detail": "Indiquer le mois couvert par le fichier (AAAA-MM)."}, status=400)
+        try:
+            first = parse_month(mois)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=400)
+        if first > timezone.localdate().replace(day=1):
+            return Response({"detail": f"Le mois {first:%m/%Y} n'a pas encore commencé."}, status=400)
         try:
             path = save_upload(f.read(), f.name)
         except OSError as e:
             return Response({"detail": f"Répertoire d'import indisponible ({e.__class__.__name__}) : vérifier le montage FUEL_IMPORT_ROOT."}, status=503)
         try:
-            process_closing_upload.delay(str(path), request.user.pk)
-            message = "Fichier reçu : import et recalcul des bilans en cours (quelques minutes pour un Closing complet)."
+            process_closing_upload.delay(str(path), request.user.pk, first.strftime("%Y-%m"))
+            message = "Fichier reçu : import et recalcul des bilans en cours (quelques minutes pour un fichier complet)."
         except Exception:  # broker indisponible : le passage automatique (15 min) prendra le fichier dans incoming/closing/
-            message = "Fichier reçu : il sera importé au prochain passage automatique (15 min au plus)."
-        return Response({"fichier": path.name, "message": message}, status=202)
+            message = "Fichier reçu : il sera importé au prochain passage automatique (15 min au plus), sans le mois déclaré."
+        return Response({"fichier": path.name, "mois": first.strftime("%Y-%m"), "message": message}, status=202)
+
+
+class ClosingUploadDetailView(APIView):
+    """
+    DELETE /api/fuel-tracking/configuration/closing/<id>/   retire un fichier de clôture importé (champ facultatif « motif ») :
+    supprime les stocks, mouvements, targets et lignes qu'il a créés, conserve le lot marqué « retiré » (qui, quand, quoi) et le
+    fichier archivé, puis recalcule en arrière-plan les bilans des mois qu'il couvrait. Le fichier peut ensuite être réimporté.
+    """
+    permission_classes = [IsCphValidator]
+    parser_classes = [JSONParser, FormParser]
+
+    def delete(self, request, pk):
+        from fuel_tracking.models import FuelImportBatch
+        from fuel_tracking.services.closing_upload import withdraw_batch
+        from fuel_tracking.tasks import recompute_after_closing_withdrawal
+
+        b = FuelImportBatch.objects.filter(pk=pk).first()
+        if b is None:
+            return Response({"detail": "Fichier introuvable."}, status=404)
+        try:
+            res = withdraw_batch(b, request.user, str(request.data.get("motif") or "").strip())
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=400)
+        if res["mois"]:
+            try:
+                recompute_after_closing_withdrawal.delay(b.pk, res["mois"])
+            except Exception:  # broker indisponible : le calcul automatique de nuit reprendra ces mois
+                res["avertissement"] = "Recalcul des bilans au prochain calcul automatique (chaque nuit)."
+        b.refresh_from_db()
+        return Response({**res, "lot": _closing_lot(b)}, status=200)

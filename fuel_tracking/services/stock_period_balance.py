@@ -323,7 +323,11 @@ def compute_balances(start, end, site_ids=None, persist=True) -> list[dict]:
 
     if site_ids is None:
         tank_sites = set(FuelTankMaster.objects.filter(active=True).exclude(validation_status="REJETEE").values_list("site_id", flat=True))
-        site_ids = sorted(set(obs_by_site) | set(enoc_by_site) | set(mv_by_site) | tank_sites)
+        # Sites ayant déjà un bilan sur cette période : toujours recalculés, sinon un site qui a perdu ses données (fichier retiré)
+        # garderait un bilan périmé au lieu de passer « non calculable ».
+        from fuel_tracking.models import FuelStockBalance
+        known = set(FuelStockBalance.objects.filter(observation_start=start, observation_end=end).values_list("site_id", flat=True))
+        site_ids = sorted(set(obs_by_site) | set(enoc_by_site) | set(mv_by_site) | tank_sites | known)
     sites = {s["site_id"]: s for s in Site.objects.filter(site_id__in=site_ids).values("site_id", "name", "zone", "country", "installed_typology")}
     profiles = energy_profiles(site_ids)
     tanks = site_tanks(site_ids)
