@@ -25,7 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from django.conf import settings
@@ -85,6 +85,10 @@ def cfg() -> dict:
         # Relevé de clôture (Closing / Output App Fuel) daté jusqu'à N jours APRÈS la borne : utilisable avec réserve
         # (campagne de relevés terrain étalée sur les premiers jours du mois suivant). 0 = jamais (règle stricte).
         "post_days": int(getattr(settings, "FUEL_BALANCE_CLOSING_POST_BOUNDARY_DAYS", 0) or 0),
+        # écart d'arrondi : |variation négative| ≤ tolérance = 0 L (ex. −0,0006 L issu des stocks à 12 décimales du fichier), pas une anomalie
+        "neg_tolerance": Decimal(str(getattr(settings, "FUEL_BALANCE_NEGATIVE_TOLERANCE_L", 0) or 0)),
+        # Mois de RÉFÉRENCE (ex. septembre 2026) : le bilan reprend TELLE QUELLE la ligne du fichier Closing (aucun recalcul)
+        "reference_periods": [str(m).strip()[:7] for m in (getattr(settings, "FUEL_CLOSING_REFERENCE_PERIODS", None) or []) if str(m).strip()],
     }
 
 
@@ -337,6 +341,9 @@ def compute_balances(start, end, site_ids=None, persist=True) -> list[dict]:
     batch_ids = {o["batch_id"] for lst in obs_by_site.values() for o in lst if o.get("batch_id")}
     batches = dict(FuelImportBatch.objects.filter(pk__in=batch_ids).values_list("pk", "file_name"))
     previous = _previous_final_stocks(site_ids, start, c)
+    month = reference_month(start, end, c)
+    if month:
+        c = {**c, "reference_batches": reference_batches(month)}
     rows = [_site_balance(sid, start, end, c, obs_by_site.get(sid, []), enoc_by_site.get(sid, []), mv_by_site.get(sid, []),
                           tanks.get(sid, []), sites.get(sid), profiles.get(sid, {}), unbalanced, batches, previous.get(sid))
             for sid in site_ids]
@@ -627,8 +634,153 @@ def _final_observations(obs: list[dict], end, c: dict, start=None) -> list[dict]
     return [o for o in window if str(o["source_type"]).upper() in allowed]
 
 
+REFERENCE_CAUSE = "REFERENCE_CLOSING"   # bilan repris tel quel du fichier Closing (mois de référence)
+OUTPUT_FILE_LABEL = "Output App Fuel"
+
+
+def reference_month(start, end, c: dict) -> str | None:
+    """« AAAA-MM » si la période est un mois de référence (FUEL_CLOSING_REFERENCE_PERIODS) entièrement contenu dans ce mois."""
+    m = _day(start).strftime("%Y-%m")
+    return m if m in (c.get("reference_periods") or []) and _day(end).strftime("%Y-%m") == m else None
+
+
+def reference_batches(month: str) -> list[int]:
+    """Lots « fichier Closing » (hors Output App Fuel, hors fichiers retirés) qui servent de référence au mois `month`, du plus
+    prioritaire au moins prioritaire : d'abord ceux dont le mois a été DÉCLARÉ à l'import, puis ceux sans mois déclaré dont la
+    majorité des stocks finaux tombe dans ce mois ; à égalité, le plus récent."""
+    from fuel_tracking.models import FuelImportBatch
+    from fuel_tracking.services.closing_upload import CANCEL_KEY, MONTH_KEY, final_stock_month
+
+    declared, guessed = [], []
+    for b in FuelImportBatch.objects.filter(source_type="CLOSING").order_by("-received_at", "-pk"):
+        summary = b.summary or {}
+        if CANCEL_KEY in summary or (summary.get("stocks_closing") or {}).get("format") == OUTPUT_FILE_LABEL:
+            continue
+        if summary.get(MONTH_KEY):
+            if summary[MONTH_KEY] == month:
+                declared.append(b.pk)
+        elif final_stock_month(b)[0] == month:
+            guessed.append(b.pk)
+    return declared + guessed
+
+
+def _reference_line(obs: list[dict], start, end, c: dict):
+    """Ligne du fichier Closing du mois de référence : (contexte, relevé initial, relevé final). La ligne est prise dans le lot de
+    référence du mois (voir reference_batches), TELLE QUELLE, quelles que soient ses dates ; le fichier Output App Fuel est ignoré.
+    Sans lot de référence connu : ligne dont la date de relevé finale tombe dans le mois (ou jusqu'à N j après)."""
+    rank = {pk: i for i, pk in enumerate(c.get("reference_batches") or [])}
+    lo, hi = _day(start), _day(end) + timedelta(days=c.get("post_days", 0))
+    lines = defaultdict(list)
+    for o in obs:
+        ctx = o.get("source_context") or {}
+        if o["source_type"] != "CLOSING" or ctx.get("type") != "closing_periode" or not ctx.get("periode") \
+                or ctx.get("fichier") == OUTPUT_FILE_LABEL or o["validation_status"] == "REJECTED":
+            continue
+        if rank:
+            if o.get("batch_id") in rank:
+                lines[(rank[o["batch_id"]], tuple(ctx["periode"]))].append(o)
+            continue
+        try:
+            fin = date.fromisoformat(str(ctx["periode"][1])[:10])
+        except (TypeError, ValueError):
+            continue
+        if lo <= fin <= hi:
+            lines[(0, tuple(ctx["periode"]))].append(o)
+    if not lines:
+        return None, None, None
+    best = min(r for r, _p in lines)
+    key = max((k for k in lines if k[0] == best), key=lambda k: (str(k[1][1]), str(k[1][0])))
+    per = key[1]
+    lines = {per: lines[key]}
+    group = sorted(lines[per], key=lambda o: o["observation_datetime"])
+    pick = lambda d: next((o for o in group if _day(o["observation_datetime"]).isoformat() == str(d)[:10]), None)  # noqa: E731
+    return dict(group[-1].get("source_context") or {}), pick(per[0]), pick(per[1])
+
+
+def _reference_balance(site_id, start, end, c, obs, tanks, site, profile, month: str) -> dict:  # noqa: C901
+    """Mois de référence : bilan = ligne du fichier Closing TELLE QUELLE (stocks, mouvements, consommation considérée) — aucun
+    relevé ENOC, aucune règle de fraîcheur, aucun rapprochement. Le fichier fait foi ; une formule incohérente est signalée, jamais corrigée."""
+    ctx, o_ini, o_fin = _reference_line(obs, start, end, c)
+    L = lambda o: Decimal(str(o["level_value"])) if o is not None and o.get("level_value") is not None else None  # noqa: E731
+    V = lambda k: Decimal(str(ctx.get(k))) if ctx and ctx.get(k) is not None else D0  # noqa: E731
+    C = lambda k: Decimal(str(ctx[k])) if ctx and ctx.get(k) is not None else None  # noqa: E731
+    ini_l = L(o_ini) if o_ini is not None else C("stock_initial_l")      # valeur du fichier même si le relevé n'a pas été créé
+    fin_l = L(o_fin) if o_fin is not None else C("stock_final_l")
+
+    def detail(o, boundary, final):
+        if o is None:
+            return {}
+        d = _candidate(o, boundary, final, c)
+        d.update(litres=float(o["level_value"]), utilisable=True, motif_rejet=None, reference=True)
+        return d
+
+    ini, fin = detail(o_ini, start, False), detail(o_fin, end, True)
+    rr = V("rajout_retrait_l")
+    comps = {k: D0 for k in COMPONENTS}
+    comps.update(livraisons_externes_l=V("livre_l"), rajouts_l=max(rr, D0), retraits_l=max(-rr, D0), vols_l=V("vole_l"), vidanges_l=V("vidange_l"))
+    file_conso = Decimal(str(ctx["conso_closing_l"])) if ctx and ctx.get("conso_closing_l") is not None else None
+    motifs, alerts, infos = [], [], []
+    variation = conso = None
+    cause, statut = None, "NON_CALCULABLE"
+    if not ctx:
+        cause = "DONNEES_STOCK_INCOMPLETES"
+        motifs.append(f"Mois de référence {month} : aucune ligne du fichier Closing pour ce site.")
+    elif file_conso is None and (ini_l is None or fin_l is None):
+        cause = "DONNEES_STOCK_INCOMPLETES"
+        motifs.append(f"Mois de référence {month} : ligne du Closing sans consommation ni stocks complets.")
+    else:
+        calc = None if ini_l is None or fin_l is None else (ini_l + comps["livraisons_externes_l"] + comps["rajouts_l"] - comps["retraits_l"]
+                                                            - comps["vols_l"] - comps["vidanges_l"] - fin_l)
+        variation = file_conso if file_conso is not None else calc
+        infos.append(f"Mois de référence {month} : données reprises TELLES QUELLES du fichier Closing (stocks, mouvements et "
+                     f"consommation considérée) — aucun recalcul EnerTrack.")
+        if file_conso is not None and calc is not None and abs(calc - file_conso) > max(Decimal(20), abs(file_conso) * Decimal("0.05")):
+            alerts.append("CLOSING_FORMULE_INCOHERENTE : formule du Closing incohérente pour ce site")
+            motifs.append(f"Formule du Closing incohérente : stocks et mouvements donnent {calc:.0f} L, le Closing retient "
+                          f"{file_conso:.0f} L (valeur du Closing affichée telle quelle).")
+        if variation < 0:
+            cause = "CONSO_NEGATIVE"
+            motifs.append(f"Consommation négative dans le fichier Closing ({variation:.0f} L) : à contrôler avec Ops.")
+            alerts.append("VARIATION_NEGATIVE : consommation négative dans le fichier Closing")
+        else:
+            conso, statut, cause = variation, "PRET_A_CERTIFIER", REFERENCE_CAUSE
+    t0 = o_ini["observation_datetime"] if o_ini else start
+    t1 = o_fin["observation_datetime"] if o_fin else end
+    days = (t1 - t0).total_seconds() / 86400 if (o_ini and o_fin) else None
+    conso_j = (conso / Decimal(str(days))).quantize(Decimal("0.001")) if conso is not None and days and days > 0 else None
+    entrees_ext = comps["livraisons_externes_l"]
+    ref = {**(ctx or {}), "decision": REFERENCE_CAUSE}
+    if ini:
+        ini["reference_closing"] = ref
+    if fin:
+        fin["reference_closing"] = ref
+    out = {
+        "country": (site or {}).get("country"), "site_id": site_id, "site_name": (site or {}).get("name"), "zone": (site or {}).get("zone"),
+        "typologie": (site or {}).get("installed_typology"), "profil_energetique": profile.get("profil"),
+        "observation_start": start, "observation_end": end,
+        "stock_initial_l": ini_l, "source_stock_initial": "CLOSING" if ini_l is not None else None, "date_stock_initial": t0 if o_ini else None,
+        "stock_initial_detail": ini, "stock_final_l": fin_l, "source_stock_final": "CLOSING" if fin_l is not None else None,
+        "date_stock_final": t1 if o_fin else None, "stock_final_detail": fin,
+        **comps, "consommation_reelle_l": conso, "variation_stock_l": variation, "conso_journaliere_l": conso_j,
+        "conso_closing_l": file_conso, "source_conso_closing": "CLOSING" if file_conso is not None else None,
+        "statut_bilan": statut, "resultat_bilan": statut, "cause_principale": cause, "score_confiance": 100 if conso is not None else None,
+        "score_detail": [{"critere": "reference_closing", "points": 100 if conso is not None else 0,
+                          "motif": "Mois de référence : le fichier Closing fait foi."}],
+        "reserves": [], "estimation": False,
+        "age_stock_initial_j": ini.get("age_jours") if ini else None, "age_stock_final_j": fin.get("age_jours") if fin else None,
+        "entrees_externes_nettes_l": entrees_ext, "volume_transfere_l": D0, "impact_ponctions_l": D0, "volume_brut_integre_l": entrees_ext,
+        "motifs": motifs + infos, "alertes": alerts, "candidats": {"initial": [ini] if ini else [], "final": [fin] if fin else []},
+        "mouvements": [], "mouvements_exclus": [], "periode_effective_debut": t0, "periode_effective_fin": t1, "rule_version": current_rule_version(),
+    }
+    out["proposition"] = _proposition(out, tanks, c)
+    return out
+
+
 def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, profile, unbalanced, batches=None,  # noqa: C901
                   previous=None) -> dict:
+    month = reference_month(start, end, c)
+    if month:
+        return _reference_balance(site_id, start, end, c, obs, tanks, site, profile, month)
     motifs, alerts, reserves, major, infos = [], [], [], [], []
     cause = None
     ini, ini_cands, a1 = _select(_initial_observations(obs, start, c, previous, infos, reserves), start, False, tanks, c)
@@ -719,6 +871,9 @@ def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, pro
                  + comps["rajouts_l"] - comps["transferts_sortants_l"] - comps["retraits_l"] - comps["vols_l"] - comps["vidanges_l"]
                  - Decimal(str(fin["litres"])))
         variation = conso
+        if Decimal("0") > conso >= -c.get("neg_tolerance", Decimal("0")):
+            motifs.append(f"Variation de stock de {conso:.4f} L ramenée à 0 L : écart d'arrondi (tolérance {c['neg_tolerance']} L).")
+            conso = variation = Decimal("0")
         if conso < 0:
             motifs.append(f"Variation de stock négative ({conso:.0f} L) : mouvement manquant ou relevé erroné — anomalie, non certifiable.")
             alerts.append("VARIATION_NEGATIVE : variation de stock négative, bilan non certifiable")

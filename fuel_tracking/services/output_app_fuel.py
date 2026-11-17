@@ -119,10 +119,14 @@ def process_output_file(batch, rows, file_name: str, resolver, tanks_of) -> dict
         periode = [r["date_initiale"].isoformat() if r["date_initiale"] else None, r["date_finale"].isoformat() if r["date_finale"] else None]
         context = {"type": "closing_periode", "fichier": FILE_LABEL, "periode": periode, "source_stock_final": src or None,
                    "livre_l": r["livre_l"], "livraison_eydon_l": r["livraison_eydon_l"], "livraison_carte_total_l": r["livraison_carte_total_l"],
-                   # ajouts − retraits + ponctions (solde net des transferts entre sites), comme la colonne équivalente du Closing
-                   "rajout_retrait_l": (None if r["ajout_l"] is None and r["retrait_l"] is None and r["ponction_l"] is None
-                                        else (r["ajout_l"] or 0) - (r["retrait_l"] or 0) + (r["ponction_l"] or 0)),
+                   # ajouts − retraits. « Total Ponction » (AG) n'est PAS ajouté : c'est le solde des ponctions DÉJÀ comptées
+                   # dans « Total Ajout » (AE) / « Total Retrait » (AF) — l'ajouter comptait chaque ponction deux fois
+                   # (ex. KDG_0884 : AF 4 360, AG −4 360). Formule Ops vérifiée : variation = O + AK − AJ − AQ, avec
+                   # AK = AC + AD + AE (introduit) et AJ = AF + AH + AI (retiré) ; « ponction_l » reste en contexte (information).
+                   "rajout_retrait_l": (None if r["ajout_l"] is None and r["retrait_l"] is None
+                                        else (r["ajout_l"] or 0) - (r["retrait_l"] or 0)),
                    "ponction_l": r["ponction_l"], "vole_l": r["vole_l"], "vidange_l": r["vidange_l"],
+                   "ponction_corrigee": True,  # rajout_retrait_l n'inclut pas la ponction (voir fuel_post_deploy, correctif du 17/11)
                    "conso_closing_l": r["variation_ops_l"], "conso_theorique_ops_l": r["conso_theorique_ops_l"],
                    "source_conso_theorique_ops": r["source_conso_theorique_ops"]}
         for kind, value, d in (("initial", r["stock_initial_l"], r["date_initiale"]), ("final", r["stock_final_l"], r["date_finale"])):

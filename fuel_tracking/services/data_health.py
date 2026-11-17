@@ -68,4 +68,46 @@ def health(top: int = 60) -> dict:
         },
         "releves_en_retard": [{"site_id": s, "dernier_releve": d.isoformat(), "jours": (now - d).days} for s, d in late[:top]],
         "sites_sans_releve": never[:top],
+        "stock_final": final_stock_coverage(base, top),
     }
+
+
+def final_stock_coverage(base: set, top: int = 60) -> dict | None:
+    """
+    Couverture du STOCK FINAL du dernier mois complet dans la source convenue (règles MVP) — remplace, à l'écran, le contrôle
+    des relevés de gardiennage, qui ne sont plus une source du bilan :
+      - mois avant FUEL_APP_STOCK_START (septembre, octobre 2026) : relevé du fichier de clôture (Closing / Output App Fuel) ;
+      - ensuite : relevé ENOC (terrain, gardiennage, niveaux de ravitaillement).
+    Relevé exploitable = 0 à 3 j avant la fin du mois (ou jusqu'à N j après pour un relevé de clôture) ; avec réserve = 4 à 14 j avant.
+    None si les règles MVP ne sont pas actives.
+    """
+    from datetime import datetime, time
+
+    from fuel_tracking.models import FuelStockObservation as Obs
+    from fuel_tracking.services import stock_period_balance as SB
+
+    c = SB.cfg()
+    if not c.get("final_sources") or not base:
+        return None
+    today = timezone.localdate()
+    end_day = today.replace(day=1) - timedelta(days=1)
+    first = end_day.replace(day=1)
+    use_closing = not SB._uses_app_initial(datetime.combine(first, time.min), c)
+    post = c.get("post_days", 0) if use_closing else 0
+    tz = timezone.get_current_timezone()
+    lo = datetime.combine(end_day - timedelta(days=c["reserve_days"]), time.min, tz)
+    hi = datetime.combine(end_day + timedelta(days=post), time(23, 59, 59), tz)
+    qs = Obs.objects.filter(observation_datetime__range=(lo, hi)).exclude(validation_status="REJECTED")
+    qs = qs.filter(source_type="CLOSING") if use_closing else qs.filter(source_type__in=c["final_sources"])
+    best = {}
+    for sid, dt in qs.values_list("site_id", "observation_datetime").iterator():
+        k = sid.upper()
+        age = (end_day - timezone.localtime(dt).date()).days  # négatif = après la fin du mois
+        if k not in best or abs(age) < abs(best[k]):
+            best[k] = age
+    ok = sorted(s for s in base if s in best and best[s] <= c["fresh_days"])
+    reserve = sorted(s for s in base if s in best and best[s] > c["fresh_days"])
+    absent = sorted(s for s in base if s not in best)
+    return {"mois": first.strftime("%Y-%m"), "source": "Fichier de clôture (Closing / Output App Fuel)" if use_closing else "ENOC",
+            "fenetre": [lo.date().isoformat(), hi.date().isoformat()], "sites_base": len(base), "sites_exploitables": len(ok),
+            "sites_avec_reserve": len(reserve), "sites_sans_releve": len(absent), "sans_releve": absent[:top]}

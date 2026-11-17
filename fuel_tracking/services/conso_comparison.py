@@ -56,7 +56,8 @@ HELP = {
 # Statuts du bilan
 NON_CALCULABLE, VARIATION_CALCULEE, ESTIMATION, PRET, CERTIFIEE = (
     "NON_CALCULABLE", "VARIATION_CALCULEE", "ESTIMATION_AVEC_RESERVE", "PRET_A_CERTIFIER", "CONSOMMATION_REELLE_CERTIFIEE")
-STATUTS_BILAN = (NON_CALCULABLE, VARIATION_CALCULEE, ESTIMATION, PRET, CERTIFIEE)
+REFERENCE = "REFERENCE_CLOSING"   # mois de référence : ligne du fichier Closing reprise telle quelle (aucun recalcul)
+STATUTS_BILAN = (NON_CALCULABLE, VARIATION_CALCULEE, ESTIMATION, PRET, REFERENCE, CERTIFIEE)
 _BLOCKING_CAUSES = {"DONNEES_STOCK_INCOMPLETES", "CM_SANS_CUVE", "STOCK_TROP_ANCIEN", "CONFLIT_ENOC_CLOSING", "MOUVEMENTS_A_CONTROLER", "TRANSFERT_DESEQUILIBRE",
                     "RELEVES_INCOHERENTS", "SITE_NON_RECONNU", "SCORE_INSUFFISANT"}
 _CERTIFIED = ("CERTIFIE", "CERTIFIE_AVEC_RESERVE")
@@ -75,6 +76,8 @@ def bilan_status(b) -> str:
         return NON_CALCULABLE
     if b.niveau_certification in _CERTIFIED and b.statut_bilan != "NON_CALCULABLE":
         return CERTIFIEE
+    if b.cause_principale == REFERENCE and b.statut_bilan != "NON_CALCULABLE":
+        return REFERENCE
     if b.cause_principale == "CONSO_NEGATIVE" and b.variation_stock_l is not None:
         return VARIATION_CALCULEE                                    # visible mais anomalie : jamais certifiable
     if b.statut_bilan == "NON_CALCULABLE" or b.cause_principale in _BLOCKING_CAUSES:
@@ -170,6 +173,8 @@ def _action(b, statut) -> str:
         return "Aucune : bilan certifié."
     if statut == PRET:
         return "Certification par le Fuel Manager."
+    if statut == REFERENCE:
+        return "Aucune : données du fichier Closing (mois de référence), affichées telles quelles."
     return action_for(b)
 
 
@@ -375,7 +380,8 @@ def _kpis(rows: list[dict]) -> dict:
             "cph_nulle_variation_positive": sum(1 for r in rows if "CPH_NULLE_VARIATION_POSITIVE" in r["stock"]["alertes_comparaison"]),
             "closing_non_independant": sum(1 for r in rows if r["closing"]["controle_independant"] is False),
         },
-        "bilans": {"prets": cnt(PRET), "avec_reserve": cnt(ESTIMATION), "non_calculables": cnt(NON_CALCULABLE), "certifies": cnt(CERTIFIEE), "variation_calculee": cnt(VARIATION_CALCULEE)},
+        "bilans": {"prets": cnt(PRET), "avec_reserve": cnt(ESTIMATION), "non_calculables": cnt(NON_CALCULABLE), "certifies": cnt(CERTIFIEE), "variation_calculee": cnt(VARIATION_CALCULEE),
+                   "reference_closing": cnt(REFERENCE)},
         "couverture_cph_pct": round(len(cpc) / n * 100, 1) if n else None,
     }
 
@@ -410,7 +416,7 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
                                "motif": None if ok else "Site absent du fichier Closing (base de référence) : affiché pour information, exclu des totaux et des indicateurs."}
     rows = _filter(rows, params)
     order = (params.get("tri") or "site").strip()
-    sev = {NON_CALCULABLE: 0, VARIATION_CALCULEE: 1, ESTIMATION: 2, PRET: 3, CERTIFIEE: 4}
+    sev = {NON_CALCULABLE: 0, VARIATION_CALCULEE: 1, ESTIMATION: 2, PRET: 3, REFERENCE: 3, CERTIFIEE: 4}
     if order == "gravite":
         rows.sort(key=lambda r: (sev[r["stock"]["statut"]], r["site_id"]))
     elif order == "variation":

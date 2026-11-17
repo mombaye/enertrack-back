@@ -426,6 +426,75 @@ class OutputAppFuelImportTests(TmpRootMixin, MvpBase):
         self.assertIsNone(r["consommation_reelle_l"])
 
 
+class OutputPonctionAndRoundingTests(OutputAppFuelImportTests):
+    """Correctif du 17/11/2026 : « Total Ponction » n'est pas recompté ; un résidu d'arrondi négatif n'est pas une anomalie."""
+
+    def output_bytes(self):
+        head = ["", "ID du site", "Nom du site", "Région O&M", "Date de Relevé Initiale", "Qtité laissée à la date initiale (relevé de terrain)",
+                "Qtité laissée retenue", "Source de donnée de stock", "Total Livraison Fuel EYDON", "Total Livraison Fuel CARTE TOTAL",
+                "Total Ajout", "Total Retrait", "Total Ponction", "Total QTE volée déclarée", "Total QTE vidangée / Fuite / Ecart de Stock",
+                "Date de Relevé Finale", "Qtité laissée à la date finale (relevé de terrain)", "Qtité laissée retenue", "Source de donnée de stock",
+                "Variation de stock Fuel considéréé  (L)", "Estimation Conso Fuel Théorique retenue  (L)", "Source de donnée Estimation Conso Fuel théorique"]
+        d = lambda m, j: datetime(2026, m, j)  # noqa: E731
+        rows = [["", "INVENTAIRE"], head,
+                # ponction de 4 360 L sortie du site : déjà dans « Total Retrait » (AF), « Total Ponction » (AG) n'en est que le solde
+                ["", "DKR_0001", "ALPHA", "DAKAR", d(9, 30), 5000, 5000, "relevé de terrain", 0, 0, 0, 4360, -4360, 0, 0,
+                 d(10, 31), 300, 300, "Relevés de Terrain Technicien", 340, None, None],
+                # stocks fichier à 12 décimales : variation −0,4 L ≤ tolérance (1 L) = arrondi
+                ["", "DKR_0002", "BETA", "DAKAR", d(9, 30), 800, 800, "relevé de terrain", 0, 0, 0, 0, 0, 0, 0,
+                 d(10, 31), 800.4, 800.4, "Relevés de Terrain Technicien", 0, None, None]]
+        return xlsx({"Output": rows})
+
+    def balances(self):
+        oct1 = timezone.make_aware(datetime(2026, 10, 1))
+        oct31 = timezone.make_aware(datetime(2026, 10, 31, 23, 59, 59))
+        return {r["site_id"]: r for r in SB.compute_balances(oct1, oct31, site_ids=["DKR_0001", "DKR_0002"], persist=False)}
+
+    def test_import_and_october_balance(self):
+        from fuel_tracking.services import stock_import_pipeline as P
+
+        P.process_bytes(self.output_bytes(), "Output App Fuel.xlsx", "CLOSING", origin="UPLOAD")
+        rows = self.balances()
+        # formule Ops : O + AK − AJ − AQ = 5 000 + 0 − 4 360 − 300 = 340 L (et non 5 000 − 8 720 − 300 = −4 020 L)
+        self.assertEqual(float(rows["DKR_0001"]["consommation_reelle_l"]), 340.0)
+        self.assertEqual(float(rows["DKR_0002"]["consommation_reelle_l"]), 0.0)
+        self.assertNotEqual(rows["DKR_0002"]["cause_principale"], "CONSO_NEGATIVE")
+        self.assertTrue(any("écart d'arrondi" in m for m in rows["DKR_0002"]["motifs"]))
+
+    @override_settings(FUEL_BALANCE_NEGATIVE_TOLERANCE_L=0)
+    def test_without_tolerance_rounding_is_negative(self):
+        from fuel_tracking.services import stock_import_pipeline as P
+
+        P.process_bytes(self.output_bytes(), "Output App Fuel.xlsx", "CLOSING", origin="UPLOAD")
+        self.assertEqual(self.balances()["DKR_0002"]["cause_principale"], "CONSO_NEGATIVE")
+
+    def test_post_deploy_corrects_previous_import(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from fuel_tracking.models import FuelStockObservation as Obs
+        from fuel_tracking.services import stock_import_pipeline as P
+
+        P.process_bytes(self.output_bytes(), "Output App Fuel.xlsx", "CLOSING", origin="UPLOAD")
+        for o in Obs.objects.filter(source_type="CLOSING", site_id="DKR_0001"):   # contexte d'un import antérieur au correctif
+            ctx = dict(o.source_context)
+            ctx["rajout_retrait_l"] = -8720.0
+            ctx.pop("ponction_corrigee")
+            Obs.objects.filter(pk=o.pk).update(source_context=ctx)
+        self.assertLess(float(self.balances()["DKR_0001"]["variation_stock_l"]), 0)
+        out = StringIO()
+        call_command("fuel_post_deploy", stdout=out)
+        self.assertIn("2 relevé(s) au contexte de ponction à corriger", out.getvalue())
+        self.assertEqual(float(self.balances()["DKR_0001"]["consommation_reelle_l"]), 340.0)
+        out = StringIO()
+        call_command("fuel_post_deploy", stdout=out)                            # idempotent
+        self.assertIn("0 relevé(s) au contexte de ponction", out.getvalue())
+
+    def test_strict_rule_rejects_readings_after_boundary(self):
+        pass  # sans objet pour ce fichier
+
+
 class ClosingAuthoritativeOctoberTests(MvpBase):
     """Décision 17/11/2026 : septembre / octobre 2026, totaux du fichier de clôture prioritaires sur ENOC ; novembre : ENOC seul."""
 
@@ -474,6 +543,50 @@ class UploadStepTests(MvpBase):
 
 
 @override_settings(CELERY_TASK_ALWAYS_EAGER=True, CELERY_TASK_EAGER_PROPAGATES=True)
+@override_settings(FUEL_CLOSING_REFERENCE_PERIODS=["2026-09"])
+class ClosingReferenceMonthTests(ConfigurationClosingUploadTests):
+    """Septembre 2026 = mois de RÉFÉRENCE : le bilan reprend la ligne du fichier Closing TELLE QUELLE (pas de recalcul)."""
+
+    def ref_bytes(self):
+        head = ["Id du site", "Nombre de GE installé [ex: 1,2,3 …]", "Date de relevé initiale", "Qtité laissée à la date du relevé",
+                "Total Livraison", "Qté rajoutée ou retirée de la cuve par les techniciens d' un site à l' autre", "Qté volée",
+                "Qté vidangée (fuel de mauvaise qualité)", "Date de relevé finale", "Qtité laissée à la date du relevé",
+                "Qtité cons considéréé (l)", "Test date"]
+        rows = [["Synthèse"], head,
+                # conso du Closing (450) ≠ formule (500 + 200 − 50 − 300 = 350) : la valeur du fichier est affichée telle quelle
+                ["DKR_0001", 1, datetime(2026, 8, 31), 500, 200, -50, 0, 0, datetime(2026, 9, 30), 300, 450, None],
+                # relevé final daté du 28/10 dans le Closing de septembre : repris quand même (ligne du fichier)
+                ["DKR_0002", 1, datetime(2026, 8, 30), 900, 0, 0, 0, 0, datetime(2026, 10, 28), 900, 0, None]]
+        return xlsx({"Synthese conso fuel": rows})
+
+    def test_september_is_the_file_as_is(self):
+        from fuel_tracking.services import conso_comparison as CC
+
+        res = self.upload(self.manager, self.ref_bytes(), mois="2026-09")
+        self.assertEqual(res.status_code, 202, res.content)
+        s = timezone.make_aware(datetime(2026, 9, 1))
+        e = timezone.make_aware(datetime(2026, 9, 30, 23, 59, 59))
+        rows = {r["site_id"]: r for r in SB.compute_balances(s, e, site_ids=["DKR_0001", "DKR_0002"], persist=False)}
+        a = rows["DKR_0001"]
+        self.assertEqual((float(a["stock_initial_l"]), float(a["livraisons_externes_l"]), float(a["retraits_l"]), float(a["stock_final_l"])),
+                         (500.0, 200.0, 50.0, 300.0))
+        self.assertEqual((float(a["variation_stock_l"]), float(a["conso_closing_l"]), a["cause_principale"]), (450.0, 450.0, "REFERENCE_CLOSING"))
+        self.assertTrue(any("incohérente" in m for m in a["motifs"]))
+        b = rows["DKR_0002"]
+        self.assertEqual((float(b["stock_initial_l"]), float(b["stock_final_l"]), float(b["variation_stock_l"])), (900.0, 900.0, 0.0))
+        SB.compute_balances(s, e, site_ids=["DKR_0001"])
+        bal = FuelStockBalance.objects.get(site_id="DKR_0001", observation_start=s)
+        self.assertEqual(CC.bilan_status(bal), CC.REFERENCE)
+
+    @override_settings(FUEL_CLOSING_REFERENCE_PERIODS=[])
+    def test_without_reference_month_september_is_computed(self):
+        self.upload(self.manager, self.ref_bytes(), mois="2026-09")
+        s = timezone.make_aware(datetime(2026, 9, 1))
+        e = timezone.make_aware(datetime(2026, 9, 30, 23, 59, 59))
+        r = SB.compute_balances(s, e, site_ids=["DKR_0001"], persist=False)[0]
+        self.assertNotEqual(r["cause_principale"], "REFERENCE_CLOSING")
+
+
 class ConfigurationMonthAndWithdrawalTests(ConfigurationClosingUploadTests):
     """Mois déclaré à l'import et retrait d'un fichier importé (rubrique Configuration)."""
 
@@ -521,3 +634,26 @@ class ConfigurationMonthAndWithdrawalTests(ConfigurationClosingUploadTests):
         self.upload(self.manager, self.sept_file(), mois="2026-09")         # réimport du même fichier : accepté (pas un doublon)
         self.assertEqual(Obs.objects.filter(source_type="CLOSING").count(), 2)
         self.assertEqual(FuelImportBatch.objects.filter(source_type="CLOSING", duplicate_of__isnull=False).count(), 0)
+
+
+class FinalStockHealthTests(MvpBase):
+    """Santé des données : couverture du stock final dans la source convenue (plus les relevés de gardiennage)."""
+
+    def test_coverage_uses_agreed_source(self):
+        from fuel_tracking.services.data_health import final_stock_coverage
+
+        end_day = timezone.localdate().replace(day=1) - timedelta(days=1)
+        first = end_day.replace(day=1)
+        tz = timezone.get_current_timezone()
+        at = lambda d: timezone.make_aware(datetime.combine(d, datetime.min.time()), tz) + timedelta(hours=12)  # noqa: E731
+        app_start = (first + timedelta(days=40)).replace(day=1).isoformat()  # mois complet = période « fichier de clôture »
+        with override_settings(FUEL_APP_STOCK_START=app_start):
+            self.obs(300, at(end_day), source="CLOSING", tank_id="SITE")              # DKR_0001 : relevé de clôture fin de mois
+            self.obs(250, at(end_day), site="DKR_0002")                                # DKR_0002 : gardiennage fichier seulement
+            f = final_stock_coverage({"DKR_0001", "DKR_0002"})
+        self.assertTrue(f["source"].startswith("Fichier de clôture"))
+        self.assertEqual((f["sites_exploitables"], f["sites_sans_releve"], f["sans_releve"]), (1, 1, ["DKR_0002"]))
+        with override_settings(FUEL_APP_STOCK_START=first.isoformat()):                # mois complet = période ENOC
+            self.obs(280, at(end_day - timedelta(days=6)), site="DKR_0002", source="ENOC")
+            f = final_stock_coverage({"DKR_0001", "DKR_0002"})
+        self.assertEqual((f["source"], f["sites_avec_reserve"], f["sans_releve"]), ("ENOC", 1, ["DKR_0001"]))

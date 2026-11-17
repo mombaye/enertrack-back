@@ -716,14 +716,17 @@ def _process_closing_stocks(batch, file_bytes: bytes, file_name: str, resolver) 
             if not plausible(d):
                 stats["dates_invraisemblables"] += 1
                 continue
-            has_fuel = (r["nb_ge"] or 0) >= 1 or (r["stock_initial_l"] or 0) > 0 or (r["stock_final_l"] or 0) > 0
+            # un mouvement ou une conso non nuls au Closing = site avec carburant (ligne du fichier à reprendre telle quelle)
+            has_fuel = (r["nb_ge"] or 0) >= 1 or (r["stock_initial_l"] or 0) > 0 or (r["stock_final_l"] or 0) > 0 \
+                or any(r[k] for k in ("livre_l", "rajout_retrait_l", "vole_l", "vidange_l", "conso_closing_l"))
             if value <= 0 and not has_fuel:
                 stats["sans_carburant_ignores"] += 1  # site sans GE ni stock sur toute la période : pas de carburant, pas un 0 L mesuré
                 continue
             event_id = "CL:" + fingerprint("CLOSING", site_id, d, kind, value)
             context = {"type": "closing_periode", "periode": [r["date_initiale"].isoformat(), r["date_finale"].isoformat()],
                        "livre_l": r["livre_l"], "rajout_retrait_l": r["rajout_retrait_l"], "vole_l": r["vole_l"], "vidange_l": r["vidange_l"],
-                       "conso_closing_l": _ref, "formule_coherente": coherent}
+                       "conso_closing_l": _ref, "formule_coherente": coherent,
+                       "stock_initial_l": r["stock_initial_l"], "stock_final_l": r["stock_final_l"], "ligne": r["ligne"]}
             if event_id in existing:
                 Obs.objects.filter(pk=existing[event_id]).update(source_context=context)  # complète le contexte d'un stock déjà importé
                 stats["doublons"] += 1

@@ -25,6 +25,36 @@ class Command(BaseCommand):
         self._pilotage(w, dry_run)
         self._bilans(w, periodes, dry_run)
         self._regles_mvp(w, periodes, dry_run)
+        self._ponctions_output(w, dry_run)
+
+    def _ponctions_output(self, w, dry_run):
+        """
+        4. Correctif du 17/11/2026 : les relevés importés d'un fichier Output App Fuel avant ce correctif comptaient deux fois les
+           ponctions (« Total Ponction » ajouté à « Total Ajout » − « Total Retrait », qui l'incluent déjà). Corrige leur contexte
+           (rajout_retrait_l −= ponction_l, une seule fois : marqueur « ponction_corrigee ») puis recalcule les bilans des mois couverts.
+        """
+        try:
+            from fuel_tracking.models import FuelImportBatch, FuelStockObservation as Obs
+            from fuel_tracking.services.closing_upload import months_covered, recompute_months
+
+            todo = [o for o in Obs.objects.filter(source_type="CLOSING", source_context__fichier="Output App Fuel").only("id", "batch_id", "source_context")
+                    if not (o.source_context or {}).get("ponction_corrigee")]
+            w(f"Output App Fuel : {len(todo)} relevé(s) au contexte de ponction à corriger.")
+            if dry_run or not todo:
+                return
+            batches = set()
+            for o in todo:
+                ctx = dict(o.source_context or {})
+                if ctx.get("rajout_retrait_l") is not None and ctx.get("ponction_l"):
+                    ctx["rajout_retrait_l"] = ctx["rajout_retrait_l"] - ctx["ponction_l"]
+                ctx["ponction_corrigee"] = True
+                Obs.objects.filter(pk=o.pk).update(source_context=ctx)
+                batches.add(o.batch_id)
+            for b in FuelImportBatch.objects.filter(pk__in=[x for x in batches if x]):
+                res = recompute_months(months_covered(b), track=[b])
+                w(f"  Lot #{b.pk} ({b.file_name}) : bilans recalculés {[(m['debut'][:7], m['calculables'], m['sites']) for m in res]}")
+        except Exception as e:  # ne jamais empêcher le démarrage du service
+            w(f"Output App Fuel : correctif des ponctions impossible ({e}).")
 
     def _regles_mvp(self, w, periodes, dry_run):
         """

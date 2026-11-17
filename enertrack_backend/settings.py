@@ -463,6 +463,11 @@ FUEL_FINAL_STOCK_SOURCES = [x.strip() for x in os.getenv("FUEL_FINAL_STOCK_SOURC
 # Relevé de clôture (Closing / Output App Fuel) daté jusqu'à N jours APRÈS le début ou la fin de période : utilisé avec réserve
 # (la campagne terrain d'octobre 2026 a relevé des stocks jusqu'au 05/11). 0 = jamais (règle stricte). À confirmer métier.
 FUEL_BALANCE_CLOSING_POST_BOUNDARY_DAYS = int(os.getenv("FUEL_BALANCE_CLOSING_POST_BOUNDARY_DAYS", "6"))
+# Variation négative d'au plus N litres = écart d'arrondi des stocks fichier → 0 L (pas CONSO_NEGATIVE).
+FUEL_BALANCE_NEGATIVE_TOLERANCE_L = float(os.getenv("FUEL_BALANCE_NEGATIVE_TOLERANCE_L", "1"))
+# Mois de RÉFÉRENCE : le bilan affiche TELLE QUELLE la ligne du fichier Closing (stocks, mouvements, consommation considérée),
+# sans aucun recalcul. Septembre 2026 = Closing de référence ; octobre est calculé (stock initial Closing, final Output App Fuel).
+FUEL_CLOSING_REFERENCE_PERIODS = [m.strip() for m in os.getenv("FUEL_CLOSING_REFERENCE_PERIODS", "2026-09").split(",") if m.strip()]
 # Mouvements issus des fichiers (Closing, terrain, gardiennage) : désactivés, seuls les mouvements ENOC sont comptés.
 FUEL_BALANCE_FILE_MOVEMENTS = os.getenv("FUEL_BALANCE_FILE_MOVEMENTS", "false").strip().lower() in ("1", "true", "yes", "on")
 # Rapprochement Closing / ENOC : actif uniquement quand les deux stocks viennent d'un fichier de clôture (périodes historiques : septembre,
