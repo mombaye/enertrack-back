@@ -144,6 +144,14 @@ def _closing_of(b) -> dict | None:
     return None
 
 
+def _days(b) -> int | None:
+    """Nombre de jours entre le relevé initial et le relevé final retenus (« Nbre Jour cons » du fichier Closing)."""
+    if b is None or not b.date_stock_initial or not b.date_stock_final:
+        return None
+    n = (b.date_stock_final.date() - b.date_stock_initial.date()).days
+    return n if n > 0 else None
+
+
 def _source_text(src) -> str | None:
     lab = {"CLOSING": "Closing", "LOLIFORCE": "Loliforce", "SCSS": "SCSS", "ENOC": "ENOC", "HISTORICAL_REFUELING": "Historique refueling"}
     return lab.get(src, src)
@@ -274,6 +282,10 @@ def _row(cph: dict | None, b, d_from: date, d_to: date, days: int, target, thres
             "ponctions_entrantes_l": _f(b.transferts_entrants_l) if b else None, "ponctions_sortantes_l": _f(b.transferts_sortants_l) if b else None,
             "rajouts_l": _f(b.rajouts_l) if b else None, "retraits_l": _f(b.retraits_l) if b else None, "vols_l": _f(b.vols_l) if b else None, "vidanges_l": _f(b.vidanges_l) if b else None,
             "final_l": _f(b.stock_final_l) if b else None, "source_final": _source_text(b.source_stock_final) if b else None,
+            # dates des relevés retenus et conso moyenne L/jour (colonnes du fichier Closing : AS, CD, EQ, ER)
+            "date_initial": b.date_stock_initial.date().isoformat() if b and b.date_stock_initial else None,
+            "date_final": b.date_stock_final.date().isoformat() if b and b.date_stock_final else None,
+            "jours": _days(b), "conso_moyenne_jour_l": _f(var / _days(b), 2) if var is not None and _days(b) else None,
             "variation_l": var, "statut": statut, "statut_moteur": b.statut_bilan if b else None, "cause": cause,
             "score": b.score_confiance if b else None, "reserves": (b.reserves or []) if b else [], "alertes": alerts, "alertes_comparaison": cmp_alerts, "bilan_id": b.pk if b else None,
             "motif": " · ".join(motifs) or None, "action": _action(b, statut),
