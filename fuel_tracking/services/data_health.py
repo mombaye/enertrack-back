@@ -14,10 +14,25 @@ from django.utils import timezone
 GUARD_DELAY_DAYS = int(getattr(settings, "FUEL_GUARD_READING_MAX_AGE_DAYS", 16))     # relevés reçus toutes les 2 semaines : alerte au-delà
 
 
-def _batch(source_type):
+def _closing_batch_for(mois: str | None):
+    """Fichier de clôture qui couvre le mois affiché (mois déclaré à l'import, sinon mois majoritaire des stocks finaux) ;
+    à défaut, le plus récent. Ex. octobre 2026 → Output App Fuel, septembre 2026 → Closing de septembre."""
+    from fuel_tracking.models import FuelImportBatch as B
+    from fuel_tracking.services.closing_upload import CANCEL_KEY, MONTH_KEY, final_stock_month
+
+    if not mois:
+        return None
+    for b in B.objects.filter(source_type="CLOSING", status__in=("ACCEPTED", "VALIDATION_REQUIRED")).order_by("-received_at"):
+        s = b.summary or {}
+        if CANCEL_KEY not in s and (s.get(MONTH_KEY) or final_stock_month(b)[0]) == mois:
+            return b
+    return None
+
+
+def _batch(source_type, batch=None):
     from fuel_tracking.models import FuelImportBatch as B
 
-    b = B.objects.filter(source_type=source_type, status__in=("ACCEPTED", "VALIDATION_REQUIRED")).order_by("-received_at").first()
+    b = batch or B.objects.filter(source_type=source_type, status__in=("ACCEPTED", "VALIDATION_REQUIRED")).order_by("-received_at").first()
     if b is None:
         return None
     return {"fichier": b.file_name, "recu_le": b.received_at.isoformat(), "lignes": b.rows_total, "acceptees": b.rows_accepted + b.rows_warning, "rejetees": b.rows_rejected,
@@ -53,7 +68,7 @@ def health(top: int = 60, mois: str | None = None) -> dict:
     return {
         "generated_at": now.isoformat(),
         "sources": {
-            "closing": _batch("CLOSING"),
+            "closing": _batch("CLOSING", _closing_batch_for(mois)),
             "gardiennage": {"loliforce": _batch("LOLIFORCE"), "scss": _batch("SCSS"),
                             "dernier_releve": max(last.values()).isoformat() if last else None, "sites_avec_releve": len(last)},
             "enoc": {"derniere_synchro": (enoc_run.finished_at or enoc_run.started_at).isoformat() if enoc_run else None,
@@ -101,7 +116,7 @@ def final_stock_coverage(base: set, top: int = 60, mois: str | None = None) -> d
         first = last_complete.replace(day=1)
     end_day = (first.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
     month = first.strftime("%Y-%m")
-    sans_ge = sites_without_genset(month) | sites_without_genset((end_day + timedelta(days=1)).strftime("%Y-%m"))
+    sans_ge = sites_without_genset(month)               # liste de l'Output App Fuel DU MOIS seulement (jamais du mois suivant)
     sans_ge = {s for s in base if s in sans_ge}          # sites de la base déclarés sans GE ni cuve : hors périmètre
     base = base - sans_ge
     if month in (c.get("reference_periods") or []):
@@ -115,15 +130,17 @@ def final_stock_coverage(base: set, top: int = 60, mois: str | None = None) -> d
                    .values_list("site_id_resolved", flat=True)}
         sans_carburant = (in_file - have) & base
         base = base - sans_carburant
-        sans_ge = sans_ge | sans_carburant
         absent = sorted(s for s in base if s not in have)
         return {"mois": month, "source": "Fichier Closing de référence (repris tel quel)", "fenetre": [first.isoformat(), end_day.isoformat()],
                 "sites_base": len(base), "sites_exploitables": len(base) - len(absent), "sites_avec_reserve": 0, "sites_sans_releve": len(absent),
-                "sans_releve": absent[:top], "sites_sans_ge_exclus": len(sans_ge)}
+                "sans_releve": absent[:top], "sites_sans_ge_exclus": len(sans_ge), "lignes_sans_carburant_exclues": len(sans_carburant)}
     use_closing = not SB._uses_app_initial(datetime.combine(first, time.min), c)
     post = c.get("post_days", 0) if use_closing else 0
     tz = timezone.get_current_timezone()
     lo = datetime.combine(end_day - timedelta(days=c["reserve_days"]), time.min, tz)
+    if use_closing and month in (getattr(settings, "FUEL_CLOSING_AUTHORITATIVE_PERIODS", None) or []):
+        # mois où le fichier de clôture fait foi : tout stock final relevé dans le mois est retenu (avec réserve), décision du 17/11/2026
+        lo = datetime.combine(first + timedelta(days=1), time.min, tz)
     hi = datetime.combine(end_day + timedelta(days=post), time(23, 59, 59), tz)
     qs = Obs.objects.filter(observation_datetime__range=(lo, hi)).exclude(validation_status="REJECTED")
     qs = qs.filter(source_type="CLOSING") if use_closing else qs.filter(source_type__in=c["final_sources"])

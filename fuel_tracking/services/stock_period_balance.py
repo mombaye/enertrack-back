@@ -153,6 +153,10 @@ def _candidate(o: dict, boundary, final: bool, c: dict) -> dict:
         tier = "APRES_BORNE"  # relevé de clôture fait quelques jours après la borne : période effective décalée, avec réserve
     else:
         tier = "POSTERIEUR"
+    if tier == "TROP_ANCIEN" and final and o["source_type"] == "CLOSING" and c.get("closing_final_any_age")             and _day(t) >= c["closing_final_any_age"]:          # relevé fait DANS le mois (jamais le stock de début repris)
+        # Mois où le fichier de clôture fait foi (sept./oct. 2026) : le stock final retenu par Ops est accepté quel que soit
+        # son âge (décision du 17/11/2026), toujours AVEC RÉSERVE — jamais pour un relevé ENOC.
+        tier = "CLOSING_RETENU"
     if reason is None and tier == "TROP_ANCIEN":
         reason = f"relevé trop ancien ({age} j > {c['reserve_days']} j)"
     if reason is None and tier == "POSTERIEUR":
@@ -174,7 +178,7 @@ def _candidate(o: dict, boundary, final: bool, c: dict) -> dict:
 
 
 def _tier_rank(tier: str) -> int:
-    return {"EXACT": 0, "FRAIS": 1, "RESERVE": 2, "APRES_BORNE": 2}.get(tier, 9)
+    return {"EXACT": 0, "FRAIS": 1, "RESERVE": 2, "APRES_BORNE": 2, "CLOSING_RETENU": 3}.get(tier, 9)
 
 
 def _select(obs: list[dict], boundary, final: bool, tanks: list, c: dict) -> tuple[dict | None, list[dict], list[str]]:  # noqa: C901
@@ -223,7 +227,8 @@ def _select(obs: list[dict], boundary, final: bool, tanks: list, c: dict) -> tup
                               f"{o['litres']:.0f} L (écart > {tol:.0f} L) — valeur retenue selon la priorité, à contrôler.")
         tier_txt = {"EXACT": "relevé du jour de la borne", "FRAIS": f"relevé antérieur de {chosen['age_jours']} j (frais ≤ {c['fresh_days']} j)",
                     "RESERVE": f"relevé antérieur de {chosen['age_jours']} j (réserve, ≤ {c['reserve_days']} j)",
-                    "APRES_BORNE": f"relevé de clôture postérieur de {chosen['age_jours']} j à la borne (réserve, ≤ {c.get('post_days', 0)} j)"}[chosen["tier"]]
+                    "APRES_BORNE": f"relevé de clôture postérieur de {chosen['age_jours']} j à la borne (réserve, ≤ {c.get('post_days', 0)} j)",
+                    "CLOSING_RETENU": f"stock final retenu par Ops dans le fichier de clôture, relevé {chosen['age_jours']} j avant la borne (réserve)"}[chosen["tier"]]
         chosen["motif_selection"] = (
             f"{chosen['source_libelle']} (priorité {chosen['rang_priorite']}) — {tier_txt} ; valeur {chosen['mode_valeur']}"
             + (" (ESTIMATION, confiance faible)" if chosen["estimation"] else "")
@@ -784,7 +789,10 @@ def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, pro
     motifs, alerts, reserves, major, infos = [], [], [], [], []
     cause = None
     ini, ini_cands, a1 = _select(_initial_observations(obs, start, c, previous, infos, reserves), start, False, tanks, c)
-    fin, fin_cands, a2 = _select(_final_observations(obs, end, c, start), end, True, tanks, c)
+    month = _day(start).strftime("%Y-%m")
+    any_age = bool(c.get("app_stock_start")) and not _uses_app_initial(start, c)         and month in (getattr(settings, "FUEL_CLOSING_AUTHORITATIVE_PERIODS", None) or [])
+    c_fin = {**c, "closing_final_any_age": _day(start) + timedelta(days=1) if any_age else None}
+    fin, fin_cands, a2 = _select(_final_observations(obs, end, c, start), end, True, tanks, c_fin)
     alerts += a1 + a2
     official = set(c.get("final_sources") or []) | ({APP_SOURCE, "CLOSING"} if c.get("app_stock_start") else set())
     if ini and fin and datetime.fromisoformat(fin["date"]) <= datetime.fromisoformat(ini["date"]):
@@ -809,6 +817,9 @@ def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, pro
                     reserves.append(f"Stock {label} : volume calculé à partir des dimensions de cuve, plaque non confirmée.")
             if x["tier"] == "RESERVE":
                 reserves.append(f"Stock {label} ancien de {x['age_jours']} j (4-{c['reserve_days']} j) : estimation avec réserve.")
+            elif x["tier"] == "CLOSING_RETENU":
+                reserves.append(f"Stock {label} relevé {x['age_jours']} j avant la borne (> {c['reserve_days']} j) mais retenu par Ops "
+                                f"dans le fichier de clôture : bilan sur la période effective, avec réserve.")
             elif x["tier"] == "APRES_BORNE":
                 reserves.append(f"Stock {label} relevé {x['age_jours']} j après la borne (campagne de clôture) : bilan calculé sur la "
                                 f"période effective du relevé initial au relevé final, avec réserve.")

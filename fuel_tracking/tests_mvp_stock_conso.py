@@ -426,6 +426,8 @@ class OutputAppFuelImportTests(TmpRootMixin, MvpBase):
         cov = final_stock_coverage({"DKR_0001", "DKR_0003"}, mois="2026-10")
         self.assertEqual((cov["mois"], cov["sites_base"], cov["sites_sans_ge_exclus"]), ("2026-10", 1, 1))
         self.assertNotIn("DKR_0003", cov["sans_releve"])
+        sept = final_stock_coverage({"DKR_0001", "DKR_0003"}, mois="2026-09")   # liste d'octobre jamais appliquée à septembre
+        self.assertEqual(sept["sites_sans_ge_exclus"], 0)
 
     @override_settings(FUEL_BALANCE_CLOSING_POST_BOUNDARY_DAYS=0)
     def test_strict_rule_rejects_readings_after_boundary(self):
@@ -709,3 +711,39 @@ class ClosingKpiParseTests(MvpBase):
         k = kpis_for_period(date(2026, 10, 1), date(2026, 10, 31))
         self.assertEqual((k["source"], k["kpis"]["nb_jours"]["valeur"]), ("CALCUL_ENERTRACK", 31))
         self.assertIsNone(k["kpis"]["commande_mois_suivant_l"]["valeur"])   # non disponible, jamais 0
+
+
+class ClosingRetainedFinalStockTests(OutputAppFuelImportTests):
+    """Mois où le fichier de clôture fait foi : stock final retenu par Ops accepté quel que soit son âge (avec réserve)."""
+
+    def output_bytes(self):
+        head = ["", "ID du site", "Nom du site", "Région O&M", "Date de Relevé Initiale", "Qtité laissée à la date initiale (relevé de terrain)",
+                "Qtité laissée retenue", "Source de donnée de stock", "Total Livraison Fuel EYDON", "Total Livraison Fuel CARTE TOTAL",
+                "Total Ajout", "Total Retrait", "Total Ponction", "Total QTE volée déclarée", "Total QTE vidangée / Fuite / Ecart de Stock",
+                "Date de Relevé Finale", "Qtité laissée à la date finale (relevé de terrain)", "Qtité laissée retenue", "Source de donnée de stock",
+                "Variation de stock Fuel considéréé  (L)", "Estimation Conso Fuel Théorique retenue  (L)", "Source de donnée Estimation Conso Fuel théorique"]
+        d = lambda m, j: datetime(2026, m, j)  # noqa: E731
+        rows = [["", "INVENTAIRE"], head,
+                ["", "DKR_0001", "ALPHA", "DAKAR", d(9, 30), 1000, 1000, "relevé de terrain", 0, 0, 0, 0, 0, 0, 0,
+                 d(10, 15), 830, 830, "Relevés de Terrain Technicien", 170, None, None]]   # relevé 16 j avant la fin du mois
+        return xlsx({"Output": rows})
+
+    def _oct(self):
+        from fuel_tracking.services import stock_import_pipeline as P
+
+        P.process_bytes(self.output_bytes(), "Output App Fuel.xlsx", "CLOSING", origin="UPLOAD")
+        return SB.compute_balances(timezone.make_aware(datetime(2026, 10, 1)), timezone.make_aware(datetime(2026, 10, 31, 23, 59, 59)),
+                                   site_ids=["DKR_0001"], persist=False)[0]
+
+    def test_import_and_october_balance(self):
+        r = self._oct()
+        self.assertEqual((float(r["consommation_reelle_l"]), r["statut_bilan"], r["stock_final_detail"]["tier"]),
+                         (170.0, "ESTIMATION_AVEC_RESERVE", "CLOSING_RETENU"))
+        self.assertTrue(any("retenu par Ops" in x for x in r["reserves"]))
+
+    @override_settings(FUEL_CLOSING_AUTHORITATIVE_PERIODS=[])
+    def test_strict_rule_rejects_readings_after_boundary(self):
+        self.assertEqual(self._oct()["cause_principale"], "STOCK_TROP_ANCIEN")   # hors mois où le fichier fait foi : règle des 14 j
+
+    def test_sites_without_genset_excluded_from_health(self):
+        pass  # sans objet pour ce fichier
