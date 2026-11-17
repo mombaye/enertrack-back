@@ -415,6 +415,18 @@ class OutputAppFuelImportTests(TmpRootMixin, MvpBase):
         self.assertTrue(any("après la borne" in x for x in b2["reserves"]))
         self.assertTrue(b2["estimation"])                                   # stock final estimé : jamais présenté comme mesuré
 
+    def test_sites_without_genset_excluded_from_health(self):
+        from fuel_tracking.services import stock_import_pipeline as P
+        from fuel_tracking.services.data_health import final_stock_coverage
+        from fuel_tracking.services.output_app_fuel import sites_without_genset
+
+        b = P.process_bytes(self.output_bytes(), "Output App Fuel.xlsx", "CLOSING", origin="UPLOAD")
+        self.assertEqual(b.summary["stocks_closing"]["sites_sans_ge"], ["DKR_0003"])
+        self.assertEqual(sites_without_genset("2026-10"), {"DKR_0003"})
+        cov = final_stock_coverage({"DKR_0001", "DKR_0003"}, mois="2026-10")
+        self.assertEqual((cov["mois"], cov["sites_base"], cov["sites_sans_ge_exclus"]), ("2026-10", 1, 1))
+        self.assertNotIn("DKR_0003", cov["sans_releve"])
+
     @override_settings(FUEL_BALANCE_CLOSING_POST_BOUNDARY_DAYS=0)
     def test_strict_rule_rejects_readings_after_boundary(self):
         from fuel_tracking.services import stock_import_pipeline as P
@@ -492,6 +504,9 @@ class OutputPonctionAndRoundingTests(OutputAppFuelImportTests):
         self.assertIn("0 relevé(s) au contexte de ponction", out.getvalue())
 
     def test_strict_rule_rejects_readings_after_boundary(self):
+        pass  # sans objet pour ce fichier
+
+    def test_sites_without_genset_excluded_from_health(self):
         pass  # sans objet pour ce fichier
 
 
@@ -657,3 +672,40 @@ class FinalStockHealthTests(MvpBase):
             self.obs(280, at(end_day - timedelta(days=6)), site="DKR_0002", source="ENOC")
             f = final_stock_coverage({"DKR_0001", "DKR_0002"})
         self.assertEqual((f["source"], f["sites_avec_reserve"], f["sans_releve"]), ("ENOC", 1, ["DKR_0001"]))
+
+
+class ClosingKpiParseTests(MvpBase):
+    """Bloc de KPI de l'en-tête du Closing : valeurs lues telles quelles, libellés conservés."""
+
+    def test_parse_header_block(self):
+        from fuel_tracking.services.closing_kpis import parse_kpis
+
+        g = [[None] * 160 for _ in range(12)]
+        put = lambda r, c, v: g[r].__setitem__(c, v)  # noqa: E731
+        put(5, 2, 533); put(5, 3, "Nbre de site avec GE"); put(5, 4, 1.05); put(5, 5, "Conso moyenne / jour SEPTEMBRE 2026")
+        put(6, 2, 400818); put(6, 3, "Quantité laissée dans les cuves aux dates de relevés de AOUT 2026")
+        put(6, 4, 394244); put(6, 5, "Quantité laissée dans les cuves  aux dates de relevés de SEPTEMBRE 2026")
+        put(8, 2, 123700); put(8, 3, "Qtité Commandée  SEPTEMBRE 2026  pour Conso OCTOBR 2026 chez Fournisseur Aktivco")
+        put(9, 2, 79200); put(9, 3, "Qtité Commandée  SEPTEMBRE 2026  pour Conso OCTOBR 2026 mais non-livrée chez Fournisseur Aktivco")
+        put(8, 4, 103355); put(8, 5, "Quantité consommée entre les dates de relevés")
+        put(11, 2, -1580); put(11, 3, "Autre Quantité livrée non-Aktivco entre les dates de relevés"); put(11, 4, 3378); put(11, 5, "Nbre de site")
+        put(6, 154, "Estimation Conso Fuel SEPTEMBRE 2026 Sites ESCO (Litres)"); put(6, 155, 105670)
+        put(7, 154, "Estimation Conso Fuel AOUT 2026 Sites ESCO (Litres)"); put(7, 155, 84490)
+        k = parse_kpis(g)
+        self.assertEqual({x: k[x]["valeur"] for x in ("nb_sites_ge", "stock_initial_l", "stock_final_l", "commande_mois_suivant_l",
+                                                     "commande_non_livree_l", "conso_releves_l", "autre_l", "nb_sites",
+                                                     "estimation_conso_mois_l", "estimation_conso_prec_l")},
+                         {"nb_sites_ge": 533, "stock_initial_l": 400818, "stock_final_l": 394244, "commande_mois_suivant_l": 123700,
+                          "commande_non_livree_l": 79200, "conso_releves_l": 103355, "autre_l": -1580, "nb_sites": 3378,
+                          "estimation_conso_mois_l": 105670, "estimation_conso_prec_l": 84490})
+        self.assertIn("AOUT 2026", k["estimation_conso_prec_l"]["libelle"])
+
+    def test_partial_period_has_no_kpis(self):
+        from datetime import date
+
+        from fuel_tracking.services.closing_kpis import kpis_for_period
+
+        self.assertIsNone(kpis_for_period(date(2026, 10, 1), date(2026, 10, 15)))
+        k = kpis_for_period(date(2026, 10, 1), date(2026, 10, 31))
+        self.assertEqual((k["source"], k["kpis"]["nb_jours"]["valeur"]), ("CALCUL_ENERTRACK", 31))
+        self.assertIsNone(k["kpis"]["commande_mois_suivant_l"]["valeur"])   # non disponible, jamais 0

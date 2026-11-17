@@ -24,7 +24,7 @@ def _batch(source_type):
             "doublons": b.rows_duplicate, "statut": b.status, "periode": [str(b.declared_period_start or ""), str(b.declared_period_end or "")]}
 
 
-def health(top: int = 60) -> dict:
+def health(top: int = 60, mois: str | None = None) -> dict:
     from django.db.models import Max
 
     from fuel_tracking.models import FuelEnocMovement, FuelEnocSyncRun, FuelSiteDailyFacts, FuelStockObservation as Obs
@@ -68,11 +68,11 @@ def health(top: int = 60) -> dict:
         },
         "releves_en_retard": [{"site_id": s, "dernier_releve": d.isoformat(), "jours": (now - d).days} for s, d in late[:top]],
         "sites_sans_releve": never[:top],
-        "stock_final": final_stock_coverage(base, top),
+        "stock_final": final_stock_coverage(base, top, mois),
     }
 
 
-def final_stock_coverage(base: set, top: int = 60) -> dict | None:
+def final_stock_coverage(base: set, top: int = 60, mois: str | None = None) -> dict | None:
     """
     Couverture du STOCK FINAL du dernier mois complet dans la source convenue (règles MVP) — remplace, à l'écran, le contrôle
     des relevés de gardiennage, qui ne sont plus une source du bilan :
@@ -89,9 +89,37 @@ def final_stock_coverage(base: set, top: int = 60) -> dict | None:
     c = SB.cfg()
     if not c.get("final_sources") or not base:
         return None
+    from datetime import date
+
+    from fuel_tracking.services.output_app_fuel import sites_without_genset
+
     today = timezone.localdate()
-    end_day = today.replace(day=1) - timedelta(days=1)
-    first = end_day.replace(day=1)
+    last_complete = today.replace(day=1) - timedelta(days=1)
+    try:
+        first = date(int(mois[:4]), int(mois[5:7]), 1) if mois else last_complete.replace(day=1)
+    except (TypeError, ValueError):
+        first = last_complete.replace(day=1)
+    end_day = (first.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+    month = first.strftime("%Y-%m")
+    sans_ge = sites_without_genset(month) | sites_without_genset((end_day + timedelta(days=1)).strftime("%Y-%m"))
+    sans_ge = {s for s in base if s in sans_ge}          # sites de la base déclarés sans GE ni cuve : hors périmètre
+    base = base - sans_ge
+    if month in (c.get("reference_periods") or []):
+        # Mois de référence : le stock final est celui de la ligne du fichier Closing, quelle que soit sa date.
+        ref = SB.reference_batches(month)
+        from fuel_tracking.models import FuelImportRow
+
+        have = {s.upper() for s in Obs.objects.filter(batch_id__in=ref, source_type="CLOSING").values_list("site_id", flat=True)}
+        # ligne présente dans le fichier mais sans carburant (pas de GE, tout à 0) : pas un relevé manquant
+        in_file = {s.upper() for s in FuelImportRow.objects.filter(batch_id__in=ref).exclude(site_id_resolved=None)
+                   .values_list("site_id_resolved", flat=True)}
+        sans_carburant = (in_file - have) & base
+        base = base - sans_carburant
+        sans_ge = sans_ge | sans_carburant
+        absent = sorted(s for s in base if s not in have)
+        return {"mois": month, "source": "Fichier Closing de référence (repris tel quel)", "fenetre": [first.isoformat(), end_day.isoformat()],
+                "sites_base": len(base), "sites_exploitables": len(base) - len(absent), "sites_avec_reserve": 0, "sites_sans_releve": len(absent),
+                "sans_releve": absent[:top], "sites_sans_ge_exclus": len(sans_ge)}
     use_closing = not SB._uses_app_initial(datetime.combine(first, time.min), c)
     post = c.get("post_days", 0) if use_closing else 0
     tz = timezone.get_current_timezone()
@@ -108,6 +136,7 @@ def final_stock_coverage(base: set, top: int = 60) -> dict | None:
     ok = sorted(s for s in base if s in best and best[s] <= c["fresh_days"])
     reserve = sorted(s for s in base if s in best and best[s] > c["fresh_days"])
     absent = sorted(s for s in base if s not in best)
-    return {"mois": first.strftime("%Y-%m"), "source": "Fichier de clôture (Closing / Output App Fuel)" if use_closing else "ENOC",
+    return {"mois": month, "source": "Fichier de clôture (Closing / Output App Fuel)" if use_closing else "ENOC",
             "fenetre": [lo.date().isoformat(), hi.date().isoformat()], "sites_base": len(base), "sites_exploitables": len(ok),
-            "sites_avec_reserve": len(reserve), "sites_sans_releve": len(absent), "sans_releve": absent[:top]}
+            "sites_avec_reserve": len(reserve), "sites_sans_releve": len(absent), "sans_releve": absent[:top],
+            "sites_sans_ge_exclus": len(sans_ge)}

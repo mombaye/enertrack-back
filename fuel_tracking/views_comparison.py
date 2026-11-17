@@ -90,7 +90,7 @@ class ConsommationsSanteView(APIView):
     def get(self, request):
         from fuel_tracking.services.data_health import health
 
-        return Response(health())
+        return Response(health(mois=request.query_params.get("mois") or None))
 
 
 class ConsommationsEvolutionView(APIView):

@@ -26,6 +26,31 @@ class Command(BaseCommand):
         self._bilans(w, periodes, dry_run)
         self._regles_mvp(w, periodes, dry_run)
         self._ponctions_output(w, dry_run)
+        self._sans_ge_output(w, dry_run)
+        self._kpis_closing(w, dry_run)
+
+    def _kpis_closing(self, w, dry_run):
+        """6. Closing importés avant le 17/11/2026 : enregistre le bloc de KPI de l'en-tête (relu dans la copie d'archive)."""
+        if dry_run:
+            return
+        try:
+            from fuel_tracking.services.closing_kpis import backfill_file_kpis
+
+            w(f"Closing : KPI de l'en-tête enregistrés pour {backfill_file_kpis()} lot(s).")
+        except Exception as e:  # ne jamais empêcher le démarrage du service
+            w(f"Closing : KPI de l'en-tête impossibles ({e}).")
+
+    def _sans_ge_output(self, w, dry_run):
+        """5. Lots Output App Fuel importés avant le 17/11/2026 : enregistre la liste des sites « sans GE et sans cuve » (relue
+           dans la copie d'archive) pour les exclure de la santé des données et des totaux du mois."""
+        if dry_run:
+            return
+        try:
+            from fuel_tracking.services.output_app_fuel import backfill_sites_without_genset
+
+            w(f"Output App Fuel : liste des sites sans GE complétée pour {backfill_sites_without_genset()} lot(s).")
+        except Exception as e:  # ne jamais empêcher le démarrage du service
+            w(f"Output App Fuel : liste des sites sans GE impossible ({e}).")
 
     def _ponctions_output(self, w, dry_run):
         """

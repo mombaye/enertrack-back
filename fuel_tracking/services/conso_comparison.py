@@ -386,6 +386,16 @@ def _kpis(rows: list[dict]) -> dict:
     }
 
 
+def _closing_kpis(d_from: date, d_to: date) -> dict | None:
+    """KPI de synthèse « comme le fichier Closing » (mois complet) — jamais bloquant pour l'écran."""
+    try:
+        from fuel_tracking.services.closing_kpis import kpis_for_period
+
+        return kpis_for_period(d_from, d_to)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def closing_base_sites() -> set[str]:
     """Base de référence = sites présents dans le fichier Closing (mêmes sites que le fichier). Vide si aucun Closing n'a été importé."""
     from fuel_tracking.models import FuelStockObservation as Obs
@@ -410,10 +420,15 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
     rows = [_row(cph_by_site.get(sid), balances.get(sid), d_from, d_to, days, targets.get(sid.upper()), {}) for sid in ids]
     # Correspondance avec la base du fichier Closing : un site sans correspondance est AFFICHÉ mais jamais utilisé dans les totaux et indicateurs.
     base = closing_base_sites()
+    from fuel_tracking.services.output_app_fuel import sites_without_genset
+
+    sans_ge = sites_without_genset(d_from.strftime("%Y-%m"))
     for r in rows:
         ok = (not base) or r["site_id"].upper() in base
-        r["correspondance"] = {"base_closing": ok, "utilise": ok,
-                               "motif": None if ok else "Site absent du fichier Closing (base de référence) : affiché pour information, exclu des totaux et des indicateurs."}
+        motif = None if ok else "Site absent du fichier Closing (base de référence) : affiché pour information, exclu des totaux et des indicateurs."
+        if ok and r["site_id"].upper() in sans_ge:
+            ok, motif = False, "Site sans GE et sans cuve ce mois-là (fichier Output App Fuel) : hors périmètre carburant, exclu des totaux."
+        r["correspondance"] = {"base_closing": ok, "utilise": ok, "motif": motif}
     rows = _filter(rows, params)
     order = (params.get("tri") or "site").strip()
     sev = {NON_CALCULABLE: 0, VARIATION_CALCULEE: 1, ESTIMATION: 2, PRET: 3, REFERENCE: 3, CERTIFIEE: 4}
@@ -443,6 +458,7 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
                  "sans_correspondance": {"sites": sum(1 for r in rows if not r["correspondance"]["utilise"]), "base_closing_sites": len(base),
                                          "note": "Sites hors du fichier Closing : affichés, non utilisés dans les totaux."}},
         "rows": rows, "labels": LABELS, "aide": HELP,
+        "kpis_closing": _closing_kpis(d_from, d_to),
         "qualite_cph": [c for c in _couvertures([r for r in cph_rows if r.get("perimetre", "GE") == "GE"]) if c.get("code") != "rapprochement"] if with_cph_quality else [],
         "facettes": {
             "pays": uniq(lambda r: r["country"]), "zones": uniq(lambda r: r["zone"]), "typologies": uniq(lambda r: r["typologie"]),

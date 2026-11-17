@@ -92,6 +92,47 @@ def parse_rows(rows) -> list[dict]:
     return out
 
 
+def sites_without_genset(month: str) -> set[str]:
+    """Sites déclarés « Site sans GE et sans cuve » par le fichier Output App Fuel du mois `month` (AAAA-MM) : hors périmètre
+    carburant ce mois-là (jamais comptés « sans relevé » ni « non calculable »)."""
+    from fuel_tracking.models import FuelImportBatch
+    from fuel_tracking.services.closing_upload import CANCEL_KEY, MONTH_KEY, final_stock_month
+
+    out = set()
+    for b in FuelImportBatch.objects.filter(source_type="CLOSING", summary__stocks_closing__format=FILE_LABEL):
+        s = b.summary or {}
+        if CANCEL_KEY in s:
+            continue
+        if (s.get(MONTH_KEY) or final_stock_month(b)[0]) == month:
+            out |= {x.upper() for x in (s.get("stocks_closing") or {}).get("sites_sans_ge") or []}
+    return out
+
+
+def backfill_sites_without_genset() -> int:
+    """Lots Output App Fuel importés avant le 17/11/2026 : relit la copie d'archive pour enregistrer la liste des sites sans GE."""
+    from pathlib import Path
+
+    from fuel_tracking.models import FuelImportBatch
+    from fuel_tracking.services.stock_import_files import iter_sheets
+    from fuel_tracking.services.stock_registry import SiteResolver
+
+    done = 0
+    for b in FuelImportBatch.objects.filter(source_type="CLOSING", summary__stocks_closing__format=FILE_LABEL):
+        st = (b.summary or {}).get("stocks_closing") or {}
+        if "sites_sans_ge" in st or not b.archive_path or not Path(b.archive_path).is_file():
+            continue
+        resolver = SiteResolver()
+        recs = []
+        for _n, rows in iter_sheets(Path(b.archive_path).read_bytes(), b.file_name, only={SHEET}):
+            recs = parse_rows(list(rows))
+        st["sites_sans_ge"] = sorted({(resolver.resolve(r["site"]) or r["site"]).upper() for r in recs
+                                      if _norm(r["source_finale"]) == SOURCE_FINAL_SKIP})
+        b.summary = {**(b.summary or {}), "stocks_closing": st}
+        b.save(update_fields=["summary"])
+        done += 1
+    return done
+
+
 def process_output_file(batch, rows, file_name: str, resolver, tanks_of) -> dict:
     """Crée les relevés de clôture (stocks initial et final) à partir des lignes du fichier Output App Fuel."""
     from fuel_tracking.models import FuelStockObservation as Obs
@@ -102,7 +143,7 @@ def process_output_file(batch, rows, file_name: str, resolver, tanks_of) -> dict
     data = parse_rows(rows)
     stats = {"format": FILE_LABEL, "lignes_site": len(data), "stocks_importes": 0, "doublons": 0, "sites_inconnus": 0,
              "sites_sans_ge_ignores": 0, "dates_invraisemblables": 0, "stock_final_estime_energy_desk": 0,
-             "sources_stock_final": {}, "stocks_absents": 0, "capacite_depassee_a_valider": 0}
+             "sources_stock_final": {}, "stocks_absents": 0, "capacite_depassee_a_valider": 0, "sites_sans_ge": []}
     site_ids = {resolver.resolve(r["site"]) for r in data} - {None}
     tanks = tanks_of(site_ids)
     existing = dict(Obs.objects.filter(source_type="CLOSING", site_id__in=site_ids).values_list("source_event_id", "pk"))
@@ -110,6 +151,7 @@ def process_output_file(batch, rows, file_name: str, resolver, tanks_of) -> dict
         src = r["source_finale"] or ""
         if _norm(src) == SOURCE_FINAL_SKIP:
             stats["sites_sans_ge_ignores"] += 1
+            stats["sites_sans_ge"].append((resolver.resolve(r["site"]) or r["site"]).upper())
             continue
         site_id = resolver.resolve(r["site"])
         if site_id is None:

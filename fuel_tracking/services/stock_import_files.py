@@ -698,9 +698,13 @@ def _process_closing_stocks(batch, file_bytes: bytes, file_name: str, resolver) 
 
     stats = {"stocks_importes": 0, "doublons": 0, "sites_inconnus": 0, "sans_carburant_ignores": 0, "dates_invraisemblables": 0,
              "formule_incoherente_a_valider": 0, "capacite_depassee_a_valider": 0}
+    from fuel_tracking.services.closing_kpis import parse_kpis
+
     data = []
     for _name, rows in iter_sheets(file_bytes, file_name, only={CLOSING_SHEET}):
+        rows = list(rows)
         data, _diag = closing_stock_rows(rows)
+        stats["kpis_closing"] = parse_kpis(rows)   # bloc de KPI de l'en-tête, tel quel (mois de référence)
     site_ids = {resolver.resolve(r["site"]) for r in data} - {None}
     tanks = R.site_tanks(site_ids)
     existing = dict(Obs.objects.filter(source_type="CLOSING", site_id__in=site_ids).values_list("source_event_id", "pk"))
