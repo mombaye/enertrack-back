@@ -152,6 +152,45 @@ def _days(b) -> int | None:
     return n if n > 0 else None
 
 
+def raison_non_calcul(b, statut: str, var) -> str | None:
+    """Message clair, en une phrase, qui dit POURQUOI la consommation d'un site n'est pas calculée (ou est à contrôler) et quoi faire.
+    None pour un site calculé. Lecture seule : déduit du bilan enregistré, aucune valeur inventée."""
+    if b is None:
+        return "Aucun bilan pour cette période : aucune donnée de stock ou de mouvement pour ce site. Lancer le calcul du bilan de la période."
+    if statut not in (NON_CALCULABLE, VARIATION_CALCULEE):
+        return None
+    cause = b.cause_principale or ""
+    ini, fin = b.stock_initial_l is not None, b.stock_final_l is not None
+    if var is None and b.variation_stock_l is not None:
+        var = float(b.variation_stock_l)
+    if cause == "CONSO_NEGATIVE" or (var is not None and var < 0):
+        return (f"Consommation négative ({var:.0f} L) : le stock final est plus haut que ce qu'expliquent le stock initial et les mouvements "
+                f"ENOC — une livraison ou un rajout manque probablement dans ENOC, ou un relevé de stock est faux.") if var is not None else \
+            "Consommation négative : une livraison manque probablement dans ENOC, ou un relevé de stock est faux."
+    if cause == "SITE_NON_RECONNU":
+        return "Site absent de Gestion des sites : l'importer (Import Sites) pour que son bilan soit calculé."
+    if cause in ("DONNEES_STOCK_INCOMPLETES", "STOCK_TROP_ANCIEN", "CM_SANS_CUVE") and not (ini and fin):
+        which = "initial et final" if not ini and not fin else "initial" if not ini else "final"
+        src = "le fichier de clôture (Closing / Output App Fuel)" if b.observation_start.date().isoformat() < "2026-11-01" else "ENOC"
+        if cause == "STOCK_TROP_ANCIEN":
+            return f"Stock {which} trop ancien : le relevé disponible est trop éloigné de la borne de la période. Il faut un relevé plus récent dans {src}."
+        if cause == "CM_SANS_CUVE":
+            return f"Stock {which} relevé en cm sans cuve validée : impossible de le convertir en litres. Valider la cuve du site (Suivi Stock)."
+        return f"Stock {which} {'absents' if not ini and not fin else 'absent'} : aucun relevé de stock pour ce site dans {src} autour de la borne de la période."
+    if cause == "RELEVES_INCOHERENTS":
+        return "Relevés incohérents : le relevé final n'est pas postérieur au relevé initial. Vérifier les dates des relevés."
+    if cause == "MOUVEMENTS_A_CONTROLER":
+        return "Un mouvement ENOC exécuté n'a pas d'impact établi (quantité ou sens inconnu) : le compléter dans ENOC."
+    if cause == "TRANSFERT_DESEQUILIBRE":
+        return "Ponction déséquilibrée dans ENOC (sortie et entrée de quantités différentes) : corriger la ponction."
+    if cause == "SCORE_INSUFFISANT":
+        return f"Données trop peu fiables (score {b.score_confiance}/100) : stock estimé, relevé ancien ou mouvements incomplets."
+    if cause == "CONFLIT_ENOC_CLOSING":
+        return "Conflit entre les mouvements ENOC et le fichier de clôture : à arbitrer."
+    first = (b.motifs or [None])[0]
+    return first or "Données insuffisantes pour calculer la consommation (voir le détail du bilan)."
+
+
 def _source_text(src) -> str | None:
     lab = {"CLOSING": "Closing", "LOLIFORCE": "Loliforce", "SCSS": "SCSS", "ENOC": "ENOC", "HISTORICAL_REFUELING": "Historique refueling"}
     return lab.get(src, src)
@@ -289,6 +328,7 @@ def _row(cph: dict | None, b, d_from: date, d_to: date, days: int, target, thres
             "variation_l": var, "statut": statut, "statut_moteur": b.statut_bilan if b else None, "cause": cause,
             "score": b.score_confiance if b else None, "reserves": (b.reserves or []) if b else [], "alertes": alerts, "alertes_comparaison": cmp_alerts, "bilan_id": b.pk if b else None,
             "motif": " · ".join(motifs) or None, "action": _action(b, statut),
+            "raison_non_calcul": raison_non_calcul(b, statut, var),
         },
         "closing": {"conso_l": conso_closing, "ecart_l": ecart_cl, "ecart_pct": pct_cl, "pct_na": na_cl, "controle_independant": closing_indep, "explication": explication},
         "target": {"periode_l": tgt_f, "mensuel_l": _f(target.target_mensuel_l) if target else None, "source": target.source_target if target else None,
