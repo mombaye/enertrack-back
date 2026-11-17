@@ -441,12 +441,18 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
     from fuel_tracking.services.output_app_fuel import sites_without_genset
 
     sans_ge = sites_without_genset(d_from.strftime("%Y-%m"))
+    # Sites déclarés « sans GE et sans cuve » pour ce mois (Output App Fuel) : hors périmètre carburant, NON affichés (ce ne sont
+    # pas des anomalies). Sites absents du fichier Closing : affichés pour information, exclus des totaux (alerte à traiter).
+    n_sans_ge = sum(1 for r in rows if r["site_id"].upper() in sans_ge)
+    rows = [r for r in rows if r["site_id"].upper() not in sans_ge]
     for r in rows:
         ok = (not base) or r["site_id"].upper() in base
         motif = None if ok else "Site absent du fichier Closing (base de référence) : affiché pour information, exclu des totaux et des indicateurs."
-        if ok and r["site_id"].upper() in sans_ge:
-            ok, motif = False, "Site sans GE et sans cuve ce mois-là (fichier Output App Fuel) : hors périmètre carburant, exclu des totaux."
         r["correspondance"] = {"base_closing": ok, "utilise": ok, "motif": motif}
+    # nombre de sites par statut avec les AUTRES filtres (le filtre de statut lui-même ne doit pas vider les compteurs)
+    statut_counts = {}
+    for r in _filter(rows, {**(params or {}), "statut_bilan": None}):
+        statut_counts[r["stock"]["statut"]] = statut_counts.get(r["stock"]["statut"], 0) + 1
     rows = _filter(rows, params)
     order = (params.get("tri") or "site").strip()
     sev = {NON_CALCULABLE: 0, VARIATION_CALCULEE: 1, ESTIMATION: 2, PRET: 3, REFERENCE: 3, CERTIFIEE: 4}
@@ -473,6 +479,7 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
                     "bilan_disponible": bool(balances), "sites_avec_bilan": len(balances),
                     "sites_calculables": sum(1 for b in balances.values() if bilan_status(b) != NON_CALCULABLE), "regle": current_rule_version()},
         "kpis": {**_kpis([r for r in rows if r["correspondance"]["utilise"]]),
+                 "sans_ge_exclus": n_sans_ge,
                  "sans_correspondance": {"sites": sum(1 for r in rows if not r["correspondance"]["utilise"]), "base_closing_sites": len(base),
                                          "note": "Sites hors du fichier Closing : affichés, non utilisés dans les totaux."}},
         "rows": rows, "labels": LABELS, "aide": HELP,
@@ -482,7 +489,7 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
         "qualite_cph": [c for c in _couvertures([r for r in cph_rows if r.get("perimetre", "GE") == "GE"]) if c.get("code") != "rapprochement"] if with_cph_quality else [],
         "facettes": {
             "pays": uniq(lambda r: r["country"]), "zones": uniq(lambda r: r["zone"]), "typologies": uniq(lambda r: r["typologie"]),
-            "typologies_energie": uniq(lambda r: r["typologie_energie"]), "statuts_bilan": list(STATUTS_BILAN),
+            "typologies_energie": uniq(lambda r: r["typologie_energie"]), "statuts_bilan": list(STATUTS_BILAN), "statuts_compte": statut_counts,
             "sources_stock": uniq(lambda r: r["stock"]["source_initial"]), "sources_runtime": uniq(lambda r: r["cph"]["runtime_source"]),
             "sources_puissance": uniq(lambda r: r["cph"]["power_source"]), "sources_target": uniq(lambda r: r["target"]["source"]),
         },
