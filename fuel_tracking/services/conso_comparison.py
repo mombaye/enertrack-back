@@ -398,12 +398,18 @@ def _kpis(rows: list[dict]) -> dict:
     }
 
 
-def _closing_kpis(d_from: date, d_to: date) -> dict | None:
+def _has_filter(params) -> bool:
+    keys = ("pays", "zone", "typologie", "typologie_energie", "statut_bilan", "statut_certification", "source_stock", "source_runtime",
+            "source_puissance", "source_target", "correspondance", "qualite", "site")
+    return any((params or {}).get(k) for k in keys)
+
+
+def _closing_kpis(d_from: date, d_to: date, sites: set[str] | None = None) -> dict | None:
     """KPI de synthèse « comme le fichier Closing » (mois complet) — jamais bloquant pour l'écran."""
     try:
         from fuel_tracking.services.closing_kpis import kpis_for_period
 
-        return kpis_for_period(d_from, d_to)
+        return kpis_for_period(d_from, d_to, sites)
     except Exception:  # noqa: BLE001
         return None
 
@@ -470,7 +476,9 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
                  "sans_correspondance": {"sites": sum(1 for r in rows if not r["correspondance"]["utilise"]), "base_closing_sites": len(base),
                                          "note": "Sites hors du fichier Closing : affichés, non utilisés dans les totaux."}},
         "rows": rows, "labels": LABELS, "aide": HELP,
-        "kpis_closing": _closing_kpis(d_from, d_to),
+        # KPI dynamiques : période exacte affichée et, si un filtre est actif, seulement les sites affichés
+        "kpis_closing": _closing_kpis(d_from, d_to, {r["site_id"].upper() for r in rows if r["correspondance"]["utilise"]}
+                                      if _has_filter(params) else None),
         "qualite_cph": [c for c in _couvertures([r for r in cph_rows if r.get("perimetre", "GE") == "GE"]) if c.get("code") != "rapprochement"] if with_cph_quality else [],
         "facettes": {
             "pays": uniq(lambda r: r["country"]), "zones": uniq(lambda r: r["zone"]), "typologies": uniq(lambda r: r["typologie"]),

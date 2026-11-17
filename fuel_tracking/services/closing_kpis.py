@@ -17,7 +17,7 @@ KPI de synthèse du fichier Closing (en-tête de la feuille « Synthese conso fu
       Estimation conso du mois précédent             = Σ L/jour du mois précédent × nb jours du mois (FC12)
       Estimation stock fin de mois                   = Σ max(0 ; stock final − L/jour × jours jusqu'à la fin du mois) (CL12)
       Estimation livraison du mois                   = Σ livraisons + Σ rajouts / retraits          (EZ11)
-      PROJECTION du mois suivant                     = Σ L/jour du mois × nb jours du mois suivant  (méthode du fichier :
+      PROJECTION du mois suivant                     = Σ L/jour × nb jours du mois qui suit la période (méthode du fichier :
                                                        c'est ainsi que le mois suivant calcule « l'estimation du mois précédent »)
 Les commandes Aktivco (commandé / non livré) et le stock d'appoint ne sont pas dans les bilans : « non disponible » (jamais 0).
 """
@@ -114,11 +114,11 @@ def _next_month(last: date) -> str:
     return (last + timedelta(days=1)).strftime("%Y-%m")
 
 
-def _balances(month: str) -> list:
+def _balances(d_from: date, d_to: date) -> list:
+    """Bilans enregistrés pour la période EXACTE [d_from ; d_to] (mêmes bilans que le tableau)."""
     from fuel_tracking.models import FuelStockBalance as B
 
-    first, last = _month_bounds(month)
-    return list(B.objects.filter(observation_start__date=first, observation_end__date=last))
+    return list(B.objects.filter(observation_start__date=d_from, observation_end__date=d_to))
 
 
 def _f(v):
@@ -143,14 +143,34 @@ def _perimeter(month: str) -> set[str] | None:
     return (base - sites_without_genset(month)) if base else None
 
 
-def computed_kpis(month: str) -> dict:
-    """KPI du mois calculés par EnerTrack (bilans enregistrés), mêmes définitions que le fichier Closing."""
-    first, last = _month_bounds(month)
-    n_days = (last - first).days + 1
-    base = _perimeter(month)
+def _label(d_from: date, d_to: date) -> str:
+    """« OCTOBRE 2026 » pour un mois civil complet, sinon « du 01/10/2026 au 15/10/2026 »."""
+    first, last = _month_bounds(d_from.strftime("%Y-%m"))
+    if d_from == first and d_to == last:
+        return f"{MOIS[first.month - 1]} {first.year}"
+    return f"du {d_from:%d/%m/%Y} au {d_to:%d/%m/%Y}"
+
+
+def _previous_period(d_from: date, d_to: date) -> tuple[date, date]:
+    """Mois précédent pour un mois complet ; sinon période de même durée juste avant."""
+    first, last = _month_bounds(d_from.strftime("%Y-%m"))
+    if d_from == first and d_to == last:
+        return _month_bounds(_prev_month(first))
+    n = (d_to - d_from).days + 1
+    return d_from - timedelta(days=n), d_from - timedelta(days=1)
+
+
+def computed_kpis(d_from: date, d_to: date, sites: set[str] | None = None) -> dict:
+    """KPI de la période calculés par EnerTrack (bilans enregistrés), mêmes définitions que le fichier Closing.
+    `sites` (identifiants en majuscules) : restreint aux sites affichés (filtres de l'écran)."""
+    n_days = (d_to - d_from).days + 1
+    base = _perimeter(d_from.strftime("%Y-%m"))
+    if sites is not None:
+        base = (base & sites) if base is not None else set(sites)
     keep = lambda b: base is None or b.site_id.upper() in base  # noqa: E731
-    rows = [b for b in _balances(month) if keep(b)]
-    prev = {b.site_id: b for b in _balances(_prev_month(first)) if keep(b)}
+    rows = [b for b in _balances(d_from, d_to) if keep(b)]
+    p_from, p_to = _previous_period(d_from, d_to)
+    prev = {b.site_id: b for b in _balances(p_from, p_to) if keep(b)}
     calc = [b for b in rows if b.variation_stock_l is not None]
     S = lambda f, xs=calc: round(sum(f(b) or 0 for b in xs), 1) if xs else None  # noqa: E731
     stock_ini, stock_fin = S(lambda b: _f(b.stock_initial_l)), S(lambda b: _f(b.stock_final_l))
@@ -166,52 +186,51 @@ def computed_kpis(month: str) -> dict:
     for b, d, n in daily:
         if d is None:
             continue
-        late_start = b.date_stock_initial.date() > first - timedelta(days=1) + timedelta(days=10)
+        late_start = b.date_stock_initial.date() > d_from - timedelta(days=1) + timedelta(days=10)
         est_mois += d * (n if late_start else n_days)
-        gap = (last - b.date_stock_final.date()).days
+        gap = (d_to - b.date_stock_final.date()).days
         est_stock += max(0.0, float(b.stock_final_l) - max(0, gap) * d) if b.stock_final_l is not None else 0.0
     est_prec = est_stock_prec = 0.0
-    prev_last = first - timedelta(days=1)
     for b in calc:
-        p = prev.get(b.site_id)
-        d = _daily(p)[0] if p is not None else None
+        pb = prev.get(b.site_id)
+        d = _daily(pb)[0] if pb is not None else None
         if d is None:
             continue
         est_prec += d * n_days
         if b.stock_initial_l is not None and b.date_stock_initial:
-            gap = (prev_last - b.date_stock_initial.date()).days
+            gap = (p_to - b.date_stock_initial.date()).days
             est_stock_prec += max(0.0, float(b.stock_initial_l) - max(0, gap) * d)
-    nxt_first, nxt_last = _month_bounds(_next_month(last))
-    projection = sum(d for _b, d, _n in daily if d is not None) * ((nxt_last - nxt_first).days + 1) if rates else None
-    M, P, N = MOIS[first.month - 1], MOIS[prev_last.month - 1], MOIS[nxt_first.month - 1]
-    y, py = first.year, prev_last.year
+    nxt_first, nxt_last = _month_bounds(_next_month(d_to))
+    projection = sum(rates) * ((nxt_last - nxt_first).days + 1) if rates else None
+    M, P = _label(d_from, d_to), _label(p_from, p_to)
+    N = f"{MOIS[nxt_first.month - 1]} {nxt_first.year}"
     v = lambda label, val: {"libelle": label, "valeur": None if val is None else round(val, 3)}  # noqa: E731
     return {
         "nb_sites_ge": v("Nbre de site avec GE", len(rows)),
-        "stock_initial_l": v(f"Quantité laissée dans les cuves aux dates de relevés de {P} {py}", stock_ini),
-        "stock_final_l": v(f"Quantité laissée dans les cuves aux dates de relevés de {M} {y}", stock_fin),
-        "appoint_initial_l": v(f"Quantité laissée stock d'appoint aux dates de relevés de {P} {py}", None),
-        "appoint_final_l": v(f"Quantité laissée stock d'appoint aux dates de relevés de {M} {y}", None),
-        "commande_mois_suivant_l": v(f"Qtité Commandée {M} {y} pour Conso {N} chez Fournisseur Aktivco", None),
-        "commande_non_livree_l": v(f"Qtité Commandée {M} {y} pour Conso {N} mais non-livrée chez Fournisseur Aktivco", None),
+        "stock_initial_l": v(f"Quantité laissée dans les cuves aux dates de relevés de début ({P})", stock_ini),
+        "stock_final_l": v(f"Quantité laissée dans les cuves aux dates de relevés de {M}", stock_fin),
+        "appoint_initial_l": v("Quantité laissée stock d'appoint (début)", None),
+        "appoint_final_l": v(f"Quantité laissée stock d'appoint {M}", None),
+        "commande_mois_suivant_l": v(f"Qtité Commandée pour Conso {N} chez Fournisseur Aktivco", None),
+        "commande_non_livree_l": v(f"Qtité Commandée pour Conso {N} mais non-livrée chez Fournisseur Aktivco", None),
         "livree_l": v("Quantité commandée et livrée entre les dates de relevés", livree),
         "autre_l": v("Autre Quantité livrée / rajoutée ou retirée entre les dates de relevés", autre),
         # moyenne des L/jour sur TOUS les sites de la base (0 pour un site sans conso), comme ER12 du fichier
-        "conso_moyenne_jour_l": v(f"Conso moyenne / jour {M} {y}", (sum(rates) / max(len(rates), len(base) if base is not None else 0))
+        "conso_moyenne_jour_l": v(f"Conso moyenne / jour {M}", (sum(rates) / max(len(rates), len(base) if base is not None else 0))
                                   if rates else None),
         "conso_releves_l": v("Quantité consommée entre les dates de relevés", conso),
         "perdue_l": v("Quantité perdue", perdue),
         "check_l": v("CHECK", check),
         "nb_sites": v("Nbre de site", len(base) if base is not None else len(rows)),
-        "nb_jours": v("Nbre de jour Mois actuel -->", n_days),
+        "nb_jours": v("Nbre de jour de la période -->", n_days),
         "ecart_theorique_l": v("Ecart Conso Théorique Vs Conso Variation de Stock", vid),
         "vol_probable_l": v("Probable Quantité volée (Investigations à mener)", vols),
-        "estimation_conso_mois_l": v(f"Estimation Conso Fuel {M} {y} Sites ESCO (Litres)", est_mois if rates else None),
-        "estimation_conso_prec_l": v(f"Estimation Conso Fuel {P} {py} Sites ESCO (Litres)", est_prec if prev else None),
-        "estimation_stock_fin_l": v(f"Estimation Stock fin {M} {y}", est_stock if rates else None),
-        "estimation_stock_fin_prec_l": v(f"Estimation Stock fin {P} {py}", est_stock_prec if prev else None),
-        "estimation_livraison_l": v(f"Estimation Livraison Fuel {M} {y}", None if livree is None else livree + (autre or 0)),
-        "projection_mois_suivant_l": v(f"Projection Conso Fuel {N} {nxt_first.year} Sites ESCO (Litres)", projection),
+        "estimation_conso_mois_l": v(f"Estimation Conso Fuel {M} Sites ESCO (Litres)", est_mois if rates else None),
+        "estimation_conso_prec_l": v(f"Estimation Conso Fuel {P} Sites ESCO (Litres)", est_prec if prev else None),
+        "estimation_stock_fin_l": v(f"Estimation Stock fin {M}", est_stock if rates else None),
+        "estimation_stock_fin_prec_l": v(f"Estimation Stock fin {P}", est_stock_prec if prev else None),
+        "estimation_livraison_l": v(f"Estimation Livraison Fuel {M}", None if livree is None else livree + (autre or 0)),
+        "projection_mois_suivant_l": v(f"Projection Conso Fuel {N} Sites ESCO (Litres)", projection),
     }
 
 
@@ -227,26 +246,23 @@ def _file_kpis(month: str) -> dict | None:
     return None
 
 
-def kpis_for_period(d_from: date, d_to: date) -> dict | None:
-    """KPI « comme le fichier Closing » pour un mois civil complet ; None pour une autre période."""
+def kpis_for_period(d_from: date, d_to: date, sites: set[str] | None = None) -> dict | None:
+    """KPI « comme le fichier Closing » pour N'IMPORTE QUELLE période affichée (dynamiques) :
+      - mois de référence complet, sans filtre de sites → valeurs de l'en-tête du fichier Closing, telles quelles ;
+      - sinon → calculés depuis les bilans de la période exacte (et des seuls sites filtrés)."""
     from fuel_tracking.services import stock_period_balance as SB
 
-    first, last = _month_bounds(d_from.strftime("%Y-%m"))
-    if d_from != first or d_to != last:
-        return None
-    month = first.strftime("%Y-%m")
-    calc = computed_kpis(month)
-    if month in (SB.cfg().get("reference_periods") or []):
+    month = d_from.strftime("%Y-%m")
+    first, last = _month_bounds(month)
+    calc = computed_kpis(d_from, d_to, sites)
+    if sites is None and d_from == first and d_to == last and month in (SB.cfg().get("reference_periods") or []):
         f = _file_kpis(month)
         if f:
             kpis = dict(f["kpis"])
             kpis["projection_mois_suivant_l"] = calc["projection_mois_suivant_l"]   # le fichier ne la donne pas : méthode du fichier
-            return {"mois": month, "source": "FICHIER_CLOSING", "fichier": f["fichier"], "kpis": kpis,
-                    "note": "Mois de référence : valeurs lues dans l'en-tête du fichier Closing, telles quelles. Projection : "
-                            "conso moyenne L/jour du mois × nb de jours du mois suivant (méthode du fichier)."}
-    return {"mois": month, "source": "CALCUL_ENERTRACK", "fichier": None, "kpis": calc,
-            "note": "Valeurs calculées par EnerTrack à partir des bilans de stock du mois, avec les formules du fichier Closing. "
-                    "Commandes Aktivco et stock d'appoint : non disponibles dans les bilans."}
+            return {"mois": month, "debut": d_from.isoformat(), "fin": d_to.isoformat(), "source": "FICHIER_CLOSING",
+                    "fichier": f["fichier"], "kpis": kpis}
+    return {"mois": month, "debut": d_from.isoformat(), "fin": d_to.isoformat(), "source": "CALCUL_ENERTRACK", "fichier": None, "kpis": calc}
 
 
 def backfill_file_kpis() -> int:
