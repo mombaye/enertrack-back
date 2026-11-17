@@ -34,7 +34,7 @@ from django.db.models import Q
 from django.utils import timezone
 
 RULE_VERSION = "bilan-v2"
-MVP_RULE_VERSION = "bilan-v3-mvp"  # règles du cahier des charges 16/11/2026 (FUEL_MVP_IGNORE_VALIDATION / FUEL_APP_STOCK_START / …)
+MVP_RULE_VERSION = "bilan-v4-mvp"  # 18/11/2026 : fichiers = stocks seulement, mouvements ENOC ; v3 = 16/11/2026  # règles du cahier des charges 16/11/2026 (FUEL_MVP_IGNORE_VALIDATION / FUEL_APP_STOCK_START / …)
 
 
 def current_rule_version() -> str:
@@ -790,7 +790,9 @@ def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, pro
     cause = None
     ini, ini_cands, a1 = _select(_initial_observations(obs, start, c, previous, infos, reserves), start, False, tanks, c)
     month = _day(start).strftime("%Y-%m")
-    any_age = bool(c.get("app_stock_start")) and not _uses_app_initial(start, c)         and month in (getattr(settings, "FUEL_CLOSING_AUTHORITATIVE_PERIODS", None) or [])
+    # Mois dont les stocks viennent du fichier de clôture (avant FUEL_APP_STOCK_START : septembre, octobre 2026) : le stock final retenu
+    # par Ops est accepté quel que soit son âge s'il est relevé dans le mois (décision du 17/11/2026), avec réserve.
+    any_age = bool(c.get("app_stock_start")) and not _uses_app_initial(start, c)
     c_fin = {**c, "closing_final_any_age": _day(start) + timedelta(days=1) if any_age else None}
     fin, fin_cands, a2 = _select(_final_observations(obs, end, c, start), end, True, tanks, c_fin)
     alerts += a1 + a2

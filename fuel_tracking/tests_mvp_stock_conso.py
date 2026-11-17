@@ -429,6 +429,19 @@ class OutputAppFuelImportTests(TmpRootMixin, MvpBase):
         sept = final_stock_coverage({"DKR_0001", "DKR_0003"}, mois="2026-09")   # liste d'octobre jamais appliquée à septembre
         self.assertEqual(sept["sites_sans_ge_exclus"], 0)
 
+    @override_settings(FUEL_CLOSING_AUTHORITATIVE_PERIODS=[], FUEL_BALANCE_CLOSING_CROSSCHECK=False, FUEL_CLOSING_REFERENCE_PERIODS=[])
+    def test_files_give_stocks_only_movements_from_enoc(self):
+        """Décision du 18/11/2026 : du fichier, seuls les stocks ; les 600 L livrés au fichier ne sont PAS comptés (aucun mouvement ENOC ici)."""
+        from fuel_tracking.services import stock_import_pipeline as P
+
+        P.process_bytes(self.output_bytes(), "Output App Fuel.xlsx", "CLOSING", origin="UPLOAD")
+        oct1 = timezone.make_aware(datetime(2026, 10, 1))
+        oct31 = timezone.make_aware(datetime(2026, 10, 31, 23, 59, 59))
+        a = SB.compute_balances(oct1, oct31, site_ids=["DKR_0001"], persist=False)[0]
+        self.assertEqual((float(a["stock_initial_l"]), float(a["stock_final_l"]), float(a["livraisons_externes_l"])), (1000.0, 400.0, 0.0))
+        self.assertEqual(float(a["consommation_reelle_l"]), 600.0)
+        self.assertEqual(float(a["conso_closing_l"]), 1200.0)      # conso d'Ops : contrôle seulement
+
     @override_settings(FUEL_BALANCE_CLOSING_POST_BOUNDARY_DAYS=0)
     def test_strict_rule_rejects_readings_after_boundary(self):
         from fuel_tracking.services import stock_import_pipeline as P
@@ -504,6 +517,9 @@ class OutputPonctionAndRoundingTests(OutputAppFuelImportTests):
         out = StringIO()
         call_command("fuel_post_deploy", stdout=out)                            # idempotent
         self.assertIn("0 relevé(s) au contexte de ponction", out.getvalue())
+
+    def test_files_give_stocks_only_movements_from_enoc(self):
+        pass  # sans objet pour ce fichier
 
     def test_strict_rule_rejects_readings_after_boundary(self):
         pass  # sans objet pour ce fichier
@@ -743,9 +759,18 @@ class ClosingRetainedFinalStockTests(OutputAppFuelImportTests):
                          (170.0, "ESTIMATION_AVEC_RESERVE", "CLOSING_RETENU"))
         self.assertTrue(any("retenu par Ops" in x for x in r["reserves"]))
 
-    @override_settings(FUEL_CLOSING_AUTHORITATIVE_PERIODS=[])
+    @override_settings(FUEL_APP_STOCK_START=None)
     def test_strict_rule_rejects_readings_after_boundary(self):
-        self.assertEqual(self._oct()["cause_principale"], "STOCK_TROP_ANCIEN")   # hors mois où le fichier fait foi : règle des 14 j
+        r = self._oct()                                     # hors mois de stocks issus du fichier : règle des 14 j, jamais accepté
+        self.assertIsNone(r["consommation_reelle_l"])
+        self.assertNotEqual((r["stock_final_detail"] or {}).get("tier"), "CLOSING_RETENU")
+
+    @override_settings(FUEL_CLOSING_AUTHORITATIVE_PERIODS=[], FUEL_BALANCE_CLOSING_CROSSCHECK=False)
+    def test_still_accepted_when_movements_come_from_enoc(self):
+        self.assertEqual(self._oct()["stock_final_detail"]["tier"], "CLOSING_RETENU")
+
+    def test_files_give_stocks_only_movements_from_enoc(self):
+        pass  # sans objet pour ce fichier
 
     def test_sites_without_genset_excluded_from_health(self):
         pass  # sans objet pour ce fichier

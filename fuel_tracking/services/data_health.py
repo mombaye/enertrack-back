@@ -138,7 +138,7 @@ def final_stock_coverage(base: set, top: int = 60, mois: str | None = None) -> d
     post = c.get("post_days", 0) if use_closing else 0
     tz = timezone.get_current_timezone()
     lo = datetime.combine(end_day - timedelta(days=c["reserve_days"]), time.min, tz)
-    if use_closing and month in (getattr(settings, "FUEL_CLOSING_AUTHORITATIVE_PERIODS", None) or []):
+    if use_closing:
         # mois où le fichier de clôture fait foi : tout stock final relevé dans le mois est retenu (avec réserve), décision du 17/11/2026
         lo = datetime.combine(first + timedelta(days=1), time.min, tz)
     hi = datetime.combine(end_day + timedelta(days=post), time(23, 59, 59), tz)
