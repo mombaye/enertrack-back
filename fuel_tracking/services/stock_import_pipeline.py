@@ -193,6 +193,15 @@ def process_bytes(data: bytes, file_name: str, source_type: str, *, origin: str 
             _finalize_counts(batch)
             _declare_period(batch)
             batch.status, batch.status_message = _decide_status(batch)
+            # Fichier de clôture sans ligne « cuve » (ex. Output App Fuel) : le résultat utile est le nombre de stocks importés,
+            # pas les lignes du registre — sinon un import réussi s'afficherait « Aucune ligne exploitable trouvée ».
+            cl = (stats or {}).get("stocks_closing") or {}
+            if batch.rows_total == 0 and cl.get("stocks_importes"):
+                batch.status = B.Status.ACCEPTED
+                batch.status_message = (f"{cl['stocks_importes']} stock(s) importé(s) ({cl.get('format') or 'Closing'})"
+                                        + (f", {cl['sites_inconnus']} site(s) inconnu(s) de Gestion des sites" if cl.get("sites_inconnus") else "")
+                                        + (f", {cl['stock_final_estime_energy_desk']} stock(s) final(s) estimé(s) Energy Desk"
+                                           if cl.get("stock_final_estime_energy_desk") else "") + ".")
             batch.summary = stats
     except Exception as exc:  # échec technique : le lot reste tracé, le fichier va dans rejected/
         logger.exception("[stock_registry] échec du traitement de %s", file_name)

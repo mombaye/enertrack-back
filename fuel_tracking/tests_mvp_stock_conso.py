@@ -236,6 +236,10 @@ class ConfigurationClosingUploadTests(TmpRootMixin, MvpBase):
         self.assertEqual((bal.get().source_stock_initial, float(bal.get().stock_initial_l)), ("CLOSING", 500.0))
         status = self.client.get("/api/fuel-tracking/configuration/closing/").json()
         self.assertEqual((status["lots"][0]["stocks_importes"], status["en_attente"], status["peut_envoyer"]), (2, [], True))
+        lot = status["lots"][0]
+        self.assertEqual((lot["etape"], lot["format"], lot["recalcul_bilans"]["statut"]), ("TERMINE", "Closing", "TERMINE"))
+        self.assertEqual(lot["recalcul_bilans"]["mois_faits"], lot["recalcul_bilans"]["mois_total"])
+        self.assertGreaterEqual(lot["recalcul_bilans"]["mois_total"], 1)
 
     def test_same_file_twice_is_not_reimported(self):
         d1, d2 = datetime(2026, 8, 31), datetime(2026, 9, 30)
@@ -389,6 +393,8 @@ class OutputAppFuelImportTests(TmpRootMixin, MvpBase):
         st = b.summary["stocks_closing"]
         self.assertEqual((st["format"], st["stocks_importes"], st["sites_sans_ge_ignores"], st["sites_inconnus"], st["stock_final_estime_energy_desk"]),
                          ("Output App Fuel", 4, 1, 1, 1))
+        self.assertEqual(b.status, "ACCEPTED")
+        self.assertIn("4 stock(s) importé(s) (Output App Fuel)", b.status_message)
         oct1 = timezone.make_aware(datetime(2026, 10, 1))
         oct31 = timezone.make_aware(datetime(2026, 10, 31, 23, 59, 59))
         rows = {r["site_id"]: r for r in SB.compute_balances(oct1, oct31, site_ids=["DKR_0001", "DKR_0002"], persist=False)}
@@ -443,3 +449,19 @@ class ClosingAuthoritativeOctoberTests(MvpBase):
         self.tc("TC-OCT2", 200, timezone.make_aware(datetime(2026, 10, 10)))
         r = SB.compute_balances(oct1, oct31, site_ids=["DKR_0001"], persist=False)[0]
         self.assertEqual(float(r["consommation_reelle_l"]), 400.0)            # ENOC = Closing : pas de remplacement
+
+
+class UploadStepTests(MvpBase):
+    def test_steps(self):
+        from types import SimpleNamespace as N
+
+        from fuel_tracking.views_stock import _upload_step
+
+        b = lambda status, dup=None: N(status=status, duplicate_of_id=dup)  # noqa: E731
+        self.assertEqual(_upload_step(b("PROCESSING"), None), "IMPORT")
+        self.assertEqual(_upload_step(b("ACCEPTED"), {"statut": "EN_COURS"}), "RECALCUL")
+        self.assertEqual(_upload_step(b("ACCEPTED"), {"statut": "TERMINE"}), "TERMINE")
+        self.assertEqual(_upload_step(b("REJECTED", dup=3), None), "DOUBLON")
+        self.assertEqual(_upload_step(b("FAILED"), None), "ECHEC")
+        self.assertEqual(_upload_step(b("ACCEPTED"), {"statut": "ECHEC"}), "ECHEC")
+        self.assertEqual(_upload_step(b("ACCEPTED"), None), "IMPORTE")

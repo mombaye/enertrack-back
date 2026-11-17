@@ -831,6 +831,26 @@ class ImportProcessIncomingView(APIView):
                          "statuts": {st: sum(1 for x in out if x["status"] == st) for st in sorted({x["status"] for x in out})}})
 
 
+def _upload_step(b, recalc) -> str:
+    """Étape d'un import de fichier de clôture, pour le suivi à l'écran :
+    IMPORT (lecture du fichier) → RECALCUL (bilans des mois couverts) → TERMINE ; ECHEC ; DOUBLON (fichier déjà reçu) ;
+    IMPORTE (lot importé sans recalcul suivi — dépôt direct dans le partage : recalcul au passage de nuit)."""
+    st = (recalc or {}).get("statut")
+    if b.status in ("RECEIVED", "PROCESSING"):
+        return "IMPORT"
+    if st == "EN_COURS":
+        return "RECALCUL"
+    if st == "ECHEC" or (b.status == "FAILED" and not st):
+        return "ECHEC"
+    if st == "TERMINE":
+        return "TERMINE"
+    if b.duplicate_of_id:
+        return "DOUBLON"
+    if st == "NON_LANCE" or b.status == "REJECTED":
+        return "ECHEC"
+    return "IMPORTE"
+
+
 class ClosingUploadView(APIView):
     """
     Rubrique « Configuration » du Suivi Carburant — fichier de clôture (Closing).
@@ -859,6 +879,10 @@ class ClosingUploadView(APIView):
             d["stocks_importes"] = stocks.get("stocks_importes")
             d["sites_inconnus"] = stocks.get("sites_inconnus")
             d["formule_incoherente"] = stocks.get("formule_incoherente_a_valider")
+            d["format"] = stocks.get("format") or "Closing"
+            recalc = (b.summary or {}).get("recalcul_bilans") or None
+            d["recalcul_bilans"] = recalc
+            d["etape"] = _upload_step(b, recalc)
             out.append(d)
         return Response({"lots": out, "en_attente": pending_files(), "peut_envoyer": getattr(request.user, "role", None) in VALIDATOR_ROLES})
 

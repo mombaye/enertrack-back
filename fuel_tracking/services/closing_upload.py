@@ -84,41 +84,62 @@ def months_covered(batch, today: date | None = None) -> list[tuple[date, date]]:
     return months
 
 
-def recompute_balances(batch) -> list[dict]:
+RECALC_KEY = "recalcul_bilans"  # avancement du recalcul, enregistré dans FuelImportBatch.summary (suivi à l'écran)
+
+
+def _set_progress(batches, data: dict) -> None:
+    """Enregistre l'avancement du recalcul sur le(s) lot(s) suivis par l'interface (aucune migration : champ JSON summary)."""
+    for b in {x.pk: x for x in batches if x is not None}.values():
+        b.summary = {**(b.summary or {}), RECALC_KEY: data}
+        b.save(update_fields=["summary"])
+
+
+def recompute_balances(batch, track=None) -> list[dict]:
+    """Recalcule les bilans des mois couverts par le lot, du plus ancien au plus récent ; avancement enregistré mois par mois."""
     from fuel_tracking.services import stock_period_balance as SB
     from fuel_tracking.services.period_utils import day_bounds
 
+    track = track or [batch]
+    months = months_covered(batch)
+    started = timezone.now().isoformat()
     res = []
-    for start, end in months_covered(batch):
+    _set_progress(track, {"statut": "EN_COURS", "debut": started, "mois_total": len(months), "mois_faits": 0, "mois": []})
+    for start, end in months:
         s, e = day_bounds(start, end)
         rows = SB.compute_balances(s, e)
         res.append({"debut": start.isoformat(), "fin": end.isoformat(), "sites": len(rows),
                     "calculables": sum(1 for r in rows if r.get("consommation_reelle_l") is not None)})
+        _set_progress(track, {"statut": "EN_COURS", "debut": started, "mois_total": len(months), "mois_faits": len(res), "mois": res})
+    _set_progress(track, {"statut": "TERMINE", "debut": started, "fin": timezone.now().isoformat(), "mois_total": len(months),
+                          "mois_faits": len(res), "mois": res})
     return res
 
 
 def process_saved(path: str, user_id: int | None = None) -> dict:
-    """Traite un fichier déposé par l'interface puis recalcule les bilans des mois couverts."""
+    """Traite un fichier déposé par l'interface puis recalcule les bilans des mois couverts (avancement suivi à l'écran)."""
     from django.contrib.auth import get_user_model
 
     from fuel_tracking.models import FuelImportBatch as B
-    from fuel_tracking.services.stock_import_pipeline import process_bytes, sha256
+    from fuel_tracking.models import FuelStockObservation as Obs
+    from fuel_tracking.services.stock_import_pipeline import process_bytes
 
     p = Path(path)
     user = get_user_model().objects.filter(pk=user_id).first() if user_id else None
     if p.exists():
-        batch = process_bytes(p.read_bytes(), p.name, SOURCE_TYPE, origin="UPLOAD", user=user, src_path=p)
+        uploaded = process_bytes(p.read_bytes(), p.name, SOURCE_TYPE, origin="UPLOAD", user=user, src_path=p)
     else:  # déjà pris en charge par le passage automatique : on retrouve son lot par le nom horodaté
-        batch = B.objects.filter(source_type=SOURCE_TYPE, file_name=p.name[:255]).order_by("-received_at").first()
-        if batch is None:
+        uploaded = B.objects.filter(source_type=SOURCE_TYPE, file_name=p.name[:255]).order_by("-received_at").first()
+        if uploaded is None:
             return {"statut": "INTROUVABLE", "fichier": p.name}
-    if batch.duplicate_of_id:
-        batch = batch.duplicate_of
-    from fuel_tracking.models import FuelStockObservation as Obs
-
+    batch = uploaded.duplicate_of if uploaded.duplicate_of_id else uploaded  # doublon : on recalcule à partir du lot d'origine
     has_stocks = Obs.objects.filter(batch_id=batch.pk, source_type=SOURCE_TYPE).exists()
     if batch.status not in (B.Status.ACCEPTED, B.Status.VALIDATION_REQUIRED) and not has_stocks:
+        _set_progress([uploaded], {"statut": "NON_LANCE", "motif": "Aucun stock importé : pas de bilan à recalculer."})
         return {"statut": batch.status, "lot": batch.pk, "bilans": []}
-    bilans = recompute_balances(batch)
+    try:
+        bilans = recompute_balances(batch, track=[uploaded, batch])
+    except Exception as exc:
+        _set_progress([uploaded, batch], {"statut": "ECHEC", "fin": timezone.now().isoformat(), "motif": f"{type(exc).__name__} : {exc}"[:500]})
+        raise
     logger.info("[fuel_tracking] Closing %s (lot %s) importé, bilans recalculés : %s", batch.file_name, batch.pk, bilans)
     return {"statut": batch.status, "lot": batch.pk, "bilans": bilans}
