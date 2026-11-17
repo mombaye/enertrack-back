@@ -17,6 +17,7 @@ from rest_framework.test import APIClient
 
 from fuel_tracking.models import FuelImportBatch, FuelMovement, FuelStockBalance, FuelStockObservation as Obs
 from fuel_tracking.services import enoc_canonical as C
+from fuel_tracking.services import stock_period_balance as SB
 from fuel_tracking.services.stock_file_analysis import closing_stock_rows
 from fuel_tracking.tests_enoc_qualification import MVP_RULES
 from fuel_tracking.tests_stock_period_balance import BalanceBase
@@ -36,7 +37,17 @@ class MvpBase(BalanceBase):
         return self.obs(liters, at, source="ENOC", **values)
 
 
-class MvpEnocStatusTests(MvpBase):
+class MvpAppBase(MvpBase):
+    """Période à partir de FUEL_APP_STOCK_START (novembre 2026 et après) : stock final = relevé ENOC le plus récent."""
+
+    def setUp(self):
+        super().setUp()
+        ov = override_settings(FUEL_APP_STOCK_START=self.start.date().isoformat())
+        ov.enable()
+        self.addCleanup(ov.disable)
+
+
+class MvpEnocStatusTests(MvpAppBase):
     def test_pending_and_done_without_trace_are_eligible_rejected_never(self):
         base = {"_has_request": True}
         self.assertTrue(C.map_status({**base, "raw_status": "pending"})["eligible_for_stock"])
@@ -61,15 +72,66 @@ class MvpEnocStatusTests(MvpBase):
 
 
 class MvpStockOriginTests(MvpBase):
-    # Étape 1 — période historique (avant FUEL_APP_STOCK_START) : stock initial = Closing uniquement
-    def test_historical_initial_from_closing_only_final_from_latest_enoc(self):
+    # Étape 1 — période historique (septembre, octobre 2026 : avant FUEL_APP_STOCK_START) : stocks initial ET final = Closing
+    def test_historical_period_initial_and_final_from_closing(self):
         self.obs(900, self.start + timedelta(hours=2))                       # gardiennage fichier (Loliforce) : ignoré
         self.closing_initial(500, self.start + timedelta(hours=1))
         self.obs(250, self.end - timedelta(hours=1))                         # gardiennage fichier en fin de période : ignoré
-        self.enoc_level(350, self.end - timedelta(days=2))                   # plus ancien
-        self.enoc_level(320, self.end - timedelta(hours=3))                  # plus récent → retenu
+        self.closing_initial(330, self.end - timedelta(hours=3))             # stock final du Closing → retenu
+        self.enoc_level(320, self.end - timedelta(hours=1))                  # relevé ENOC plus récent : pas utilisé avant novembre
         r = self.compute()["DKR_0001"]
         self.assertEqual((r["source_stock_initial"], float(r["stock_initial_l"])), ("CLOSING", 500.0))
+        self.assertEqual((r["source_stock_final"], float(r["stock_final_l"])), ("CLOSING", 330.0))
+        self.assertEqual(float(r["consommation_reelle_l"]), 170.0)
+        self.assertFalse(any("source moins fiable" in x for x in r["reserves"]))
+
+    def test_historical_period_without_closing_final_not_computable(self):
+        self.closing_initial(500, self.start + timedelta(hours=1))
+        self.enoc_level(320, self.end - timedelta(hours=1))                  # ENOC seul en fin de période historique : insuffisant
+        r = self.compute()["DKR_0001"]
+        self.assertIsNone(r["consommation_reelle_l"])
+        self.assertTrue(any("Stock final absent" in m for m in r["motifs"]))
+
+    def test_no_closing_initial_means_not_computable(self):
+        self.obs(500, self.start + timedelta(hours=1))  # seul un relevé de gardiennage fichier : pas une source du stock initial historique
+        self.closing_initial(300, self.end - timedelta(hours=1))
+        r = self.compute()["DKR_0001"]
+        self.assertIsNone(r["consommation_reelle_l"])
+        self.assertEqual((r["statut_bilan"], r["cause_principale"]), ("NON_CALCULABLE", "DONNEES_STOCK_INCOMPLETES"))
+
+    # Étape 1 — à partir de FUEL_APP_STOCK_START : stock initial = stock final du bilan précédent
+    def test_app_period_initial_is_previous_balance_final(self):
+        prev_start, prev_end = self.start - timedelta(days=19), self.start - timedelta(seconds=1)
+        self.closing_initial(800, prev_start + timedelta(hours=1))
+        self.closing_initial(500, prev_end - timedelta(hours=2))
+        self.compute(start=prev_start, end=prev_end)                          # bilan précédent (historique) : stock final Closing 500 L
+        self.closing_initial(999, self.start + timedelta(hours=1))           # Closing de la période : ignoré, l'application prend le relais
+        self.enoc_level(300, self.end - timedelta(hours=1))
+        with override_settings(FUEL_APP_STOCK_START=self.start.date().isoformat()):
+            r = self.compute()["DKR_0001"]
+        self.assertEqual((r["source_stock_initial"], float(r["stock_initial_l"])), ("APP", 500.0))
+        self.assertEqual((r["source_stock_final"], float(r["stock_final_l"])), ("ENOC", 300.0))
+        self.assertEqual(float(r["consommation_reelle_l"]), 200.0)
+        self.assertTrue(any("bilan précédent" in m for m in r["motifs"]))
+
+    def test_app_period_without_previous_balance_falls_back_on_closing_with_reserve(self):
+        self.closing_initial(600, self.start - timedelta(hours=6))
+        self.enoc_level(300, self.end - timedelta(hours=1))
+        with override_settings(FUEL_APP_STOCK_START=self.start.date().isoformat()):
+            r = self.compute()["DKR_0001"]
+        self.assertEqual((r["source_stock_initial"], float(r["stock_initial_l"])), ("CLOSING", 600.0))
+        self.assertEqual(r["statut_bilan"], "ESTIMATION_AVEC_RESERVE")
+        self.assertTrue(any("repli sur le dernier stock du fichier de clôture" in x for x in r["reserves"]))
+
+
+class MvpFinalStockEnocTests(MvpAppBase):
+    # À partir de novembre : stock final = relevé ENOC le plus récent (validation non requise)
+    def test_final_is_latest_enoc_reading(self):
+        self.closing_initial(500, self.start + timedelta(hours=1))
+        self.obs(250, self.end - timedelta(hours=1))                         # gardiennage fichier : ignoré
+        self.enoc_level(350, self.end - timedelta(days=2))
+        self.enoc_level(320, self.end - timedelta(hours=3))
+        r = self.compute()["DKR_0001"]
         self.assertEqual((r["source_stock_final"], float(r["stock_final_l"])), ("ENOC", 320.0))
         self.assertEqual(float(r["consommation_reelle_l"]), 180.0)
         self.assertFalse(any("source moins fiable" in x for x in r["reserves"]))  # ENOC est la source officielle du stock final
@@ -96,38 +158,8 @@ class MvpStockOriginTests(MvpBase):
         r = self.compute()["DKR_0001"]
         self.assertEqual(float(r["stock_final_l"]), 300.0)
 
-    def test_no_closing_initial_means_not_computable(self):
-        self.obs(500, self.start + timedelta(hours=1))  # seul un relevé de gardiennage fichier : pas une source du stock initial historique
-        self.enoc_level(300, self.end - timedelta(hours=1))
-        r = self.compute()["DKR_0001"]
-        self.assertIsNone(r["consommation_reelle_l"])
-        self.assertEqual((r["statut_bilan"], r["cause_principale"]), ("NON_CALCULABLE", "DONNEES_STOCK_INCOMPLETES"))
 
-    # Étape 1 — à partir de FUEL_APP_STOCK_START : stock initial = stock final du bilan précédent
-    def test_app_period_initial_is_previous_balance_final(self):
-        prev_start, prev_end = self.start - timedelta(days=19), self.start - timedelta(seconds=1)
-        self.closing_initial(800, prev_start + timedelta(hours=1))
-        self.enoc_level(500, prev_end - timedelta(hours=2))
-        self.compute(start=prev_start, end=prev_end)                          # bilan précédent enregistré (stock final ENOC 500 L)
-        self.closing_initial(999, self.start + timedelta(hours=1))           # Closing de la période : ignoré, l'application prend le relais
-        self.enoc_level(300, self.end - timedelta(hours=1))
-        with override_settings(FUEL_APP_STOCK_START=self.start.date().isoformat()):
-            r = self.compute()["DKR_0001"]
-        self.assertEqual((r["source_stock_initial"], float(r["stock_initial_l"])), ("APP", 500.0))
-        self.assertEqual(float(r["consommation_reelle_l"]), 200.0)
-        self.assertTrue(any("bilan précédent" in m for m in r["motifs"]))
-
-    def test_app_period_without_previous_balance_falls_back_on_closing_with_reserve(self):
-        self.closing_initial(600, self.start - timedelta(hours=6))
-        self.enoc_level(300, self.end - timedelta(hours=1))
-        with override_settings(FUEL_APP_STOCK_START=self.start.date().isoformat()):
-            r = self.compute()["DKR_0001"]
-        self.assertEqual((r["source_stock_initial"], float(r["stock_initial_l"])), ("CLOSING", 600.0))
-        self.assertEqual(r["statut_bilan"], "ESTIMATION_AVEC_RESERVE")
-        self.assertTrue(any("repli sur le dernier stock du fichier de clôture" in x for x in r["reserves"]))
-
-
-class MvpMovementsAndClosingTests(MvpBase):
+class MvpMovementsAndClosingTests(MvpAppBase):
     # Étape 2 — mouvements de fichiers : listés, jamais comptés
     def test_file_movements_listed_not_counted(self):
         self.closing_initial(500, self.start + timedelta(hours=1))
@@ -224,3 +256,190 @@ class ConfigurationClosingUploadTests(TmpRootMixin, MvpBase):
             declared_period_start, declared_period_end = date(2026, 8, 31), date(2026, 10, 2)
         m = months_covered(Batch(), today=date(2026, 11, 16))
         self.assertEqual([x[0].isoformat() for x in m], ["2026-08-01", "2026-09-01", "2026-10-01"])
+
+
+class GensetDbAbaqueTests(MvpBase):
+    """Point 3 : abaque CPH lu dans l'onglet GENSET DB du Closing (courbes + correspondance avec l'inventaire des sites)."""
+    HEAD = [None, "Manufacturer ", "Type", "Genset List", "Type de GE", None, "Voltage [V]", "No. of phases", "PRP [kVA]", "PRP [kW]",
+            "cosφ", "Conso 100%", "Conso 75%", "Conso 50%", "a", "b", "c", "Conso Moyenne"]
+
+    def rows(self):
+        return [[None, None, None, None, 1, 2, 3], self.HEAD, [None] * 11 + [1, 0.75, 0.5],
+                [None, None, None, None, "Site avec cuve et sans GE"],
+                [None, "FG Wilson", "P50-3 (DSE4520)", "FG Wilson P50-3 (DSE4520)", "P50-3 ", 50, 400, 3, 45, 36, 0.8, 10.6, 8.1, 5.9, 0.8, 7.9, 1.9, 10],
+                [None, "FG Wilson", "P50-3 (DSE7320)", "FG Wilson P50-3 (DSE7320)", "P50-3 ", 50, 400, 3, 45, 36, 0.8, 10.6, 8.1, 5.9, 0.8, 7.9, 1.9, 10],
+                [None, "SDMO", None, None, "K22", 22, 400, 3, 20, 16, 0.8, 5.1, 3.9, 2.8, 0.8, 3.0, 1.3, 5]]
+
+    def test_parse_dedup_and_fit(self):
+        from fuel_tracking.services import genset_db_import as G
+
+        curves, warnings = G.parse_rows(self.rows())
+        self.assertEqual(len(curves), 2)  # deux variantes de contrôleur, mêmes points : une seule courbe P50-3
+        p50 = next(c for c in curves if c["model"] == "P50-3")
+        self.assertEqual((p50["manufacturer"], float(p50["prp_kva"]), float(p50["conso_75_l_h"]), p50["curve_id"][:4]), ("FG Wilson", 45.0, 8.1, "GDB-"))
+        self.assertEqual(G.candidates_for("FG Wilson P50-3", curves), [p50["curve_id"]])
+        self.assertEqual(G.candidates_for("SDMO - K22", curves), [next(c["curve_id"] for c in curves if c["model"] == "K22")])
+        self.assertEqual(G.candidates_for("FG Wilson P50-3U", curves), [])  # variante non rapprochée automatiquement
+
+    def test_apply_creates_curves_and_auto_matches_inventory(self):
+        from fuel_tracking.models import CphCurve, CphInventoryMapping
+        from fuel_tracking.services import genset_db_import as G
+
+        curves, _ = G.parse_rows(self.rows())
+        res = G.apply(curves, "closing_sept.xlsb", labels=[("FG Wilson P50-3", Decimal("50")), ("SDMO - K22", Decimal("22")),
+                                                            ("FG Wilson P33-3U", Decimal("33"))])
+        self.assertEqual((res["courbes_creees"], res["types_ge_avec_courbe"], res["types_ge_sans_courbe"]), (2, 2, 1))
+        m = CphInventoryMapping.objects.get(inventory_label="FG Wilson P50-3")
+        self.assertEqual(m.match_status, "AUTO_VALIDE_COMPATIBLE", m.match_reasons)
+        self.assertEqual(m.validated_curve.model, "P50-3")
+        self.assertEqual(CphCurve.objects.get(pk=m.validated_curve_id).source, G.SOURCE_LABEL)
+        again = G.apply(curves, "closing_sept.xlsb", labels=[("FG Wilson P50-3", Decimal("50"))])  # réimport idempotent
+        self.assertEqual((again["courbes_creees"], CphInventoryMapping.objects.count()), (0, 2))
+
+    def test_manual_decision_never_overwritten(self):
+        from fuel_tracking.models import CphInventoryMapping
+        from fuel_tracking.services import genset_db_import as G
+
+        CphInventoryMapping.objects.create(inventory_label="FG Wilson P50-3", inventory_label_normalized="fg wilson p50-3",
+                                           inventory_kva=Decimal("50"), candidate_curve_ids=[], abaque_status="COURBE_CPH_MANQUANTE",
+                                           match_status="REJETE", match_method="RETRAIT_MANUEL")
+        curves, _ = G.parse_rows(self.rows())
+        G.apply(curves, "closing_sept.xlsb", labels=[("FG Wilson P50-3", Decimal("50"))])
+        m = CphInventoryMapping.objects.get(inventory_label="FG Wilson P50-3")
+        self.assertEqual((m.match_status, m.candidate_curve_ids), ("REJETE", []))
+
+
+class EnocLevelFieldsTests(BalanceBase):
+    """ENOC a remplacé level_before / level_after (+ unité) par level_*_l et level_*_cm (constaté en prod le 17/11/2026)."""
+
+    def test_level_of_reads_new_and_old_fields(self):
+        from fuel_tracking.services.enoc_mongo_service import level_of
+
+        self.assertEqual(level_of({"level_after_l": 130.0, "level_after_cm": None, "level_after_unit": "L"}, "after"), (130.0, "L"))
+        self.assertEqual(level_of({"level_before_l": None, "level_before_cm": 42.0}, "before"), (42.0, "cm"))
+        self.assertEqual(level_of({"level_before": 55, "level_before_unit": "cm", "level_before_l": 300}, "before"), (55, "cm"))  # ancien champ prioritaire
+        self.assertEqual(level_of({"level_after_l": 0.0}, "after"), (0.0, "L"))  # 0 L mesuré reste 0, jamais « absent »
+        self.assertEqual(level_of(None, "after"), (None, None))
+
+    def test_fetch_movements_maps_new_level_fields_to_registry(self):
+        from unittest import mock
+
+        from fuel_tracking.management.commands.sync_enoc_fuel_movements import clean_payload
+        from fuel_tracking.models import FuelEnocMovement, FuelStockObservation as Obs
+        from fuel_tracking.services import enoc_mongo_service as EM
+        from fuel_tracking.services import stock_enoc as E
+
+        at = self.base + timedelta(days=10)
+        req = {"_id": "oid-1", "request_code": "RC-1", "status": "done", "site_id": "DKR_0001", "operation_type": "TOTAL_CARD",
+               "created_at": (at - timedelta(days=1)).isoformat(), "level_before_l": 120.0, "level_before_cm": None,
+               "approved_quantity_liters": 200, "action": {"validated_at": (at - timedelta(hours=12)).isoformat()}}
+        op = {"request_code": "RC-1", "operation_type": "TOTAL_CARD", "operation_date": at.isoformat(), "created_at": at.isoformat(),
+              "quantity_added_liters": 200.0, "level_after_l": None, "level_after_cm": 41.0, "level_after_unit": "cm"}
+
+        class Coll:
+            def __init__(self, docs):
+                self.docs = docs
+
+            def find(self, *a, **k):
+                return list(self.docs)
+
+        class Client:
+            def __getitem__(self, name):
+                return type("DB", (), {"fuel_requests": Coll([req]), "fuel_operations": Coll([op])})()
+
+            def close(self):
+                pass
+
+        with mock.patch.object(EM, "_connect", return_value=Client()):
+            items = EM.fetch_fuel_movements()
+        self.assertEqual((items[0]["level_before"], items[0]["level_before_unit"], items[0]["level_after"], items[0]["level_after_unit"]),
+                         (120.0, "L", 41.0, "cm"))
+        FuelEnocMovement.objects.create(**clean_payload(items[0]))
+        E.sync_enoc_to_registry()
+        obs = {o.source_event_id: o for o in Obs.objects.filter(source_type="ENOC")}
+        self.assertEqual((obs["RC-1:before"].level_unit, float(obs["RC-1:before"].level_value)), ("L", 120.0))
+        self.assertEqual((obs["RC-1:after"].level_unit, float(obs["RC-1:after"].level_value)), ("CM", 41.0))
+
+
+class OutputAppFuelImportTests(TmpRootMixin, MvpBase):
+    """Fichier « Output App Fuel » (feuille Output) importé comme fichier de clôture : stocks initial (O) et final (AM / AQ / AR)."""
+
+    def output_bytes(self):
+        head = ["", "ID du site", "Nom du site", "Région O&M", "Date de Relevé Initiale", "Qtité laissée à la date initiale (relevé de terrain)",
+                "Qtité laissée retenue", "Source de donnée de stock", "Total Livraison Fuel EYDON", "Total Livraison Fuel CARTE TOTAL",
+                "Total Ajout", "Total Retrait", "Total Ponction", "Total QTE volée déclarée", "Total QTE vidangée / Fuite / Ecart de Stock",
+                "Date de Relevé Finale", "Qtité laissée à la date finale (relevé de terrain)", "Qtité laissée retenue", "Source de donnée de stock",
+                "Variation de stock Fuel considéréé  (L)", "Estimation Conso Fuel Théorique retenue  (L)", "Source de donnée Estimation Conso Fuel théorique"]
+        d = lambda m, j: datetime(2026, m, j)  # noqa: E731
+        rows = [["", "INVENTAIRE"], head,
+                ["", "DKR_0001", "ALPHA", "DAKAR", d(9, 30), 1000, 1000, "relevé de terrain", 0, 600, 0, 0, 0, 0, 0,
+                 d(10, 31), 400, 400, "Relevés de Terrain Technicien", 1200, 1100, "calcul cph et temps de marche GE"],
+                ["", "DKR_0002", "SOURCE", "DAKAR", d(10, 2), 800, 800, "relevé de terrain", 0, 0, 0, 0, 0, 0, 0,
+                 d(11, 5), 300, 300, "Estimation Energy Desk", 500, None, None],
+                ["", "DKR_0003", "SANS GE", "DAKAR", d(9, 30), 0, 0, "relevé de terrain", 0, 0, 0, 0, 0, 0, 0,
+                 d(10, 31), 0, 0, "Site sans GE et sans cuve", 0, None, None],
+                ["", "XXX_9999", "INCONNU", "DAKAR", d(9, 30), 10, 10, "relevé de terrain", 0, 0, 0, 0, 0, 0, 0,
+                 d(10, 31), 5, 5, "Relevés de Terrain Technicien", 5, None, None]]
+        return xlsx({"Output": rows})
+
+    def test_import_and_october_balance(self):
+        from fuel_tracking.services import stock_import_pipeline as P
+
+        b = P.process_bytes(self.output_bytes(), "Output App Fuel.xlsx", "CLOSING", origin="UPLOAD")
+        st = b.summary["stocks_closing"]
+        self.assertEqual((st["format"], st["stocks_importes"], st["sites_sans_ge_ignores"], st["sites_inconnus"], st["stock_final_estime_energy_desk"]),
+                         ("Output App Fuel", 4, 1, 1, 1))
+        oct1 = timezone.make_aware(datetime(2026, 10, 1))
+        oct31 = timezone.make_aware(datetime(2026, 10, 31, 23, 59, 59))
+        rows = {r["site_id"]: r for r in SB.compute_balances(oct1, oct31, site_ids=["DKR_0001", "DKR_0002"], persist=False)}
+        a = rows["DKR_0001"]
+        self.assertEqual((a["source_stock_initial"], float(a["stock_initial_l"]), a["source_stock_final"], float(a["stock_final_l"])),
+                         ("CLOSING", 1000.0, "CLOSING", 400.0))
+        # Octobre = période où le fichier de clôture fait foi (ENOC incomplet) : 1 000 + 600 livrés au fichier − 400 = 1 200 L,
+        # identique à la variation Ops ; ENOC reste affiché, le bilan est « avec réserve ».
+        self.assertEqual(float(a["consommation_reelle_l"]), 1200.0)
+        self.assertEqual(float(a["conso_closing_l"]), 1200.0)
+        self.assertEqual(float(a["livraisons_externes_l"]), 600.0)
+        self.assertTrue(any("Closing de la période validée" in x for x in a["reserves"]))
+        b2 = rows["DKR_0002"]                                               # relevés du 02/10 et du 05/11 + stock final estimé Energy Desk
+        self.assertEqual((float(b2["stock_initial_l"]), float(b2["stock_final_l"]), b2["statut_bilan"]), (800.0, 300.0, "ESTIMATION_AVEC_RESERVE"))
+        self.assertTrue(any("après la borne" in x for x in b2["reserves"]))
+        self.assertTrue(b2["estimation"])                                   # stock final estimé : jamais présenté comme mesuré
+
+    @override_settings(FUEL_BALANCE_CLOSING_POST_BOUNDARY_DAYS=0)
+    def test_strict_rule_rejects_readings_after_boundary(self):
+        from fuel_tracking.services import stock_import_pipeline as P
+
+        P.process_bytes(self.output_bytes(), "Output App Fuel.xlsx", "CLOSING", origin="UPLOAD")
+        oct1 = timezone.make_aware(datetime(2026, 10, 1))
+        oct31 = timezone.make_aware(datetime(2026, 10, 31, 23, 59, 59))
+        r = SB.compute_balances(oct1, oct31, site_ids=["DKR_0002"], persist=False)[0]
+        self.assertIsNone(r["consommation_reelle_l"])
+
+
+class ClosingAuthoritativeOctoberTests(MvpBase):
+    """Décision 17/11/2026 : septembre / octobre 2026, totaux du fichier de clôture prioritaires sur ENOC ; novembre : ENOC seul."""
+
+    def test_sept_closing_initial_with_october_file_final_uses_file_totals(self):
+        oct1 = timezone.make_aware(datetime(2026, 10, 1))
+        oct31 = timezone.make_aware(datetime(2026, 10, 31, 23, 59, 59))
+        sept_ctx = {"type": "closing_periode", "periode": ["2026-08-31", "2026-09-30"], "livre_l": 0, "conso_closing_l": 300}
+        oct_ctx = {"type": "closing_periode", "fichier": "Output App Fuel", "periode": ["2026-09-30", "2026-10-31"], "livre_l": 700,
+                   "rajout_retrait_l": 0, "vole_l": 0, "vidange_l": 0, "conso_closing_l": 900}
+        self.obs(500, timezone.make_aware(datetime(2026, 9, 30, 12)), source="CLOSING", tank_id="SITE", source_context=sept_ctx)
+        self.obs(300, timezone.make_aware(datetime(2026, 10, 31, 12)), source="CLOSING", tank_id="SITE", source_context=oct_ctx)
+        self.tc("TC-OCT", 200, timezone.make_aware(datetime(2026, 10, 10)))   # ENOC : 200 L seulement
+        r = SB.compute_balances(oct1, oct31, site_ids=["DKR_0001"], persist=False)[0]
+        self.assertEqual(float(r["consommation_reelle_l"]), 900.0)            # 500 + 700 (fichier) − 300, et non 500 + 200 − 300
+        self.assertTrue(any(m["source"] == "ENOC" for m in r["mouvements_exclus"]))  # ENOC conservé pour audit
+
+    @override_settings(FUEL_CLOSING_AUTHORITATIVE_PERIODS=[])
+    def test_without_authoritative_period_enoc_kept(self):
+        oct1 = timezone.make_aware(datetime(2026, 10, 1))
+        oct31 = timezone.make_aware(datetime(2026, 10, 31, 23, 59, 59))
+        ctx = {"type": "closing_periode", "periode": ["2026-09-30", "2026-10-31"], "livre_l": 200, "rajout_retrait_l": 0, "vole_l": 0, "vidange_l": 0}
+        self.obs(500, timezone.make_aware(datetime(2026, 9, 30, 12)), source="CLOSING", tank_id="SITE", source_context=ctx)
+        self.obs(300, timezone.make_aware(datetime(2026, 10, 31, 12)), source="CLOSING", tank_id="SITE", source_context=ctx)
+        self.tc("TC-OCT2", 200, timezone.make_aware(datetime(2026, 10, 10)))
+        r = SB.compute_balances(oct1, oct31, site_ids=["DKR_0001"], persist=False)[0]
+        self.assertEqual(float(r["consommation_reelle_l"]), 400.0)            # ENOC = Closing : pas de remplacement

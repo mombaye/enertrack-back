@@ -24,10 +24,12 @@ from fuel_tracking.services import stock_work_queue as W
 # Elles restent activables par variables d'environnement : les tests historiques les vérifient toujours ; les règles MVP
 # (valeurs par défaut de settings.py) sont vérifiées par tests_mvp_stock_conso.py.
 LEGACY_RULES = dict(FUEL_MVP_IGNORE_VALIDATION=False, FUEL_APP_STOCK_START="", FUEL_FINAL_STOCK_SOURCES=[],
-                    FUEL_BALANCE_FILE_MOVEMENTS=True, FUEL_BALANCE_CLOSING_CROSSCHECK=True)
+                    FUEL_BALANCE_FILE_MOVEMENTS=True, FUEL_BALANCE_CLOSING_CROSSCHECK=True, FUEL_BALANCE_CLOSING_POST_BOUNDARY_DAYS=0,
+                    FUEL_CLOSING_AUTHORITATIVE_PERIODS=[])
 MVP_RULES = dict(FUEL_MVP_IGNORE_VALIDATION=True, FUEL_APP_STOCK_START="2026-11-01",
                  FUEL_FINAL_STOCK_SOURCES=["ENOC_TERRAIN", "ENOC_GARDIENNAGE", "ENOC"],
-                 FUEL_BALANCE_FILE_MOVEMENTS=False, FUEL_BALANCE_CLOSING_CROSSCHECK=False)
+                 FUEL_BALANCE_FILE_MOVEMENTS=False, FUEL_BALANCE_CLOSING_CROSSCHECK=True, FUEL_BALANCE_CLOSING_POST_BOUNDARY_DAYS=6,
+                 FUEL_CLOSING_AUTHORITATIVE_PERIODS=["2026-09", "2026-10"])
 
 
 class EnocBase(TestCase):

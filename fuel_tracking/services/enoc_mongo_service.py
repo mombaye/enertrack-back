@@ -63,6 +63,25 @@ def _jsonable(doc):
     return doc
 
 
+def level_of(doc: dict | None, kind: str) -> tuple[object | None, str | None]:
+    """
+    Niveau de cuve d'un document ENOC (kind = "before" sur fuel_requests, "after" sur fuel_operations) → (valeur, unité).
+
+    ENOC a remplacé (constaté en prod le 17/11/2026) le couple level_<kind> / level_<kind>_unit par deux champs typés
+    level_<kind>_l (litres) et level_<kind>_cm (centimètres) : sur octobre 2026, 0 niveau dans l'ancien champ contre
+    329 / 176 niveaux avant et 130 / 44 niveaux après dans les nouveaux. Ordre : ancien champ s'il est renseigné (données
+    historiques), sinon litres, sinon centimètres. Jamais de conversion ici (la conversion cm → L dépend de la cuve).
+    """
+    d = doc or {}
+    if d.get(f"level_{kind}") is not None:
+        return d.get(f"level_{kind}"), d.get(f"level_{kind}_unit")
+    if d.get(f"level_{kind}_l") is not None:
+        return d.get(f"level_{kind}_l"), "L"
+    if d.get(f"level_{kind}_cm") is not None:
+        return d.get(f"level_{kind}_cm"), "cm"
+    return None, d.get(f"level_{kind}_unit")
+
+
 def fetch_fuel_movements() -> list[dict]:
     """
     Combine `fuel_requests` + `fuel_operations` en une liste de mouvements
@@ -111,10 +130,10 @@ def fetch_fuel_movements() -> list[dict]:
                 "requested_quantity_liters": req.get("requested_quantity_liters"),
                 "approved_quantity_liters": req.get("approved_quantity_liters"),
                 "quantity_added_liters": (op or {}).get("quantity_added_liters"),
-                "level_before": req.get("level_before"),
-                "level_before_unit": req.get("level_before_unit"),
-                "level_after": (op or {}).get("level_after"),
-                "level_after_unit": (op or {}).get("level_after_unit"),
+                "level_before": level_of(req, "before")[0],
+                "level_before_unit": level_of(req, "before")[1],
+                "level_after": level_of(op, "after")[0],
+                "level_after_unit": level_of(op, "after")[1],
                 "hour_meter_before": req.get("hour_meter_before"),
                 "hour_meter_after": (op or {}).get("hour_meter_after"),
                 "monthly_target_liters": (op or {}).get("monthly_target_liters"),
@@ -165,8 +184,8 @@ def fetch_fuel_movements() -> list[dict]:
                 "quantity_added_liters": op.get("quantity_added_liters"),
                 "level_before": None,
                 "level_before_unit": None,
-                "level_after": op.get("level_after"),
-                "level_after_unit": op.get("level_after_unit"),
+                "level_after": level_of(op, "after")[0],
+                "level_after_unit": level_of(op, "after")[1],
                 "hour_meter_before": None,
                 "hour_meter_after": op.get("hour_meter_after"),
                 "monthly_target_liters": op.get("monthly_target_liters"),

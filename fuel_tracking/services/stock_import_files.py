@@ -652,7 +652,15 @@ def process_closing_file(batch, file_bytes: bytes, file_name: str) -> dict:
         found = True
         _process_tank_sheet(batch, sheet, rows, resolver, stats, only_new_sites=False)
     if not found:
-        raise ValueError("Feuille « Synthese conso fuel » introuvable : fichier closing non reconnu.")
+        # Fichier « Output App Fuel » (feuille « Output ») : clôture consolidée après la campagne terrain — même rôle que le Closing.
+        from fuel_tracking.services import output_app_fuel as OAF
+
+        for _sheet, rows in iter_sheets(file_bytes, file_name, only={OAF.SHEET}):
+            rows = list(rows)  # lu deux fois (détection de l'en-tête puis lecture)
+            if OAF.find_header(rows)[0] is not None:
+                stats["stocks_closing"] = OAF.process_output_file(batch, rows, file_name, resolver, R.site_tanks)
+                return stats
+        raise ValueError("Feuille « Synthese conso fuel » (Closing) ou « Output » (Output App Fuel) introuvable : fichier de clôture non reconnu.")
     stats["stocks_closing"] = _process_closing_stocks(batch, file_bytes, file_name, resolver)
 
     # Import du target depuis l'onglet dédié du même fichier Closing, si présent.
@@ -663,6 +671,14 @@ def process_closing_file(batch, file_bytes: bytes, file_name: str) -> dict:
     except ValueError as exc:
         # Onglet absent → information seulement, pas un échec de l'import Closing
         stats["targets_closing"] = {"skipped": True, "reason": str(exc)}
+
+    # Abaque CPH depuis l'onglet « GENSET DB » du même Closing (courbes par modèle de GE + correspondance avec
+    # l'inventaire des sites). Onglet absent → information seulement, jamais un échec de l'import Closing.
+    try:
+        from fuel_tracking.services import genset_db_import as GDB
+        stats["abaque_genset_db"] = GDB.import_from_closing(file_bytes, file_name)
+    except ValueError as exc:
+        stats["abaque_genset_db"] = {"skipped": True, "reason": str(exc)}
 
     return stats
 

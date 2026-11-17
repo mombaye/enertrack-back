@@ -439,7 +439,9 @@ FUEL_PROPOSED_TANK_MIN_SCORE = int(os.getenv("FUEL_PROPOSED_TANK_MIN_SCORE", "70
 FUEL_CLOSING_CONFLICT_REVIEW_L = float(os.getenv("FUEL_CLOSING_CONFLICT_REVIEW_L", "300"))
 # Périodes (mois AAAA-MM, séparés par des virgules) dont le Closing est VALIDÉ : sur ces périodes seulement, en cas de conflit, les totaux du
 # Closing remplacent ceux d'ENOC (ENOC reste affiché). Jamais une règle globale applicable à tous les mois. Exemple : "2026-08".
-FUEL_CLOSING_AUTHORITATIVE_PERIODS = [x.strip() for x in os.getenv("FUEL_CLOSING_AUTHORITATIVE_PERIODS", "").split(",") if x.strip()]
+# Décision métier 17/11/2026 (MVP) : septembre et octobre 2026 — la saisie ENOC d'octobre est incomplète (22 160 L intégrés contre
+# 134 605 L livrés au fichier de clôture), les totaux du fichier de clôture (Closing / Output App Fuel) font foi ; ENOC seul ensuite.
+FUEL_CLOSING_AUTHORITATIVE_PERIODS = [x.strip() for x in os.getenv("FUEL_CLOSING_AUTHORITATIVE_PERIODS", "2026-09,2026-10").split(",") if x.strip()]
 # Cuves à traiter en premier (décision métier), séparées par des virgules.
 FUEL_PRIORITY_TANK_SITES = [x.strip() for x in os.getenv("FUEL_PRIORITY_TANK_SITES", "KLD_2035,KLD_2049,KLD_1259,KLD_1775,BKL_0516").split(",") if x.strip()]
 # Cuve VALIDÉE sans plaque, dimensions cohérentes : estimation autorisée UNIQUEMENT « avec réserve » (jamais certifiable automatiquement).
@@ -457,7 +459,12 @@ FUEL_APP_STOCK_START = os.getenv("FUEL_APP_STOCK_START", "2026-11-01")
 # Stock final : relevé le plus récent parmi ces sources (ordre = priorité à date égale). ENOC = niveaux avant / après ravitaillement.
 # ENOC_TERRAIN / ENOC_GARDIENNAGE : à ajouter dès que leurs collections Mongo sont raccordées.
 FUEL_FINAL_STOCK_SOURCES = [x.strip() for x in os.getenv("FUEL_FINAL_STOCK_SOURCES", "ENOC_TERRAIN,ENOC_GARDIENNAGE,ENOC").split(",") if x.strip()]
+# Relevé de clôture (Closing / Output App Fuel) daté jusqu'à N jours APRÈS le début ou la fin de période : utilisé avec réserve
+# (la campagne terrain d'octobre 2026 a relevé des stocks jusqu'au 05/11). 0 = jamais (règle stricte). À confirmer métier.
+FUEL_BALANCE_CLOSING_POST_BOUNDARY_DAYS = int(os.getenv("FUEL_BALANCE_CLOSING_POST_BOUNDARY_DAYS", "6"))
 # Mouvements issus des fichiers (Closing, terrain, gardiennage) : désactivés, seuls les mouvements ENOC sont comptés.
 FUEL_BALANCE_FILE_MOVEMENTS = os.getenv("FUEL_BALANCE_FILE_MOVEMENTS", "false").strip().lower() in ("1", "true", "yes", "on")
-# Rapprochement Closing / ENOC (complément, conflit, seuil FUEL_CLOSING_CONFLICT_REVIEW_L) : désactivé ; le Closing reste une mesure de contrôle.
-FUEL_BALANCE_CLOSING_CROSSCHECK = os.getenv("FUEL_BALANCE_CLOSING_CROSSCHECK", "false").strip().lower() in ("1", "true", "yes", "on")
+# Rapprochement Closing / ENOC : actif uniquement quand les deux stocks viennent d'un fichier de clôture (périodes historiques : septembre,
+# octobre 2026) ; sur les périodes de FUEL_CLOSING_AUTHORITATIVE_PERIODS, les totaux du fichier remplacent ENOC. À partir de novembre les
+# stocks viennent de l'application et d'ENOC : aucun rapprochement, mouvements ENOC seuls.
+FUEL_BALANCE_CLOSING_CROSSCHECK = os.getenv("FUEL_BALANCE_CLOSING_CROSSCHECK", "true").strip().lower() in ("1", "true", "yes", "on")
