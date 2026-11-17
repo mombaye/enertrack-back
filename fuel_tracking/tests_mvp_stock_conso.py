@@ -707,7 +707,9 @@ class ClosingKpiParseTests(MvpBase):
 
         from fuel_tracking.services.closing_kpis import kpis_for_period
 
-        self.assertIsNone(kpis_for_period(date(2026, 10, 1), date(2026, 10, 15)))
+        part = kpis_for_period(date(2026, 10, 1), date(2026, 10, 15))   # KPI dynamiques : toute période affichée
+        self.assertEqual((part["source"], part["kpis"]["nb_jours"]["valeur"]), ("CALCUL_ENERTRACK", 15))
+        self.assertIn("du 01/10/2026 au 15/10/2026", part["kpis"]["estimation_conso_mois_l"]["libelle"])
         k = kpis_for_period(date(2026, 10, 1), date(2026, 10, 31))
         self.assertEqual((k["source"], k["kpis"]["nb_jours"]["valeur"]), ("CALCUL_ENERTRACK", 31))
         self.assertIsNone(k["kpis"]["commande_mois_suivant_l"]["valeur"])   # non disponible, jamais 0
