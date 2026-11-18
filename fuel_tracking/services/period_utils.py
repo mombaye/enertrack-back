@@ -60,7 +60,8 @@ def balances_for_days(d_from: date, d_to: date):
 
 def latest_balances_by_site(d_from: date, d_to: date) -> dict:
     out: dict = {}
-    for b in balances_for_days(d_from, d_to).order_by("calculated_at"):
+    # colonnes lourdes non utilisées par l'écran (proposition de commande, détail du score, liste des mouvements) : non chargées
+    for b in balances_for_days(d_from, d_to).defer("proposition", "score_detail", "mouvements").order_by("calculated_at"):
         out[b.site_id] = b
     return out
 

@@ -42,7 +42,7 @@ class ConsommationsView(APIView):
             return Response({"detail": str(e)}, status=400)
         if d_from is None:
             return Response({"detail": "Aucun bilan de stock calculé : lancez le calcul des bilans.", "rows": [], "total": 0, "periode": None}, status=200)
-        data = C.build(d_from, d_to, p)
+        data = _cached_build(d_from, d_to, p)
         rows = data.pop("rows")
         try:
             size = max(1, min(int(p.get("page_size", 50)), 200))
@@ -85,6 +85,37 @@ class ConsommationsExportView(APIView):
         r["Content-Disposition"] = f'attachment; filename="{name}"'
         r["X-Row-Count"] = str(n)
         return r
+
+
+def _data_version() -> str:
+    """Empreinte des données de l'écran : tout recalcul de bilan, import de fichier, synchro Snowflake / CPH change la clé."""
+    from django.db.models import Count, Max
+
+    from fuel_tracking.models import FuelImportBatch, FuelStockBalance
+    from fuel_tracking.services.cph_service import data_version
+
+    b = FuelStockBalance.objects.aggregate(n=Count("id"), m=Max("calculated_at"))
+    i = FuelImportBatch.objects.aggregate(n=Count("id"), m=Max("received_at"))
+    return f"{b['n']}|{b['m']}|{i['n']}|{i['m']}|{data_version()}"
+
+
+def _cached_build(d_from, d_to, p):
+    """Résultat du calcul de l'écran mis en cache (10 min, clé = période + filtres + version des données) : changer de page ou
+    revenir sur l'écran ne recalcule plus tout. Jamais servi périmé : tout nouveau calcul ou import change la version."""
+    import copy
+    import hashlib
+    import json
+
+    from django.core.cache import cache
+
+    params = {k: v for k, v in (p.dict() if hasattr(p, "dict") else dict(p)).items() if k not in ("page", "page_size")}
+    raw = json.dumps([str(d_from), str(d_to), sorted(params.items()), _data_version()], default=str)
+    key = "fuel-conso-build:" + hashlib.sha1(raw.encode()).hexdigest()
+    data = cache.get(key)
+    if data is None:
+        data = C.build(d_from, d_to, params)
+        cache.set(key, data, 600)
+    return copy.deepcopy(data)
 
 
 class ConsommationsSanteView(APIView):

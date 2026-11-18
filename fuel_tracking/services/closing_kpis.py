@@ -118,7 +118,9 @@ def _balances(d_from: date, d_to: date) -> list:
     """Bilans enregistrés pour la période EXACTE [d_from ; d_to] (mêmes bilans que le tableau)."""
     from fuel_tracking.models import FuelStockBalance as B
 
-    return list(B.objects.filter(observation_start__date=d_from, observation_end__date=d_to))
+    return list(B.objects.filter(observation_start__date=d_from, observation_end__date=d_to).only(
+        "site_id", "variation_stock_l", "stock_initial_l", "stock_final_l", "livraisons_externes_l", "carte_total_l", "rajouts_l",
+        "retraits_l", "transferts_entrants_l", "transferts_sortants_l", "vols_l", "vidanges_l", "date_stock_initial", "date_stock_final"))
 
 
 def _f(v):

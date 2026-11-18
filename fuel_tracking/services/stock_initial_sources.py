@@ -127,7 +127,7 @@ def _snowflake_points(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, dat
     finally:
         conn.close()
     result = (out, ("Snowflake : " + " ; ".join(errors) + ".") if errors else None)
-    cache.set(key, result, 3600)       # résultat partiel compris (une vue en erreur ne se répare pas en quelques minutes)
+    cache.set(key, result, 6 * 3600)   # valeurs passées (dates de relevés) : stables ; résultat partiel compris
     return result
 
 
