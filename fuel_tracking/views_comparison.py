@@ -99,7 +99,7 @@ def _data_version() -> str:
     return f"{b['n']}|{b['m']}|{i['n']}|{i['m']}|{data_version()}"
 
 
-SYNC_MAX = 20          # paires (site, jour) manquantes lues pendant la requête ; au-delà : tâche de fond
+SYNC_MAX = 0           # aucune lecture Snowflake / ENOC pendant l'affichage : toujours en tâche de fond (la page ne bloque jamais)
 BUILD_TTL = 6 * 3600   # la clé contient la version des données : un recalcul ou un import la change (jamais servi périmé)
 
 

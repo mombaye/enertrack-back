@@ -146,7 +146,6 @@ def _fetch_snowflake(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, date
 
         days = sorted({d for _, d in pairs})
         sites = sorted({s for s, _ in pairs})
-        ph_s = ",".join(["%s"] * len(sites))
         ph_d = ",".join(["%s"] * len(days))
         conn = _connect()
     except Exception as e:  # noqa: BLE001 — Snowflake injoignable : colonnes FMS « n.d. », jamais bloquant
@@ -156,20 +155,26 @@ def _fetch_snowflake(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, date
         cur = conn.cursor()
         # Requête bornée dans le temps (paramètre de SESSION, aucune écriture) : jamais de requête qui bloque indéfiniment.
         try:
-            cur.execute("ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 120")
+            cur.execute(f"ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = {SF_TIMEOUT_S}")
         except Exception:  # noqa: BLE001
             pass
-        # 1. Niveau du capteur (Fuel Sensor FMS) — lu indépendamment du compteur
-        try:
-            cur.execute(f"SELECT SITE_ID, DATE, LAST_VALID_LEVEL FROM {FUEL_REPORT}.VW_FUEL_REPORT "
-                        f"WHERE SITE_ID IN ({ph_s}) AND DATE IN ({ph_d}) AND LAST_VALID_LEVEL IS NOT NULL", [*sites, *days])
-            for sid, d, lvl in cur.fetchall():
-                k = (sid, _day(d))
-                if k in pairs:
-                    out.setdefault(k, {})["niveau_l"] = _f(lvl)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("VW_FUEL_REPORT illisible (niveau FMS) : %s", e)
-            errors.append("niveau Fuel Sensor FMS non lu (VW_FUEL_REPORT en erreur côté Snowflake)")
+        # 1. Niveau du capteur (Fuel Sensor FMS) — lu indépendamment du compteur. Filtre par DATA_ID, comme la synchro des faits
+        #    journaliers (le filtre par SITE_ID dépassait le délai de 120 s sur cette vue). Plusieurs lignes contradictoires le
+        #    même jour → aucune valeur (jamais un choix arbitraire).
+        ids_lvl = sorted({data_ids[s] for s in sites if s in data_ids})
+        if ids_lvl:
+            try:
+                by_id_lvl = {did: sid for sid, did in data_ids.items()}
+                cur.execute(f"SELECT DATA_ID, DATE, IFF(MIN(LAST_VALID_LEVEL) = MAX(LAST_VALID_LEVEL), MAX(LAST_VALID_LEVEL), NULL) "
+                            f"FROM {FUEL_REPORT}.VW_FUEL_REPORT WHERE DATA_ID IN ({','.join(['%s'] * len(ids_lvl))}) AND DATE IN ({ph_d}) "
+                            f"AND LAST_VALID_LEVEL IS NOT NULL GROUP BY DATA_ID, DATE", [*ids_lvl, *days])
+                for did, d, lvl in cur.fetchall():
+                    k = (by_id_lvl.get(int(did)) if str(did).isdigit() else by_id_lvl.get(did), _day(d))
+                    if k in pairs and lvl is not None:
+                        out.setdefault(k, {})["niveau_l"] = _f(lvl)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("VW_FUEL_REPORT illisible (niveau FMS) : %s", e)
+                errors.append("niveau Fuel Sensor FMS non lu (VW_FUEL_REPORT en erreur ou trop lente côté Snowflake)")
         # 2. Index compteur FMS : GENSET_REPORT.TOTAL_DG_RUNNING_HOUR (compteur horaire cumulé du GE, par site et par jour).
         #    Remplace la vue GFMS_DATA_TRACKER_NC, cassée côté Snowflake ; lu indépendamment du niveau.
         ids = sorted({data_ids[s] for s in sites if s in data_ids})
@@ -196,6 +201,7 @@ def _fetch_snowflake(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, date
 # par page ou à « Tous les sites » réutilise ce qui a déjà été lu. Les dates de relevé sont passées : valeurs stables (24 h).
 # Échec de lecture : gardé 10 min seulement, avec son message, pour réessayer ensuite sans bloquer chaque affichage.
 PAIR_TTL_OK, PAIR_TTL_ERR, FETCH_CHUNK = 24 * 3600, 600, 150
+SF_TIMEOUT_S = 300   # lecture faite en tâche de fond uniquement (jamais pendant l'affichage) : délai large mais borné
 PREFIX_SF, PREFIX_GUARD = "fuel-si:sf:v4", "fuel-si:guard:v2"
 
 

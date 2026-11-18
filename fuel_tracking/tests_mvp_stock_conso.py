@@ -1030,7 +1030,7 @@ class FmsPartialReadTests(MvpBase):
             def fetchall(self):
                 if "GENSET_REPORT" in self.sql:
                     return [(7, date(2026, 9, 30), 502.4833)]
-                return [("DKR_0001", date(2026, 9, 30), 634.6)]
+                return [(7, date(2026, 9, 30), 634.6)]   # VW_FUEL_REPORT lue par DATA_ID
 
         conn = mock.Mock()
         conn.cursor.return_value = Cur()
