@@ -12,7 +12,7 @@ Sources (lecture seule ; ENOC et Snowflake ne sont jamais modifiés) :
   Qtité (Fuel Sensor FMS)                   Snowflake VW_FUEL_REPORT.LAST_VALID_LEVEL du même jour ;
   Qtité retenue                             FMS si disponible, sinon relevé de terrain ;
   Compteur genset (Société de gardiennage)  compteur horaire des relevés ENOC de gardiennage du même jour ;
-  Compteur genset (Index Compteur FMS)      Snowflake GFMS_DATA_TRACKER_NC.DG_TOTAL_RUNNING_TIME_MINUTES (dernière valeur du jour ÷ 60) ;
+  Compteur genset (Index Compteur FMS)      Snowflake GENSET_REPORT.TOTAL_DG_RUNNING_HOUR (compteur horaire cumulé du jour) ;
   Compteur retenu                           FMS si disponible, sinon gardiennage.
 Snowflake indisponible : les colonnes FMS restent vides (« n.d. »), jamais 0 ; l'écran ne casse pas.
 """
@@ -79,7 +79,7 @@ def _snowflake_points(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, dat
 
     # clé stable entre processus (hash() de Python change à chaque démarrage : le cache n'était jamais partagé)
     raw = "|".join(f"{s}@{d.isoformat()}" for s, d in sorted(pairs))
-    key = "fuel-stock-initial-sf:v2:" + hashlib.sha1(raw.encode()).hexdigest()
+    key = "fuel-stock-initial-sf:v3:" + hashlib.sha1(raw.encode()).hexdigest()
     hit = cache.get(key)
     if isinstance(hit, tuple) and len(hit) == 2:
         return hit
@@ -87,7 +87,7 @@ def _snowflake_points(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, dat
     out: dict[tuple[str, date], dict] = {}
     errors = []
     try:
-        from fuel_tracking.services.fuel_daily_facts_snowflake import FUEL_REPORT, PROD, _connect
+        from fuel_tracking.services.fuel_daily_facts_snowflake import ANALYTICS, FUEL_REPORT, _connect
 
         days = sorted({d for _, d in pairs})
         sites = sorted({s for s, _ in pairs})
@@ -110,24 +110,22 @@ def _snowflake_points(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, dat
         except Exception as e:  # noqa: BLE001
             logger.warning("VW_FUEL_REPORT illisible (niveau FMS) : %s", e)
             errors.append("niveau Fuel Sensor FMS non lu (VW_FUEL_REPORT en erreur côté Snowflake)")
-        # 2. Index compteur FMS — une vue en erreur côté Snowflake ne fait pas perdre le niveau
+        # 2. Index compteur FMS : GENSET_REPORT.TOTAL_DG_RUNNING_HOUR (compteur horaire cumulé du GE, par site et par jour).
+        #    Remplace la vue GFMS_DATA_TRACKER_NC, cassée côté Snowflake ; lu indépendamment du niveau.
         ids = sorted({data_ids[s] for s in sites if s in data_ids})
         if ids:
             try:
                 by_id = {did: sid for sid, did in data_ids.items()}
                 ph_i = ",".join(["%s"] * len(ids))
-                cur.execute(f"""
-                    SELECT ID, CAST("TIMESTAMP" AS DATE) AS day, DG_TOTAL_RUNNING_TIME_MINUTES
-                    FROM {PROD}.GFMS_DATA_TRACKER_NC
-                    WHERE ID IN ({ph_i}) AND CAST("TIMESTAMP" AS DATE) IN ({ph_d}) AND DG_TOTAL_RUNNING_TIME_MINUTES IS NOT NULL
-                    QUALIFY ROW_NUMBER() OVER (PARTITION BY ID, CAST("TIMESTAMP" AS DATE) ORDER BY "TIMESTAMP" DESC) = 1""", [*ids, *days])
-                for did, d, minutes in cur.fetchall():
-                    k = (by_id.get(did), _day(d))
-                    if k in pairs and minutes is not None:
-                        out.setdefault(k, {})["index_h"] = round(float(minutes) / 60.0, 2)
+                cur.execute(f"SELECT DATA_ID, DATE, TOTAL_DG_RUNNING_HOUR FROM {ANALYTICS}.GENSET_REPORT "
+                            f"WHERE DATA_ID IN ({ph_i}) AND DATE IN ({ph_d}) AND TOTAL_DG_RUNNING_HOUR IS NOT NULL", [*ids, *days])
+                for did, d, hours in cur.fetchall():
+                    k = (by_id.get(int(did)) if str(did).isdigit() else by_id.get(did), _day(d))
+                    if k in pairs and hours is not None:
+                        out.setdefault(k, {})["index_h"] = round(float(hours), 2)
             except Exception as e:  # noqa: BLE001
-                logger.warning("GFMS_DATA_TRACKER_NC illisible (index compteur FMS) : %s", e)
-                errors.append("index compteur FMS non lu (vue GFMS_DATA_TRACKER_NC en erreur côté Snowflake)")
+                logger.warning("GENSET_REPORT illisible (index compteur FMS) : %s", e)
+                errors.append("index compteur FMS non lu (GENSET_REPORT en erreur côté Snowflake)")
     finally:
         conn.close()
     result = (out, ("Snowflake : " + " ; ".join(errors) + ".") if errors else None)

@@ -928,15 +928,26 @@ class FmsPartialReadTests(MvpBase):
 
             def execute(self, sql, params):
                 self.n += 1
-                if "GFMS_DATA_TRACKER_NC" in sql:
-                    raise RuntimeError("View definition declared 126 column(s), but view query produces 254 column(s)")
+                self.sql = sql
+                if "GENSET_REPORT" in sql and fail_counter:
+                    raise RuntimeError("SQL compilation error")
 
             def fetchall(self):
+                if "GENSET_REPORT" in self.sql:
+                    return [(7, date(2026, 9, 30), 502.4833)]
                 return [("DKR_0001", date(2026, 9, 30), 634.6)]
 
         conn = mock.Mock()
         conn.cursor.return_value = Cur()
+        fail_counter = True
         with mock.patch("fuel_tracking.services.fuel_daily_facts_snowflake._connect", return_value=conn):
             vals, err = S._snowflake_points({("DKR_0001", date(2026, 9, 30))})
         self.assertEqual(vals[("DKR_0001", date(2026, 9, 30))], {"niveau_l": 634.6})
-        self.assertIn("GFMS_DATA_TRACKER_NC", err)
+        self.assertIn("GENSET_REPORT", err)
+        # compteur lu dans GENSET_REPORT.TOTAL_DG_RUNNING_HOUR (heures cumulées du jour)
+        cache.clear()
+        fail_counter = False
+        conn.cursor.return_value = Cur()
+        with mock.patch("fuel_tracking.services.fuel_daily_facts_snowflake._connect", return_value=conn):
+            vals, err = S._snowflake_points({("DKR_0001", date(2026, 9, 30))})
+        self.assertEqual((vals[("DKR_0001", date(2026, 9, 30))], err), ({"niveau_l": 634.6, "index_h": 502.48}, None))
