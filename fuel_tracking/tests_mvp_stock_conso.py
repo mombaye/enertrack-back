@@ -789,7 +789,36 @@ class SnowflakePerimeterTests(MvpBase):
         INV.objects.create(country="SN", data_id=1, site_id="DKR_0001", dg_count=1)
         INV.objects.create(country="SN", data_id=2, site_id="DKR_0002", dg_count=0)
         INV.objects.create(country="SN", data_id=3, site_id="DKR_0003", dg_count=2)
-        self.assertEqual(perimeter_sites("2026-10"), {"DKR_0001", "DKR_0003"})
+        self.assertEqual(perimeter_sites("2026-10"), {"DKR_0001", "DKR_0003"})   # aucun stock dans les fichiers ici
         k = kpis_for_period(date(2026, 10, 1), date(2026, 10, 31))["kpis"]
         self.assertEqual((k["nb_sites"]["valeur"], k["nb_sites_ge"]["valeur"]), (3, 2))
         self.assertIn("Snowflake", k["nb_sites_ge"]["detail"]["source"])
+
+
+class PerimeterUnionTests(OutputAppFuelImportTests):
+    """Un site avec du carburant dans les fichiers reste dans le périmètre même si Snowflake ne lui connaît pas de GE."""
+
+    def test_site_with_stock_kept_even_without_snowflake_ge(self):
+        from fuel_tracking.models import FuelSiteInventory as INV
+        from fuel_tracking.services import stock_import_pipeline as P
+        from fuel_tracking.services.conso_comparison import perimeter_sites
+
+        P.process_bytes(self.output_bytes(), "Output App Fuel.xlsx", "CLOSING", origin="UPLOAD")
+        INV.objects.create(country="SN", data_id=1, site_id="DKR_0001", dg_count=0)     # Snowflake : pas de GE
+        INV.objects.create(country="SN", data_id=9, site_id="DKR_0009", dg_count=1)
+        per = perimeter_sites("2026-10")
+        self.assertIn("DKR_0001", per)        # stock dans l'Output → gardé
+        self.assertIn("DKR_0009", per)        # GE selon Snowflake → gardé
+        self.assertNotIn("DKR_0003", per)     # « sans GE et sans cuve » dans l'Output, inconnu de Snowflake
+
+    def test_import_and_october_balance(self):
+        pass
+
+    def test_strict_rule_rejects_readings_after_boundary(self):
+        pass
+
+    def test_sites_without_genset_excluded_from_health(self):
+        pass
+
+    def test_files_give_stocks_only_movements_from_enoc(self):
+        pass

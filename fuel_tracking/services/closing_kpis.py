@@ -239,8 +239,8 @@ def computed_kpis(d_from: date, d_to: date, sites: set[str] | None = None) -> di
     ext, carte = S0(lambda b: _f(b.livraisons_externes_l)), S0(lambda b: _f(b.carte_total_l))
     raj, ret = S0(lambda b: _f(b.rajouts_l)), S0(lambda b: _f(b.retraits_l))
     t_in, t_out = S0(lambda b: _f(b.transferts_entrants_l)), S0(lambda b: _f(b.transferts_sortants_l))
-    perim = ("Sites avec groupe électrogène selon l'inventaire Snowflake (SITE_ESCO_CURRENT) ; les stocks viennent des fichiers, tout le reste "
-             "des sources (ENOC, Snowflake)"
+    perim = ("Sites avec groupe électrogène selon l'inventaire Snowflake (SITE_ESCO_CURRENT) + sites qui ont un stock de carburant dans les "
+             "fichiers de clôture ; les stocks viennent des fichiers, tout le reste des sources (ENOC, Snowflake)"
              + (", restreints aux sites affichés (filtres de l'écran)" if sites is not None else "") + ".")
     sum_on = f"Somme sur les {n_calc} site(s) dont la consommation est calculée (variations négatives comprises), pour que le CHECK tombe juste."
     stock_src = ("Fichier de clôture (Closing / Output App Fuel) : seule donnée reprise des fichiers"

@@ -513,14 +513,17 @@ def snowflake_sites() -> tuple[set[str], set[str]] | None:
 
 
 def perimeter_sites(month: str) -> set[str]:
-    """PÉRIMÈTRE de suivi carburant d'un mois (base de tous les totaux, KPI et contrôles) :
-      - sites AVEC GE selon l'inventaire Snowflake (décision du 18/11/2026 : seuls les stocks viennent des fichiers) ;
-      - à défaut d'inventaire Snowflake : sites des fichiers de clôture, sans ceux déclarés « sans GE et sans cuve »."""
+    """PÉRIMÈTRE de suivi carburant d'un mois (base de tous les totaux, KPI et contrôles), décision du 18/11/2026 :
+      sites AVEC GE selon l'inventaire Snowflake + sites qui ont un stock de carburant dans les fichiers de clôture (sans ceux
+      déclarés « sans GE et sans cuve ») — aucun site qui a du carburant n'est perdu si l'inventaire Snowflake est incomplet."""
+    sf = snowflake_sites()
+    return (sf[1] if sf is not None else set()) | fuel_stock_sites(month)
+
+
+def fuel_stock_sites(month: str) -> set[str]:
+    """Sites qui ont un stock de carburant dans les fichiers de clôture, sans ceux déclarés « sans GE et sans cuve » pour le mois."""
     from fuel_tracking.services.output_app_fuel import sites_without_genset
 
-    sf = snowflake_sites()
-    if sf is not None:
-        return sf[1]
     return closing_base_sites() - sites_without_genset(month)
 
 
@@ -553,12 +556,13 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
 
     base = perimeter_sites(d_from.strftime("%Y-%m"))
     sf = snowflake_sites()
-    sans_ge = (sf[0] - sf[1]) if sf is not None else sites_without_genset(d_from.strftime("%Y-%m"))
+    sans_ge = ((sf[0] - sf[1]) - base) if sf is not None else sites_without_genset(d_from.strftime("%Y-%m"))
     n_sans_ge = sum(1 for r in rows if r["site_id"].upper() in sans_ge)
     rows = [r for r in rows if r["site_id"].upper() not in sans_ge]
     for r in rows:
         ok = (not base) or r["site_id"].upper() in base
-        motif = None if ok else ("Site absent de l'inventaire Snowflake : affiché pour information, exclu des totaux et des indicateurs." if sf is not None
+        motif = None if ok else ("Site hors périmètre (ni GE dans l'inventaire Snowflake, ni stock dans les fichiers de clôture) : affiché pour information, "
+                                 "exclu des totaux et des indicateurs." if sf is not None
                                  else "Site absent du fichier Closing (base de référence) : affiché pour information, exclu des totaux et des indicateurs.")
         r["correspondance"] = {"base_closing": ok, "utilise": ok, "motif": motif}
     # nombre de sites par statut avec les AUTRES filtres (le filtre de statut lui-même ne doit pas vider les compteurs)
