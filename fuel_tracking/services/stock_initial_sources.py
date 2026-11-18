@@ -8,10 +8,12 @@ Initiale »), jamais sur une autre période. Exemple : relevé initial le 30/09/
 Sources (lecture seule ; ENOC et Snowflake ne sont jamais modifiés) :
   INVENTAIRE           Gestion des sites (core.Site) + inventaire Snowflake SITE_ESCO_CURRENT (GRID_SUPPLY_MODIFIED) ;
   Date / Qtité (relevé de terrain)          fichier de clôture (Closing / Output App Fuel) ;
-  Qtité (Société de gardiennage)            relevés de gardiennage ENOC (Loliforce, SCSS, ENOC_GARDIENNAGE) du même jour ;
+  Qtité (Société de gardiennage)            ENOC, partie « Relevé de gardien » (collection fuel_level_readings), même site et même
+                                            jour, valeur telle qu'enregistrée ; aucun relevé ce jour-là → vide (jamais d'estimation,
+                                            jamais un fichier Loliforce/SCSS, jamais un autre jour) ;
   Qtité (Fuel Sensor FMS)                   Snowflake VW_FUEL_REPORT.LAST_VALID_LEVEL du même jour ;
   Qtité retenue                             FMS si disponible, sinon relevé de terrain ;
-  Compteur genset (Société de gardiennage)  compteur horaire des relevés ENOC de gardiennage du même jour ;
+  Compteur genset (Société de gardiennage)  compteur horaire porté par ce même relevé de gardien ENOC, s'il existe ;
   Compteur genset (Index Compteur FMS)      Snowflake GENSET_REPORT.TOTAL_DG_RUNNING_HOUR (compteur horaire cumulé du jour) ;
   Compteur retenu                           FMS si disponible, sinon gardiennage.
 Snowflake indisponible : les colonnes FMS restent vides (« n.d. »), jamais 0 ; l'écran ne casse pas.
@@ -24,8 +26,7 @@ from datetime import date, datetime, timedelta
 from django.core.cache import cache
 
 logger = logging.getLogger(__name__)
-GUARD_SOURCES = ("ENOC_GARDIENNAGE", "LOLIFORCE", "SCSS")
-SRC_TERRAIN, SRC_FMS, SRC_GUARD = "Relevé de terrain (fichier de clôture)", "Fuel Sensor FMS (Snowflake)", "Société de gardiennage (ENOC)"
+SRC_TERRAIN, SRC_FMS, SRC_GUARD = "Relevé de terrain (fichier de clôture)", "Fuel Sensor FMS (Snowflake)", "Relevé de gardien (ENOC)"
 SRC_INDEX_FMS = "Index Compteur FMS (Snowflake)"
 
 
@@ -39,34 +40,95 @@ def _day(v) -> date | None:
     return v if isinstance(v, date) and not isinstance(v, datetime) else date.fromisoformat(str(v)[:10])
 
 
-def _guard_readings(pairs: set[tuple[str, date]]) -> dict[tuple[str, date], dict]:
-    """Relevé de gardiennage ENOC le plus tardif du jour exact, par (site, jour)."""
-    from django.utils import timezone
+# Champs « compteur horaire » possibles sur un relevé de gardien ENOC (lus seulement s'ils sont présents).
+_HOUR_FIELDS = ("hour_meter", "compteur_horaire", "compteur", "genset_hours", "running_hours")
 
-    from fuel_tracking.models import FuelStockObservation as Obs
+
+def _enoc_day(v) -> date | None:
+    """Jour du relevé ENOC (date_releve : texte ISO ou datetime). Fuseau métier Africa/Dakar = UTC+0."""
+    if not v:
+        return None
+    try:
+        return v.date() if isinstance(v, datetime) else date.fromisoformat(str(v)[:10])
+    except ValueError:
+        return None
+
+
+def _num(v):
+    try:
+        return None if v is None or v == "" else float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_guard_doc(doc) -> dict:
+    """Valeurs d'un relevé de gardien ENOC, telles qu'enregistrées. Rien n'est estimé ni converti."""
+    litres = []
+    for t in doc.get("tanks") or []:
+        lit = _num(t.get("level_liters"))
+        # 0 L sans hauteur en cm : valeur par défaut de l'import ENOC, pas une mesure → ignorée
+        if lit is not None and not (lit == 0 and t.get("level_cm") is None):
+            litres.append(lit)
+    hours = next((_num(doc.get(k)) for k in _HOUR_FIELDS if _num(doc.get(k)) is not None), None)
+    return {"litres": _f(sum(litres)) if litres else None, "compteur": _f(hours)}
+
+
+def _guard_readings(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, date], dict], str | None]:
+    """ENOC « Relevé de gardien » : pour chaque (site, jour) demandé, le relevé de CE site fait CE jour-là, sinon rien.
+
+    Lecture seule de la collection ENOC fuel_level_readings. Plusieurs relevés le même jour : le plus tardif.
+    ENOC injoignable : colonnes vides et message, jamais de valeur reprise d'une autre source.
+    """
+    import hashlib
 
     if not pairs:
-        return {}
-    sites = {s for s, _ in pairs}
+        return {}, None
+    raw = "|".join(f"{s}@{d.isoformat()}" for s, d in sorted(pairs))
+    key = "fuel-stock-initial-guard:v1:" + hashlib.sha1(raw.encode()).hexdigest()
+    hit = cache.get(key)
+    if isinstance(hit, tuple) and len(hit) == 2:
+        return hit
+    from django.conf import settings
+
+    from fuel_tracking.services.enoc_mongo_service import _connect
+
+    sites = sorted({s for s, _ in pairs})
     days = sorted({d for _, d in pairs})
-    tz = timezone.get_current_timezone()
-    lo = timezone.make_aware(datetime.combine(days[0], datetime.min.time()), tz)
-    hi = timezone.make_aware(datetime.combine(days[-1] + timedelta(days=1), datetime.min.time()), tz)
+    lo, hi = days[0], days[-1] + timedelta(days=1)
+    try:
+        client = _connect()
+    except Exception as e:  # noqa: BLE001 — ENOC injoignable : colonne vide, jamais bloquant
+        logger.warning("ENOC injoignable pour les relevés de gardien : %s", e)
+        result = ({}, "ENOC injoignable : relevés de gardien non lus.")
+        cache.set(key, result, 300)   # évite 8 s d'attente à chaque page tant qu'ENOC est injoignable
+        return result
     out: dict[tuple[str, date], dict] = {}
-    qs = (Obs.objects.filter(source_type__in=GUARD_SOURCES, site_id__in=sites, observation_datetime__gte=lo, observation_datetime__lt=hi)
-          .exclude(validation_status="REJECTED").order_by("observation_datetime")
-          .values_list("site_id", "observation_datetime", "level_liters", "estimated_liters", "level_value", "level_unit", "hour_meter"))
-    for sid, dt, liters, est, val, unit, hm in qs:
-        key = (sid, timezone.localtime(dt, tz).date())
-        if key not in pairs:
-            continue
-        cur = out.setdefault(key, {"litres": None, "compteur": None})
-        litres = liters if liters is not None else est if est is not None else (val if unit == "L" else None)
-        if litres is not None:
-            cur["litres"] = _f(litres)
-        if hm is not None:
-            cur["compteur"] = _f(hm)
-    return out
+    try:
+        db = client[settings.ENOC_MONGO_DB_NAME]
+        crit = {"site_id": {"$in": sites}, "$or": [
+            {"date_releve": {"$gte": lo.isoformat(), "$lt": hi.isoformat()}},                                    # texte ISO
+            {"date_releve": {"$gte": datetime.combine(lo, datetime.min.time()), "$lt": datetime.combine(hi, datetime.min.time())}},
+        ]}
+        best: dict[tuple[str, date], tuple[str, dict]] = {}
+        for doc in db.fuel_level_readings.find(crit):
+            k = (doc.get("site_id"), _enoc_day(doc.get("date_releve")))
+            if k not in pairs:
+                continue
+            stamp = str(doc.get("date_releve"))
+            if k not in best or stamp >= best[k][0]:
+                best[k] = (stamp, doc)
+        for k, (_, doc) in best.items():
+            v = _parse_guard_doc(doc)
+            if v["litres"] is not None or v["compteur"] is not None:
+                out[k] = v
+        result = (out, None)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Lecture ENOC fuel_level_readings impossible : %s", e)
+        result = ({}, "ENOC : relevés de gardien non lus (erreur de lecture).")
+    finally:
+        client.close()
+    cache.set(key, result, 3600)
+    return result
 
 
 def _snowflake_points(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, date], dict], str | None]:
@@ -145,8 +207,9 @@ def enrich(rows: list[dict]) -> str | None:
     zones = dict(Site.ZONE_CHOICES)
     grid = {sid.upper(): g for sid, g in INV.objects.filter(site_id__in=ids).values_list("site_id", "grid_supply")}
     pairs = {(r["site_id"], _day(r["stock"].get("date_initial"))) for r in rows if r["stock"].get("date_initial")}
-    guards = _guard_readings(pairs)
+    guards, gerr = _guard_readings(pairs)
     sf, err = _snowflake_points(pairs)
+    err = " ".join(m for m in (err, gerr) if m) or None
     for r in rows:
         s = sites.get(r["site_id"].upper()) or {}
         kind = s.get("installed_site_type") or s.get("site_type")

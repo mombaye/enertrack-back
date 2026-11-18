@@ -864,23 +864,63 @@ class StockInitialSourcesTests(OutputAppFuelImportTests):
         d = CC.build(date(2026, 10, 1), date(2026, 10, 31), {"site": "DKR_0001"}, with_cph_quality=False)
         return d["rows"]
 
-    def test_terrain_used_when_no_fms_and_guard_same_day_only(self):
+    @staticmethod
+    def _enoc(docs):
+        """Faux client ENOC : la collection fuel_level_readings renvoie `docs` (lecture seule)."""
         from unittest import mock
 
+        coll = mock.MagicMock()
+        coll.find.side_effect = lambda crit: [d for d in docs if d["site_id"] in crit["site_id"]["$in"]]
+        db = mock.MagicMock(fuel_level_readings=coll)
+        client = mock.MagicMock()
+        client.__getitem__.return_value = db
+        return client
+
+    def _enrich(self, rows, docs=None, down=False):
+        from unittest import mock
+
+        from django.core.cache import cache
+
+        from fuel_tracking.services import enoc_mongo_service as M
+        from fuel_tracking.services import stock_initial_sources as S
+
+        cache.clear()
+        conn = mock.patch.object(M, "_connect", side_effect=M.EnocMongoConnectionError("down")) if down else mock.patch.object(M, "_connect", return_value=self._enoc(docs or []))
+        with conn, mock.patch.object(S, "_snowflake_points", return_value=({}, None)):
+            return S.enrich(rows)
+
+    def test_guard_value_is_enoc_reading_of_same_site_same_day_only(self):
         from fuel_tracking.models import FuelStockObservation as Obs
         from fuel_tracking.services import stock_initial_sources as S
 
         rows = self._rows()
-        tz = timezone.get_current_timezone()
-        for dt, lit in ((datetime(2026, 9, 30, 9), 950), (datetime(2026, 9, 29, 9), 111)):     # même jour / veille (ignorée)
-            Obs.objects.create(site_id="DKR_0001", tank_id="1", source_type="LOLIFORCE", observation_datetime=timezone.make_aware(dt, tz),
-                               level_raw=f"{lit} L", level_value=lit, level_unit="L", level_liters=lit, hour_meter=1234,
-                               source_event_id=f"G{lit}", validation_status="VALIDATED")
-        with mock.patch.object(S, "_snowflake_points", return_value=({}, None)):
-            S.enrich(rows)
+        # un fichier Loliforce le même jour n'est PAS un relevé de gardien ENOC : ignoré
+        Obs.objects.create(site_id="DKR_0001", tank_id="1", source_type="LOLIFORCE", observation_datetime=timezone.make_aware(datetime(2026, 9, 30, 9)),
+                           level_raw="777 L", level_value=777, level_unit="L", level_liters=777, hour_meter=99, source_event_id="G777", validation_status="VALIDATED")
+        docs = [
+            {"site_id": "DKR_0001", "date_releve": "2026-09-29T08:00:00", "tanks": [{"level_liters": 111, "level_cm": 20}]},   # veille : ignorée
+            {"site_id": "DKR_0001", "date_releve": "2026-09-30T08:00:00", "tanks": [{"level_liters": 900, "level_cm": 80}]},
+            {"site_id": "DKR_0001", "date_releve": "2026-09-30T17:00:00", "tanks": [{"level_liters": 950, "level_cm": 82}], "hour_meter": 1234},
+            {"site_id": "DKR_0002", "date_releve": "2026-09-30T08:00:00", "tanks": [{"level_liters": 500, "level_cm": 50}]},   # autre site
+        ]
+        self.assertIsNone(self._enrich(rows, docs))
         x = rows[0]["stock_initial_sources"]
         self.assertEqual((x["date"], x["terrain_l"], x["gardiennage_l"], x["retenue_l"], x["source"]), ("2026-09-30", 1000.0, 950.0, 1000.0, S.SRC_TERRAIN))
         self.assertEqual((x["compteur_gardiennage_h"], x["compteur_retenu_h"], x["source_compteur"]), (1234.0, 1234.0, S.SRC_GUARD))
+
+    def test_no_enoc_reading_that_day_gives_empty_not_invented(self):
+        rows = self._rows()
+        docs = [{"site_id": "DKR_0001", "date_releve": "2026-10-02T08:00:00", "tanks": [{"level_liters": 640, "level_cm": 60}]},
+                {"site_id": "DKR_0001", "date_releve": "2026-09-30T08:00:00", "tanks": [{"level_liters": 0, "level_cm": None}]}]   # 0 L par défaut : pas une mesure
+        self._enrich(rows, docs)
+        x = rows[0]["stock_initial_sources"]
+        self.assertEqual((x["gardiennage_l"], x["compteur_gardiennage_h"]), (None, None))
+
+    def test_enoc_down_leaves_guard_empty_with_message(self):
+        rows = self._rows()
+        msg = self._enrich(rows, down=True)
+        self.assertIn("ENOC injoignable", msg)
+        self.assertIsNone(rows[0]["stock_initial_sources"]["gardiennage_l"])
 
     def test_fms_has_priority(self):
         from datetime import date
@@ -889,7 +929,7 @@ class StockInitialSourcesTests(OutputAppFuelImportTests):
         from fuel_tracking.services import stock_initial_sources as S
 
         rows = self._rows()
-        with mock.patch.object(S, "_snowflake_points", return_value=({("DKR_0001", date(2026, 9, 30)): {"niveau_l": 980.0, "index_h": 5000.0}}, None)):
+        with mock.patch.object(S, "_guard_readings", return_value=({}, None)),                 mock.patch.object(S, "_snowflake_points", return_value=({("DKR_0001", date(2026, 9, 30)): {"niveau_l": 980.0, "index_h": 5000.0}}, None)):
             S.enrich(rows)
         x = rows[0]["stock_initial_sources"]
         self.assertEqual((x["retenue_l"], x["source"], x["compteur_retenu_h"], x["source_compteur"]), (980.0, S.SRC_FMS, 5000.0, S.SRC_INDEX_FMS))
