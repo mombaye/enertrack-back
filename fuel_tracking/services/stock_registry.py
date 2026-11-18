@@ -50,12 +50,16 @@ def tolerance_pct() -> float:
 # ── Sites ────────────────────────────────────────────────────────────────────
 
 class SiteResolver:
-    """Rapproche un identifiant brut du référentiel core.Site (casse ignorée)."""
+    """Rapproche un identifiant brut des sites connus (casse ignorée) : référentiel core.Site ET inventaire Snowflake
+    (SITE_ESCO_CURRENT) — les informations de site viennent de Snowflake, aucun site n'est à créer à la main."""
 
     def __init__(self):
         from core.models import Site
+        from fuel_tracking.models import FuelSiteInventory
 
         pairs = list(Site.objects.values_list("site_id", "name"))
+        known = {s.upper() for s, _ in pairs if s}
+        pairs += [(s, n) for s, n in FuelSiteInventory.objects.values_list("site_id", "site_name") if s and s.upper() not in known]
         self.by_upper = {s.upper(): s for s, _ in pairs if s}
         names: dict[str, set] = defaultdict(set)
         for s, n in pairs:

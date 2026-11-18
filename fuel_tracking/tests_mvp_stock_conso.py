@@ -834,20 +834,17 @@ class PerimeterUnionTests(OutputAppFuelImportTests):
         pass
 
 
-class MissingSitesTests(MvpBase):
-    """Sites connus de Snowflake mais absents de Gestion des sites : aperçu puis création (identifiant + nom seulement)."""
 
-    def test_preview_and_create(self):
-        from core.models import Site
+class SnowflakeSitesRecognisedTests(MvpBase):
+    """Un site absent de Gestion des sites mais connu de l'inventaire Snowflake est reconnu (import et bilan) : aucun site à créer."""
+
+    def test_resolver_and_balance_use_snowflake_inventory(self):
         from fuel_tracking.models import FuelSiteInventory as INV
-        from fuel_tracking.services.missing_sites import create_missing, preview
+        from fuel_tracking.services.stock_registry import SiteResolver
 
-        INV.objects.create(country="SN", data_id=1, site_id="NEW_0001", site_name="NOUVEAU", dg_count=1)
-        INV.objects.create(country="SN", data_id=2, site_id="DKR_0001", site_name="ALPHA", dg_count=1)   # déjà présent
-        p = preview()
-        self.assertEqual([e["site_id"] for e in p["sites"]], ["NEW_0001"])
-        r = create_missing()
-        self.assertEqual(r["crees"], 1)
-        s = Site.objects.get(site_id="NEW_0001")
-        self.assertEqual((s.name, s.installed_typology), ("NOUVEAU", None))
-        self.assertEqual(create_missing()["crees"], 0)                         # idempotent
+        INV.objects.create(country="SN", data_id=1, site_id="SNW_0001", site_name="SITE SNOWFLAKE", dg_count=1)
+        self.assertEqual(SiteResolver().resolve("snw_0001"), "SNW_0001")
+        r = SB.compute_balances(timezone.make_aware(datetime(2026, 10, 1)), timezone.make_aware(datetime(2026, 10, 31, 23, 59, 59)),
+                                site_ids=["SNW_0001"], persist=False)[0]
+        self.assertNotEqual(r["cause_principale"], "SITE_NON_RECONNU")
+        self.assertEqual(r["site_name"], "SITE SNOWFLAKE")

@@ -344,6 +344,11 @@ def compute_balances(start, end, site_ids=None, persist=True) -> list[dict]:
         known = set(FuelStockBalance.objects.filter(observation_start=start, observation_end=end).values_list("site_id", flat=True))
         site_ids = sorted(set(obs_by_site) | set(enoc_by_site) | set(mv_by_site) | tank_sites | known)
     sites = {s["site_id"]: s for s in Site.objects.filter(site_id__in=site_ids).values("site_id", "name", "zone", "country", "installed_typology")}
+    # Site absent de core.Site mais connu de l'inventaire Snowflake : reconnu (les informations de site viennent de Snowflake).
+    from fuel_tracking.models import FuelSiteInventory
+
+    for sid, name in FuelSiteInventory.objects.filter(site_id__in=[x for x in site_ids if x not in sites]).values_list("site_id", "site_name"):
+        sites.setdefault(sid, {"site_id": sid, "name": name, "zone": None, "country": None, "installed_typology": None})
     profiles = energy_profiles(site_ids)
     tanks = site_tanks(site_ids)
     unbalanced = {b["transfer_id"] for b in check_transfer_balance()}
