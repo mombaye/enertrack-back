@@ -905,3 +905,38 @@ class StockInitialSourcesTests(OutputAppFuelImportTests):
 
     def test_files_give_stocks_only_movements_from_enoc(self):
         pass
+
+
+class FmsPartialReadTests(MvpBase):
+    """Vue du compteur FMS en erreur côté Snowflake : le niveau du capteur reste lu (lectures indépendantes)."""
+
+    def test_level_kept_when_counter_view_fails(self):
+        from datetime import date
+        from unittest import mock
+
+        from django.core.cache import cache
+
+        from fuel_tracking.models import FuelSiteInventory as INV
+        from fuel_tracking.services import stock_initial_sources as S
+
+        INV.objects.create(country="SN", data_id=7, site_id="DKR_0001", dg_count=1)
+        cache.clear()
+
+        class Cur:
+            def __init__(self):
+                self.n = 0
+
+            def execute(self, sql, params):
+                self.n += 1
+                if "GFMS_DATA_TRACKER_NC" in sql:
+                    raise RuntimeError("View definition declared 126 column(s), but view query produces 254 column(s)")
+
+            def fetchall(self):
+                return [("DKR_0001", date(2026, 9, 30), 634.6)]
+
+        conn = mock.Mock()
+        conn.cursor.return_value = Cur()
+        with mock.patch("fuel_tracking.services.fuel_daily_facts_snowflake._connect", return_value=conn):
+            vals, err = S._snowflake_points({("DKR_0001", date(2026, 9, 30))})
+        self.assertEqual(vals[("DKR_0001", date(2026, 9, 30))], {"niveau_l": 634.6})
+        self.assertIn("GFMS_DATA_TRACKER_NC", err)

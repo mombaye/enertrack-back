@@ -78,27 +78,38 @@ def _snowflake_points(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, dat
     key = "fuel-stock-initial-sf:" + str(hash(tuple(sorted((s, d.isoformat()) for s, d in pairs))))
     hit = cache.get(key)
     if hit is not None:
-        return hit, None
+        return hit
     data_ids = {sid: did for sid, did in INV.objects.filter(site_id__in={s for s, _ in pairs}).values_list("site_id", "data_id")}
     out: dict[tuple[str, date], dict] = {}
+    errors = []
     try:
         from fuel_tracking.services.fuel_daily_facts_snowflake import FUEL_REPORT, PROD, _connect
 
         days = sorted({d for _, d in pairs})
         sites = sorted({s for s, _ in pairs})
+        ph_s = ",".join(["%s"] * len(sites))
+        ph_d = ",".join(["%s"] * len(days))
         conn = _connect()
+    except Exception as e:  # noqa: BLE001 — Snowflake injoignable : colonnes FMS « n.d. », jamais bloquant
+        logger.warning("Snowflake injoignable pour les valeurs du stock initial : %s", e)
+        return {}, "Snowflake injoignable : valeurs FMS non lues."
+    try:
+        cur = conn.cursor()
+        # 1. Niveau du capteur (Fuel Sensor FMS) — lu indépendamment du compteur
         try:
-            cur = conn.cursor()
-            ph_s = ",".join(["%s"] * len(sites))
-            ph_d = ",".join(["%s"] * len(days))
             cur.execute(f"SELECT SITE_ID, DATE, LAST_VALID_LEVEL FROM {FUEL_REPORT}.VW_FUEL_REPORT "
                         f"WHERE SITE_ID IN ({ph_s}) AND DATE IN ({ph_d}) AND LAST_VALID_LEVEL IS NOT NULL", [*sites, *days])
             for sid, d, lvl in cur.fetchall():
                 k = (sid, _day(d))
                 if k in pairs:
                     out.setdefault(k, {})["niveau_l"] = _f(lvl)
-            ids = sorted({data_ids[s] for s in sites if s in data_ids})
-            if ids:
+        except Exception as e:  # noqa: BLE001
+            logger.warning("VW_FUEL_REPORT illisible (niveau FMS) : %s", e)
+            errors.append("niveau Fuel Sensor FMS non lu (VW_FUEL_REPORT en erreur côté Snowflake)")
+        # 2. Index compteur FMS — une vue en erreur côté Snowflake ne fait pas perdre le niveau
+        ids = sorted({data_ids[s] for s in sites if s in data_ids})
+        if ids:
+            try:
                 by_id = {did: sid for sid, did in data_ids.items()}
                 ph_i = ",".join(["%s"] * len(ids))
                 cur.execute(f"""
@@ -110,13 +121,14 @@ def _snowflake_points(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, dat
                     k = (by_id.get(did), _day(d))
                     if k in pairs and minutes is not None:
                         out.setdefault(k, {})["index_h"] = round(float(minutes) / 60.0, 2)
-        finally:
-            conn.close()
-    except Exception as e:  # noqa: BLE001 — Snowflake indisponible : jamais bloquant, colonnes FMS « n.d. »
-        logger.warning("Snowflake indisponible pour les valeurs du stock initial : %s", e)
-        return {}, "Snowflake indisponible : valeurs FMS non lues."
-    cache.set(key, out, 3600)
-    return out, None
+            except Exception as e:  # noqa: BLE001
+                logger.warning("GFMS_DATA_TRACKER_NC illisible (index compteur FMS) : %s", e)
+                errors.append("index compteur FMS non lu (vue GFMS_DATA_TRACKER_NC en erreur côté Snowflake)")
+    finally:
+        conn.close()
+    result = (out, ("Snowflake : " + " ; ".join(errors) + ".") if errors else None)
+    cache.set(key, result, 3600)       # résultat partiel compris (une vue en erreur ne se répare pas en quelques minutes)
+    return result
 
 
 def enrich(rows: list[dict]) -> str | None:

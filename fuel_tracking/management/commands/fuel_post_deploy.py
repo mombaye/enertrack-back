@@ -99,7 +99,20 @@ class Command(BaseCommand):
             if version != SB.MVP_RULE_VERSION:
                 w(f"Règles des bilans ({version}) : règles MVP inactives, rien à appliquer.")
                 return
-            periods =list(B.objects.values_list("observation_start", "observation_end").distinct().order_by("-observation_end")[:periodes])
+            periods = list(B.objects.values_list("observation_start", "observation_end").distinct().order_by("-observation_end")[:periodes])
+            # + mois civils COMPLETS des 3 derniers mois (jamais masqués par des périodes personnalisées plus récentes)
+            from calendar import monthrange
+            from datetime import timedelta as _td
+
+            from django.utils import timezone as _tz
+
+            first = _tz.localdate().replace(day=1)
+            for _ in range(3):
+                first = (first - _td(days=1)).replace(day=1)
+                last = first.replace(day=monthrange(first.year, first.month)[1])
+                for s_, e_ in B.objects.filter(observation_start__date=first, observation_end__date=last).values_list("observation_start", "observation_end").distinct():
+                    if (s_, e_) not in periods:
+                        periods.append((s_, e_))
             stale = [(s, e) for s, e in periods if B.objects.filter(observation_start=s, observation_end=e).exclude(rule_version=version).exists()]
             w(f"Règles des bilans ({version}) : {len(stale)} période(s) récente(s) à recalculer.")
             if dry_run:

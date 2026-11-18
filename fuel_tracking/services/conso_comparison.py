@@ -152,7 +152,7 @@ def _days(b) -> int | None:
     return n if n > 0 else None
 
 
-def raison_non_calcul(b, statut: str, var) -> str | None:
+def raison_non_calcul(b, statut: str, var, sans_ge_ops: set | None = None) -> str | None:
     """Message clair, en une phrase, qui dit POURQUOI la consommation d'un site n'est pas calculée (ou est à contrôler) et quoi faire.
     None pour un site calculé. Lecture seule : déduit du bilan enregistré, aucune valeur inventée."""
     if b is None:
@@ -161,6 +161,9 @@ def raison_non_calcul(b, statut: str, var) -> str | None:
         return None
     cause = b.cause_principale or ""
     ini, fin = b.stock_initial_l is not None, b.stock_final_l is not None
+    if sans_ge_ops and b.site_id.upper() in sans_ge_ops and not (ini and fin):
+        return ("Ops déclare ce site « sans GE et sans cuve » dans le fichier de clôture du mois : aucun stock de fin de mois. "
+                "Snowflake lui connaît pourtant un GE : vérifier l'inventaire avec Ops.")
     if var is None and b.variation_stock_l is not None:
         var = float(b.variation_stock_l)
     if cause == "CONSO_NEGATIVE" or (var is not None and var < 0):
@@ -225,7 +228,7 @@ def _action(b, statut) -> str:
     return action_for(b)
 
 
-def _row(cph: dict | None, b, d_from: date, d_to: date, days: int, target, thresholds_used: dict) -> dict:
+def _row(cph: dict | None, b, d_from: date, d_to: date, days: int, target, thresholds_used: dict, sans_ge_ops: set | None = None) -> dict:
     site_id = (cph or {}).get("site_id") or b.site_id
     statut = bilan_status(b)
     var = variation_of(b, statut)
@@ -328,7 +331,7 @@ def _row(cph: dict | None, b, d_from: date, d_to: date, days: int, target, thres
             "variation_l": var, "statut": statut, "statut_moteur": b.statut_bilan if b else None, "cause": cause,
             "score": b.score_confiance if b else None, "reserves": (b.reserves or []) if b else [], "alertes": alerts, "alertes_comparaison": cmp_alerts, "bilan_id": b.pk if b else None,
             "motif": " · ".join(motifs) or None, "action": _action(b, statut),
-            "raison_non_calcul": raison_non_calcul(b, statut, var),
+            "raison_non_calcul": raison_non_calcul(b, statut, var, sans_ge_ops),
         },
         "closing": {"conso_l": conso_closing, "ecart_l": ecart_cl, "ecart_pct": pct_cl, "pct_na": na_cl, "controle_independant": closing_indep, "explication": explication},
         "target": {"periode_l": tgt_f, "mensuel_l": _f(target.target_mensuel_l) if target else None, "source": target.source_target if target else None,
@@ -548,7 +551,10 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
     balances = latest_balances_by_site(d_from, d_to)
     targets = TG.active_targets()
     ids = sorted(set(balances) | {s for s, r in cph_by_site.items() if r.get("perimetre", "GE") == "GE"})
-    rows = [_row(cph_by_site.get(sid), balances.get(sid), d_from, d_to, days, targets.get(sid.upper()), {}) for sid in ids]
+    from fuel_tracking.services.output_app_fuel import sites_without_genset as _sans_ge
+
+    sans_ge_ops = _sans_ge(d_from.strftime("%Y-%m"))
+    rows = [_row(cph_by_site.get(sid), balances.get(sid), d_from, d_to, days, targets.get(sid.upper()), {}, sans_ge_ops) for sid in ids]
     # Correspondance avec la base du fichier Closing : un site sans correspondance est AFFICHÉ mais jamais utilisé dans les totaux et indicateurs.
     # Périmètre = sites avec GE selon l'inventaire Snowflake. Sites SANS GE selon Snowflake (ou déclarés « sans GE et sans cuve ») :
     # hors périmètre carburant, non affichés. Sites absents de l'inventaire : affichés pour information, exclus des totaux.
