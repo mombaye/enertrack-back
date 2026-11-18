@@ -83,21 +83,14 @@ def _parse_guard_doc(doc) -> dict:
     return {"litres": _f(sum(litres)) if litres else None, "compteur": _f(hours)}
 
 
-def _guard_readings(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, date], dict], str | None]:
+def _fetch_guard(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, date], dict], str | None]:
     """ENOC « Relevé de gardien » : pour chaque (site, jour) demandé, le relevé de CE site fait CE jour-là, sinon rien.
 
     Lecture seule de la collection ENOC fuel_level_readings. Plusieurs relevés le même jour : le plus tardif.
     ENOC injoignable : colonnes vides et message, jamais de valeur reprise d'une autre source.
     """
-    import hashlib
-
     if not pairs:
         return {}, None
-    raw = "|".join(f"{s}@{d.isoformat()}" for s, d in sorted(pairs))
-    key = "fuel-stock-initial-guard:v1:" + hashlib.sha1(raw.encode()).hexdigest()
-    hit = cache.get(key)
-    if isinstance(hit, tuple) and len(hit) == 2:
-        return hit
     from django.conf import settings
 
     from fuel_tracking.services.enoc_mongo_service import _connect
@@ -109,9 +102,7 @@ def _guard_readings(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, date]
         client = _connect()
     except Exception as e:  # noqa: BLE001 — ENOC injoignable : colonne vide, jamais bloquant
         logger.warning("ENOC injoignable pour les relevés de gardien : %s", e)
-        result = ({}, "ENOC injoignable : relevés de gardien non lus.")
-        cache.set(key, result, 300)   # évite 8 s d'attente à chaque page tant qu'ENOC est injoignable
-        return result
+        return {}, "ENOC injoignable : relevés de gardien non lus."
     out: dict[tuple[str, date], dict] = {}
     try:
         db = client[settings.ENOC_MONGO_DB_NAME]
@@ -137,24 +128,15 @@ def _guard_readings(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, date]
         result = ({}, "ENOC : relevés de gardien non lus (erreur de lecture).")
     finally:
         client.close()
-    cache.set(key, result, 3600)
     return result
 
 
-def _snowflake_points(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, date], dict], str | None]:
-    """(site, jour) → {"niveau_l", "index_h"} lus dans Snowflake au jour exact. Cache 1 h. (valeurs, message d'erreur)."""
+def _fetch_snowflake(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, date], dict], str | None]:
+    """(site, jour) → {"niveau_l", "index_h"} lus dans Snowflake au jour exact (lecture seule). (valeurs, message d'erreur)."""
     from fuel_tracking.models import FuelSiteInventory as INV
 
     if not pairs:
         return {}, None
-    import hashlib
-
-    # clé stable entre processus (hash() de Python change à chaque démarrage : le cache n'était jamais partagé)
-    raw = "|".join(f"{s}@{d.isoformat()}" for s, d in sorted(pairs))
-    key = "fuel-stock-initial-sf:v3:" + hashlib.sha1(raw.encode()).hexdigest()
-    hit = cache.get(key)
-    if isinstance(hit, tuple) and len(hit) == 2:
-        return hit
     data_ids = {sid: did for sid, did in INV.objects.filter(site_id__in={s for s, _ in pairs}).values_list("site_id", "data_id")}
     out: dict[tuple[str, date], dict] = {}
     errors = []
@@ -171,6 +153,11 @@ def _snowflake_points(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, dat
         return {}, "Snowflake injoignable : valeurs FMS non lues."
     try:
         cur = conn.cursor()
+        # Requête bornée dans le temps (paramètre de SESSION, aucune écriture) : jamais de requête qui bloque indéfiniment.
+        try:
+            cur.execute("ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 120")
+        except Exception:  # noqa: BLE001
+            pass
         # 1. Niveau du capteur (Fuel Sensor FMS) — lu indépendamment du compteur
         try:
             cur.execute(f"SELECT SITE_ID, DATE, LAST_VALID_LEVEL FROM {FUEL_REPORT}.VW_FUEL_REPORT "
@@ -200,9 +187,78 @@ def _snowflake_points(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, dat
                 errors.append("index compteur FMS non lu (GENSET_REPORT en erreur côté Snowflake)")
     finally:
         conn.close()
-    result = (out, ("Snowflake : " + " ; ".join(errors) + ".") if errors else None)
-    cache.set(key, result, 6 * 3600)   # valeurs passées (dates de relevés) : stables ; résultat partiel compris
-    return result
+    return out, (("Snowflake : " + " ; ".join(errors) + ".") if errors else None)
+
+
+# ── Cache par (site, jour) ────────────────────────────────────────────────────────────────────────────────────────────────
+# Chaque valeur lue (Snowflake FMS, ENOC gardien) est gardée par site et par jour de relevé : changer de page, passer à 200
+# par page ou à « Tous les sites » réutilise ce qui a déjà été lu. Les dates de relevé sont passées : valeurs stables (24 h).
+# Échec de lecture : gardé 10 min seulement, avec son message, pour réessayer ensuite sans bloquer chaque affichage.
+PAIR_TTL_OK, PAIR_TTL_ERR, FETCH_CHUNK = 24 * 3600, 600, 150
+PREFIX_SF, PREFIX_GUARD = "fuel-si:sf:v4", "fuel-si:guard:v2"
+
+
+def _pkey(prefix: str, site: str, day: date) -> str:
+    return f"{prefix}:{site}:{day.isoformat()}"
+
+
+def _cached(prefix: str, pairs) -> tuple[dict, set]:
+    keys = {_pkey(prefix, s, d): (s, d) for s, d in pairs}
+    try:
+        got = cache.get_many(list(keys)) if keys else {}
+    except Exception:  # noqa: BLE001 — cache indisponible : on relit les sources
+        got = {}
+    found = {keys[k]: v for k, v in got.items() if isinstance(v, dict)}
+    return found, set(pairs) - set(found)
+
+
+def _points(prefix: str, fetch_fn, pairs, fetch: bool = True):
+    """(valeurs par (site, jour), message d'erreur, paires encore non lues). Ne relit la source que pour les paires absentes du cache."""
+    found, missing = _cached(prefix, pairs)
+    if missing and fetch:
+        todo = sorted(missing)
+        for i in range(0, len(todo), FETCH_CHUNK):
+            chunk = set(todo[i:i + FETCH_CHUNK])
+            out, err = fetch_fn(chunk)
+            vals = {pr: ({**out.get(pr, {}), "_err": err} if err else out.get(pr, {})) for pr in chunk}
+            try:
+                cache.set_many({_pkey(prefix, *pr): v for pr, v in vals.items()}, PAIR_TTL_ERR if err else PAIR_TTL_OK)
+            except Exception:  # noqa: BLE001
+                pass
+            found.update(vals)
+        missing = set()
+    errs = sorted({v["_err"] for v in found.values() if v.get("_err")})
+    return {k: {x: y for x, y in v.items() if x != "_err"} for k, v in found.items()}, (" ".join(errs) or None), missing
+
+
+def _snowflake_points(pairs, fetch: bool = True):
+    """(site, jour) → {"niveau_l", "index_h"} : cache par paire, Snowflake relu seulement pour les paires manquantes."""
+    vals, err, _ = _points(PREFIX_SF, _fetch_snowflake, pairs, fetch)
+    return vals, err
+
+
+def _guard_readings(pairs, fetch: bool = True):
+    """(site, jour) → relevé de gardien ENOC du jour exact : cache par paire, ENOC relu seulement pour les paires manquantes."""
+    vals, err, _ = _points(PREFIX_GUARD, _fetch_guard, pairs, fetch)
+    return vals, err
+
+
+def row_pairs(rows) -> set:
+    return {(r["site_id"], _day(r["stock"].get("date_initial"))) for r in rows if r["stock"].get("date_initial")}
+
+
+def missing_pairs(pairs) -> set:
+    """Paires (site, jour) dont une valeur Snowflake ou ENOC n'est pas encore en cache."""
+    return _cached(PREFIX_SF, pairs)[1] | _cached(PREFIX_GUARD, pairs)[1]
+
+
+def warm_pairs(pairs) -> int:
+    """Lit (et met en cache) Snowflake et ENOC pour les paires manquantes. Retourne le nombre de paires lues."""
+    miss = missing_pairs(pairs)
+    if miss:
+        _snowflake_points(miss)
+        _guard_readings(miss)
+    return len(miss)
 
 
 ENOC_COMPONENTS = {"eydon_l": ("truck_l",), "carte_total_l": ("carte_total_l",),
@@ -254,7 +310,7 @@ def ravitaillement(rows: list[dict]) -> None:
         r["ravitaillement"] = out
 
 
-def enrich(rows: list[dict]) -> str | None:
+def enrich(rows: list[dict], fetch: bool = True) -> str | None:
     """Ajoute à chaque ligne du tableau les blocs « inventaire » et « stock_initial_sources ». Retourne un message si Snowflake a échoué."""
     from core.models import Site
 
@@ -265,10 +321,10 @@ def enrich(rows: list[dict]) -> str | None:
         "site_id", "zone", "site_type", "installed_site_type", "ordered_typology", "billing_typology")}
     zones = dict(Site.ZONE_CHOICES)
     grid = {sid.upper(): g for sid, g in INV.objects.filter(site_id__in=ids).values_list("site_id", "grid_supply")}
-    pairs = {(r["site_id"], _day(r["stock"].get("date_initial"))) for r in rows if r["stock"].get("date_initial")}
+    pairs = row_pairs(rows)
     ravitaillement(rows)
-    guards, gerr = _guard_readings(pairs)
-    sf, err = _snowflake_points(pairs)
+    guards, gerr = _guard_readings(pairs, fetch)
+    sf, err = _snowflake_points(pairs, fetch)
     err = " ".join(m for m in (err, gerr) if m) or None
     for r in rows:
         s = sites.get(r["site_id"].upper()) or {}

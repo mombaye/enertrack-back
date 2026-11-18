@@ -28,6 +28,18 @@ class Command(BaseCommand):
         self._ponctions_output(w, dry_run)
         self._sans_ge_output(w, dry_run)
         self._kpis_closing(w, dry_run)
+        self._warm(w, dry_run)
+
+    def _warm(self, w, dry_run):
+        """7. Préchauffe l'écran Suivi Conso (calcul + valeurs Snowflake / ENOC) : premier affichage sans attente après déploiement."""
+        if dry_run:
+            return
+        try:
+            from fuel_tracking.views_comparison import warm_cache
+
+            w(f"Suivi Conso préchauffé : {warm_cache()}")
+        except Exception as e:  # ne jamais empêcher le démarrage du service
+            w(f"Suivi Conso : préchauffage impossible ({e}).")
 
     def _kpis_closing(self, w, dry_run):
         """6. Closing importés avant le 17/11/2026 : enregistre le bloc de KPI de l'en-tête (relu dans la copie d'archive)."""

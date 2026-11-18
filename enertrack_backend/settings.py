@@ -220,6 +220,8 @@ CELERY_TASK_ROUTES = {
     "certification.finalize_certification_batch": {"queue": "celery"},
     "fuel_tracking.process_closing_upload": {"queue": "interactive"},  # envoi du Closing depuis la rubrique Configuration
     "fuel_tracking.recompute_after_closing_withdrawal": {"queue": "interactive"},  # retrait d'un fichier (Configuration)
+    "fuel_tracking.warm_stock_initial_sources": {"queue": "interactive"},  # valeurs FMS / ENOC d'une page du Suivi Conso
+    "fuel_tracking.warm_conso_cache": {"queue": "interactive"},            # préchauffage de l'écran Suivi Conso
     "billing.*": {"queue": "interactive"},
     "certification.*": {"queue": "interactive"},
 }
@@ -262,6 +264,11 @@ CELERY_BEAT_SCHEDULE = {
     'fuel-balances-nightly': {
         'task': 'fuel_tracking.auto_compute_stock_balances',
         'schedule': crontab(hour=3, minute=11),
+    },
+    'fuel-conso-cache-warm-15min': {
+        # écran Suivi Conso toujours prêt : recalcul mis en cache dès qu'une donnée change (version), valeurs FMS / ENOC lues d'avance
+        'task': 'fuel_tracking.warm_conso_cache',
+        'schedule': crontab(minute='*/15'),
     },
     'fuel-stock-sync-5min': {
         'task': 'fuel_tracking.sync_fuel_stock_current',

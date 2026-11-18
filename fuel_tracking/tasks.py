@@ -280,7 +280,30 @@ def auto_compute_stock_balances(self):
     from fuel_tracking.services.auto_balances import compute_recent_months
 
     try:
-        return compute_recent_months(2)
+        result = compute_recent_months(2)
     except Exception:
         logger.exception("[fuel_tracking] Échec du calcul automatique des bilans de stock")
+        return None
+    warm_conso_cache.delay()   # écran Suivi Conso prêt dès la fin du calcul (pas de latence au premier affichage)
+    return result
+
+
+@shared_task(bind=True, name="fuel_tracking.warm_stock_initial_sources", soft_time_limit=600, time_limit=660)
+def warm_stock_initial_sources(self, pairs: list):
+    """Lit en tâche de fond (lecture seule) les valeurs Snowflake FMS / ENOC gardien de paires [site, "AAAA-MM-JJ"] et les met en cache."""
+    from fuel_tracking.services.stock_initial_sources import warm_pairs
+
+    return warm_pairs({(s, date.fromisoformat(d)) for s, d in pairs})
+
+
+@shared_task(bind=True, name="fuel_tracking.warm_conso_cache", soft_time_limit=25 * 60, time_limit=30 * 60)
+@_exclusive("warm_conso_cache", 30 * 60)
+def warm_conso_cache(self):
+    """Préchauffe l'écran Suivi Conso (calcul + valeurs Snowflake / ENOC de tous les sites) : affichage sans attente."""
+    from fuel_tracking.views_comparison import warm_cache
+
+    try:
+        return warm_cache()
+    except Exception:
+        logger.exception("[fuel_tracking] Échec du préchauffage du Suivi Conso")
         return None

@@ -1037,3 +1037,61 @@ class FmsPartialReadTests(MvpBase):
         with mock.patch("fuel_tracking.services.fuel_daily_facts_snowflake._connect", return_value=conn):
             vals, err = S._snowflake_points({("DKR_0001", date(2026, 9, 30))})
         self.assertEqual((vals[("DKR_0001", date(2026, 9, 30))], err), ({"niveau_l": 634.6, "index_h": 502.48}, None))
+
+
+class StockInitialPairCacheTests(MvpBase):
+    """Valeurs Snowflake / ENOC gardées par (site, jour) : changer de page ou de taille de page ne relit que ce qui manque."""
+
+    def test_only_missing_pairs_are_fetched(self):
+        from datetime import date
+        from unittest import mock
+
+        from django.core.cache import cache
+
+        from fuel_tracking.services import stock_initial_sources as S
+
+        cache.clear()
+        calls = []
+
+        def fake(pairs):
+            calls.append(set(pairs))
+            return {p: {"niveau_l": 100.0} for p in pairs if p[0] != "S_3"}, None
+
+        d = date(2026, 9, 30)
+        with mock.patch.object(S, "_fetch_snowflake", side_effect=fake):
+            a, err = S._snowflake_points({("S_1", d), ("S_2", d)})
+            b, _ = S._snowflake_points({("S_1", d), ("S_2", d), ("S_3", d)})   # 200 par page : seul S_3 est lu
+        self.assertIsNone(err)
+        self.assertEqual(calls, [{("S_1", d), ("S_2", d)}, {("S_3", d)}])
+        self.assertEqual((b[("S_1", d)]["niveau_l"], b[("S_3", d)]), (100.0, {}))   # S_3 lu, sans valeur : pas relu, jamais 0
+        self.assertEqual(S.missing_pairs({("S_3", d)}), {("S_3", d)})              # pas encore lu côté ENOC gardien
+
+    def test_failure_is_kept_with_message_but_retried_later(self):
+        from datetime import date
+        from unittest import mock
+
+        from django.core.cache import cache
+
+        from fuel_tracking.services import stock_initial_sources as S
+
+        cache.clear()
+        d = date(2026, 9, 30)
+        with mock.patch.object(S, "_fetch_snowflake", return_value=({}, "Snowflake injoignable : valeurs FMS non lues.")) as f:
+            v1, e1 = S._snowflake_points({("S_1", d)})
+            v2, e2 = S._snowflake_points({("S_1", d)})
+        self.assertEqual(f.call_count, 1)
+        self.assertEqual((v1, e1, e2), ({("S_1", d): {}}, "Snowflake injoignable : valeurs FMS non lues.", "Snowflake injoignable : valeurs FMS non lues."))
+
+    def test_fetch_false_never_reads_sources(self):
+        from datetime import date
+        from unittest import mock
+
+        from django.core.cache import cache
+
+        from fuel_tracking.services import stock_initial_sources as S
+
+        cache.clear()
+        with mock.patch.object(S, "_fetch_snowflake") as f:
+            vals, err = S._snowflake_points({("S_9", date(2026, 9, 30))}, fetch=False)
+        f.assert_not_called()
+        self.assertEqual((vals, err), ({}, None))

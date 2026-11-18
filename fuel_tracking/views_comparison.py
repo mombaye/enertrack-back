@@ -52,10 +52,10 @@ class ConsommationsView(APIView):
         data["total"] = len(rows)
         data["page"], data["page_size"] = page, size
         data["rows"] = rows[(page - 1) * size: page * size]
-        # Blocs « INVENTAIRE » et « DONNÉES DE STOCK INITIAL » (format Output App Fuel) pour la page affichée seulement
-        from fuel_tracking.services.stock_initial_sources import enrich
-
-        data["avertissement_sources"] = enrich(data["rows"])
+        # Blocs « INVENTAIRE », « DONNÉES DE STOCK INITIAL » et « RAVITAILLEMENT » pour la page affichée seulement.
+        # Les valeurs Snowflake / ENOC déjà en cache s'affichent tout de suite ; celles qui manquent sont lues EN TÂCHE DE FOND
+        # (au-delà de SYNC_MAX paires) : la page ne reste jamais bloquée sur une source externe lente.
+        data["avertissement_sources"], data["sources_en_attente"] = _enrich_page(data["rows"])
         data["periode"]["par_defaut"] = is_default
         return Response(data)
 
@@ -99,8 +99,58 @@ def _data_version() -> str:
     return f"{b['n']}|{b['m']}|{i['n']}|{i['m']}|{data_version()}"
 
 
+SYNC_MAX = 20          # paires (site, jour) manquantes lues pendant la requête ; au-delà : tâche de fond
+BUILD_TTL = 6 * 3600   # la clé contient la version des données : un recalcul ou un import la change (jamais servi périmé)
+
+
+def _enrich_page(rows) -> tuple[str | None, int]:
+    """(message sources, nombre de sites dont les valeurs Snowflake / ENOC sont en cours de lecture)."""
+    from django.core.cache import cache
+
+    from fuel_tracking.services import stock_initial_sources as S
+
+    miss = S.missing_pairs(S.row_pairs(rows))
+    if len(miss) <= SYNC_MAX:
+        return S.enrich(rows), 0
+    try:
+        from fuel_tracking.tasks import warm_stock_initial_sources
+
+        lock = "fuel-si:warm-lock:" + ",".join(sorted(f"{s}@{d}" for s, d in miss))[:200]
+        if cache.add(lock, 1, 120):   # une seule lecture en cours pour les mêmes sites
+            warm_stock_initial_sources.delay([[s, d.isoformat()] for s, d in sorted(miss)])
+    except Exception:  # noqa: BLE001 — pas de file Celery : lecture directe (comportement d'avant)
+        return S.enrich(rows), 0
+    # valeurs déjà en cache affichées tout de suite ; le reste arrive au prochain rafraîchissement (l'interface relance seule)
+    return S.enrich(rows, fetch=False), len(S.missing_pairs(S.row_pairs(rows)))
+
+
+def warm_cache(months: int = 2) -> list[dict]:
+    """Préchauffe l'écran Suivi Conso : calcul de la période par défaut et des `months` derniers mois complets, puis valeurs
+    Snowflake / ENOC de tous leurs sites. Appelé après chaque calcul des bilans et périodiquement (Celery)."""
+    from datetime import timedelta
+
+    from django.utils import timezone
+
+    from fuel_tracking.services import stock_initial_sources as S
+
+    periods = []
+    dflt = default_period()
+    if dflt:
+        periods.append((dflt[0], dflt[1]))
+    first = timezone.localdate().replace(day=1)
+    for _ in range(months):
+        last = first - timedelta(days=1)
+        first = last.replace(day=1)
+        periods.append((first, last))
+    done = []
+    for a, b in dict.fromkeys(periods):
+        rows = _cached_build(a, b, {"date_debut": a.isoformat(), "date_fin": b.isoformat()})["rows"]
+        done.append({"periode": f"{a}→{b}", "sites": len(rows), "lus": S.warm_pairs(S.row_pairs(rows))})
+    return done
+
+
 def _cached_build(d_from, d_to, p):
-    """Résultat du calcul de l'écran mis en cache (10 min, clé = période + filtres + version des données) : changer de page ou
+    """Résultat du calcul de l'écran mis en cache (6 h, clé = période + filtres + version des données) : changer de page ou
     revenir sur l'écran ne recalcule plus tout. Jamais servi périmé : tout nouveau calcul ou import change la version."""
     import copy
     import hashlib
@@ -114,7 +164,7 @@ def _cached_build(d_from, d_to, p):
     data = cache.get(key)
     if data is None:
         data = C.build(d_from, d_to, params)
-        cache.set(key, data, 600)
+        cache.set(key, data, BUILD_TTL)
     return copy.deepcopy(data)
 
 
