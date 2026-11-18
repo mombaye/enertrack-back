@@ -136,11 +136,10 @@ def _daily(b) -> tuple[float | None, int | None]:
 
 
 def _perimeter(month: str) -> set[str] | None:
-    from fuel_tracking.services.conso_comparison import closing_base_sites
-    from fuel_tracking.services.output_app_fuel import sites_without_genset
+    """Périmètre des KPI : sites avec GE selon Snowflake (voir conso_comparison.perimeter_sites)."""
+    from fuel_tracking.services.conso_comparison import perimeter_sites
 
-    base = closing_base_sites()
-    return (base - sites_without_genset(month)) if base else None
+    return perimeter_sites(month) or None
 
 
 def _label(d_from: date, d_to: date) -> str:
@@ -205,8 +204,9 @@ def computed_kpis(d_from: date, d_to: date, sites: set[str] | None = None) -> di
     M, P = _label(d_from, d_to), _label(p_from, p_to)
     N = f"{MOIS[nxt_first.month - 1]} {nxt_first.year}"
     v = lambda label, val: {"libelle": label, "valeur": None if val is None else round(val, 3)}  # noqa: E731
+    inv = _snowflake_inventory(sites, {b.site_id.upper() for b in rows})
     out = {
-        "nb_sites_ge": v("Nbre de site avec GE", len(rows)),
+        "nb_sites_ge": v("Nbre de site avec GE", inv["avec_ge"] if inv else len(rows)),
         "stock_initial_l": v(f"Quantité laissée dans les cuves aux dates de relevés de début ({P})", stock_ini),
         "stock_final_l": v(f"Quantité laissée dans les cuves aux dates de relevés de {M}", stock_fin),
         "appoint_initial_l": v("Quantité laissée stock d'appoint (début)", None),
@@ -221,7 +221,7 @@ def computed_kpis(d_from: date, d_to: date, sites: set[str] | None = None) -> di
         "conso_releves_l": v("Quantité consommée entre les dates de relevés", conso),
         "perdue_l": v("Quantité perdue", perdue),
         "check_l": v("CHECK", check),
-        "nb_sites": v("Nbre de site", len(base) if base is not None else len(rows)),
+        "nb_sites": v("Nbre de site", inv["sites"] if inv else (len(base) if base is not None else len(rows))),
         "nb_jours": v("Nbre de jour de la période -->", n_days),
         "ecart_theorique_l": v("Ecart Conso Théorique Vs Conso Variation de Stock", vid),
         "vol_probable_l": v("Probable Quantité volée (Investigations à mener)", vols),
@@ -239,15 +239,20 @@ def computed_kpis(d_from: date, d_to: date, sites: set[str] | None = None) -> di
     ext, carte = S0(lambda b: _f(b.livraisons_externes_l)), S0(lambda b: _f(b.carte_total_l))
     raj, ret = S0(lambda b: _f(b.rajouts_l)), S0(lambda b: _f(b.retraits_l))
     t_in, t_out = S0(lambda b: _f(b.transferts_entrants_l)), S0(lambda b: _f(b.transferts_sortants_l))
-    perim = ("Sites présents dans le fichier de clôture du mois, sans les sites déclarés « sans GE et sans cuve »"
+    perim = ("Sites avec groupe électrogène selon l'inventaire Snowflake (SITE_ESCO_CURRENT) ; les stocks viennent des fichiers, tout le reste "
+             "des sources (ENOC, Snowflake)"
              + (", restreints aux sites affichés (filtres de l'écran)" if sites is not None else "") + ".")
     sum_on = f"Somme sur les {n_calc} site(s) dont la consommation est calculée (variations négatives comprises), pour que le CHECK tombe juste."
     stock_src = ("Fichier de clôture (Closing / Output App Fuel) : seule donnée reprise des fichiers"
                  if not _day_ge_app(d_from) else "Stock final du bilan précédent (EnerTrack) / relevés ENOC")
     nd = "Donnée non disponible : elle n'existe dans aucune source du bilan (ni fichier de clôture, ni ENOC). Jamais remplacée par 0."
     D = {
-        "nb_sites_ge": ("Bilans de stock de la période", "Nombre de sites qui ont un bilan sur la période (calculable ou non).",
-                        [("Bilans de la période", len(rows)), ("dont calculés", n_calc)]),
+        "nb_sites_ge": ((f"Snowflake — inventaire des sites ESCO ({INVENTORY_VIEW}), synchronisé le {inv['synchro']}." if inv else
+                         "Inventaire Snowflake vide : nombre de sites qui ont un bilan sur la période (repli)."),
+                        "Nombre de sites de l'inventaire Snowflake avec au moins un groupe électrogène (DG_COUNT ≥ 1)"
+                        + (", restreint aux sites affichés." if sites is not None else "."),
+                        [("Sites avec GE (Snowflake)", inv["avec_ge"] if inv else None), ("dont avec un bilan sur la période", inv["avec_ge_et_bilan"] if inv else len(rows)),
+                         ("dont consommation calculée", len({b.site_id.upper() for b in calc} & inv["ge_ids"]) if inv else n_calc)]),
         "stock_initial_l": (f"{stock_src} — stock initial retenu par site.", sum_on + " Σ stock initial.",
                             [("Sites", n_calc), ("Σ stock initial (L)", stock_ini)]),
         "stock_final_l": (f"{stock_src} — stock final retenu par site.", sum_on + " Σ stock final.",
@@ -274,12 +279,38 @@ def computed_kpis(d_from: date, d_to: date, sites: set[str] | None = None) -> di
                     "Stock initial + livré + autre quantité − stock final − consommé − perdu. 0 (affiché « - ») = les chiffres sont cohérents entre eux.",
                     [("Stock initial (L)", stock_ini), ("+ Livré (L)", livree), ("+ Autre quantité (L)", autre), ("− Stock final (L)", stock_fin),
                      ("− Consommé (L)", conso), ("− Perdu (L)", perdue), ("= CHECK (L)", check)]),
-        "nb_sites": ("Fichier(s) de clôture importés (Configuration).", "Nombre de sites du périmètre.", [("Sites du périmètre", len(base) if base is not None else len(rows))]),
+        "nb_sites": ((f"Snowflake — inventaire des sites ESCO ({INVENTORY_VIEW}), synchronisé le {inv['synchro']}." if inv else
+                      "Inventaire Snowflake vide : sites des fichiers de clôture (repli)."),
+                     "Nombre total de sites de l'inventaire Snowflake (avec ou sans GE)" + (", restreint aux sites affichés." if sites is not None else "."),
+                     [("Sites (Snowflake)", inv["sites"] if inv else None), ("dont avec GE", inv["avec_ge"] if inv else None),
+                      ("Sites du périmètre de suivi (fichiers de clôture)", len(base) if base is not None else len(rows))]),
     }
     for key, (src, op, comps) in D.items():
         out[key]["detail"] = {"source": src, "operation": op, "perimetre": perim, "periode": [d_from.isoformat(), d_to.isoformat()],
                               "composantes": [{"libelle": l_, "valeur": v_} for l_, v_ in comps]}
     return out
+
+
+INVENTORY_VIEW = "DB_GFMS_ANALYTICS_PROD.GOLD.SITE_ESCO_CURRENT"
+
+
+def _snowflake_inventory(sites: set[str] | None, with_bal: set[str]) -> dict | None:
+    """Nombre de sites et de sites avec GE selon l'inventaire Snowflake (copie locale FuelSiteInventory, lecture seule).
+    None si l'inventaire n'a jamais été synchronisé."""
+    from django.db.models import Max
+
+    from fuel_tracking.models import FuelSiteInventory as INV
+
+    rows = list(INV.objects.values_list("site_id", "dg_count"))
+    if not rows:
+        return None
+    ids = {s.upper() for s, _ in rows if s}
+    ge = {s.upper() for s, n in rows if s and (n or 0) >= 1}
+    if sites is not None:
+        ids, ge = ids & sites, ge & sites
+    last = INV.objects.aggregate(v=Max("synced_at"))["v"]
+    return {"sites": len(ids), "avec_ge": len(ge), "avec_ge_et_bilan": len(ge & with_bal), "ge_ids": ge,
+            "synchro": last.strftime("%d/%m/%Y") if last else "date inconnue"}
 
 
 def _day_ge_app(d: date) -> bool:

@@ -43,10 +43,10 @@ def health(top: int = 60, mois: str | None = None) -> dict:
     from django.db.models import Max
 
     from fuel_tracking.models import FuelEnocMovement, FuelEnocSyncRun, FuelSiteDailyFacts, FuelStockObservation as Obs
-    from fuel_tracking.services.conso_comparison import closing_base_sites
+    from fuel_tracking.services.conso_comparison import perimeter_sites
 
     now = timezone.now()
-    base = closing_base_sites()
+    base = perimeter_sites((timezone.localdate().replace(day=1) - timedelta(days=1)).strftime("%Y-%m") if not mois else mois)
 
     # Gardiennage : dernier relevé par site (toutes sociétés confondues, jamais additionnés)
     last = {}

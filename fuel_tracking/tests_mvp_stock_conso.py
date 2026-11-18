@@ -774,3 +774,22 @@ class ClosingRetainedFinalStockTests(OutputAppFuelImportTests):
 
     def test_sites_without_genset_excluded_from_health(self):
         pass  # sans objet pour ce fichier
+
+
+class SnowflakePerimeterTests(MvpBase):
+    """Périmètre de suivi = sites avec GE selon l'inventaire Snowflake ; nombres de sites lus dans Snowflake."""
+
+    def test_perimeter_and_site_counts_from_snowflake(self):
+        from datetime import date
+
+        from fuel_tracking.models import FuelSiteInventory as INV
+        from fuel_tracking.services.closing_kpis import kpis_for_period
+        from fuel_tracking.services.conso_comparison import perimeter_sites
+
+        INV.objects.create(country="SN", data_id=1, site_id="DKR_0001", dg_count=1)
+        INV.objects.create(country="SN", data_id=2, site_id="DKR_0002", dg_count=0)
+        INV.objects.create(country="SN", data_id=3, site_id="DKR_0003", dg_count=2)
+        self.assertEqual(perimeter_sites("2026-10"), {"DKR_0001", "DKR_0003"})
+        k = kpis_for_period(date(2026, 10, 1), date(2026, 10, 31))["kpis"]
+        self.assertEqual((k["nb_sites"]["valeur"], k["nb_sites_ge"]["valeur"]), (3, 2))
+        self.assertIn("Snowflake", k["nb_sites_ge"]["detail"]["source"])

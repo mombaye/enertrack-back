@@ -502,6 +502,28 @@ def _closing_kpis(d_from: date, d_to: date, sites: set[str] | None = None) -> di
         return None
 
 
+def snowflake_sites() -> tuple[set[str], set[str]] | None:
+    """(tous les sites, sites avec GE) de l'inventaire Snowflake SITE_ESCO_CURRENT (copie locale, lecture seule) ; None si jamais synchronisé."""
+    from fuel_tracking.models import FuelSiteInventory as INV
+
+    rows = list(INV.objects.values_list("site_id", "dg_count"))
+    if not rows:
+        return None
+    return {s.upper() for s, _ in rows if s}, {s.upper() for s, n in rows if s and (n or 0) >= 1}
+
+
+def perimeter_sites(month: str) -> set[str]:
+    """PÉRIMÈTRE de suivi carburant d'un mois (base de tous les totaux, KPI et contrôles) :
+      - sites AVEC GE selon l'inventaire Snowflake (décision du 18/11/2026 : seuls les stocks viennent des fichiers) ;
+      - à défaut d'inventaire Snowflake : sites des fichiers de clôture, sans ceux déclarés « sans GE et sans cuve »."""
+    from fuel_tracking.services.output_app_fuel import sites_without_genset
+
+    sf = snowflake_sites()
+    if sf is not None:
+        return sf[1]
+    return closing_base_sites() - sites_without_genset(month)
+
+
 def closing_base_sites() -> set[str]:
     """Base de référence = sites présents dans le fichier Closing (mêmes sites que le fichier). Vide si aucun Closing n'a été importé."""
     from fuel_tracking.models import FuelStockObservation as Obs
@@ -525,17 +547,19 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
     ids = sorted(set(balances) | {s for s, r in cph_by_site.items() if r.get("perimetre", "GE") == "GE"})
     rows = [_row(cph_by_site.get(sid), balances.get(sid), d_from, d_to, days, targets.get(sid.upper()), {}) for sid in ids]
     # Correspondance avec la base du fichier Closing : un site sans correspondance est AFFICHÉ mais jamais utilisé dans les totaux et indicateurs.
-    base = closing_base_sites()
+    # Périmètre = sites avec GE selon l'inventaire Snowflake. Sites SANS GE selon Snowflake (ou déclarés « sans GE et sans cuve ») :
+    # hors périmètre carburant, non affichés. Sites absents de l'inventaire : affichés pour information, exclus des totaux.
     from fuel_tracking.services.output_app_fuel import sites_without_genset
 
-    sans_ge = sites_without_genset(d_from.strftime("%Y-%m"))
-    # Sites déclarés « sans GE et sans cuve » pour ce mois (Output App Fuel) : hors périmètre carburant, NON affichés (ce ne sont
-    # pas des anomalies). Sites absents du fichier Closing : affichés pour information, exclus des totaux (alerte à traiter).
+    base = perimeter_sites(d_from.strftime("%Y-%m"))
+    sf = snowflake_sites()
+    sans_ge = (sf[0] - sf[1]) if sf is not None else sites_without_genset(d_from.strftime("%Y-%m"))
     n_sans_ge = sum(1 for r in rows if r["site_id"].upper() in sans_ge)
     rows = [r for r in rows if r["site_id"].upper() not in sans_ge]
     for r in rows:
         ok = (not base) or r["site_id"].upper() in base
-        motif = None if ok else "Site absent du fichier Closing (base de référence) : affiché pour information, exclu des totaux et des indicateurs."
+        motif = None if ok else ("Site absent de l'inventaire Snowflake : affiché pour information, exclu des totaux et des indicateurs." if sf is not None
+                                 else "Site absent du fichier Closing (base de référence) : affiché pour information, exclu des totaux et des indicateurs.")
         r["correspondance"] = {"base_closing": ok, "utilise": ok, "motif": motif}
     # nombre de sites par statut avec les AUTRES filtres (le filtre de statut lui-même ne doit pas vider les compteurs)
     statut_counts = {}
