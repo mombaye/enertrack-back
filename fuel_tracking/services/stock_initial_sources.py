@@ -75,9 +75,13 @@ def _snowflake_points(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, dat
 
     if not pairs:
         return {}, None
-    key = "fuel-stock-initial-sf:" + str(hash(tuple(sorted((s, d.isoformat()) for s, d in pairs))))
+    import hashlib
+
+    # clé stable entre processus (hash() de Python change à chaque démarrage : le cache n'était jamais partagé)
+    raw = "|".join(f"{s}@{d.isoformat()}" for s, d in sorted(pairs))
+    key = "fuel-stock-initial-sf:v2:" + hashlib.sha1(raw.encode()).hexdigest()
     hit = cache.get(key)
-    if hit is not None:
+    if isinstance(hit, tuple) and len(hit) == 2:
         return hit
     data_ids = {sid: did for sid, did in INV.objects.filter(site_id__in={s for s, _ in pairs}).values_list("site_id", "data_id")}
     out: dict[tuple[str, date], dict] = {}

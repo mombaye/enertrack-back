@@ -572,6 +572,8 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
                                  else "Site absent du fichier Closing (base de référence) : affiché pour information, exclu des totaux et des indicateurs.")
         r["correspondance"] = {"base_closing": ok, "utilise": ok, "motif": motif}
     # nombre de sites par statut avec les AUTRES filtres (le filtre de statut lui-même ne doit pas vider les compteurs)
+    # liste des sites de la période (pour les suggestions de la barre de recherche), avant tout filtre
+    site_options = [{"id": sid, "nom": nom} for sid, nom in sorted({(r["site_id"], r["site_name"] or "") for r in rows})]
     statut_counts = {}
     for r in _filter(rows, {**(params or {}), "statut_bilan": None}):
         statut_counts[r["stock"]["statut"]] = statut_counts.get(r["stock"]["statut"], 0) + 1
@@ -612,7 +614,7 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
         "qualite_cph": [c for c in _couvertures([r for r in cph_rows if r.get("perimetre", "GE") == "GE"]) if c.get("code") != "rapprochement"] if with_cph_quality else [],
         "facettes": {
             "pays": uniq(lambda r: r["country"]), "zones": uniq(lambda r: r["zone"]), "typologies": uniq(lambda r: r["typologie"]),
-            "typologies_energie": uniq(lambda r: r["typologie_energie"]), "statuts_bilan": list(STATUTS_BILAN), "statuts_compte": statut_counts,
+            "typologies_energie": uniq(lambda r: r["typologie_energie"]), "statuts_bilan": list(STATUTS_BILAN), "statuts_compte": statut_counts, "sites": site_options,
             "sources_stock": uniq(lambda r: r["stock"]["source_initial"]), "sources_runtime": uniq(lambda r: r["cph"]["runtime_source"]),
             "sources_puissance": uniq(lambda r: r["cph"]["power_source"]), "sources_target": uniq(lambda r: r["target"]["source"]),
         },
