@@ -611,6 +611,16 @@ class ClosingReferenceMonthTests(ConfigurationClosingUploadTests):
         bal = FuelStockBalance.objects.get(site_id="DKR_0001", observation_start=s)
         self.assertEqual(CC.bilan_status(bal), CC.REFERENCE)
 
+    @override_settings(FUEL_CLOSING_REFERENCE_PERIODS=[], FUEL_BALANCE_CLOSING_CROSSCHECK=False, FUEL_CLOSING_AUTHORITATIVE_PERIODS=[])
+    def test_late_final_of_month_file_line_is_retained(self):
+        """Stock final relevé le 28/10 sur la ligne du Closing de septembre : retenu par Ops → bilan de septembre calculé, avec réserve."""
+        self.upload(self.manager, self.ref_bytes(), mois="2026-09")
+        s = timezone.make_aware(datetime(2026, 9, 1))
+        e = timezone.make_aware(datetime(2026, 9, 30, 23, 59, 59))
+        r = SB.compute_balances(s, e, site_ids=["DKR_0002"], persist=False)[0]
+        self.assertEqual((r["stock_final_detail"]["tier"], float(r["stock_final_l"]), float(r["variation_stock_l"])), ("CLOSING_RETENU_APRES", 900.0, 0.0))
+        self.assertTrue(any("après la borne mais retenu par Ops" in x for x in r["reserves"]))
+
     @override_settings(FUEL_CLOSING_REFERENCE_PERIODS=[])
     def test_without_reference_month_september_is_computed(self):
         self.upload(self.manager, self.ref_bytes(), mois="2026-09")

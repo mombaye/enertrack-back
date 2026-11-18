@@ -34,7 +34,7 @@ from django.db.models import Q
 from django.utils import timezone
 
 RULE_VERSION = "bilan-v2"
-MVP_RULE_VERSION = "bilan-v4-mvp"  # 18/11/2026 : fichiers = stocks seulement, mouvements ENOC ; v3 = 16/11/2026  # règles du cahier des charges 16/11/2026 (FUEL_MVP_IGNORE_VALIDATION / FUEL_APP_STOCK_START / …)
+MVP_RULE_VERSION = "bilan-v5-mvp"  # 18/11/2026 : stock final tardif retenu (ligne du fichier du mois) ; v4 = fichiers = stocks seulement, mouvements ENOC  # règles du cahier des charges 16/11/2026 (FUEL_MVP_IGNORE_VALIDATION / FUEL_APP_STOCK_START / …)
 
 
 def current_rule_version() -> str:
@@ -157,6 +157,10 @@ def _candidate(o: dict, boundary, final: bool, c: dict) -> dict:
         # Mois où le fichier de clôture fait foi (sept./oct. 2026) : le stock final retenu par Ops est accepté quel que soit
         # son âge (décision du 17/11/2026), toujours AVEC RÉSERVE — jamais pour un relevé ENOC.
         tier = "CLOSING_RETENU"
+    if tier == "POSTERIEUR" and final and o["source_type"] == "CLOSING" and o.get("batch_id") in (c.get("closing_month_batches") or ()):
+        # Ligne du fichier de clôture DU MOIS dont Ops a retenu un stock final relevé plus tard (ex. 28/10 dans le Closing de septembre) :
+        # retenu avec réserve, bilan sur la période effective (le mois suivant repart de ce même relevé : pas de double comptage).
+        tier = "CLOSING_RETENU_APRES"
     if reason is None and tier == "TROP_ANCIEN":
         reason = f"relevé trop ancien ({age} j > {c['reserve_days']} j)"
     if reason is None and tier == "POSTERIEUR":
@@ -178,7 +182,7 @@ def _candidate(o: dict, boundary, final: bool, c: dict) -> dict:
 
 
 def _tier_rank(tier: str) -> int:
-    return {"EXACT": 0, "FRAIS": 1, "RESERVE": 2, "APRES_BORNE": 2, "CLOSING_RETENU": 3}.get(tier, 9)
+    return {"EXACT": 0, "FRAIS": 1, "RESERVE": 2, "APRES_BORNE": 2, "CLOSING_RETENU": 3, "CLOSING_RETENU_APRES": 4}.get(tier, 9)
 
 
 def _select(obs: list[dict], boundary, final: bool, tanks: list, c: dict) -> tuple[dict | None, list[dict], list[str]]:  # noqa: C901
@@ -228,7 +232,8 @@ def _select(obs: list[dict], boundary, final: bool, tanks: list, c: dict) -> tup
         tier_txt = {"EXACT": "relevé du jour de la borne", "FRAIS": f"relevé antérieur de {chosen['age_jours']} j (frais ≤ {c['fresh_days']} j)",
                     "RESERVE": f"relevé antérieur de {chosen['age_jours']} j (réserve, ≤ {c['reserve_days']} j)",
                     "APRES_BORNE": f"relevé de clôture postérieur de {chosen['age_jours']} j à la borne (réserve, ≤ {c.get('post_days', 0)} j)",
-                    "CLOSING_RETENU": f"stock final retenu par Ops dans le fichier de clôture, relevé {chosen['age_jours']} j avant la borne (réserve)"}[chosen["tier"]]
+                    "CLOSING_RETENU": f"stock final retenu par Ops dans le fichier de clôture, relevé {chosen['age_jours']} j avant la borne (réserve)",
+                    "CLOSING_RETENU_APRES": f"stock final retenu par Ops dans le fichier de clôture du mois, relevé {chosen['age_jours']} j après la borne (réserve)"}[chosen["tier"]]
         chosen["motif_selection"] = (
             f"{chosen['source_libelle']} (priorité {chosen['rang_priorite']}) — {tier_txt} ; valeur {chosen['mode_valeur']}"
             + (" (ESTIMATION, confiance faible)" if chosen["estimation"] else "")
@@ -307,7 +312,8 @@ def compute_balances(start, end, site_ids=None, persist=True) -> list[dict]:
     lo, hi = start - pad, end + pad
     # Relevés : fenêtre élargie pour voir (et signaler) les relevés trop anciens plutôt que de les ignorer en silence
     obs_lo = start - timedelta(days=c["reserve_days"] + 31)
-    obs_qs = Obs.objects.filter(observation_datetime__range=(obs_lo, hi)).exclude(source_type="SNOWFLAKE")
+    # + 45 j : stock final d'une ligne du fichier de clôture du mois relevé tard (retenu par Ops, voir CLOSING_RETENU_APRES)
+    obs_qs = Obs.objects.filter(observation_datetime__range=(obs_lo, hi + timedelta(days=45))).exclude(source_type="SNOWFLAKE")
     enoc_qs = EQ.objects.filter(Q(accounting_at__range=(lo, hi)) | Q(accounting_at__isnull=True, actual_operation_at__range=(lo, hi)))
     mv_qs = FuelMovement.objects.filter(movement_datetime__range=(lo, hi))
     if site_ids is not None:
@@ -349,6 +355,8 @@ def compute_balances(start, end, site_ids=None, persist=True) -> list[dict]:
     month = reference_month(start, end, c)
     if month:
         c = {**c, "reference_batches": reference_batches(month)}
+    if c.get("app_stock_start") and not _uses_app_initial(start, c):
+        c = {**c, "closing_month_batches": set(reference_batches(_day(start).strftime("%Y-%m")))}
     rows = [_site_balance(sid, start, end, c, obs_by_site.get(sid, []), enoc_by_site.get(sid, []), mv_by_site.get(sid, []),
                           tanks.get(sid, []), sites.get(sid), profiles.get(sid, {}), unbalanced, batches, previous.get(sid))
             for sid in site_ids]
@@ -632,7 +640,8 @@ def _final_observations(obs: list[dict], end, c: dict, start=None) -> list[dict]
     window = [o for o in obs if o["observation_datetime"] <= end + timedelta(days=1)]
     if c.get("app_stock_start") and start is not None and not _uses_app_initial(start, c):
         horizon = end + timedelta(days=1 + c.get("post_days", 0))
-        return [o for o in obs if o["source_type"] == "CLOSING" and o["observation_datetime"] <= horizon]
+        month_batches = c.get("closing_month_batches") or ()
+        return [o for o in obs if o["source_type"] == "CLOSING" and (o["observation_datetime"] <= horizon or o.get("batch_id") in month_batches)]
     if not c.get("final_sources"):
         return window
     allowed = set(c["final_sources"])
@@ -794,7 +803,7 @@ def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, pro
     # par Ops est accepté quel que soit son âge s'il est relevé dans le mois (décision du 17/11/2026), avec réserve.
     any_age = bool(c.get("app_stock_start")) and not _uses_app_initial(start, c)
     c_fin = {**c, "closing_final_any_age": _day(start) + timedelta(days=1) if any_age else None}
-    fin, fin_cands, a2 = _select(_final_observations(obs, end, c, start), end, True, tanks, c_fin)
+    fin, fin_cands, a2 = _select(_final_observations(obs, end, c_fin, start), end, True, tanks, c_fin)
     alerts += a1 + a2
     official = set(c.get("final_sources") or []) | ({APP_SOURCE, "CLOSING"} if c.get("app_stock_start") else set())
     if ini and fin and datetime.fromisoformat(fin["date"]) <= datetime.fromisoformat(ini["date"]):
@@ -819,6 +828,9 @@ def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, pro
                     reserves.append(f"Stock {label} : volume calculé à partir des dimensions de cuve, plaque non confirmée.")
             if x["tier"] == "RESERVE":
                 reserves.append(f"Stock {label} ancien de {x['age_jours']} j (4-{c['reserve_days']} j) : estimation avec réserve.")
+            elif x["tier"] == "CLOSING_RETENU_APRES":
+                reserves.append(f"Stock {label} relevé {x['age_jours']} j après la borne mais retenu par Ops dans le fichier de clôture du mois : "
+                                f"bilan sur la période effective (jusqu'à ce relevé), avec réserve.")
             elif x["tier"] == "CLOSING_RETENU":
                 reserves.append(f"Stock {label} relevé {x['age_jours']} j avant la borne (> {c['reserve_days']} j) mais retenu par Ops "
                                 f"dans le fichier de clôture : bilan sur la période effective, avec réserve.")

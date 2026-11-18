@@ -145,6 +145,12 @@ def final_stock_coverage(base: set, top: int = 60, mois: str | None = None) -> d
     qs = Obs.objects.filter(observation_datetime__range=(lo, hi)).exclude(validation_status="REJECTED")
     qs = qs.filter(source_type="CLOSING") if use_closing else qs.filter(source_type__in=c["final_sources"])
     best = {}
+    if use_closing:
+        # stock final de la ligne du fichier de clôture du mois relevé après la fenêtre : retenu par Ops → compté « avec réserve »
+        late = Obs.objects.filter(batch_id__in=SB.reference_batches(month), source_type="CLOSING", level_raw__contains="stock final",
+                                  observation_datetime__gt=hi).exclude(validation_status="REJECTED")
+        for sid in late.values_list("site_id", flat=True):
+            best.setdefault(sid.upper(), c["reserve_days"])
     for sid, dt in qs.values_list("site_id", "observation_datetime").iterator():
         k = sid.upper()
         age = (end_day - timezone.localtime(dt).date()).days  # négatif = après la fin du mois
