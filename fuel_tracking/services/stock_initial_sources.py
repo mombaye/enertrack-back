@@ -281,6 +281,13 @@ def _file_dates(r: dict, details: dict) -> tuple[date | None, date | None]:
     return _day(per[0] or r["stock"].get("date_initial")), _day(per[1] or r["stock"].get("date_final"))
 
 
+def _file_final_date(r: dict, details: dict) -> str | None:
+    """Date de Relevé Finale lue dans la ligne du fichier de clôture uniquement (jamais une date reprise d'ailleurs)."""
+    ctx = _file_line_context(*details.get(r["stock"].get("bilan_id"), (None, None)))
+    d = _day(((ctx or {}).get("periode") or [None, None])[1])
+    return d.isoformat() if d else None
+
+
 def ravitaillement(rows: list[dict]) -> None:
     """Ajoute à chaque ligne le bloc « ravitaillement » : 6 totaux lus dans ENOC sur la plage de dates du fichier du site."""
     from django.utils import timezone
@@ -327,7 +334,9 @@ def ravitaillement(rows: list[dict]) -> None:
         d0, d1 = (bounds[r["site_id"]][0].date(), bounds[r["site_id"]][1].date()) if t else (None, None)
         r["ravitaillement"] = {**({k: round(t[k], 3) for k in RAV_KEYS} if t else dict.fromkeys(RAV_KEYS)),
                                "nb_mouvements_enoc": t["n"] if t else None, "source": "ENOC" if t else None,
-                               "debut": d0.isoformat() if d0 else None, "fin": d1.isoformat() if d1 else None}
+                               "debut": d0.isoformat() if d0 else None, "fin": d1.isoformat() if d1 else None,
+                               # « Date de Relevé Finale » telle qu'écrite dans la ligne du fichier de clôture (contrôle) ; vide si absente
+                               "date_finale_fichier": _file_final_date(r, details)}
 
 
 def enrich(rows: list[dict], fetch: bool = True) -> str | None:
