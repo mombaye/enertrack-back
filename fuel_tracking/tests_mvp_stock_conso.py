@@ -922,6 +922,52 @@ class StockInitialSourcesTests(OutputAppFuelImportTests):
         self.assertIn("ENOC injoignable", msg)
         self.assertIsNone(rows[0]["stock_initial_sources"]["gardiennage_l"])
 
+    def _rav_rows(self):
+        from fuel_tracking.models import FuelStockBalance as B
+
+        rows = self._rows()
+        B.objects.filter(pk=rows[0]["stock"]["bilan_id"]).update(mouvements=[
+            {"source": "ENOC", "composante": "truck_l", "quantite_l": 500.0},
+            {"source": "ENOC", "composante": "truck_l", "quantite_l": 250.0},
+            {"source": "ENOC", "composante": "carte_total_l", "quantite_l": 300.0},
+            {"source": "ENOC", "composante": "transferts_entrants_l", "quantite_l": 120.0},
+            {"source": "ENOC", "composante": "transferts_sortants_l", "quantite_l": -80.0},
+            {"source": "CLOSING", "composante": "livraisons_externes_l", "quantite_l": 999.0},   # pas ENOC : jamais compté
+        ])
+        return rows
+
+    def test_ravitaillement_enoc_totals_only_from_enoc(self):
+        from fuel_tracking.models import FuelStockBalance as B
+        from fuel_tracking.services import stock_initial_sources as S
+
+        rows = self._rav_rows()
+        S.ravitaillement(rows)
+        x = rows[0]["ravitaillement"]
+        self.assertEqual((x["eydon_l"], x["carte_total_l"], x["ajout_l"], x["retrait_l"], x["nb_mouvements_enoc"]), (750.0, 300.0, 120.0, 80.0, 5))
+        # volé / fuite : repris de la ligne du fichier du mois (avant FUEL_APP_STOCK_START)
+        ctx = (B.objects.get(pk=rows[0]["stock"]["bilan_id"]).stock_final_detail or {}).get("contexte_source") or {}
+        self.assertEqual(x["source_vol_fuite"], S.SRC_FILE_MOVES)
+        self.assertEqual((x["vole_l"], x["fuite_l"]), (S._f(ctx.get("vole_l")), S._f(ctx.get("vidange_l"))))
+
+    def test_ravitaillement_vol_fuite_from_fuel_manager_after_app_start(self):
+        from django.test import override_settings
+
+        from fuel_tracking.services import stock_initial_sources as S
+
+        rows = self._rav_rows()
+        with override_settings(FUEL_APP_STOCK_START="2026-09-01"):
+            S.ravitaillement(rows)
+        x = rows[0]["ravitaillement"]
+        self.assertEqual((x["vole_l"], x["fuite_l"], x["source_vol_fuite"]), (None, None, S.SRC_FM))
+        self.assertEqual(x["eydon_l"], 750.0)
+
+    def test_ravitaillement_empty_without_balance(self):
+        from fuel_tracking.services import stock_initial_sources as S
+
+        rows = [{"site_id": "X_1", "periode": {"debut": "2026-10-01"}, "stock": {"bilan_id": None, "date_initial": None, "date_final": None}}]
+        S.ravitaillement(rows)
+        self.assertTrue(all(rows[0]["ravitaillement"][k] is None for k in ("eydon_l", "carte_total_l", "ajout_l", "retrait_l", "vole_l", "fuite_l")))
+
     def test_fms_has_priority(self):
         from datetime import date
         from unittest import mock

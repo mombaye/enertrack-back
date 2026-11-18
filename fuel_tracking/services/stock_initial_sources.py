@@ -17,6 +17,16 @@ Sources (lecture seule ; ENOC et Snowflake ne sont jamais modifiés) :
   Compteur genset (Index Compteur FMS)      Snowflake GENSET_REPORT.TOTAL_DG_RUNNING_HOUR (compteur horaire cumulé du jour) ;
   Compteur retenu                           FMS si disponible, sinon gardiennage.
 Snowflake indisponible : les colonnes FMS restent vides (« n.d. »), jamais 0 ; l'écran ne casse pas.
+
+Bloc « DONNÉES DE RAVITAILLEMENT » (6 colonnes), sur la période du bilan : de la date de relevé initiale à la date de relevé finale.
+  Total Livraison Fuel EYDON           ENOC, livraisons camion (hors Carte Total) intégrées au bilan ;
+  Total Livraison Fuel CARTE TOTAL     ENOC, livraisons Carte Total intégrées au bilan ;
+  Total Ajout                          ENOC, ponctions entrantes (+ rajouts ENOC) ;
+  Total Retrait                        ENOC, ponctions sortantes (+ retraits ENOC) ;
+  Total QTE volée déclarée             mois avant FUEL_APP_STOCK_START (sept., oct. 2026) : ligne du fichier de clôture
+                                       (Closing « Qté Volée » / Output App Fuel) ; ensuite : fournie par le Fuel Manager ;
+  Total QTE vidangée / Fuite / Écart   idem (Closing « Qté vidangée / Fuite / Écart » / Output App Fuel).
+Seuls les mouvements de source ENOC comptent dans les 4 premiers totaux ; sans bilan (pas de période) : vide, jamais 0.
 """
 from __future__ import annotations
 
@@ -195,6 +205,55 @@ def _snowflake_points(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, dat
     return result
 
 
+ENOC_COMPONENTS = {"eydon_l": ("truck_l",), "carte_total_l": ("carte_total_l",),
+                   "ajout_l": ("transferts_entrants_l", "rajouts_l"), "retrait_l": ("transferts_sortants_l", "retraits_l")}
+SRC_FILE_MOVES, SRC_FM = "Fichier de clôture (Closing / Output App Fuel)", "À fournir par le Fuel Manager"
+
+
+def _file_line_context(ini: dict | None, fin: dict | None) -> dict | None:
+    """Contexte de la ligne du fichier de clôture retenue par le bilan (stock final, sinon initial)."""
+    for x in (fin, ini):
+        if isinstance(x, dict) and x.get("source") == "CLOSING" and isinstance(x.get("contexte_source"), dict):
+            return x["contexte_source"]
+    return None
+
+
+def ravitaillement(rows: list[dict]) -> None:
+    """Ajoute à chaque ligne le bloc « ravitaillement » (6 totaux), sur la période du bilan du site."""
+    from django.conf import settings
+
+    from fuel_tracking.models import FuelStockBalance as B
+
+    ids = [r["stock"].get("bilan_id") for r in rows if r["stock"].get("bilan_id")]
+    data = {pk: (mv, ini, fin) for pk, mv, ini, fin in B.objects.filter(pk__in=ids).values_list(
+        "pk", "mouvements", "stock_initial_detail", "stock_final_detail")}
+    app_start = _day(getattr(settings, "FUEL_APP_STOCK_START", None) or "2026-11-01")
+    for r in rows:
+        bal = data.get(r["stock"].get("bilan_id"))
+        out = {k: None for k in ENOC_COMPONENTS} | {"vole_l": None, "fuite_l": None, "nb_mouvements_enoc": None,
+                                                    "source_vol_fuite": None, "debut": r["stock"].get("date_initial"), "fin": r["stock"].get("date_final")}
+        if bal is None:
+            r["ravitaillement"] = out
+            continue
+        mv, ini, fin = bal
+        # 4 totaux ENOC : seulement si la période du site est connue (date initiale ET finale) ; sinon vides, jamais 0
+        if r["stock"].get("date_initial") and r["stock"].get("date_final"):
+            enoc = [m for m in (mv or []) if m.get("source") == "ENOC" and m.get("quantite_l") is not None]
+            for key, comps in ENOC_COMPONENTS.items():
+                out[key] = _f(sum(abs(float(m["quantite_l"])) for m in enoc if m.get("composante") in comps))
+            out["nb_mouvements_enoc"] = len(enoc)
+        # volé / fuite : valeurs de la ligne du fichier (mois avant FUEL_APP_STOCK_START), même si le stock initial manque
+        debut = _day(r["stock"].get("date_initial") or (r.get("periode") or {}).get("debut"))
+        if debut is not None and debut < app_start:
+            ctx = _file_line_context(ini, fin)
+            if ctx is not None:
+                out["vole_l"], out["fuite_l"] = _f(ctx.get("vole_l")), _f(ctx.get("vidange_l"))
+                out["source_vol_fuite"] = SRC_FILE_MOVES
+        elif debut is not None:
+            out["source_vol_fuite"] = SRC_FM
+        r["ravitaillement"] = out
+
+
 def enrich(rows: list[dict]) -> str | None:
     """Ajoute à chaque ligne du tableau les blocs « inventaire » et « stock_initial_sources ». Retourne un message si Snowflake a échoué."""
     from core.models import Site
@@ -207,6 +266,7 @@ def enrich(rows: list[dict]) -> str | None:
     zones = dict(Site.ZONE_CHOICES)
     grid = {sid.upper(): g for sid, g in INV.objects.filter(site_id__in=ids).values_list("site_id", "grid_supply")}
     pairs = {(r["site_id"], _day(r["stock"].get("date_initial"))) for r in rows if r["stock"].get("date_initial")}
+    ravitaillement(rows)
     guards, gerr = _guard_readings(pairs)
     sf, err = _snowflake_points(pairs)
     err = " ".join(m for m in (err, gerr) if m) or None
