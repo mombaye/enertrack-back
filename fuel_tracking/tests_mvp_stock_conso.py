@@ -832,3 +832,22 @@ class PerimeterUnionTests(OutputAppFuelImportTests):
 
     def test_files_give_stocks_only_movements_from_enoc(self):
         pass
+
+
+class MissingSitesTests(MvpBase):
+    """Sites connus de Snowflake mais absents de Gestion des sites : aperçu puis création (identifiant + nom seulement)."""
+
+    def test_preview_and_create(self):
+        from core.models import Site
+        from fuel_tracking.models import FuelSiteInventory as INV
+        from fuel_tracking.services.missing_sites import create_missing, preview
+
+        INV.objects.create(country="SN", data_id=1, site_id="NEW_0001", site_name="NOUVEAU", dg_count=1)
+        INV.objects.create(country="SN", data_id=2, site_id="DKR_0001", site_name="ALPHA", dg_count=1)   # déjà présent
+        p = preview()
+        self.assertEqual([e["site_id"] for e in p["sites"]], ["NEW_0001"])
+        r = create_missing()
+        self.assertEqual(r["crees"], 1)
+        s = Site.objects.get(site_id="NEW_0001")
+        self.assertEqual((s.name, s.installed_typology), ("NOUVEAU", None))
+        self.assertEqual(create_missing()["crees"], 0)                         # idempotent

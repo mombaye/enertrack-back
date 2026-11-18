@@ -99,3 +99,23 @@ class ConsommationsEvolutionView(APIView):
 
     def get(self, request):
         return Response(C.evolution(12))
+
+
+class SitesManquantsView(APIView):
+    """GET /api/fuel-tracking/sites-manquants/ — sites connus (Snowflake, fichiers) mais absents de Gestion des sites (aperçu).
+    POST — les crée dans Gestion des sites (identifiant + nom seulement, rôle validateur)."""
+
+    def get_permissions(self):
+        from fuel_tracking.views_cph import IsCphValidator
+
+        return [IsCphValidator()] if self.request.method == "POST" else [IsAuthenticated()]
+
+    def get(self, request):
+        from fuel_tracking.services.missing_sites import preview
+
+        return Response(preview())
+
+    def post(self, request):
+        from fuel_tracking.services.missing_sites import create_missing
+
+        return Response(create_missing())
