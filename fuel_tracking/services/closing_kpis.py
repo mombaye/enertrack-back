@@ -205,7 +205,7 @@ def computed_kpis(d_from: date, d_to: date, sites: set[str] | None = None) -> di
     M, P = _label(d_from, d_to), _label(p_from, p_to)
     N = f"{MOIS[nxt_first.month - 1]} {nxt_first.year}"
     v = lambda label, val: {"libelle": label, "valeur": None if val is None else round(val, 3)}  # noqa: E731
-    return {
+    out = {
         "nb_sites_ge": v("Nbre de site avec GE", len(rows)),
         "stock_initial_l": v(f"Quantité laissée dans les cuves aux dates de relevés de début ({P})", stock_ini),
         "stock_final_l": v(f"Quantité laissée dans les cuves aux dates de relevés de {M}", stock_fin),
@@ -232,6 +232,62 @@ def computed_kpis(d_from: date, d_to: date, sites: set[str] | None = None) -> di
         "estimation_livraison_l": v(f"Estimation Livraison Fuel {M}", None if livree is None else livree + (autre or 0)),
         "projection_mois_suivant_l": v(f"Projection Conso Fuel {N} Sites ESCO (Litres)", projection),
     }
+    # ── Explication de chaque valeur (modal « d'où vient ce chiffre ») : source, opération, composantes chiffrées ──
+    n_calc, n_neg = len(calc), sum(1 for b in calc if b.variation_stock_l < 0)
+    neg_l = round(sum(float(b.variation_stock_l) for b in calc if b.variation_stock_l < 0), 1)
+    S0 = lambda f: S(f) if calc else None  # noqa: E731
+    ext, carte = S0(lambda b: _f(b.livraisons_externes_l)), S0(lambda b: _f(b.carte_total_l))
+    raj, ret = S0(lambda b: _f(b.rajouts_l)), S0(lambda b: _f(b.retraits_l))
+    t_in, t_out = S0(lambda b: _f(b.transferts_entrants_l)), S0(lambda b: _f(b.transferts_sortants_l))
+    perim = ("Sites présents dans le fichier de clôture du mois, sans les sites déclarés « sans GE et sans cuve »"
+             + (", restreints aux sites affichés (filtres de l'écran)" if sites is not None else "") + ".")
+    sum_on = f"Somme sur les {n_calc} site(s) dont la consommation est calculée (variations négatives comprises), pour que le CHECK tombe juste."
+    stock_src = ("Fichier de clôture (Closing / Output App Fuel) : seule donnée reprise des fichiers"
+                 if not _day_ge_app(d_from) else "Stock final du bilan précédent (EnerTrack) / relevés ENOC")
+    nd = "Donnée non disponible : elle n'existe dans aucune source du bilan (ni fichier de clôture, ni ENOC). Jamais remplacée par 0."
+    D = {
+        "nb_sites_ge": ("Bilans de stock de la période", "Nombre de sites qui ont un bilan sur la période (calculable ou non).",
+                        [("Bilans de la période", len(rows)), ("dont calculés", n_calc)]),
+        "stock_initial_l": (f"{stock_src} — stock initial retenu par site.", sum_on + " Σ stock initial.",
+                            [("Sites", n_calc), ("Σ stock initial (L)", stock_ini)]),
+        "stock_final_l": (f"{stock_src} — stock final retenu par site.", sum_on + " Σ stock final.",
+                          [("Sites", n_calc), ("Σ stock final (L)", stock_fin)]),
+        "appoint_initial_l": ("Aucune", nd, []), "appoint_final_l": ("Aucune", nd, []),
+        "commande_mois_suivant_l": ("Aucune (commandes Aktivco)", nd, []), "commande_non_livree_l": ("Aucune (commandes Aktivco)", nd, []),
+        "livree_l": ("ENOC — livraisons qualifiées (camion / Eydon et Carte Total), comptées entre les deux relevés de chaque site.",
+                     sum_on + " Σ (livraisons externes + Carte Total).",
+                     [("Livraisons externes (L)", ext), ("Carte Total (L)", carte), ("Total (L)", livree)]),
+        "autre_l": ("ENOC — rajouts, retraits et ponctions entre sites, comptés entre les deux relevés de chaque site.",
+                    sum_on + " Σ (rajouts − retraits + ponctions entrantes − ponctions sortantes).",
+                    [("Rajouts (L)", raj), ("Retraits (L)", ret), ("Ponctions entrantes (L)", t_in), ("Ponctions sortantes (L)", t_out), ("Total (L)", autre)]),
+        "conso_moyenne_jour_l": ("Bilans de stock de la période.",
+                                 "Pour chaque site calculé : consommation ÷ nombre de jours entre ses deux relevés ; puis moyenne sur tous les sites du "
+                                 "périmètre (0 pour un site sans consommation calculée), comme dans le fichier Closing.",
+                                 [("Σ des L/jour (L/j)", round(sum(rates), 2) if rates else None), ("Sites pris en compte", max(len(rates), len(base) if base is not None else 0))]),
+        "conso_releves_l": ("Calcul EnerTrack (stocks des fichiers + mouvements ENOC).",
+                            sum_on + " Pour chaque site : stock initial + livraisons + rajouts + ponctions entrantes − retraits − ponctions sortantes "
+                                     "− vols − vidanges − stock final.",
+                            [("Sites", n_calc), ("dont variations négatives", n_neg), ("Total des variations négatives (L)", neg_l), ("Total (L)", conso)]),
+        "perdue_l": ("ENOC — vols et vidanges / fuites déclarés, comptés entre les deux relevés de chaque site.", sum_on + " Σ vols + Σ vidanges.",
+                     [("Vols (L)", vols), ("Vidanges / fuites (L)", vid), ("Total (L)", perdue)]),
+        "check_l": ("Contrôle de cohérence des valeurs ci-dessus.",
+                    "Stock initial + livré + autre quantité − stock final − consommé − perdu. 0 (affiché « - ») = les chiffres sont cohérents entre eux.",
+                    [("Stock initial (L)", stock_ini), ("+ Livré (L)", livree), ("+ Autre quantité (L)", autre), ("− Stock final (L)", stock_fin),
+                     ("− Consommé (L)", conso), ("− Perdu (L)", perdue), ("= CHECK (L)", check)]),
+        "nb_sites": ("Fichier(s) de clôture importés (Configuration).", "Nombre de sites du périmètre.", [("Sites du périmètre", len(base) if base is not None else len(rows))]),
+    }
+    for key, (src, op, comps) in D.items():
+        out[key]["detail"] = {"source": src, "operation": op, "perimetre": perim, "periode": [d_from.isoformat(), d_to.isoformat()],
+                              "composantes": [{"libelle": l_, "valeur": v_} for l_, v_ in comps]}
+    return out
+
+
+def _day_ge_app(d: date) -> bool:
+    """Vrai si la période commence au début des stocks calculés par l'application (FUEL_APP_STOCK_START)."""
+    from fuel_tracking.services import stock_period_balance as SB
+
+    start = SB.cfg().get("app_stock_start")
+    return bool(start) and d >= start
 
 
 def _file_kpis(month: str) -> dict | None:

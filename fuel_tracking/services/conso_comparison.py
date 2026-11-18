@@ -389,6 +389,54 @@ def _filter(rows: list[dict], p) -> list[dict]:
     return rows
 
 
+def _ops_deliveries(d_from: date, d_to: date, site_ids: set[str]) -> dict[str, float]:
+    """Livraisons ATTENDUES par site selon le fichier de clôture de la période (Closing / Output App Fuel : Eydon + Carte Total).
+    Sert seulement à mesurer la complétude d'ENOC (jamais compté dans le bilan)."""
+    from datetime import date as _date, timedelta
+
+    from django.conf import settings
+
+    from fuel_tracking.models import FuelStockObservation as Obs
+
+    hi = d_to + timedelta(days=int(getattr(settings, "FUEL_BALANCE_CLOSING_POST_BOUNDARY_DAYS", 0) or 0))
+    best: dict[str, tuple] = {}
+    for sid, ctx in Obs.objects.filter(source_type="CLOSING", site_id__in=list(site_ids)).values_list("site_id", "source_context"):
+        ctx = ctx or {}
+        if ctx.get("type") != "closing_periode" or not ctx.get("periode") or ctx.get("livre_l") is None:
+            continue
+        try:
+            fin = _date.fromisoformat(str(ctx["periode"][1])[:10])
+        except (TypeError, ValueError):
+            continue
+        if d_from <= fin <= hi and (sid not in best or fin > best[sid][0]):
+            best[sid] = (fin, float(ctx["livre_l"]))
+    return {sid: v for sid, (_f, v) in best.items()}
+
+
+def _suivi_kpis(rows: list[dict], d_from: date, d_to: date) -> dict:
+    """KPI de suivi : couverture du calcul, conso moyenne / site / jour, sites à contrôler, écart vs Ops, complétude ENOC."""
+    n = len(rows)
+    calc = [r for r in rows if r["stock"]["variation_l"] is not None and r["stock"]["statut"] != NON_CALCULABLE]
+    neg = [r for r in calc if r["stock"]["variation_l"] < 0]
+    rates = [r["stock"].get("conso_moyenne_jour_l") for r in calc if r["stock"].get("conso_moyenne_jour_l") is not None]
+    both = [r for r in calc if r["closing"]["conso_l"] is not None]
+    v_ops, c_ops = sum(r["stock"]["variation_l"] for r in both), sum(r["closing"]["conso_l"] for r in both)
+    ids = {r["site_id"] for r in calc}
+    attendu = _ops_deliveries(d_from, d_to, ids) if ids else {}
+    enoc_l = sum((r["stock"].get("livraisons_externes_l") or 0) + (r["stock"].get("carte_total_l") or 0) for r in calc if r["site_id"] in attendu)
+    ops_l = sum(attendu.values())
+    pct = lambda a, b: round(a / b * 100, 1) if b else None  # noqa: E731
+    return {
+        "couverture": {"sites_calcules": len(calc), "sites": n, "pct": pct(len(calc), n)},
+        "conso_moyenne_site_jour_l": round(sum(rates) / len(rates), 2) if rates else None,
+        "a_controler": {"sites": len(neg), "litres_manquants": round(-sum(r["stock"]["variation_l"] for r in neg), 1)},
+        "ecart_ops": {"sites": len(both), "conso_enertrack_l": round(v_ops, 1), "conso_ops_l": round(c_ops, 1),
+                      "ecart_l": round(v_ops - c_ops, 1) if both else None, "ecart_pct": pct(v_ops - c_ops, c_ops) if both else None},
+        "completude_enoc": {"sites": len(attendu), "livraisons_enoc_l": round(enoc_l, 1), "livraisons_attendues_l": round(ops_l, 1),
+                            "pct": pct(enoc_l, ops_l)},
+    }
+
+
 def _kpis(rows: list[dict]) -> dict:
     n = len(rows)
     calc = [r for r in rows if r["stock"]["variation_l"] is not None]
@@ -519,6 +567,7 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
                     "bilan_disponible": bool(balances), "sites_avec_bilan": len(balances),
                     "sites_calculables": sum(1 for b in balances.values() if bilan_status(b) != NON_CALCULABLE), "regle": current_rule_version()},
         "kpis": {**_kpis([r for r in rows if r["correspondance"]["utilise"]]),
+                 "suivi": _suivi_kpis([r for r in rows if r["correspondance"]["utilise"]], d_from, d_to),
                  "sans_ge_exclus": n_sans_ge,
                  "sans_correspondance": {"sites": sum(1 for r in rows if not r["correspondance"]["utilise"]), "base_closing_sites": len(base),
                                          "note": "Sites hors du fichier Closing : affichés, non utilisés dans les totaux."}},
