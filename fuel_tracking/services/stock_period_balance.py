@@ -34,7 +34,7 @@ from django.db.models import Q
 from django.utils import timezone
 
 RULE_VERSION = "bilan-v2"
-MVP_RULE_VERSION = "bilan-v5-mvp"  # 18/11/2026 : stock final tardif retenu (ligne du fichier du mois) ; v4 = fichiers = stocks seulement, mouvements ENOC  # règles du cahier des charges 16/11/2026 (FUEL_MVP_IGNORE_VALIDATION / FUEL_APP_STOCK_START / …)
+MVP_RULE_VERSION = "bilan-v6-mvp"  # 18/11/2026 : stocks = ligne du fichier du mois aux dates exactes ; v5 = stock final tardif retenu ; v4 = fichiers = stocks seulement, mouvements ENOC  # règles du cahier des charges 16/11/2026 (FUEL_MVP_IGNORE_VALIDATION / FUEL_APP_STOCK_START / …)
 
 
 def current_rule_version() -> str:
@@ -182,7 +182,7 @@ def _candidate(o: dict, boundary, final: bool, c: dict) -> dict:
 
 
 def _tier_rank(tier: str) -> int:
-    return {"EXACT": 0, "FRAIS": 1, "RESERVE": 2, "APRES_BORNE": 2, "CLOSING_RETENU": 3, "CLOSING_RETENU_APRES": 4}.get(tier, 9)
+    return {"EXACT": 0, "FRAIS": 1, "RESERVE": 2, "APRES_BORNE": 2, "FICHIER_DU_MOIS": 2, "CLOSING_RETENU": 3, "CLOSING_RETENU_APRES": 4}.get(tier, 9)
 
 
 def _select(obs: list[dict], boundary, final: bool, tanks: list, c: dict) -> tuple[dict | None, list[dict], list[str]]:  # noqa: C901
@@ -309,9 +309,9 @@ def compute_balances(start, end, site_ids=None, persist=True) -> list[dict]:
         raise BalanceError("La fin de période doit être postérieure au début.")
     c = cfg()
     pad = timedelta(days=c["reserve_days"] + 1)
-    lo, hi = start - pad, end + pad
+    lo, hi = start - pad - timedelta(days=45), end + pad
     # Relevés : fenêtre élargie pour voir (et signaler) les relevés trop anciens plutôt que de les ignorer en silence
-    obs_lo = start - timedelta(days=c["reserve_days"] + 31)
+    obs_lo = start - timedelta(days=c["reserve_days"] + 31 + 45)
     # + 45 j : stock final d'une ligne du fichier de clôture du mois relevé tard (retenu par Ops, voir CLOSING_RETENU_APRES)
     obs_qs = Obs.objects.filter(observation_datetime__range=(obs_lo, hi + timedelta(days=45))).exclude(source_type="SNOWFLAKE")
     # Mouvements chargés jusqu'à 45 j après la fin : un relevé final tardif retenu par Ops (CLOSING_RETENU_APRES) doit voir les
@@ -364,7 +364,7 @@ def compute_balances(start, end, site_ids=None, persist=True) -> list[dict]:
     if month:
         c = {**c, "reference_batches": reference_batches(month)}
     if c.get("app_stock_start") and not _uses_app_initial(start, c):
-        c = {**c, "closing_month_batches": set(reference_batches(_day(start).strftime("%Y-%m")))}
+        c = {**c, "closing_month_batches": set(month_file_batches(_day(start).strftime("%Y-%m")))}
     rows = [_site_balance(sid, start, end, c, obs_by_site.get(sid, []), enoc_by_site.get(sid, []), mv_by_site.get(sid, []),
                           tanks.get(sid, []), sites.get(sid), profiles.get(sid, {}), unbalanced, batches, previous.get(sid))
             for sid in site_ids]
@@ -656,6 +656,56 @@ def _final_observations(obs: list[dict], end, c: dict, start=None) -> list[dict]
     return [o for o in window if str(o["source_type"]).upper() in allowed]
 
 
+def month_file_batches(month: str) -> list[int]:
+    """Lots de fichiers de clôture du mois (Closing OU Output App Fuel), mois déclaré à l'import sinon mois majoritaire des stocks
+    finaux, hors fichiers retirés ; les plus récents d'abord."""
+    from fuel_tracking.models import FuelImportBatch
+    from fuel_tracking.services.closing_upload import CANCEL_KEY, MONTH_KEY, final_stock_month
+
+    out = []
+    for b in FuelImportBatch.objects.filter(source_type="CLOSING").order_by("-received_at", "-pk"):
+        s = b.summary or {}
+        if CANCEL_KEY not in s and (s.get(MONTH_KEY) or final_stock_month(b)[0]) == month:
+            out.append(b.pk)
+    return out
+
+
+def _month_file_line(obs: list[dict], c: dict):
+    """(relevé initial, relevé final) de la ligne du fichier de clôture DU MOIS pour le site (lots déclarés pour le mois) ;
+    None si le site n'a pas de ligne complète dans ce fichier."""
+    batches = c.get("closing_month_batches") or ()
+    lines = defaultdict(list)
+    for o in obs:
+        ctx = o.get("source_context") or {}
+        if o["source_type"] == "CLOSING" and o.get("batch_id") in batches and ctx.get("type") == "closing_periode" and ctx.get("periode") \
+                and o["validation_status"] != "REJECTED":
+            lines[tuple(ctx["periode"])].append(o)
+    best = None
+    for per, group in lines.items():
+        d0, d1 = str(per[0] or "")[:10], str(per[1] or "")[:10]
+        if not d0 or not d1 or d1 <= d0:
+            continue
+        ini = next((o for o in group if _day(o["observation_datetime"]).isoformat() == d0 and "stock initial" in (o.get("level_raw") or "")), None) \
+            or next((o for o in group if _day(o["observation_datetime"]).isoformat() == d0), None)
+        fin = next((o for o in group if _day(o["observation_datetime"]).isoformat() == d1 and "stock final" in (o.get("level_raw") or "")), None) \
+            or next((o for o in group if _day(o["observation_datetime"]).isoformat() == d1), None)
+        if ini and fin and (best is None or d1 > best[2]):
+            best = (ini, fin, d1)
+    return (best[0], best[1]) if best else None
+
+
+def _file_candidate(o: dict, boundary, final: bool, c: dict) -> dict:
+    """Relevé de la ligne du fichier du mois, retenu tel quel (date exacte du fichier), quel que soit son écart à la borne du mois."""
+    x = _candidate(o, boundary, final, c)
+    if x["litres"] is None and o.get("level_value") is not None and o.get("level_unit") == "L":
+        x["litres"] = float(o["level_value"])
+    if x["tier"] not in ("EXACT", "FRAIS"):
+        x["tier"] = "FICHIER_DU_MOIS"
+    x.update(utilisable=x["litres"] is not None, motif_rejet=None if x["litres"] is not None else x["motif_rejet"],
+             motif_selection=f"Ligne du fichier de clôture du mois : relevé du {x['date'][:10]} (date exacte du fichier).")
+    return x
+
+
 REFERENCE_CAUSE = "REFERENCE_CLOSING"   # bilan repris tel quel du fichier Closing (mois de référence)
 OUTPUT_FILE_LABEL = "Output App Fuel"
 
@@ -812,6 +862,13 @@ def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, pro
     any_age = bool(c.get("app_stock_start")) and not _uses_app_initial(start, c)
     c_fin = {**c, "closing_final_any_age": _day(start) + timedelta(days=1) if any_age else None}
     fin, fin_cands, a2 = _select(_final_observations(obs, end, c_fin, start), end, True, tanks, c_fin)
+    line = _month_file_line(obs, c_fin) if any_age else None
+    if line:
+        # Décision du 18/11/2026 : les dates sont celles du fichier (Date de Relevé Initiale / Finale), jamais recalées sur le mois ;
+        # le bilan et tous les mouvements portent EXACTEMENT sur l'intervalle [relevé initial ; relevé final] de la ligne du fichier.
+        ini, fin = _file_candidate(line[0], start, False, c_fin), _file_candidate(line[1], end, True, c_fin)
+        ini_cands, fin_cands, a1, a2 = [ini], [fin], [], []
+        infos.append(f"Période du bilan = dates exactes du fichier de clôture : du {ini['date'][:10]} au {fin['date'][:10]}.")
     alerts += a1 + a2
     official = set(c.get("final_sources") or []) | ({APP_SOURCE, "CLOSING"} if c.get("app_stock_start") else set())
     if ini and fin and datetime.fromisoformat(fin["date"]) <= datetime.fromisoformat(ini["date"]):

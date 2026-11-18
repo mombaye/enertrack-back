@@ -412,7 +412,7 @@ class OutputAppFuelImportTests(TmpRootMixin, MvpBase):
         self.assertTrue(any("Closing de la période validée" in x for x in a["reserves"]))
         b2 = rows["DKR_0002"]                                               # relevés du 02/10 et du 05/11 + stock final estimé Energy Desk
         self.assertEqual((float(b2["stock_initial_l"]), float(b2["stock_final_l"]), b2["statut_bilan"]), (800.0, 300.0, "ESTIMATION_AVEC_RESERVE"))
-        self.assertTrue(any("après la borne" in x for x in b2["reserves"]))
+        self.assertEqual(b2["stock_final_detail"]["date"][:10], "2026-11-05")            # date exacte du fichier, même après la borne
         self.assertTrue(b2["estimation"])                                   # stock final estimé : jamais présenté comme mesuré
 
     def test_sites_without_genset_excluded_from_health(self):
@@ -444,13 +444,14 @@ class OutputAppFuelImportTests(TmpRootMixin, MvpBase):
 
     @override_settings(FUEL_BALANCE_CLOSING_POST_BOUNDARY_DAYS=0)
     def test_strict_rule_rejects_readings_after_boundary(self):
+        """Décision du 18/11/2026 : les dates de la ligne du fichier du mois priment sur toute tolérance (ici relevé final du 05/11)."""
         from fuel_tracking.services import stock_import_pipeline as P
 
         P.process_bytes(self.output_bytes(), "Output App Fuel.xlsx", "CLOSING", origin="UPLOAD")
         oct1 = timezone.make_aware(datetime(2026, 10, 1))
         oct31 = timezone.make_aware(datetime(2026, 10, 31, 23, 59, 59))
         r = SB.compute_balances(oct1, oct31, site_ids=["DKR_0002"], persist=False)[0]
-        self.assertIsNone(r["consommation_reelle_l"])
+        self.assertEqual((r["stock_initial_detail"]["date"][:10], r["stock_final_detail"]["date"][:10]), ("2026-10-02", "2026-11-05"))
 
 
 class OutputPonctionAndRoundingTests(OutputAppFuelImportTests):
@@ -618,8 +619,8 @@ class ClosingReferenceMonthTests(ConfigurationClosingUploadTests):
         s = timezone.make_aware(datetime(2026, 9, 1))
         e = timezone.make_aware(datetime(2026, 9, 30, 23, 59, 59))
         r = SB.compute_balances(s, e, site_ids=["DKR_0002"], persist=False)[0]
-        self.assertEqual((r["stock_final_detail"]["tier"], float(r["stock_final_l"]), float(r["variation_stock_l"])), ("CLOSING_RETENU_APRES", 900.0, 0.0))
-        self.assertTrue(any("après la borne mais retenu par Ops" in x for x in r["reserves"]))
+        self.assertEqual((r["stock_final_detail"]["tier"], float(r["stock_final_l"]), float(r["variation_stock_l"])), ("FICHIER_DU_MOIS", 900.0, 0.0))
+        self.assertEqual(r["stock_final_detail"]["date"][:10], "2026-10-28")          # date exacte du fichier
 
     @override_settings(FUEL_CLOSING_REFERENCE_PERIODS=[])
     def test_without_reference_month_september_is_computed(self):
@@ -765,9 +766,8 @@ class ClosingRetainedFinalStockTests(OutputAppFuelImportTests):
 
     def test_import_and_october_balance(self):
         r = self._oct()
-        self.assertEqual((float(r["consommation_reelle_l"]), r["statut_bilan"], r["stock_final_detail"]["tier"]),
-                         (170.0, "ESTIMATION_AVEC_RESERVE", "CLOSING_RETENU"))
-        self.assertTrue(any("retenu par Ops" in x for x in r["reserves"]))
+        self.assertEqual((float(r["consommation_reelle_l"]), r["stock_final_detail"]["tier"], r["stock_final_detail"]["date"][:10]),
+                         (170.0, "FICHIER_DU_MOIS", "2026-10-15"))                       # dates exactes de la ligne du fichier
 
     @override_settings(FUEL_APP_STOCK_START=None)
     def test_strict_rule_rejects_readings_after_boundary(self):
@@ -777,7 +777,7 @@ class ClosingRetainedFinalStockTests(OutputAppFuelImportTests):
 
     @override_settings(FUEL_CLOSING_AUTHORITATIVE_PERIODS=[], FUEL_BALANCE_CLOSING_CROSSCHECK=False)
     def test_still_accepted_when_movements_come_from_enoc(self):
-        self.assertEqual(self._oct()["stock_final_detail"]["tier"], "CLOSING_RETENU")
+        self.assertEqual(self._oct()["stock_final_detail"]["tier"], "FICHIER_DU_MOIS")
 
     def test_files_give_stocks_only_movements_from_enoc(self):
         pass  # sans objet pour ce fichier
