@@ -923,50 +923,59 @@ class StockInitialSourcesTests(OutputAppFuelImportTests):
         self.assertIsNone(rows[0]["stock_initial_sources"]["gardiennage_l"])
 
     def _rav_rows(self):
-        from fuel_tracking.models import FuelStockBalance as B
+        """Ligne du fichier DKR_0001 + mouvements ENOC dedans / hors de sa plage de dates, et des mouvements à ne jamais compter."""
+        from datetime import date
+
+        from fuel_tracking.models import FuelEnocMovement as EM, FuelEnocQualifiedMovement as EQ
 
         rows = self._rows()
-        B.objects.filter(pk=rows[0]["stock"]["bilan_id"]).update(mouvements=[
-            {"source": "ENOC", "composante": "truck_l", "quantite_l": 500.0},
-            {"source": "ENOC", "composante": "truck_l", "quantite_l": 250.0},
-            {"source": "ENOC", "composante": "carte_total_l", "quantite_l": 300.0},
-            {"source": "ENOC", "composante": "transferts_entrants_l", "quantite_l": 120.0},
-            {"source": "ENOC", "composante": "transferts_sortants_l", "quantite_l": -80.0},
-            {"source": "CLOSING", "composante": "livraisons_externes_l", "quantite_l": 999.0},   # pas ENOC : jamais compté
-        ])
-        return rows
+        d0, d1 = date.fromisoformat(rows[0]["stock"]["date_initial"]), date.fromisoformat(rows[0]["stock"]["date_final"])
+        tz = timezone.get_current_timezone()
+        inside, before = timezone.make_aware(datetime.combine(d0, datetime.min.time()) + timedelta(days=1, hours=10), tz), \
+            timezone.make_aware(datetime.combine(d0, datetime.min.time()) - timedelta(days=2), tz)
+        for n, (fam, qty, when, integ) in enumerate([("TRUCK", 500, inside, "INTEGRE"), ("TRUCK", 250, inside, "INTEGRE"), ("TOTAL_CARD", 300, inside, "INTEGRE"),
+                                                      ("TRUCK", 900, before, "INTEGRE"), ("TRUCK", 70, inside, "NON_INTEGRABLE")]):
+            EQ.objects.create(enoc_movement=EM.objects.create(source_id=f"E{n}"), type_family=fam, business_classification="LIVRAISON", execution_state="EXECUTEE",
+                              integration_status=integ, site_id_resolved="DKR_0001", accounting_at=when, integrated_quantity_l=Decimal(qty))
+        for n, (src, mtype, qty, impact, when, status) in enumerate([
+                ("ENOC", "TRANSFERT_INTERSITE_ENTRANT", 120, 120, inside, "VALIDATED"), ("ENOC", "TRANSFERT_INTERSITE_SORTANT", 80, -80, inside, "VALIDATED"),
+                ("ENOC", "THEFT", 40, None, inside, "VALIDATED"), ("ENOC", "DRAIN", 15, None, inside, "VALIDATED"),
+                ("ENOC", "THEFT", 999, None, inside, "REJECTED"), ("CLOSING", "THEFT", 555, None, inside, "VALIDATED"), ("ENOC", "DRAIN", 33, None, before, "VALIDATED")]):
+            FuelMovement.objects.create(source_type=src, source_event_id=f"M{n}", site_id="DKR_0001", movement_type=mtype, movement_datetime=when,
+                                        quantity_l=Decimal(qty), impact_stock_l=None if impact is None else Decimal(impact), status=status,
+                                        retained_in_stock=True, transfer_id=f"T{n}" if mtype.startswith("TRANSFERT") else None)
+        return rows, d0, d1
 
-    def test_ravitaillement_enoc_totals_only_from_enoc(self):
-        from fuel_tracking.models import FuelStockBalance as B
-        from fuel_tracking.services import stock_initial_sources as S
-
-        rows = self._rav_rows()
-        S.ravitaillement(rows)
-        x = rows[0]["ravitaillement"]
-        self.assertEqual((x["eydon_l"], x["carte_total_l"], x["ajout_l"], x["retrait_l"], x["nb_mouvements_enoc"]), (750.0, 300.0, 120.0, 80.0, 5))
-        # volé / fuite : repris de la ligne du fichier du mois (avant FUEL_APP_STOCK_START)
-        ctx = (B.objects.get(pk=rows[0]["stock"]["bilan_id"]).stock_final_detail or {}).get("contexte_source") or {}
-        self.assertEqual(x["source_vol_fuite"], S.SRC_FILE_MOVES)
-        self.assertEqual((x["vole_l"], x["fuite_l"]), (S._f(ctx.get("vole_l")), S._f(ctx.get("vidange_l"))))
-
-    def test_ravitaillement_vol_fuite_from_fuel_manager_after_app_start(self):
-        from django.test import override_settings
+    def test_ravitaillement_all_six_from_enoc_on_file_dates(self):
+        from unittest import mock
 
         from fuel_tracking.services import stock_initial_sources as S
 
-        rows = self._rav_rows()
-        with override_settings(FUEL_APP_STOCK_START="2026-09-01"):
+        rows, d0, d1 = self._rav_rows()
+        with mock.patch("fuel_tracking.services.stock_enoc.check_transfer_balance", return_value=[]):
             S.ravitaillement(rows)
         x = rows[0]["ravitaillement"]
-        self.assertEqual((x["vole_l"], x["fuite_l"], x["source_vol_fuite"]), (None, None, S.SRC_FM))
-        self.assertEqual(x["eydon_l"], 750.0)
+        self.assertEqual((x["debut"], x["fin"], x["source"]), (d0.isoformat(), d1.isoformat(), "ENOC"))
+        self.assertEqual({k: x[k] for k in S.RAV_KEYS},
+                         {"eydon_l": 750.0, "carte_total_l": 300.0, "ajout_l": 120.0, "retrait_l": 80.0, "vole_l": 40.0, "fuite_l": 15.0})
+        self.assertEqual(x["nb_mouvements_enoc"], 7)
+
+    def test_ravitaillement_unbalanced_ponction_not_counted(self):
+        from unittest import mock
+
+        from fuel_tracking.services import stock_initial_sources as S
+
+        rows, _, _ = self._rav_rows()
+        with mock.patch("fuel_tracking.services.stock_enoc.check_transfer_balance", return_value=[{"transfer_id": "T0"}]):
+            S.ravitaillement(rows)
+        self.assertEqual((rows[0]["ravitaillement"]["ajout_l"], rows[0]["ravitaillement"]["retrait_l"]), (0.0, 80.0))
 
     def test_ravitaillement_empty_without_balance(self):
         from fuel_tracking.services import stock_initial_sources as S
 
         rows = [{"site_id": "X_1", "periode": {"debut": "2026-10-01"}, "stock": {"bilan_id": None, "date_initial": None, "date_final": None}}]
         S.ravitaillement(rows)
-        self.assertTrue(all(rows[0]["ravitaillement"][k] is None for k in ("eydon_l", "carte_total_l", "ajout_l", "retrait_l", "vole_l", "fuite_l")))
+        self.assertTrue(all(rows[0]["ravitaillement"][k] is None for k in S.RAV_KEYS))   # pas de dates de fichier : vide, jamais 0
 
     def test_fms_has_priority(self):
         from datetime import date

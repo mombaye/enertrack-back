@@ -18,15 +18,16 @@ Sources (lecture seule ; ENOC et Snowflake ne sont jamais modifiés) :
   Compteur retenu                           FMS si disponible, sinon gardiennage.
 Snowflake indisponible : les colonnes FMS restent vides (« n.d. »), jamais 0 ; l'écran ne casse pas.
 
-Bloc « DONNÉES DE RAVITAILLEMENT » (6 colonnes), sur la période du bilan : de la date de relevé initiale à la date de relevé finale.
-  Total Livraison Fuel EYDON           ENOC, livraisons camion (hors Carte Total) intégrées au bilan ;
-  Total Livraison Fuel CARTE TOTAL     ENOC, livraisons Carte Total intégrées au bilan ;
-  Total Ajout                          ENOC, ponctions entrantes (+ rajouts ENOC) ;
-  Total Retrait                        ENOC, ponctions sortantes (+ retraits ENOC) ;
-  Total QTE volée déclarée             mois avant FUEL_APP_STOCK_START (sept., oct. 2026) : ligne du fichier de clôture
-                                       (Closing « Qté Volée » / Output App Fuel) ; ensuite : fournie par le Fuel Manager ;
-  Total QTE vidangée / Fuite / Écart   idem (Closing « Qté vidangée / Fuite / Écart » / Output App Fuel).
-Seuls les mouvements de source ENOC comptent dans les 4 premiers totaux ; sans bilan (pas de période) : vide, jamais 0.
+Bloc « DONNÉES DE RAVITAILLEMENT » (6 colonnes) : TOUT vient d'ENOC (lecture seule), sur la plage de dates de la ligne du
+fichier de chaque site : « Date de Relevé Initiale » → « Date de Relevé Finale » (même règle de bornes que le bilan :
+après le jour du relevé initial à 00:00, jusqu'au jour du relevé final à 00:00 inclus).
+  Total Livraison Fuel EYDON                    livraisons ENOC intégrées, hors Carte Total ;
+  Total Livraison Fuel CARTE TOTAL              livraisons ENOC Carte Total intégrées ;
+  Total Ajout                                   ponctions entrantes ENOC (rajouts d'un site à l'autre) ;
+  Total Retrait                                 ponctions sortantes ENOC ;
+  Total QTE volée déclarée                      vols déclarés dans ENOC ;
+  Total QTE vidangée / Fuite / Écart de Stock   vidanges déclarées dans ENOC.
+Mouvement rejeté, non intégré, ponction déséquilibrée : non compté. Aucune ligne de fichier (pas de dates) : vide, jamais 0.
 """
 from __future__ import annotations
 
@@ -261,9 +262,8 @@ def warm_pairs(pairs) -> int:
     return len(miss)
 
 
-ENOC_COMPONENTS = {"eydon_l": ("truck_l",), "carte_total_l": ("carte_total_l",),
-                   "ajout_l": ("transferts_entrants_l", "rajouts_l"), "retrait_l": ("transferts_sortants_l", "retraits_l")}
-SRC_FILE_MOVES, SRC_FM = "Fichier de clôture (Closing / Output App Fuel)", "À fournir par le Fuel Manager"
+RAV_KEYS = ("eydon_l", "carte_total_l", "ajout_l", "retrait_l", "vole_l", "fuite_l")
+ENOC_MOVE_KEY = {"TRANSFERT_INTERSITE_ENTRANT": "ajout_l", "TRANSFERT_INTERSITE_SORTANT": "retrait_l", "THEFT": "vole_l", "DRAIN": "fuite_l"}
 
 
 def _file_line_context(ini: dict | None, fin: dict | None) -> dict | None:
@@ -274,40 +274,60 @@ def _file_line_context(ini: dict | None, fin: dict | None) -> dict | None:
     return None
 
 
-def ravitaillement(rows: list[dict]) -> None:
-    """Ajoute à chaque ligne le bloc « ravitaillement » (6 totaux), sur la période du bilan du site."""
-    from django.conf import settings
+def _file_dates(r: dict, details: dict) -> tuple[date | None, date | None]:
+    """Date de Relevé Initiale / Finale de la ligne du fichier du site (sinon dates des relevés retenus par le bilan)."""
+    ctx = _file_line_context(*details.get(r["stock"].get("bilan_id"), (None, None)))
+    per = (ctx or {}).get("periode") or [None, None]
+    return _day(per[0] or r["stock"].get("date_initial")), _day(per[1] or r["stock"].get("date_final"))
 
-    from fuel_tracking.models import FuelStockBalance as B
+
+def ravitaillement(rows: list[dict]) -> None:
+    """Ajoute à chaque ligne le bloc « ravitaillement » : 6 totaux lus dans ENOC sur la plage de dates du fichier du site."""
+    from django.utils import timezone
+
+    from fuel_tracking.models import FuelEnocQualifiedMovement as EQ, FuelMovement as MV, FuelStockBalance as B
+    from fuel_tracking.services.stock_enoc import check_transfer_balance
 
     ids = [r["stock"].get("bilan_id") for r in rows if r["stock"].get("bilan_id")]
-    data = {pk: (mv, ini, fin) for pk, mv, ini, fin in B.objects.filter(pk__in=ids).values_list(
-        "pk", "mouvements", "stock_initial_detail", "stock_final_detail")}
-    app_start = _day(getattr(settings, "FUEL_APP_STOCK_START", None) or "2026-11-01")
+    details = {pk: (ini, fin) for pk, ini, fin in B.objects.filter(pk__in=ids).values_list("pk", "stock_initial_detail", "stock_final_detail")}
+    tz = timezone.get_current_timezone()
+    at = lambda d: timezone.make_aware(datetime.combine(d, datetime.min.time()), tz)  # noqa: E731
+    bounds = {}
     for r in rows:
-        bal = data.get(r["stock"].get("bilan_id"))
-        out = {k: None for k in ENOC_COMPONENTS} | {"vole_l": None, "fuite_l": None, "nb_mouvements_enoc": None,
-                                                    "source_vol_fuite": None, "debut": r["stock"].get("date_initial"), "fin": r["stock"].get("date_final")}
-        if bal is None:
-            r["ravitaillement"] = out
-            continue
-        mv, ini, fin = bal
-        # 4 totaux ENOC : seulement si la période du site est connue (date initiale ET finale) ; sinon vides, jamais 0
-        if r["stock"].get("date_initial") and r["stock"].get("date_final"):
-            enoc = [m for m in (mv or []) if m.get("source") == "ENOC" and m.get("quantite_l") is not None]
-            for key, comps in ENOC_COMPONENTS.items():
-                out[key] = _f(sum(abs(float(m["quantite_l"])) for m in enoc if m.get("composante") in comps))
-            out["nb_mouvements_enoc"] = len(enoc)
-        # volé / fuite : valeurs de la ligne du fichier (mois avant FUEL_APP_STOCK_START), même si le stock initial manque
-        debut = _day(r["stock"].get("date_initial") or (r.get("periode") or {}).get("debut"))
-        if debut is not None and debut < app_start:
-            ctx = _file_line_context(ini, fin)
-            if ctx is not None:
-                out["vole_l"], out["fuite_l"] = _f(ctx.get("vole_l")), _f(ctx.get("vidange_l"))
-                out["source_vol_fuite"] = SRC_FILE_MOVES
-        elif debut is not None:
-            out["source_vol_fuite"] = SRC_FM
-        r["ravitaillement"] = out
+        d0, d1 = _file_dates(r, details)
+        if d0 and d1 and d1 >= d0:
+            bounds[r["site_id"]] = (at(d0), at(d1))
+    tot = {sid: dict.fromkeys(RAV_KEYS, 0.0) | {"n": 0} for sid in bounds}
+    if bounds:
+        lo, hi = min(b[0] for b in bounds.values()), max(b[1] for b in bounds.values())
+        sites = list(bounds)
+
+        def add(sid, when, key, qty):
+            t0, t1 = bounds.get(sid) or (None, None)
+            if t0 and when and t0 < when <= t1 and qty is not None:
+                tot[sid][key] += abs(float(qty))
+                tot[sid]["n"] += 1
+
+        # Livraisons (EYDON / Carte Total) : mouvements ENOC qualifiés et intégrés, comme le bilan
+        for sid, acc, real, fam, qty in (EQ.objects.filter(site_id_resolved__in=sites, integration_status="INTEGRE")
+                                         .exclude(type_family="PONCTION")
+                                         .values_list("site_id_resolved", "accounting_at", "actual_operation_at", "type_family", "integrated_quantity_l")):
+            add(sid, acc or real, "carte_total_l" if fam == "TOTAL_CARD" else "eydon_l", qty)
+        # Ponctions (Ajout / Retrait), vols, vidanges : registre des mouvements ENOC retenus, jamais rejetés
+        unbalanced = {b["transfer_id"] for b in check_transfer_balance()}
+        for sid, mtype, when, qty, impact, tid in (MV.objects.filter(source_type="ENOC", site_id__in=sites, movement_type__in=list(ENOC_MOVE_KEY),
+                                                                      retained_in_stock=True, movement_datetime__gt=lo, movement_datetime__lte=hi)
+                                                   .exclude(status="REJECTED")
+                                                   .values_list("site_id", "movement_type", "movement_datetime", "quantity_l", "impact_stock_l", "transfer_id")):
+            if mtype.startswith("TRANSFERT") and tid in unbalanced:
+                continue
+            add(sid, when, ENOC_MOVE_KEY[mtype], impact if mtype.startswith("TRANSFERT") and impact is not None else qty)
+    for r in rows:
+        t = tot.get(r["site_id"])
+        d0, d1 = (bounds[r["site_id"]][0].date(), bounds[r["site_id"]][1].date()) if t else (None, None)
+        r["ravitaillement"] = {**({k: round(t[k], 3) for k in RAV_KEYS} if t else dict.fromkeys(RAV_KEYS)),
+                               "nb_mouvements_enoc": t["n"] if t else None, "source": "ENOC" if t else None,
+                               "debut": d0.isoformat() if d0 else None, "fin": d1.isoformat() if d1 else None}
 
 
 def enrich(rows: list[dict], fetch: bool = True) -> str | None:
