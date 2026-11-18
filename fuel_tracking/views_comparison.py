@@ -45,7 +45,7 @@ class ConsommationsView(APIView):
         data = _cached_build(d_from, d_to, p)
         rows = data.pop("rows")
         try:
-            size = max(1, min(int(p.get("page_size", 50)), 200))
+            size = max(1, min(int(p.get("page_size", 50)), 1000))   # « Tous les sites » côté interface
             page = max(1, int(p.get("page", 1)))
         except ValueError:
             size, page = 50, 1
