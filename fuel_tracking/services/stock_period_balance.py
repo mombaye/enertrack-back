@@ -314,8 +314,11 @@ def compute_balances(start, end, site_ids=None, persist=True) -> list[dict]:
     obs_lo = start - timedelta(days=c["reserve_days"] + 31)
     # + 45 j : stock final d'une ligne du fichier de clôture du mois relevé tard (retenu par Ops, voir CLOSING_RETENU_APRES)
     obs_qs = Obs.objects.filter(observation_datetime__range=(obs_lo, hi + timedelta(days=45))).exclude(source_type="SNOWFLAKE")
-    enoc_qs = EQ.objects.filter(Q(accounting_at__range=(lo, hi)) | Q(accounting_at__isnull=True, actual_operation_at__range=(lo, hi)))
-    mv_qs = FuelMovement.objects.filter(movement_datetime__range=(lo, hi))
+    # Mouvements chargés jusqu'à 45 j après la fin : un relevé final tardif retenu par Ops (CLOSING_RETENU_APRES) doit voir les
+    # mouvements jusqu'à sa date ; seuls ceux compris entre le relevé initial et le relevé final de chaque site sont comptés.
+    mv_hi = hi + timedelta(days=45)
+    enoc_qs = EQ.objects.filter(Q(accounting_at__range=(lo, mv_hi)) | Q(accounting_at__isnull=True, actual_operation_at__range=(lo, mv_hi)))
+    mv_qs = FuelMovement.objects.filter(movement_datetime__range=(lo, mv_hi))
     if site_ids is not None:
         site_ids = list(site_ids)
         obs_qs = obs_qs.filter(site_id__in=site_ids)

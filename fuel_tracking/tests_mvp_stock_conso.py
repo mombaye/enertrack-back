@@ -848,3 +848,60 @@ class SnowflakeSitesRecognisedTests(MvpBase):
                                 site_ids=["SNW_0001"], persist=False)[0]
         self.assertNotEqual(r["cause_principale"], "SITE_NON_RECONNU")
         self.assertEqual(r["site_name"], "SITE SNOWFLAKE")
+
+
+class StockInitialSourcesTests(OutputAppFuelImportTests):
+    """Bloc « DONNÉES DE STOCK INITIAL » : valeurs prises à la DATE EXACTE du relevé initial du fichier ; FMS prioritaire."""
+
+    def _rows(self):
+        from datetime import date
+
+        from fuel_tracking.services import conso_comparison as CC
+        from fuel_tracking.services import stock_import_pipeline as P
+
+        P.process_bytes(self.output_bytes(), "Output App Fuel.xlsx", "CLOSING", origin="UPLOAD")
+        SB.compute_balances(timezone.make_aware(datetime(2026, 10, 1)), timezone.make_aware(datetime(2026, 10, 31, 23, 59, 59)), site_ids=["DKR_0001"])
+        d = CC.build(date(2026, 10, 1), date(2026, 10, 31), {"site": "DKR_0001"}, with_cph_quality=False)
+        return d["rows"]
+
+    def test_terrain_used_when_no_fms_and_guard_same_day_only(self):
+        from unittest import mock
+
+        from fuel_tracking.models import FuelStockObservation as Obs
+        from fuel_tracking.services import stock_initial_sources as S
+
+        rows = self._rows()
+        tz = timezone.get_current_timezone()
+        for dt, lit in ((datetime(2026, 9, 30, 9), 950), (datetime(2026, 9, 29, 9), 111)):     # même jour / veille (ignorée)
+            Obs.objects.create(site_id="DKR_0001", tank_id="1", source_type="LOLIFORCE", observation_datetime=timezone.make_aware(dt, tz),
+                               level_raw=f"{lit} L", level_value=lit, level_unit="L", level_liters=lit, hour_meter=1234,
+                               source_event_id=f"G{lit}", validation_status="VALIDATED")
+        with mock.patch.object(S, "_snowflake_points", return_value=({}, None)):
+            S.enrich(rows)
+        x = rows[0]["stock_initial_sources"]
+        self.assertEqual((x["date"], x["terrain_l"], x["gardiennage_l"], x["retenue_l"], x["source"]), ("2026-09-30", 1000.0, 950.0, 1000.0, S.SRC_TERRAIN))
+        self.assertEqual((x["compteur_gardiennage_h"], x["compteur_retenu_h"], x["source_compteur"]), (1234.0, 1234.0, S.SRC_GUARD))
+
+    def test_fms_has_priority(self):
+        from datetime import date
+        from unittest import mock
+
+        from fuel_tracking.services import stock_initial_sources as S
+
+        rows = self._rows()
+        with mock.patch.object(S, "_snowflake_points", return_value=({("DKR_0001", date(2026, 9, 30)): {"niveau_l": 980.0, "index_h": 5000.0}}, None)):
+            S.enrich(rows)
+        x = rows[0]["stock_initial_sources"]
+        self.assertEqual((x["retenue_l"], x["source"], x["compteur_retenu_h"], x["source_compteur"]), (980.0, S.SRC_FMS, 5000.0, S.SRC_INDEX_FMS))
+
+    def test_import_and_october_balance(self):
+        pass
+
+    def test_strict_rule_rejects_readings_after_boundary(self):
+        pass
+
+    def test_sites_without_genset_excluded_from_health(self):
+        pass
+
+    def test_files_give_stocks_only_movements_from_enoc(self):
+        pass

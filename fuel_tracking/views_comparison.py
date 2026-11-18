@@ -52,6 +52,10 @@ class ConsommationsView(APIView):
         data["total"] = len(rows)
         data["page"], data["page_size"] = page, size
         data["rows"] = rows[(page - 1) * size: page * size]
+        # Blocs « INVENTAIRE » et « DONNÉES DE STOCK INITIAL » (format Output App Fuel) pour la page affichée seulement
+        from fuel_tracking.services.stock_initial_sources import enrich
+
+        data["avertissement_sources"] = enrich(data["rows"])
         data["periode"]["par_defaut"] = is_default
         return Response(data)
 
