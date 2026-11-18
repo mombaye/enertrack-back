@@ -1104,3 +1104,20 @@ class StockInitialPairCacheTests(MvpBase):
             vals, err = S._snowflake_points({("S_9", date(2026, 9, 30))}, fetch=False)
         f.assert_not_called()
         self.assertEqual((vals, err), ({}, None))
+
+
+class FmsSnapshotLevelTests(MvpBase):
+    """Niveau FMS archivé par la synchro de stock : utilisé seulement à la date EXACTE, sans appel Snowflake."""
+
+    def test_snapshot_level_exact_day_only(self):
+        from datetime import date
+
+        from fuel_tracking.models import FuelStockSnapshot as SNAP
+        from fuel_tracking.services import stock_initial_sources as S
+
+        d = date(2026, 9, 30)
+        SNAP.objects.create(site_id="S_1", snapshot_year=2026, snapshot_month=9, stock_snowflake_l=Decimal("640.5"), stock_snowflake_date=d)
+        SNAP.objects.create(site_id="S_2", snapshot_year=2026, snapshot_month=9, stock_snowflake_l=Decimal("300"), stock_snowflake_date=date(2026, 9, 28))
+        SNAP.objects.create(site_id="S_3", snapshot_year=2026, snapshot_month=9, stock_snowflake_l=Decimal("100"), stock_snowflake_date=d)
+        SNAP.objects.create(site_id="S_3", stock_snowflake_l=Decimal("120"), stock_snowflake_date=d)   # contradictoire : aucune valeur
+        self.assertEqual(S._snapshot_levels({("S_1", d), ("S_2", d), ("S_3", d)}), {("S_1", d): 640.5})

@@ -132,6 +132,19 @@ def _fetch_guard(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, date], d
     return result
 
 
+def _snapshot_levels(pairs) -> dict:
+    """(site, jour) → niveau FMS archivé (FuelStockSnapshot, issu de VW_FUEL_REPORT) dont la date est exactement ce jour."""
+    from fuel_tracking.models import FuelStockSnapshot as SNAP
+
+    out = {}
+    for sid, d, lvl in (SNAP.objects.filter(site_id__in={s for s, _ in pairs}, stock_snowflake_date__in={d for _, d in pairs},
+                                             stock_snowflake_l__isnull=False)
+                        .values_list("site_id", "stock_snowflake_date", "stock_snowflake_l")):
+        if (sid, d) in pairs:
+            out.setdefault((sid, d), set()).add(float(lvl))
+    return {k: _f(next(iter(v))) for k, v in out.items() if len(v) == 1}   # valeurs contradictoires : aucune
+
+
 def _fetch_snowflake(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, date], dict], str | None]:
     """(site, jour) → {"niveau_l", "index_h"} lus dans Snowflake au jour exact (lecture seule). (valeurs, message d'erreur)."""
     from fuel_tracking.models import FuelSiteInventory as INV
@@ -161,7 +174,12 @@ def _fetch_snowflake(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, date
         # 1. Niveau du capteur (Fuel Sensor FMS) — lu indépendamment du compteur. Filtre par DATA_ID, comme la synchro des faits
         #    journaliers (le filtre par SITE_ID dépassait le délai de 120 s sur cette vue). Plusieurs lignes contradictoires le
         #    même jour → aucune valeur (jamais un choix arbitraire).
-        ids_lvl = sorted({data_ids[s] for s in sites if s in data_ids})
+        # 1a. Niveaux déjà archivés par la synchro de stock (même vue VW_FUEL_REPORT, dernier niveau valide du mois) : retenus
+        #     seulement si leur date est EXACTEMENT le jour demandé — aucun appel Snowflake pour ces sites.
+        for k, v in _snapshot_levels(pairs).items():
+            out.setdefault(k, {})["niveau_l"] = v
+        rest = {sid for sid, d in pairs if "niveau_l" not in out.get((sid, d), {})}
+        ids_lvl = sorted({data_ids[s] for s in rest if s in data_ids})
         if ids_lvl:
             try:
                 by_id_lvl = {did: sid for sid, did in data_ids.items()}
@@ -174,7 +192,9 @@ def _fetch_snowflake(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, date
                         out.setdefault(k, {})["niveau_l"] = _f(lvl)
             except Exception as e:  # noqa: BLE001
                 logger.warning("VW_FUEL_REPORT illisible (niveau FMS) : %s", e)
-                errors.append("niveau Fuel Sensor FMS non lu (VW_FUEL_REPORT en erreur ou trop lente côté Snowflake)")
+                slow = "timeout" in str(e).lower() or "canceled" in str(e).lower()
+                errors.append("niveau Fuel Sensor FMS pas encore lu (vue VW_FUEL_REPORT très lente côté Snowflake) : nouvel essai automatique"
+                              if slow else "niveau Fuel Sensor FMS non lu (VW_FUEL_REPORT en erreur côté Snowflake)")
         # 2. Index compteur FMS : GENSET_REPORT.TOTAL_DG_RUNNING_HOUR (compteur horaire cumulé du GE, par site et par jour).
         #    Remplace la vue GFMS_DATA_TRACKER_NC, cassée côté Snowflake ; lu indépendamment du niveau.
         ids = sorted({data_ids[s] for s in sites if s in data_ids})
@@ -200,9 +220,9 @@ def _fetch_snowflake(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, date
 # Chaque valeur lue (Snowflake FMS, ENOC gardien) est gardée par site et par jour de relevé : changer de page, passer à 200
 # par page ou à « Tous les sites » réutilise ce qui a déjà été lu. Les dates de relevé sont passées : valeurs stables (24 h).
 # Échec de lecture : gardé 10 min seulement, avec son message, pour réessayer ensuite sans bloquer chaque affichage.
-PAIR_TTL_OK, PAIR_TTL_ERR, FETCH_CHUNK = 24 * 3600, 600, 150
-SF_TIMEOUT_S = 300   # lecture faite en tâche de fond uniquement (jamais pendant l'affichage) : délai large mais borné
-PREFIX_SF, PREFIX_GUARD = "fuel-si:sf:v4", "fuel-si:guard:v2"
+PAIR_TTL_OK, PAIR_TTL_ERR, FETCH_CHUNK = 24 * 3600, 600, 2000   # une requête pour tous les sites (coût de la vue ~fixe)
+SF_TIMEOUT_S = 420   # lecture faite en tâche de fond uniquement (jamais pendant l'affichage) : délai large mais borné
+PREFIX_SF, PREFIX_GUARD = "fuel-si:sf:v5", "fuel-si:guard:v2"   # v5 : anciens échecs (délai 120 s) ignorés
 
 
 def _pkey(prefix: str, site: str, day: date) -> str:

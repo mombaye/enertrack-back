@@ -288,7 +288,7 @@ def auto_compute_stock_balances(self):
     return result
 
 
-@shared_task(bind=True, name="fuel_tracking.warm_stock_initial_sources", soft_time_limit=600, time_limit=660)
+@shared_task(bind=True, name="fuel_tracking.warm_stock_initial_sources", soft_time_limit=900, time_limit=960)
 def warm_stock_initial_sources(self, pairs: list):
     """Lit en tâche de fond (lecture seule) les valeurs Snowflake FMS / ENOC gardien de paires [site, "AAAA-MM-JJ"] et les met en cache."""
     from fuel_tracking.services.stock_initial_sources import warm_pairs
