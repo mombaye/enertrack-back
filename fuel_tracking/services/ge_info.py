@@ -3,13 +3,14 @@
 Fabricant et type de GE par site — bloc « ESTIMATION CONSOMMATION FUEL THÉORIQUE » du Suivi Conso.
 
 Source unique : Snowflake DB_GFMS_ANALYTICS_PROD.GOLD.SITE_DG (lecture seule) — VENDOR (fabricant), GENSET_TYPE (type),
-une ligne par GE (NOM = n° du GE), S_ID = identifiant numérique du site, rapproché du DATA_ID de l'inventaire Snowflake
-(FuelSiteInventory). Valeur absente dans Snowflake → « n.d. » (jamais déduite ni reprise d'une autre source).
+une ligne par GE (NOM = n° du GE). S_ID = identifiant interne du site, rattaché au SITE_ID par l'inventaire Snowflake
+SITE_ESCO_CURRENT (colonne ID) — jointure faite dans Snowflake. (S_ID n'est PAS le DATA_ID : vérifié en prod, 4 % seulement.)
+Valeur absente dans Snowflake → « n.d. » (jamais déduite ni reprise d'une autre source).
 Plusieurs GE sur un site : valeurs distinctes jointes par « / » dans l'ordre des GE.
 
 Lecture faite EN TÂCHE DE FOND (refresh) et gardée en cache 48 h, relue toutes les 6 h au plus ; la page lit le cache uniquement.
-Garde-fou : si moins de MIN_MATCH des S_ID correspondent à un DATA_ID de l'inventaire, rien n'est rattaché (rapprochement non
-fiable) et la raison est conservée dans le résultat.
+Garde-fou : si moins de MIN_MATCH des S_ID de SITE_DG trouvent un site unique dans SITE_ESCO_CURRENT, rien n'est rattaché
+(rapprochement non fiable) et la raison est conservée ; un S_ID rattaché à plusieurs SITE_ID n'est jamais utilisé.
 """
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ from django.core.cache import cache
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
-CACHE_KEY = "fuel-ge-info:v2"
+CACHE_KEY = "fuel-ge-info:v3"   # v3 : rattachement par SITE_ESCO_CURRENT.ID
 CACHE_TTL = 48 * 3600
 REFRESH_AFTER_S = 6 * 3600
 MIN_MATCH = 0.5
@@ -38,30 +39,35 @@ def _join(values) -> str | None:
 
 
 def fetch_snowflake() -> tuple[dict, dict]:
-    """site → [(n° GE, fabricant, type)] lus dans SITE_DG ; (valeurs, méta de rapprochement)."""
-    from fuel_tracking.models import FuelSiteInventory as INV
+    """site → [(n° GE, fabricant, type)] lus dans SITE_DG, rattachés au SITE_ID par SITE_ESCO_CURRENT.ID ; (valeurs, méta)."""
     from fuel_tracking.services.fuel_daily_facts_snowflake import ANALYTICS, _connect
 
-    inv = {}
-    for did, sid in INV.objects.values_list("data_id", "site_id"):
-        inv.setdefault(int(did), set()).add(sid)
     conn = _connect()
     try:
         cur = conn.cursor()
-        cur.execute(f"SELECT S_ID, NOM, VENDOR, GENSET_TYPE FROM {ANALYTICS}.SITE_DG WHERE S_ID IS NOT NULL")
+        cur.execute(f"""
+            SELECT d.S_ID, d.NOM, d.VENDOR, d.GENSET_TYPE,
+                   IFF(MIN(e.SITE_ID) = MAX(e.SITE_ID), MAX(e.SITE_ID), NULL) AS site_id,
+                   COUNT(DISTINCT e.SITE_ID) AS n_sites
+            FROM {ANALYTICS}.SITE_DG d
+            LEFT JOIN {ANALYTICS}.SITE_ESCO_CURRENT e ON e.ID = d.S_ID
+            WHERE d.S_ID IS NOT NULL
+            GROUP BY d.S_ID, d.NOM, d.VENDOR, d.GENSET_TYPE
+        """)
         rows = cur.fetchall()
     finally:
         conn.close()
     ids = {int(r[0]) for r in rows}
-    matched = {i for i in ids if len(inv.get(i, ())) == 1}   # DATA_ID ambigu (plusieurs sites) : jamais rattaché
-    meta = {"lignes": len(rows), "s_id": len(ids), "rapproches": len(matched), "taux": round(len(matched) / len(ids), 3) if ids else 0}
+    matched = {int(r[0]) for r in rows if r[4] and r[5] == 1}   # S_ID rattaché à plusieurs sites : jamais utilisé
+    meta = {"lignes": len(rows), "s_id": len(ids), "rapproches": len(matched), "taux": round(len(matched) / len(ids), 3) if ids else 0,
+            "jointure": "SITE_DG.S_ID = SITE_ESCO_CURRENT.ID"}
     out: dict = {}
     if meta["taux"] < MIN_MATCH:
-        meta["ignore"] = f"S_ID rapprochés du DATA_ID pour {meta['taux']:.0%} seulement : fabricant / type de GE non rattachés."
+        meta["ignore"] = f"S_ID rattachés à un site pour {meta['taux']:.0%} seulement : fabricant / type de GE non rattachés."
         return out, meta
-    for s_id, nom, vendor, gtype in rows:
+    for s_id, nom, vendor, gtype, site_id, _n in rows:
         if int(s_id) in matched:
-            out.setdefault(next(iter(inv[int(s_id)])), []).append((nom or 0, _clean(vendor), _clean(gtype)))
+            out.setdefault(str(site_id).strip(), []).append((nom or 0, _clean(vendor), _clean(gtype)))
     return out, meta
 
 

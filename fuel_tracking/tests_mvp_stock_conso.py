@@ -1296,25 +1296,28 @@ class GeInfoTests(MvpBase):
         self.assertEqual(out["S_2"], {"fabricant_ge": None, "type_ge": "K22", "source_ge": G.SRC_SF})
         self.assertNotIn("S_4", out)
 
-    def test_snowflake_ignored_when_s_id_does_not_match_data_id(self):
+    def test_snowflake_join_on_site_esco_id_with_guard(self):
         from unittest import mock
 
-        from fuel_tracking.models import FuelSiteInventory as INV
         from fuel_tracking.services import ge_info as G
 
-        INV.objects.create(country="Senegal", data_id=7, site_id="DKR_0001", dg_count=1)
         cur = mock.Mock()
         conn = mock.Mock()
         conn.cursor.return_value = cur
         with mock.patch("fuel_tracking.services.fuel_daily_facts_snowflake._connect", return_value=conn):
-            cur.fetchall.return_value = [(7, 1, "SDMO", "K22")]
+            # (S_ID, NOM, VENDOR, GENSET_TYPE, SITE_ID rattaché, nb de SITE_ID pour ce S_ID)
+            cur.fetchall.return_value = [(10, 1, "SDMO", "K22", "DKR_0001", 1), (10, 2, "AKSA", "AP33", "DKR_0001", 1),
+                                         (11, 1, "FG Wilson", "P22-1", None, 2)]   # S_ID ambigu : jamais utilisé
             out, meta = G.fetch_snowflake()
-            self.assertEqual((out, meta["taux"]), ({"DKR_0001": [(1, "SDMO", "K22")]}, 1.0))
-            cur.fetchall.return_value = [(7, 1, "SDMO", "K22"), (8, 1, "X", "Y"), (9, 1, "X", "Y")]   # 1 S_ID sur 3 rapproché
-            out, meta = G.fetch_snowflake()
+            self.assertEqual(out, {"DKR_0001": [(1, "SDMO", "K22"), (2, "AKSA", "AP33")]})
+            self.assertEqual((meta["s_id"], meta["rapproches"]), (2, 1))
+            cur.fetchall.return_value = [(10, 1, "SDMO", "K22", None, 0), (11, 1, "X", "Y", None, 0), (12, 1, "X", "Y", "DKR_0002", 1)]
+            out, meta = G.fetch_snowflake()   # 1 S_ID sur 3 rattaché : garde-fou
             self.assertEqual(out, {})
             self.assertIn("non rattachés", meta["ignore"])
-        self.assertTrue(cur.execute.call_args[0][0].lstrip().upper().startswith("SELECT"))   # lecture seule
+        sql = cur.execute.call_args[0][0]
+        self.assertIn("e.ID = d.S_ID", sql)
+        self.assertTrue(sql.lstrip().upper().startswith("SELECT"))   # lecture seule
 
     def test_enrich_reads_cache_only(self):
         from unittest import mock
