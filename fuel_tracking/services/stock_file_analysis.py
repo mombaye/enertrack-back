@@ -99,6 +99,7 @@ def closing_stock_rows(rows) -> tuple[list[dict], dict]:
                     "vole": _first_idx(header, "qté volée", i0 + 1, i1),
                     "vidange": _first_idx(header, "qté vidangée", i0 + 1, i1),
                     "date_finale": i1, "stock_final": _first_idx(header, "qtité laissée à la date du relevé", i1 + 1, i_end),
+                    "compteur_final": _first_idx(header, "relevé visuel compteur genset", i1 + 1, i_end),
                     "conso_closing": _first_idx(header, "qtité cons considéréé", i1 + 1, i_end),
                     "conso_niveau": _first_idx(header, "qtité consommée sur la période de relevé niveau fuel", i1 + 1, i_end),
                 }
@@ -118,6 +119,8 @@ def closing_stock_rows(rows) -> tuple[list[dict], dict]:
             "conso_closing_l": F.parse_number(get("conso_closing")), "conso_niveau_l": F.parse_number(get("conso_niveau")),
             "nb_ge": F.parse_number(get("nb_ge")),
             "compteur_terrain_initial_h": F.parse_number(get("compteur_initial")),
+            # bloc « Date de Relevé Finale » du Closing : quantité laissée et compteur relevés à cette date
+            "stock_terrain_final_l": F.parse_number(get("stock_final")), "compteur_terrain_final_h": F.parse_number(get("compteur_final")),
         })
     diag = {k: (None if v is None else (header[v] if header and v < len(header) else None)) for k, v in (h_idx or {}).items()} if header else None
     return out, {"colonnes_utilisees": diag, "en_tete_trouve": header is not None}

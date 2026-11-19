@@ -1021,6 +1021,30 @@ class StockInitialSourcesTests(OutputAppFuelImportTests):
         x = rows[0]["stock_initial_sources"]
         self.assertEqual((x["compteur_terrain_h"], x["compteur_retenu_h"], x["source_compteur"]), (None, None, None))
 
+    def test_final_block_order_fms_then_guard_then_terrain(self):
+        from unittest import mock
+
+        from fuel_tracking.models import FuelStockBalance as B
+        from fuel_tracking.services import stock_initial_sources as S
+
+        rows = self._rows()
+        b = B.objects.get(pk=rows[0]["stock"]["bilan_id"])
+        for d in (b.stock_initial_detail, b.stock_final_detail):   # même ligne de fichier : mêmes valeurs sur ses deux relevés
+            o = Obs.objects.get(pk=d["observation_id"])
+            o.source_context = {**o.source_context, "stock_terrain_final_l": 410.0, "compteur_terrain_final_h": 1300.0}
+            o.save(update_fields=["source_context"])
+        df = date.fromisoformat(o.source_context["periode"][1])
+        cases = [({"niveau_l": 395.0, "index_h": 1310.0}, {"litres": 400.0, "compteur": 1305.0}, (395.0, S.SRC_FMS, 1310.0, S.SRC_INDEX_FMS)),
+                 ({}, {"litres": 400.0, "compteur": 1305.0}, (400.0, S.SRC_GUARD, 1305.0, S.SRC_GUARD)),
+                 ({}, {}, (410.0, S.SRC_TERRAIN, 1300.0, S.SRC_TERRAIN))]
+        for fms, guard, expected in cases:
+            rows = self._rows()
+            with mock.patch.object(S, "_snowflake_points", return_value=({("DKR_0001", df): fms}, None)),                     mock.patch.object(S, "_guard_readings", return_value=({("DKR_0001", df): guard}, None)):
+                S.enrich(rows)
+            x = rows[0]["stock_final_sources"]
+            self.assertEqual((x["date"], x["terrain_l"], x["compteur_terrain_h"]), (df.isoformat(), 410.0, 1300.0))
+            self.assertEqual((x["retenue_l"], x["source"], x["compteur_retenu_h"], x["source_compteur"]), expected)
+
     def test_fms_has_priority(self):
         from datetime import date
         from unittest import mock
@@ -1212,6 +1236,25 @@ class BackfillFmsLevelsTests(MvpBase):
         self.assertFalse(F.objects.filter(date=date(2026, 9, 29)).exists())
         self.assertIn("sync_fuel_daily_facts --start 2026-09-29", out.getvalue())
         self.assertTrue(all(sql.lstrip().upper().startswith("SELECT") for sql in sqls))   # lecture seule
+
+
+class TerrainFinalParsingTests(MvpBase):
+    """Bloc final des fichiers : quantité et compteur relevés sur le terrain à la Date de Relevé Finale."""
+
+    def test_closing_and_output_final_terrain_values(self):
+        from fuel_tracking.services.output_app_fuel import parse_rows
+        from fuel_tracking.services.stock_file_analysis import closing_stock_rows
+
+        head = ["ID du site", "Date de Relevé Initiale", "Qtité laissée à la date du relevé", "Relevé Visuel Compteur genset  à la date de relevé",
+                "Date de Relevé Finale", "Qtité laissée à la date du relevé", "Relevé Visuel Compteur genset  à la date de relevé"]
+        r = closing_stock_rows([head, ["DKR_0001", "30/09/2026", 500, 1200.5, "28/10/2026", 300, 1300]])[0][0]
+        self.assertEqual((r["stock_terrain_final_l"], r["compteur_terrain_final_h"]), (300, 1300))
+        head = ["ID du site", "Nom du site", "Date de Relevé Initiale", "Qtité laissée à la date initiale (relevé de terrain)",
+                "Relevé Visuel Compteur genset (relevé de terrain)", "Date de Relevé Finale", "Qtité laissée à la date finale (relevé de terrain)",
+                "Qtité laissée à la date finale (Société de gardiennage)", "Qtité laissée retenue", "Source de donnée de stock",
+                "Relevé Visuel Compteur genset (relevé de terrain)"]
+        r = parse_rows([head, ["DKR_0001", "X", "30/09/2026", 500, 324.42, "28/10/2026", 280, 290, 295, "Fuel Sensor", 400]])[0]
+        self.assertEqual((r["stock_terrain_final_l"], r["compteur_terrain_final_h"], r["stock_final_l"]), (280, 400, 295))
 
 
 class TerrainCounterParsingTests(MvpBase):

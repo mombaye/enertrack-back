@@ -20,6 +20,10 @@ Sources (lecture seule ; ENOC et Snowflake ne sont jamais modifiés) :
   Compteur genset (relevé de terrain)       fichier de clôture (Closing « Relevé Visuel Compteur genset à la date de relevé »,
                                             Output App Fuel « … (relevé de terrain) »), ligne du site, date initiale ;
   Compteur retenu                           Index Compteur FMS, sinon Société de gardiennage, sinon relevé de terrain.
+
+Bloc « DONNÉES DE STOCK FINAL » : mêmes sources à la « Date de Relevé Finale » de la ligne du fichier. Quantité de terrain et
+compteur de terrain : fichier de clôture (sept., oct.) ; gardiennage : ENOC du jour exact ; FMS : faits journaliers Snowflake.
+Quantité retenue ET compteur retenu : FMS, sinon Société de gardiennage, sinon relevé de terrain (source affichée).
 Snowflake indisponible : les colonnes FMS restent vides (« n.d. »), jamais 0 ; l'écran ne casse pas.
 
 Bloc « DONNÉES DE RAVITAILLEMENT » (6 colonnes) : TOUT vient d'ENOC (lecture seule), sur la plage de dates de la ligne du
@@ -242,7 +246,8 @@ def _guard_readings(pairs, fetch: bool = True):
 
 
 def row_pairs(rows) -> set:
-    return {(r["site_id"], _day(r["stock"].get("date_initial"))) for r in rows if r["stock"].get("date_initial")}
+    """(site, jour) des relevés initial ET final de chaque ligne (valeurs gardien / FMS lues à ces deux dates)."""
+    return {(r["site_id"], _day(r["stock"].get(k))) for r in rows for k in ("date_initial", "date_final") if r["stock"].get(k)}
 
 
 def missing_pairs(pairs) -> set:
@@ -335,32 +340,37 @@ def ravitaillement(rows: list[dict]) -> None:
                                "date_finale_fichier": _file_final_date(r, details)}
 
 
-def _terrain_counters(rows) -> dict:
-    """site → compteur genset relevé sur le terrain à la date initiale, lu sur le relevé du fichier de clôture retenu par le bilan
-    (contexte du relevé, toujours à jour même si le bilan a été calculé avant la reprise du compteur).
-    Seule la ligne de fichier dont la « Date de Relevé Initiale » est celle du site compte : un relevé partagé avec le fichier du
-    mois précédent (même site, date, valeur) porte le contexte de CE fichier-là, jamais repris pour ce mois."""
-    from fuel_tracking.models import FuelStockBalance as B, FuelStockObservation as Obs
+def _file_line_values(rows) -> dict:
+    """site → {"ini": contexte, "fin": contexte} : ligne du fichier de clôture (valeurs de terrain) correspondant aux dates du
+    bilan, cherchée parmi TOUS les relevés de clôture du site (un relevé commun à deux fichiers — ex. le 30/09, final de
+    septembre et initial d'octobre — n'est enregistré qu'une fois, rattaché à un seul fichier).
 
-    ids = [r["stock"].get("bilan_id") for r in rows if r["stock"].get("bilan_id")]
-    obs_of = {}
-    for pk, ini, fin in B.objects.filter(pk__in=ids).values_list("pk", "stock_initial_detail", "stock_final_detail"):
-        for x in (fin, ini):
-            if isinstance(x, dict) and x.get("source") == "CLOSING" and x.get("observation_id"):
-                obs_of.setdefault(pk, []).append(x["observation_id"])
-    ctx = dict(Obs.objects.filter(pk__in=[o for v in obs_of.values() for o in v]).values_list("pk", "source_context"))
+    « ini » : ligne dont la Date de Relevé Initiale est celle du bilan (de préférence avec la même date finale) ;
+    « fin » : ligne dont la Date de Relevé Finale est celle du bilan (de préférence avec la même date initiale).
+    Bilan sans date initiale : ligne du stock final ; sans date finale : ligne du stock initial. Aucune ligne aux bonnes dates :
+    vide (jamais une autre période).
+    """
+    from fuel_tracking.models import FuelStockObservation as Obs
+
+    sites = {r["site_id"] for r in rows}
+    lines: dict = {}
+    for sid, c in (Obs.objects.filter(source_type="CLOSING", site_id__in=sites).exclude(validation_status="REJECTED")
+                   .values_list("site_id", "source_context")):
+        if isinstance(c, dict) and c.get("type") == "closing_periode" and c.get("periode"):
+            per = (list(c["periode"]) + [None, None])[:2]
+            key = (str(per[0] or "")[:10], str(per[1] or "")[:10])   # une entrée par ligne de fichier (relevés initial + final fusionnés)
+            cur = lines.setdefault(sid, {}).setdefault(key, {})
+            cur.update({k: v for k, v in c.items() if v is not None or k not in cur})
     out = {}
     for r in rows:
-        d0 = str(r["stock"].get("date_initial") or "")[:10]
-        for n, oid in enumerate(obs_of.get(r["stock"].get("bilan_id"), [])):
-            c = ctx.get(oid) if isinstance(ctx.get(oid), dict) else {}
-            # stock initial non exploitable (pas de date) : seule la ligne du stock final (= ligne du fichier du mois) est retenue
-            if (str((c.get("periode") or [None])[0] or "")[:10] != d0) if d0 else n > 0:
-                continue   # contexte d'une autre ligne de fichier (autre période) : jamais repris
-            v = c.get("compteur_terrain_initial_h")
-            if v is not None:
-                out[r["site_id"]] = _f(v)
-                break
+        d0, d1 = str(r["stock"].get("date_initial") or "")[:10], str(r["stock"].get("date_final") or "")[:10]
+        cand = lines.get(r["site_id"], {})
+        both = cand.get((d0, d1)) if d0 and d1 else None
+        fin = both or next((c for (a, b), c in sorted(cand.items()) if d1 and b == d1), None)
+        ini = both or (next((c for (a, b), c in sorted(cand.items()) if a == d0), None) if d0 else fin)
+        if fin is None and not d1:
+            fin = ini   # bilan sans date finale : valeurs finales de la même ligne de fichier (dates du fichier)
+        out[r["site_id"]] = {"ini": ini or {}, "fin": fin or {}}
     return out
 
 
@@ -377,7 +387,7 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
     grid = {sid.upper(): g for sid, g in INV.objects.filter(site_id__in=ids).values_list("site_id", "grid_supply")}
     pairs = row_pairs(rows)
     ravitaillement(rows)
-    terrain_cpt = _terrain_counters(rows)
+    lines = _file_line_values(rows)
     guards, gerr = _guard_readings(pairs, fetch)
     sf, err = _snowflake_points(pairs, fetch)
     err = " ".join(m for m in (err, gerr) if m) or None
@@ -395,13 +405,35 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
         p = sf.get((r["site_id"], d), {}) if d else {}
         fms, idx = p.get("niveau_l"), p.get("index_h")
         retenue, src = (fms, SRC_FMS) if fms is not None else ((terrain, SRC_TERRAIN) if terrain is not None else (None, None))
-        cpt_terrain = terrain_cpt.get(r["site_id"])
+        line = (lines.get(r["site_id"]) or {}).get("ini") or {}
+        cpt_terrain = _f(line.get("compteur_terrain_initial_h"))
         # ordre : Index Compteur FMS → Société de gardiennage → relevé de terrain du fichier de clôture
-        cpt, csrc = next(((v, s) for v, s in ((idx, SRC_INDEX_FMS), (g.get("compteur"), SRC_GUARD), (cpt_terrain, SRC_TERRAIN)) if v is not None),
-                         (None, None))
+        cpt, csrc = _first_of((idx, SRC_INDEX_FMS), (g.get("compteur"), SRC_GUARD), (cpt_terrain, SRC_TERRAIN))
         r["stock_initial_sources"] = {
             "date": d.isoformat() if d else None, "terrain_l": terrain, "gardiennage_l": g.get("litres"), "fms_l": fms,
             "retenue_l": retenue, "source": src, "compteur_terrain_h": cpt_terrain, "compteur_gardiennage_h": g.get("compteur"), "compteur_fms_h": idx,
             "compteur_retenu_h": cpt, "source_compteur": csrc,
         }
+        # Bloc « DONNÉES DE STOCK FINAL », à la Date de Relevé Finale de la ligne du fichier (seule date retenue ; absente → n.d.)
+        line = (lines.get(r["site_id"]) or {}).get("fin") or {}
+        df = _day((line.get("periode") or [None, None])[1])
+        gf = guards.get((r["site_id"], df), {}) if df else {}
+        pf = sf.get((r["site_id"], df), {}) if df else {}
+        # quantité de terrain : colonne du fichier (Output App Fuel « relevé de terrain », Closing « Qtité laissée à la date du relevé »)
+        terrain_f = _f(line.get("stock_terrain_final_l") if line.get("stock_terrain_final_l") is not None
+                       else (line.get("stock_final_l") if "stock_initial_l" in line else None))   # ancien contexte Closing
+        cpt_terrain_f = _f(line.get("compteur_terrain_final_h"))
+        # ordre (quantité ET compteur) : Fuel Sensor / Index FMS → Société de gardiennage → relevé de terrain du fichier
+        ret_f, src_f = _first_of((pf.get("niveau_l"), SRC_FMS), (gf.get("litres"), SRC_GUARD), (terrain_f, SRC_TERRAIN))
+        cpt_f, csrc_f = _first_of((pf.get("index_h"), SRC_INDEX_FMS), (gf.get("compteur"), SRC_GUARD), (cpt_terrain_f, SRC_TERRAIN))
+        r["stock_final_sources"] = {
+            "date": df.isoformat() if df else None, "terrain_l": terrain_f, "gardiennage_l": gf.get("litres"), "fms_l": pf.get("niveau_l"),
+            "retenue_l": ret_f, "source": src_f, "compteur_terrain_h": cpt_terrain_f, "compteur_gardiennage_h": gf.get("compteur"),
+            "compteur_fms_h": pf.get("index_h"), "compteur_retenu_h": cpt_f, "source_compteur": csrc_f,
+        }
     return err
+
+
+def _first_of(*candidates):
+    """Première valeur présente (jamais 0 par défaut), avec sa source ; (None, None) si aucune."""
+    return next(((v, s) for v, s in candidates if v is not None), (None, None))
