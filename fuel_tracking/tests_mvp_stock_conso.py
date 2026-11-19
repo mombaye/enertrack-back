@@ -1365,3 +1365,37 @@ class PrpGensetDbTests(MvpBase):
         self.assertIn("ambigu", sites["B"]["prp_motif"])
         self.assertEqual((sites["C"]["prp_kva"], sites["C"]["prp_motif"]), (None, "type « P33-3U » absent de GENSET DB"))
         self.assertEqual((sites["D"]["prp_kva"], sites["D"]["prp_motif"]), (None, None))
+
+
+class AuditSuiviConsoTests(OutputAppFuelImportTests):
+    """Audit global (lecture seule) : chaque valeur affichée comparée à la source ; sources externes simulées."""
+
+    def test_status_rules(self):
+        from fuel_tracking.management.commands.audit_suivi_conso import _status
+
+        self.assertEqual([_status(None, None), _status(None, 5), _status(5, None), _status(5, 5.2), _status(5, 9), _status("K22", "k22")],
+                         ["ABSENT", "MANQUANT", "SANS_SOURCE", "OK", "ECART", "OK"])
+
+    def test_command_runs_and_compares_with_sources(self):
+        import tempfile
+        from io import StringIO
+        from pathlib import Path
+        from unittest import mock
+
+        from django.core.management import call_command
+
+        from fuel_tracking.management.commands import audit_suivi_conso as A
+        from fuel_tracking.services import stock_import_pipeline as P
+        from fuel_tracking.services import stock_initial_sources as S
+
+        P.process_bytes(self.output_bytes(), "Output App Fuel.xlsx", "CLOSING", origin="UPLOAD")
+        SB.compute_balances(timezone.make_aware(datetime(2026, 10, 1)), timezone.make_aware(datetime(2026, 10, 31, 23, 59, 59)), site_ids=["DKR_0001"])
+        fichier = {"_nom": "OAF.xlsx", "DKR_0001": {"date_initiale": date(2026, 9, 30), "date_finale": date(2026, 10, 31),
+                                                   "stock_initial_l": 1000, "stock_terrain_final_l": 800}}
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as tmp,                 mock.patch.object(A.Command, "_file_lines", return_value=fichier),                 mock.patch.object(A.Command, "_snowflake", return_value=({("DKR_0001", date(2026, 9, 30)): {"niveau": 950.0}}, {}, "")),                 mock.patch.object(A.Command, "_enoc_ge", return_value={}),                 mock.patch.object(A.Command, "_mongo_completeness", return_value=None),                 mock.patch.object(S, "_fetch_guard", return_value=({}, None)),                 mock.patch.object(S, "_guard_readings", return_value=({}, None)):
+            path = str(Path(tmp) / "audit.csv")
+            call_command("audit_suivi_conso", mois="2026-10", csv=path, stdout=out)
+            txt = Path(path).read_text(encoding="utf-8")
+        self.assertIn("SYNTHÈSE PAR CHAMP", out.getvalue())
+        self.assertIn("DKR_0001;STOCK INITIAL;Qtité FMS;;950.0;MANQUANT", txt)   # Snowflake a une valeur, le tableau non
