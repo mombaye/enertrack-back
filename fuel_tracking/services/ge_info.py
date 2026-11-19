@@ -3,9 +3,10 @@
 Fabricant et type de GE par site — bloc « ESTIMATION CONSOMMATION FUEL THÉORIQUE » du Suivi Conso.
 
 Ordre, CHAMP PAR CHAMP (fabricant et type choisis indépendamment), jamais de déduction :
-  1. Snowflake DB_GFMS_ANALYTICS_PROD.GOLD.SITE_DG (fiche actuelle) : VENDOR, GENSET_TYPE ;
-  2. Snowflake SITE_DG_DAILY (historique) : dernière version non vide du même GE (S_ID, NOM) ;
-  3. ENOC, registre des GE (ge_assets) : brand, model — GE au statut INSTALLED uniquement.
+  Fabricant GE : 1. Snowflake SITE_DG (fiche actuelle, VENDOR) ; 2. Snowflake SITE_DG_DAILY (historique) ; 3. ENOC (brand).
+  Type de GE   : 1. ENOC, registre des GE (model) — décision métier : type ENOC pour tous les sites ; 2. à défaut seulement,
+                 Snowflake SITE_DG puis historique (GENSET_TYPE), source affichée.
+  ENOC : registre des GE (ge_assets), GE au statut INSTALLED uniquement.
 « Source de donnée GE » indique la source exacte (une seule si les deux champs viennent du même endroit).
 Rattachement Snowflake : S_ID = identifiant interne du site → SITE_ESCO_CURRENT.ID → SITE_ID (jointure dans Snowflake ;
 S_ID n'est PAS le DATA_ID). Plusieurs GE sur un site : valeurs distinctes jointes par « / » dans l'ordre des GE.
@@ -26,7 +27,7 @@ from django.core.cache import cache
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
-CACHE_KEY = "fuel-ge-info:v5"   # v5 : + puissance PRP (GENSET DB)
+CACHE_KEY = "fuel-ge-info:v6"   # v6 : type de GE pris dans ENOC d'abord (PRP recalculée sur ce type)
 KW_PER_KVA = 0.8                 # Puissance PRP (kW) = Puissance PRP (kVA) × 0,8 (constante fixe)
 CACHE_TTL = 48 * 3600
 REFRESH_AFTER_S = 6 * 3600
@@ -116,6 +117,12 @@ def fetch_enoc() -> dict:
         client.close()
 
 
+def _pick_enoc_first(snowflake_values: list, enoc_values: list) -> tuple[str | None, str | None]:
+    """(valeur, source) : ENOC d'abord ; sinon Snowflake (actuel puis historique) ; sinon (None, None)."""
+    en = _join(enoc_values)
+    return (en, SRC_ENOC) if en else _pick(snowflake_values, [])
+
+
 def _pick(snowflake_values: list, enoc_values: list) -> tuple[str | None, str | None]:
     """(valeur, source) : Snowflake (actuel puis historique, GE par GE) ; sinon ENOC ; sinon (None, None)."""
     sf = [(v, s) for v, s in snowflake_values if v]
@@ -133,7 +140,7 @@ def build(sf: dict, enoc: dict) -> dict:
         ges = sorted(sf.get(sid, []), key=lambda g: g[0])
         en = enoc.get(sid, [])
         fab, fab_src = _pick([g[1] for g in ges], [_clean(e[0]) for e in en])
-        typ, typ_src = _pick([g[2] for g in ges], [_clean(e[1]) for e in en])
+        typ, typ_src = _pick_enoc_first([g[2] for g in ges], [_clean(e[1]) for e in en])   # type : ENOC d'abord
         if not fab and not typ:
             continue
         srcs = [s for s in (fab_src, typ_src) if s]

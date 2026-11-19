@@ -1310,9 +1310,11 @@ class GeInfoTests(MvpBase):
               "S_3": [(1, ("Olympian", G.SRC_SF_HIST), ("GEP22-2", G.SRC_SF_HIST))]}  # retrouvé dans l'historique
         en = {"S_1": [("SDMO", "K22")], "S_2": [("SDMO", "K22")], "S_4": [("AKSA", "AP33")], "S_5": [("None", None)]}
         out = G.build(sf, en)
-        self.assertEqual(out["S_1"], {"fabricant_ge": "CATERPILLAR / FG Wilson", "type_ge": "P33-3U / P22-1", "source_ge": G.SRC_SF})
-        self.assertEqual(out["S_2"], {"fabricant_ge": "SDMO", "type_ge": "K22", "source_ge": f"Fabricant : {G.SRC_ENOC} · Type : {G.SRC_SF}"})
-        self.assertEqual(out["S_3"]["source_ge"], G.SRC_SF_HIST)
+        # type : ENOC d'abord (décision métier) ; fabricant : Snowflake d'abord
+        self.assertEqual(out["S_1"], {"fabricant_ge": "CATERPILLAR / FG Wilson", "type_ge": "K22",
+                                      "source_ge": f"Fabricant : {G.SRC_SF} · Type : {G.SRC_ENOC}"})
+        self.assertEqual(out["S_2"], {"fabricant_ge": "SDMO", "type_ge": "K22", "source_ge": G.SRC_ENOC})
+        self.assertEqual(out["S_3"]["source_ge"], G.SRC_SF_HIST)                       # pas d'ENOC : type Snowflake (historique)
         self.assertEqual(out["S_4"], {"fabricant_ge": "AKSA", "type_ge": "AP33", "source_ge": G.SRC_ENOC})
         self.assertNotIn("S_5", out)
 
