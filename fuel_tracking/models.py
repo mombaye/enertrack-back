@@ -1063,6 +1063,7 @@ class FuelImportBatch(models.Model):
         TANK_MODELS = "TANK_MODELS", "Modèles de cuves — calculateur et conversion cm vers litres"
         TARGET_FUEL = "TARGET_FUEL", "Target fuel mensuel par site (Closing historique, onglet NR analyse variation conso fuel)"
         TERRAIN_MENSUEL = "TERRAIN_MENSUEL", "Remontées terrain mensuelles — fichier complémentaire"
+        BASE_GE = "BASE_GE", "Base GE — type de GE par site"
 
     class Status(models.TextChoices):
         RECEIVED = "RECEIVED", "Reçu"

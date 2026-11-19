@@ -4,8 +4,8 @@ Fabricant et type de GE par site — bloc « ESTIMATION CONSOMMATION FUEL THÉOR
 
 Ordre, CHAMP PAR CHAMP (fabricant et type choisis indépendamment), jamais de déduction :
   Fabricant GE : 1. Snowflake SITE_DG (fiche actuelle, VENDOR) ; 2. Snowflake SITE_DG_DAILY (historique) ; 3. ENOC (brand).
-  Type de GE   : 1. ENOC, registre des GE (model) — décision métier : type ENOC pour tous les sites ; 2. à défaut seulement,
-                 Snowflake SITE_DG puis historique (GENSET_TYPE), source affichée.
+  Type de GE   : 1. fichier « Base GE » importé dans Configuration (type BASE_GE, dernier fichier) — décision métier ;
+                 2. à défaut (site absent du fichier) : ENOC (model), puis Snowflake SITE_DG / historique ; source affichée.
   ENOC : registre des GE (ge_assets), GE au statut INSTALLED uniquement.
 « Source de donnée GE » indique la source exacte (une seule si les deux champs viennent du même endroit).
 Rattachement Snowflake : S_ID = identifiant interne du site → SITE_ESCO_CURRENT.ID → SITE_ID (jointure dans Snowflake ;
@@ -22,16 +22,18 @@ conservée) ; un S_ID rattaché à plusieurs SITE_ID n'est jamais utilisé. Une 
 from __future__ import annotations
 
 import logging
+import re
 
 from django.core.cache import cache
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
-CACHE_KEY = "fuel-ge-info:v6"   # v6 : type de GE pris dans ENOC d'abord (PRP recalculée sur ce type)
+CACHE_KEY = "fuel-ge-info:v7"   # v7 : type de GE du fichier Base GE d'abord
 KW_PER_KVA = 0.8                 # Puissance PRP (kW) = Puissance PRP (kVA) × 0,8 (constante fixe)
 CACHE_TTL = 48 * 3600
 REFRESH_AFTER_S = 6 * 3600
 MIN_MATCH = 0.5
+SRC_BASE = "Fichier Base GE"
 SRC_SF, SRC_SF_HIST, SRC_ENOC = "Snowflake (SITE_DG)", "Snowflake (historique SITE_DG)", "ENOC (registre des GE)"
 EMPTY = {"", "NONE", "NULL", "N/A", "NA", "0", "-", "UNDEFINED", "NAN"}
 
@@ -133,14 +135,17 @@ def _pick(snowflake_values: list, enoc_values: list) -> tuple[str | None, str | 
     return (en, SRC_ENOC) if en else (None, None)
 
 
-def build(sf: dict, enoc: dict) -> dict:
-    """site → {"fabricant_ge", "type_ge", "source_ge"}."""
+def build(sf: dict, enoc: dict, base: dict | None = None, base_file: str | None = None) -> dict:
+    """site → {"fabricant_ge", "type_ge", "source_ge"}. `base` : site → (type, kVA) du fichier Base GE (type prioritaire)."""
+    base = base or {}
     out = {}
-    for sid in set(sf) | set(enoc):
+    for sid in set(sf) | set(enoc) | set(base):
         ges = sorted(sf.get(sid, []), key=lambda g: g[0])
         en = enoc.get(sid, [])
         fab, fab_src = _pick([g[1] for g in ges], [_clean(e[0]) for e in en])
-        typ, typ_src = _pick_enoc_first([g[2] for g in ges], [_clean(e[1]) for e in en])   # type : ENOC d'abord
+        typ, typ_src = _pick_enoc_first([g[2] for g in ges], [_clean(e[1]) for e in en])   # à défaut : ENOC puis Snowflake
+        if _clean((base.get(sid) or (None,))[0]):   # type : fichier Base GE d'abord (décision métier)
+            typ, typ_src = _clean(base[sid][0]), f"{SRC_BASE} ({base_file})" if base_file else SRC_BASE
         if not fab and not typ:
             continue
         srcs = [s for s in (fab_src, typ_src) if s]
@@ -164,9 +169,12 @@ def refresh() -> dict:
     except Exception as e:  # noqa: BLE001
         logger.warning("ENOC ge_assets illisible : %s", e)
         en, errors = {}, errors + ["ENOC (registre des GE) non lu."]
-    if not sf and not en and cached():
+    from fuel_tracking.services.base_ge import latest_types
+
+    base, base_file = latest_types()
+    if not sf and not en and not base and cached():
         return {"erreurs": errors, "cache": "conservé (aucune source lisible)"}
-    sites = build(sf, en)
+    sites = build(sf, en, base, base_file)
     try:
         gdb, gdb_meta = fetch_genset_db()
     except Exception as e:  # noqa: BLE001 — feuille illisible : puissances « n.d. », le reste est conservé
@@ -174,7 +182,8 @@ def refresh() -> dict:
         gdb, gdb_meta = {}, {"fichier": None}
         errors.append("GENSET DB (fichier de clôture) non lue.")
     add_prp(sites, gdb, gdb_meta.get("fichier"))
-    data = {"sites": sites, "meta": {**meta, "sites_enoc": len(en), "genset_db": gdb_meta, "erreurs": errors},
+    data = {"sites": sites, "meta": {**meta, "sites_enoc": len(en), "base_ge": {"fichier": base_file, "sites": len(base)},
+                                     "genset_db": gdb_meta, "erreurs": errors},
             "lu_le": timezone.now().isoformat()}
     cache.set(CACHE_KEY, data, CACHE_TTL)
     par_source = {}
@@ -228,12 +237,15 @@ def parse_genset_db(rows) -> dict:
         norm = [" ".join(str(v).split()).lower() if v is not None else "" for v in vals]
         if head is None:
             if "type de ge" in norm and any(h.startswith("prp [kva]") for h in norm):
-                head = (norm.index("type de ge"), next(i for i, h in enumerate(norm) if h.startswith("prp [kva]")))
+                head = (norm.index("type de ge"), next(i for i, h in enumerate(norm) if h.startswith("prp [kva]")),
+                        next((i for i, h in enumerate(norm) if h.startswith("manufacturer")), None))
             continue
         t = vals[head[0]] if head[0] < len(vals) else None
         p = vals[head[1]] if head[1] < len(vals) else None
+        mf = vals[head[2]] if head[2] is not None and head[2] < len(vals) else None
         if _clean(t) and isinstance(p, (int, float)) and p > 0:
-            out.setdefault(_key(t), set()).add(round(float(p), 2))
+            for k in {_key(t), _key(f"{mf or ''}{t}")}:   # « K22 » et « SDMOK22 » (libellé « SDMO - K22 »)
+                out.setdefault(k, set()).add(round(float(p), 2))
     return out
 
 
@@ -264,7 +276,7 @@ def add_prp(sites: dict, gdb: dict, fichier: str | None) -> None:
     for v in sites.values():
         kva, motifs = [], []
         for t in [x for x in (v.get("type_ge") or "").split(" / ") if x]:
-            vals = gdb.get(_key(t))
+            vals = next((gdb[k] for k in _lookup_keys(t) if k in gdb), None)
             if not vals:
                 motifs.append(f"type « {t} » absent de GENSET DB" if fichier else "GENSET DB non disponible")
             elif len(vals) > 1:
@@ -275,3 +287,13 @@ def add_prp(sites: dict, gdb: dict, fichier: str | None) -> None:
         v["prp_kw"] = [round(x * KW_PER_KVA, 2) for x in kva] or None
         v["prp_motif"] = " ; ".join(motifs) or None
         v["prp_source"] = f"GENSET DB ({fichier})" if kva and fichier else None
+
+
+def _lookup_keys(label: str) -> list[str]:
+    """Clés GENSET DB d'un libellé de type : tel quel (« K22 » ou « SDMO - K22 » = fabricant + type), puis le modèle seul
+    après le séparateur « MARQUE - MODÈLE » (tiret entouré d'espaces, ou double tiret « SDMO--J66 »). Jamais approché."""
+    keys = [_key(label)]
+    parts = re.split(r"\s+-+\s*|\s*-{2,}\s*", str(label or "").strip(), maxsplit=1)
+    if len(parts) == 2 and parts[1].strip():
+        keys.append(_key(parts[1]))
+    return keys

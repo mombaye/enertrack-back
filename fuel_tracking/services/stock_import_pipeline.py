@@ -32,7 +32,7 @@ from fuel_tracking.services import stock_import_files as F
 logger = logging.getLogger(__name__)
 
 # Ordre de traitement : modèles de cuves, puis affectations (Closing), puis relevés (conversion possible dès l'import).
-INCOMING = {"modeles_cuves": "TANK_MODELS", "closing": "CLOSING", "target_fuel": "TARGET_FUEL", "terrain_mensuel": "TERRAIN_MENSUEL", "loliforce": "LOLIFORCE", "scss": "SCSS"}
+INCOMING = {"modeles_cuves": "TANK_MODELS", "closing": "CLOSING", "target_fuel": "TARGET_FUEL", "terrain_mensuel": "TERRAIN_MENSUEL", "loliforce": "LOLIFORCE", "scss": "SCSS", "base_ge": "BASE_GE"}
 ACCEPTED_EXT = (".xlsx", ".xlsm", ".xlsb")
 
 
@@ -99,7 +99,8 @@ def _finalize_counts(batch):
 
 
 MAPPING_VERSIONS = {"LOLIFORCE": "gardiennage-v1", "SCSS": "gardiennage-v1", "CLOSING": "closing-v1",
-                    "HISTORICAL_REFUELING": "refueling-v1", "TANK_MODELS": "tank-models-v1", "TARGET_FUEL": "target-fuel-v1", "TERRAIN_MENSUEL": "terrain-mensuel-v1"}
+                    "HISTORICAL_REFUELING": "refueling-v1", "TANK_MODELS": "tank-models-v1", "TARGET_FUEL": "target-fuel-v1", "TERRAIN_MENSUEL": "terrain-mensuel-v1",
+                    "BASE_GE": "base-ge-v1"}
 
 
 def _declare_period(batch):

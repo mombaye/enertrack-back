@@ -987,4 +987,5 @@ PROCESSORS = {
     "CLOSING": process_closing_file,
     "HISTORICAL_REFUELING": process_refueling_file,
     "TANK_MODELS": _process_tank_models,
+    "BASE_GE": lambda batch, data, name: __import__("fuel_tracking.services.base_ge", fromlist=["x"]).process_base_ge_file(batch, data, name),
 }

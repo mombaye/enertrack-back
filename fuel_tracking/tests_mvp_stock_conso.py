@@ -1376,7 +1376,8 @@ class PrpGensetDbTests(MvpBase):
                 ["", "SDMO", "", "", "J220K", 220, 400, 3, 200, 160],
                 ["", "SDMO", "", "", "J220K", 220, 400, 3, 220, 176]]                          # 2 PRP : ambigu
         gdb = G.parse_genset_db(rows)
-        self.assertEqual(gdb, {"D275": {250.0}, "P1103": {100.0}, "J220K": {200.0, 220.0}})
+        self.assertEqual({k: gdb[k] for k in ("D275", "P1103", "J220K")}, {"D275": {250.0}, "P1103": {100.0}, "J220K": {200.0, 220.0}})
+        self.assertEqual((gdb["SDMOD275"], gdb["FGWILSONP1103"]), ({250.0}, {100.0}))   # clé « fabricant + type » aussi
         sites = {"A": {"type_ge": "p110-3"}, "B": {"type_ge": "D275 / J220K"}, "C": {"type_ge": "P33-3U"}, "D": {"type_ge": None}}
         G.add_prp(sites, gdb, "Closing.xlsb")
         self.assertEqual((sites["A"]["prp_kva"], sites["A"]["prp_kw"], sites["A"]["prp_source"]), ([100.0], [80.0], "GENSET DB (Closing.xlsb)"))
@@ -1418,3 +1419,52 @@ class AuditSuiviConsoTests(OutputAppFuelImportTests):
             txt = Path(path).read_text(encoding="utf-8")
         self.assertIn("SYNTHÈSE PAR CHAMP", out.getvalue())
         self.assertIn("DKR_0001;STOCK INITIAL;Qtité FMS;;950.0;MANQUANT", txt)   # Snowflake a une valeur, le tableau non
+
+
+class BaseGeImportTests(MvpBase):
+    """Fichier « Base GE » (Configuration, BASE_GE) : type de GE par site, prioritaire ; PRP via GENSET DB (type ou fabricant + type)."""
+
+    def _xlsx(self, rows):
+        import io
+
+        import openpyxl
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Feuil32"
+        for r in rows:
+            ws.append(r)
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    def test_import_and_priority(self):
+        from fuel_tracking.services import base_ge as BG
+        from fuel_tracking.services import ge_info as G
+        from fuel_tracking.services import stock_import_pipeline as P
+
+        data = self._xlsx([[], [None, None, ";"], [None, None, 1],
+                           [None, "Site ID", "NOM", "Typologie facturée", "Type de GE", "Puissance GE (KVA)"],
+                           [None, "DKR_0001", "SITE 1", "A_Ax_S6", "SDMO - K22", 22],
+                           [None, "DKR_0001", "SITE 1 bis", "A_Ax_S6", "SDMO - K33", 33],        # doublon : première ligne retenue
+                           [None, "XYZ_9999", "INCONNU", "A_Ax_S6", "FG Wilson P33-3", 33],     # site inconnu : avertissement
+                           [None, "DKR_0002", "SITE 2", "A_Ax_S6", None, None]])                # type vide : aucun type
+        b = P.process_bytes(data, "Base GE.xlsx", "BASE_GE", origin="UPLOAD")
+        self.assertNotIn(b.status, ("REJECTED", "FAILED"))
+        base, f = BG.latest_types()
+        self.assertEqual(base["DKR_0001"], ("SDMO - K22", 22))
+        self.assertNotIn("DKR_0002", base)
+        out = G.build({"DKR_0001": [(1, ("Kohler", G.SRC_SF), ("J88K", G.SRC_SF))]}, {"DKR_0001": [("SDMO", "22")]}, base, f)
+        self.assertEqual(out["DKR_0001"]["type_ge"], "SDMO - K22")                       # fichier Base GE prioritaire
+        self.assertIn("Fichier Base GE (Base GE.xlsx)", out["DKR_0001"]["source_ge"])
+
+    def test_genset_db_lookup_by_type_or_brand_and_type(self):
+        from fuel_tracking.services import ge_info as G
+
+        gdb = G.parse_genset_db([["", "Manufacturer ", "Type", "Genset List", "Type de GE", "", "Voltage [V]", "No. of phases", "PRP [kVA]"],
+                                 ["", "SDMO", "", "", "K22", 22, 400, 3, 20],
+                                 ["", "FG Wilson", "", "", "P33-3", 33, 400, 3, 30]])
+        sites = {"A": {"type_ge": "SDMO - K22"}, "B": {"type_ge": "SDMO--K22"}, "C": {"type_ge": "FG Wilson P33-3"},
+                 "D": {"type_ge": "FG Wilson P33-3U"}, "E": {"type_ge": "K22"}}
+        G.add_prp(sites, gdb, "Closing.xlsb")
+        self.assertEqual([sites[k]["prp_kva"] for k in "ABCDE"], [[20.0], [20.0], [30.0], None, [20.0]])   # P33-3U ≠ P33-3 : jamais approché
