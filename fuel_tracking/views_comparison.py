@@ -19,6 +19,51 @@ from fuel_tracking.services import conso_comparison as C
 from fuel_tracking.services.period_utils import available_periods, default_period, to_day
 
 
+def _base_ge_reference(site_ids):
+    """Retourne les libellés site → fabricant/type du dernier lot Base GE importé.
+
+    La lecture des lignes brutes du lot est la source de vérité : contrairement
+    aux valeurs mensuelles, elle couvre aussi un site qui n'avait pas encore de
+    FuelConsommationMonthly lors du dépôt du fichier.
+    """
+    from fuel_tracking.models import FuelImportBatch, FuelImportRow
+
+    batch = (FuelImportBatch.objects.filter(source_type="BASE_GE", status__in=("ACCEPTED", "VALIDATION_REQUIRED"))
+             .order_by("-received_at", "-id").first())
+    if batch is None or not site_ids:
+        return {}
+
+    by_site = {}
+    rows = FuelImportRow.objects.filter(batch=batch, site_id_resolved__in=site_ids).order_by("row_number", "id")
+    for row in rows:
+        payload = row.raw_payload or {}
+        site_id = row.site_id_resolved
+        ge_type = str(payload.get("type_ge") or "").strip()
+        manufacturer = str(payload.get("fabricant_ge") or "").strip()
+        if ge_type:
+            # Le dernier doublon dans le fichier fait foi.
+            by_site[site_id] = {"type_ge": ge_type, "fabricant_ge": manufacturer or _manufacturer_from_label(ge_type),
+                                "source_ge": "Base GE"}
+    return by_site
+
+
+def _manufacturer_from_label(label: str) -> str:
+    """Extract common manufacturer names when Base GE only supplies a combined GE label."""
+    value = " ".join(label.split())
+    upper = value.upper()
+    known = (
+        "JOHN DEERE", "FG WILSON", "CATERPILLAR", "MITSUBISHI", "LISTER PETTER",
+        "HIMOINSA", "BAUDOUIN", "CUMMINS", "PERKINS", "KOHLER", "GENERAC", "DOOSAN",
+        "YANMAR", "VOLVO", "DENYO", "SDMO", "JCB", "MTU", "CAT",
+    )
+    for manufacturer in known:
+        if upper == manufacturer or upper.startswith(manufacturer + " ") or upper.startswith(manufacturer + "-"):
+            return manufacturer
+    # N'invente pas de marque à partir d'un modèle non reconnu : afficher le
+    # libellé complet garantit que l'information Base GE reste visible.
+    return value
+
+
 def _period(p):
     d_from, d_to = to_day(p.get("date_debut") or p.get("start")), to_day(p.get("date_fin") or p.get("end"))
     if d_from and d_to:
@@ -44,6 +89,29 @@ class ConsommationsView(APIView):
             return Response({"detail": "Aucun bilan de stock calculé : lancez le calcul des bilans.", "rows": [], "total": 0, "periode": None}, status=200)
         data = C.build(d_from, d_to, p)
         rows = data.pop("rows")
+
+        # Même référence Base GE pour chaque période sélectionnée. L'import est
+        # un référentiel courant, pas une valeur mensuelle : il prime pour le
+        # Type de GE affiché, quel que soit le mois du bilan consulté.
+        base_ge = _base_ge_reference({r["site_id"] for r in rows})
+        for row in rows:
+            ref = base_ge.get(row["site_id"])
+            cph_label = (row.get("modele_ge") or "").strip()
+            if ref:
+                row["estimation_theorique"] = {
+                    "fabricant_ge": ref["fabricant_ge"],
+                    "type_ge": ref["type_ge"],
+                    "source_ge": ref["source_ge"],
+                }
+            elif cph_label:
+                row["estimation_theorique"] = {
+                    "fabricant_ge": _manufacturer_from_label(cph_label),
+                    "type_ge": cph_label,
+                    "source_ge": "Inventaire CPH (Snowflake / ENOC)",
+                }
+            else:
+                row["estimation_theorique"] = {"fabricant_ge": None, "type_ge": None, "source_ge": None}
+
         try:
             size = max(1, min(int(p.get("page_size", 50)), 200))
             page = max(1, int(p.get("page", 1)))
