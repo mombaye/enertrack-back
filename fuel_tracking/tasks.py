@@ -311,7 +311,7 @@ def warm_conso_cache(self):
 
 @shared_task(bind=True, name="fuel_tracking.refresh_ge_info", soft_time_limit=600, time_limit=660)
 def refresh_ge_info(self):
-    """Fabricant et type de GE (Snowflake SITE_DG, sinon ENOC ge_assets ; lecture seule) mis en cache pour le Suivi Conso."""
+    """Fabricant et type de GE (Snowflake SITE_DG, lecture seule) mis en cache pour le Suivi Conso."""
     from fuel_tracking.services.ge_info import refresh
 
     try:

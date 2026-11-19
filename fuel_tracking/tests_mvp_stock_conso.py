@@ -1027,18 +1027,22 @@ class StockInitialSourcesTests(OutputAppFuelImportTests):
         from fuel_tracking.models import FuelStockBalance as B
         from fuel_tracking.services import stock_initial_sources as S
 
-        rows = self._rows()
-        b = B.objects.get(pk=rows[0]["stock"]["bilan_id"])
-        for d in (b.stock_initial_detail, b.stock_final_detail):   # même ligne de fichier : mêmes valeurs sur ses deux relevés
-            o = Obs.objects.get(pk=d["observation_id"])
-            o.source_context = {**o.source_context, "stock_terrain_final_l": 410.0, "compteur_terrain_final_h": 1300.0}
-            o.save(update_fields=["source_context"])
-        df = date.fromisoformat(o.source_context["periode"][1])
+        def rows_with_terrain_values():
+            """Lignes du tableau, puis valeurs de terrain posées sur les relevés de la ligne (une réimportation les réécrit)."""
+            rows = self._rows()
+            b = B.objects.get(pk=rows[0]["stock"]["bilan_id"])
+            for d in (b.stock_initial_detail, b.stock_final_detail):   # même ligne de fichier : mêmes valeurs sur ses deux relevés
+                o = Obs.objects.get(pk=d["observation_id"])
+                o.source_context = {**o.source_context, "stock_terrain_final_l": 410.0, "compteur_terrain_final_h": 1300.0}
+                o.save(update_fields=["source_context"])
+            return rows, date.fromisoformat(o.source_context["periode"][1])
+
+        _, df = rows_with_terrain_values()
         cases = [({"niveau_l": 395.0, "index_h": 1310.0}, {"litres": 400.0, "compteur": 1305.0}, (395.0, S.SRC_FMS, 1310.0, S.SRC_INDEX_FMS)),
                  ({}, {"litres": 400.0, "compteur": 1305.0}, (400.0, S.SRC_GUARD, 1305.0, S.SRC_GUARD)),
                  ({}, {}, (410.0, S.SRC_TERRAIN, 1300.0, S.SRC_TERRAIN))]
         for fms, guard, expected in cases:
-            rows = self._rows()
+            rows, _ = rows_with_terrain_values()
             with mock.patch.object(S, "_snowflake_points", return_value=({("DKR_0001", df): fms}, None)),                     mock.patch.object(S, "_guard_readings", return_value=({("DKR_0001", df): guard}, None)):
                 S.enrich(rows)
             x = rows[0]["stock_final_sources"]
@@ -1279,20 +1283,18 @@ class TerrainCounterParsingTests(MvpBase):
 
 
 class GeInfoTests(MvpBase):
-    """Fabricant / type de GE : Snowflake (SITE_DG) d'abord, sinon ENOC (ge_assets), champ par champ ; jamais déduit."""
+    """Fabricant / type de GE : Snowflake SITE_DG uniquement ; valeur absente → n.d. (jamais déduite ni reprise d'ailleurs)."""
 
-    def test_rule_per_field_and_multiple_ge(self):
+    def test_snowflake_only_and_multiple_ge(self):
         from fuel_tracking.services import ge_info as G
 
         sf = {"S_1": [(2, "FG Wilson", "P22-1"), (1, "CATERPILLAR", "P33-3U")],   # 2 GE : ordre des GE
-              "S_2": [(1, None, "K22")]}                                        # type seul côté Snowflake
-        en = {"S_2": [("SDMO", "K22")], "S_3": [("AKSA", None)], "S_4": [(None, None)]}
-        out = G.build(sf, en)
+              "S_2": [(1, None, "K22")],                                        # fabricant absent : n.d.
+              "S_4": [(1, "None", None)]}                                       # rien d'exploitable
+        out = G.build(sf)
         self.assertEqual(out["S_1"], {"fabricant_ge": "CATERPILLAR / FG Wilson", "type_ge": "P33-3U / P22-1", "source_ge": G.SRC_SF})
-        self.assertEqual(out["S_2"], {"fabricant_ge": "SDMO", "type_ge": "K22", "source_ge": f"Fabricant : {G.SRC_ENOC} · Type : {G.SRC_SF}"})
-        self.assertEqual(out["S_3"], {"fabricant_ge": "AKSA", "type_ge": None, "source_ge": G.SRC_ENOC})
+        self.assertEqual(out["S_2"], {"fabricant_ge": None, "type_ge": "K22", "source_ge": G.SRC_SF})
         self.assertNotIn("S_4", out)
-        self.assertIsNone(G._clean("None"))
 
     def test_snowflake_ignored_when_s_id_does_not_match_data_id(self):
         from unittest import mock
@@ -1311,7 +1313,7 @@ class GeInfoTests(MvpBase):
             cur.fetchall.return_value = [(7, 1, "SDMO", "K22"), (8, 1, "X", "Y"), (9, 1, "X", "Y")]   # 1 S_ID sur 3 rapproché
             out, meta = G.fetch_snowflake()
             self.assertEqual(out, {})
-            self.assertIn("Snowflake non utilisé", meta["ignore"])
+            self.assertIn("non rattachés", meta["ignore"])
         self.assertTrue(cur.execute.call_args[0][0].lstrip().upper().startswith("SELECT"))   # lecture seule
 
     def test_enrich_reads_cache_only(self):
@@ -1322,9 +1324,9 @@ class GeInfoTests(MvpBase):
         from fuel_tracking.services import ge_info as G
         from fuel_tracking.services import stock_initial_sources as S
 
-        cache.set(G.CACHE_KEY, {"sites": {"DKR_0001": {"fabricant_ge": "SDMO", "type_ge": "K22", "source_ge": G.SRC_ENOC}}, "lu_le": "2026-11-19T10:00:00+00:00"})
+        cache.set(G.CACHE_KEY, {"sites": {"DKR_0001": {"fabricant_ge": "SDMO", "type_ge": "K22", "source_ge": G.SRC_SF}}, "lu_le": "2026-11-19T10:00:00+00:00"})
         rows = [{"site_id": "DKR_0001", "stock": {"bilan_id": None}}, {"site_id": "DKR_0002", "stock": {"bilan_id": None}}]
-        with mock.patch.object(S, "_guard_readings", return_value=({}, None)), mock.patch.object(G, "fetch_enoc", side_effect=AssertionError("ENOC lu")):
+        with mock.patch.object(S, "_guard_readings", return_value=({}, None)), mock.patch.object(G, "fetch_snowflake", side_effect=AssertionError("Snowflake lu")):
             S.enrich(rows)
         self.assertEqual(rows[0]["estimation_theorique"]["type_ge"], "K22")
         self.assertEqual(rows[1]["estimation_theorique"], {"fabricant_ge": None, "type_ge": None, "source_ge": None})
