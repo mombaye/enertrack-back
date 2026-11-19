@@ -154,6 +154,10 @@ def warm_cache(months: int = 2) -> list[dict]:
     for a, b in dict.fromkeys(periods):
         rows = _cached_build(a, b, {"date_debut": a.isoformat(), "date_fin": b.isoformat()})["rows"]
         done.append({"periode": f"{a}→{b}", "sites": len(rows), "lus": S.warm_pairs(S.row_pairs(rows))})
+        missing = S.missing_fact_days({d for _, d in S.row_pairs(rows)})
+        if missing:   # jours de relevé sans faits Snowflake (hors fenêtre de la resynchro) : synchronisés en tâche de fond
+            S.request_fact_days(missing)
+            done[-1]["jours_snowflake_a_synchroniser"] = [d.isoformat() for d in missing]
     return done
 
 

@@ -1099,14 +1099,31 @@ class FmsFromDailyFactsTests(MvpBase):
         self.assertIsNone(err)
         self.assertEqual(vals, {("S_1", d): {"niveau_l": 634.6, "index_h": 502.48}, ("S_3", d): {"index_h": 10.0}})
 
-    def test_day_not_synced_yet_is_reported(self):
+    def test_day_not_synced_yet_is_reported_and_sync_requested(self):
         from datetime import date
+        from unittest import mock
 
         from fuel_tracking.services import stock_initial_sources as S
 
-        vals, err = S._snowflake_points({("S_1", date(2026, 9, 30))})
+        with mock.patch.object(S, "request_fact_days") as req:
+            vals, err = S._snowflake_points({("S_1", date(2026, 9, 30))})
         self.assertEqual(vals, {})
-        self.assertIn("30/09/2026 pas encore synchronisés", err)
+        self.assertIn("30/09/2026 en cours de synchronisation", err)
+        req.assert_called_once_with([date(2026, 9, 30)])
+
+    def test_day_synced_for_other_sites_is_not_reported(self):
+        """Site sans faits ce jour-là (ex. sans GE dans l'inventaire Snowflake) alors que le jour est synchronisé : pas de message."""
+        from datetime import date
+        from unittest import mock
+
+        from fuel_tracking.services import stock_initial_sources as S
+
+        d = date(2026, 9, 30)
+        self._fact(1, "AUTRE_SITE", d, 500, 10)
+        with mock.patch.object(S, "request_fact_days") as req:
+            vals, err = S._snowflake_points({("KLK_0715", d)})
+        self.assertEqual((vals, err), ({}, None))
+        req.assert_not_called()
 
     def test_snapshot_level_used_when_fact_has_no_level(self):
         from datetime import date

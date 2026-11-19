@@ -223,6 +223,7 @@ CELERY_TASK_ROUTES = {
     "fuel_tracking.warm_stock_initial_sources": {"queue": "interactive"},  # valeurs FMS / ENOC d'une page du Suivi Conso
     "fuel_tracking.warm_conso_cache": {"queue": "interactive"},            # préchauffage de l'écran Suivi Conso
     "fuel_tracking.refresh_ge_info": {"queue": "interactive"},             # fabricant / type de GE (Suivi Conso)
+    "fuel_tracking.sync_fact_days": {"queue": "celery"},                   # faits Snowflake des jours de relevé manquants (long)
     "billing.*": {"queue": "interactive"},
     "certification.*": {"queue": "interactive"},
 }

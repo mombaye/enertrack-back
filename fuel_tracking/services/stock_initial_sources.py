@@ -184,11 +184,15 @@ def _fetch_snowflake(pairs) -> tuple[dict, str | None]:
     for k, lvl in _snapshot_levels(pairs).items():
         if "niveau_l" not in out.get(k, {}):
             out.setdefault(k, {})["niveau_l"] = lvl
-    missing_days = sorted({d for _, d in pairs} - synced_days)
+    # Jour « pas encore synchronisé » = AUCUN site n'a de faits ce jour-là (et non : le site affiché n'en a pas — un site
+    # sans GE dans l'inventaire Snowflake n'a jamais de faits, ce n'est pas un retard de synchro). La synchro de ces jours
+    # est lancée automatiquement en tâche de fond (voir missing_fact_days / warm_cache).
+    missing_days = missing_fact_days({d for _, d in pairs})
     err = None
     if missing_days:
         err = ("Snowflake : faits du " + ", ".join(d.strftime("%d/%m/%Y") for d in missing_days[:5])
-               + (" …" if len(missing_days) > 5 else "") + " pas encore synchronisés (valeurs FMS n.d.).")
+               + (" …" if len(missing_days) > 5 else "") + " en cours de synchronisation (valeurs FMS n.d. en attendant).")
+        request_fact_days(missing_days)
     return out, err
 
 
@@ -231,6 +235,29 @@ def _points(prefix: str, fetch_fn, pairs, fetch: bool = True):
         missing = set()
     errs = sorted({v["_err"] for v in found.values() if v.get("_err")})
     return {k: {x: y for x, y in v.items() if x != "_err"} for k, v in found.items()}, (" ".join(errs) or None), missing
+
+
+def missing_fact_days(days) -> list:
+    """Jours sans AUCUN fait journalier Snowflake en base (tous sites confondus)."""
+    from fuel_tracking.models import FuelSiteDailyFacts as F
+
+    days = {d for d in days if d}
+    if not days:
+        return []
+    have = set(F.objects.filter(date__in=days).values_list("date", flat=True).distinct())
+    return sorted(days - have)
+
+
+def request_fact_days(days) -> None:
+    """Lance en tâche de fond la synchro Snowflake (lecture seule) des jours manquants ; une seule à la fois par jeu de jours."""
+    try:
+        key = "fuel-facts-days:lock:" + ",".join(d.isoformat() for d in sorted(days))[:180]
+        if cache.add(key, 1, 3 * 3600):   # ne pas relancer à chaque affichage : la synchro d'un jour prend quelques minutes
+            from fuel_tracking.tasks import sync_fact_days
+
+            sync_fact_days.delay([d.isoformat() for d in sorted(days)])
+    except Exception as e:  # noqa: BLE001 — pas de file Celery : la synchro nocturne / horaire reste en place
+        logger.warning("Synchro des jours manquants non lancée : %s", e)
 
 
 def _snowflake_points(pairs, fetch: bool = True):

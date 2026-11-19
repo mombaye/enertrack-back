@@ -319,3 +319,24 @@ def refresh_ge_info(self):
     except Exception:
         logger.exception("[fuel_tracking] Échec de la lecture du fabricant / type de GE")
         return None
+
+
+@shared_task(bind=True, name="fuel_tracking.sync_fact_days", soft_time_limit=3 * 3600, time_limit=3 * 3600 + 300)
+@_exclusive("sync_fact_days", 3 * 3600)
+def sync_fact_days(self, days: list):
+    """Faits journaliers Snowflake (lecture seule) des jours de relevé encore absents (ex. relevés de fin septembre, hors de la
+    fenêtre J-35 de la resynchro nocturne). Un jour à la fois ; un jour en échec n'empêche pas les autres."""
+    from datetime import date
+
+    from django.core.management import call_command
+
+    from fuel_tracking.services.stock_initial_sources import missing_fact_days
+
+    done = []
+    for d in missing_fact_days({date.fromisoformat(x) for x in days}):
+        try:
+            call_command("sync_fuel_daily_facts", start=d, end=d)
+            done.append(d.isoformat())
+        except Exception:
+            logger.exception("[fuel_tracking] Échec de la synchro des faits du %s", d)
+    return done
