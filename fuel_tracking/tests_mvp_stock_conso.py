@@ -1502,3 +1502,28 @@ class BaseGeUploadApiTests(BaseGeImportTests):
 
     def test_genset_db_lookup_by_type_or_brand_and_type(self):
         pass
+
+
+class BaseGeBrandTests(MvpBase):
+    """Fabricant GE lu dans le libellé « Type de GE » du fichier Base GE (pas de colonne fabricant) ; jamais déduit."""
+
+    def test_split_label(self):
+        from fuel_tracking.services.base_ge import known_brands, split_label
+
+        labels = ["SDMO - K22", "CATERPILLAR - DE33E0", "FG Wilson P33-3U", "PRAMAC | GDW50", "SDMO--J66", "PA50", "OLYMPIAN--GEP33-3"]
+        brands = known_brands(labels, ["FG Wilson", "Perkins"])
+        self.assertEqual([split_label(x, brands) for x in labels],
+                         [("SDMO", "K22"), ("CATERPILLAR", "DE33E0"), ("FG Wilson", "P33-3U"), ("PRAMAC", "GDW50"), ("SDMO", "J66"),
+                          (None, "PA50"), ("OLYMPIAN", "GEP33-3")])
+        self.assertEqual(split_label("SDMOX22", brands), (None, "SDMOX22"))   # « SDMO » collé au modèle : pas une marque séparée
+
+    def test_brand_from_base_ge_first(self):
+        from fuel_tracking.services import ge_info as G
+
+        base = {"S_1": ("FG Wilson P33-3U", 33), "S_2": ("PA50", 50)}
+        sf = {"S_1": [(1, ("CATERPILLAR", G.SRC_SF), ("P33-3", G.SRC_SF))], "S_2": [(1, ("Kohler", G.SRC_SF), (None, None))]}
+        out = G.build(sf, {}, base, "Base GE.xlsx", ["FG Wilson"])
+        self.assertEqual((out["S_1"]["fabricant_ge"], out["S_1"]["type_ge"], out["S_1"]["source_ge"]),
+                         ("FG Wilson", "FG Wilson P33-3U", "Fichier Base GE (Base GE.xlsx)"))
+        self.assertEqual((out["S_2"]["fabricant_ge"], out["S_2"]["source_ge"]),                       # pas de marque dans « PA50 »
+                         ("Kohler", f"Fabricant : {G.SRC_SF} · Type : Fichier Base GE (Base GE.xlsx)"))

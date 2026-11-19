@@ -3,7 +3,8 @@
 Fabricant et type de GE par site — bloc « ESTIMATION CONSOMMATION FUEL THÉORIQUE » du Suivi Conso.
 
 Ordre, CHAMP PAR CHAMP (fabricant et type choisis indépendamment), jamais de déduction :
-  Fabricant GE : 1. Snowflake SITE_DG (fiche actuelle, VENDOR) ; 2. Snowflake SITE_DG_DAILY (historique) ; 3. ENOC (brand).
+  Fabricant GE : 1. fichier « Base GE » : marque lue dans le libellé « Type de GE » (« SDMO - K22 » → SDMO ;
+                 « FG Wilson P33-3U » → FG Wilson, marque connue) ; 2. Snowflake SITE_DG (VENDOR) puis historique ; 3. ENOC (brand).
   Type de GE   : 1. fichier « Base GE » importé dans Configuration (type BASE_GE, dernier fichier) — décision métier ;
                  2. à défaut (site absent du fichier) : ENOC (model), puis Snowflake SITE_DG / historique ; source affichée.
   ENOC : registre des GE (ge_assets), GE au statut INSTALLED uniquement.
@@ -28,7 +29,7 @@ from django.core.cache import cache
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
-CACHE_KEY = "fuel-ge-info:v7"   # v7 : type de GE du fichier Base GE d'abord
+CACHE_KEY = "fuel-ge-info:v8"   # v8 : fabricant aussi lu dans le libellé du fichier Base GE
 KW_PER_KVA = 0.8                 # Puissance PRP (kW) = Puissance PRP (kVA) × 0,8 (constante fixe)
 CACHE_TTL = 48 * 3600
 REFRESH_AFTER_S = 6 * 3600
@@ -135,7 +136,7 @@ def _pick(snowflake_values: list, enoc_values: list) -> tuple[str | None, str | 
     return (en, SRC_ENOC) if en else (None, None)
 
 
-def build(sf: dict, enoc: dict, base: dict | None = None, base_file: str | None = None) -> dict:
+def build(sf: dict, enoc: dict, base: dict | None = None, base_file: str | None = None, brands=()) -> dict:
     """site → {"fabricant_ge", "type_ge", "source_ge"}. `base` : site → (type, kVA) du fichier Base GE (type prioritaire)."""
     base = base or {}
     out = {}
@@ -146,6 +147,11 @@ def build(sf: dict, enoc: dict, base: dict | None = None, base_file: str | None 
         typ, typ_src = _pick_enoc_first([g[2] for g in ges], [_clean(e[1]) for e in en])   # à défaut : ENOC puis Snowflake
         if _clean((base.get(sid) or (None,))[0]):   # type : fichier Base GE d'abord (décision métier)
             typ, typ_src = _clean(base[sid][0]), f"{SRC_BASE} ({base_file})" if base_file else SRC_BASE
+            from fuel_tracking.services.base_ge import split_label
+
+            marque, _modele = split_label(typ, brands)
+            if _clean(marque):   # fabricant : marque écrite dans le libellé du fichier Base GE d'abord
+                fab, fab_src = _clean(marque), typ_src
         if not fab and not typ:
             continue
         srcs = [s for s in (fab_src, typ_src) if s]
@@ -174,13 +180,16 @@ def refresh() -> dict:
     base, base_file = latest_types()
     if not sf and not en and not base and cached():
         return {"erreurs": errors, "cache": "conservé (aucune source lisible)"}
-    sites = build(sf, en, base, base_file)
     try:
         gdb, gdb_meta = fetch_genset_db()
     except Exception as e:  # noqa: BLE001 — feuille illisible : puissances « n.d. », le reste est conservé
         logger.warning("GENSET DB illisible : %s", e)
         gdb, gdb_meta = {}, {"fichier": None}
         errors.append("GENSET DB (fichier de clôture) non lue.")
+    from fuel_tracking.services.base_ge import known_brands
+
+    brands = known_brands([t for t, _k in base.values()], gdb_meta.get("fabricants") or [])
+    sites = build(sf, en, base, base_file, brands)
     add_prp(sites, gdb, gdb_meta.get("fichier"))
     data = {"sites": sites, "meta": {**meta, "sites_enoc": len(en), "base_ge": {"fichier": base_file, "sites": len(base)},
                                      "genset_db": gdb_meta, "erreurs": errors},
@@ -228,7 +237,7 @@ def _key(t) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(t or "").upper())
 
 
-def parse_genset_db(rows) -> dict:
+def parse_genset_db(rows, manufacturers: set | None = None) -> dict:
     """Clé du « Type de GE » → ensemble des PRP [kVA] de la feuille (une seule valeur attendue)."""
     out: dict = {}
     head = None
@@ -244,6 +253,8 @@ def parse_genset_db(rows) -> dict:
         p = vals[head[1]] if head[1] < len(vals) else None
         mf = vals[head[2]] if head[2] is not None and head[2] < len(vals) else None
         if _clean(t) and isinstance(p, (int, float)) and p > 0:
+            if manufacturers is not None and _clean(mf):
+                manufacturers.add(" ".join(str(mf).split()))
             for k in {_key(t), _key(f"{mf or ''}{t}")}:   # « K22 » et « SDMOK22 » (libellé « SDMO - K22 »)
                 out.setdefault(k, set()).add(round(float(p), 2))
     return out
@@ -260,14 +271,15 @@ def fetch_genset_db() -> tuple[dict, dict]:
               .exclude(archive_path=None).order_by("-received_at")):
         if not Path(b.archive_path).is_file():
             continue
-        gdb = {}
+        gdb, mfs = {}, set()
         try:
             for _n, rows in iter_sheets(Path(b.archive_path).read_bytes(), b.file_name, only={"GENSET DB"}):
-                gdb = parse_genset_db(list(rows))   # lignes lues pendant que le classeur est ouvert
+                gdb = parse_genset_db(list(rows), mfs)   # lignes lues pendant que le classeur est ouvert
         except Exception:  # noqa: BLE001 — archive illisible : fichier précédent
             continue
         if gdb:
-            return gdb, {"fichier": b.file_name, "types": len(gdb), "ambigus": sorted(k for k, v in gdb.items() if len(v) > 1)}
+            return gdb, {"fichier": b.file_name, "types": len(gdb), "ambigus": sorted(k for k, v in gdb.items() if len(v) > 1),
+                         "fabricants": sorted(mfs)}
     return {}, {"fichier": None, "types": 0}
 
 

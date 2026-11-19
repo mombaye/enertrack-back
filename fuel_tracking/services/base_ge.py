@@ -132,3 +132,35 @@ def looks_like_base_ge(file_bytes: bytes, file_name: str) -> bool:
             wb.close()
     except Exception:  # noqa: BLE001 — classeur illisible : laissé au traitement habituel
         return False
+
+
+# ── Fabricant lu dans le libellé « Type de GE » du fichier (le fichier n'a pas de colonne fabricant) ──
+SEP = re.compile(r"\s+-+\s*|\s*-{2,}\s*|\s*\|\s*")   # « SDMO - K22 », « SDMO--J66 », « PRAMAC | GDW50 »
+
+
+def known_brands(labels, extra=()) -> list[str]:
+    """Marques connues : celles écrites avec un séparateur dans le fichier lui-même + fabricants de GENSET DB."""
+    out = {}
+    for lab in list(labels) + list(extra):
+        parts = SEP.split(str(lab or "").strip(), maxsplit=1)
+        b = (parts[0] if len(parts) == 2 else (lab if lab in extra else "")).strip()
+        if b and not b.isdigit() and len(b) >= 2:
+            out.setdefault(b.upper(), b)
+    return sorted(out.values(), key=len, reverse=True)
+
+
+def split_label(label, brands) -> tuple[str | None, str | None]:
+    """(fabricant, modèle) lus dans le libellé : séparateur « - », « -- » ou « | » ; sinon marque connue en début de libellé
+    (« FG Wilson P33-3U ») ; sinon pas de fabricant (« PA50 »). Jamais déduit du modèle."""
+    lab = " ".join(str(label or "").split())
+    if not lab:
+        return None, None
+    parts = SEP.split(lab, maxsplit=1)
+    if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+        return parts[0].strip(), parts[1].strip()
+    up = lab.upper()
+    for b in brands:
+        n = len(b)
+        if up.startswith(b.upper()) and (len(lab) == n or not lab[n].isalnum()):
+            return lab[:n].strip(), lab[n:].strip() or None
+    return None, lab
