@@ -110,3 +110,25 @@ def latest_types() -> tuple[dict, str | None]:
         if key and key not in out:
             out[key] = (raw["type_ge"], raw.get("puissance_ge_kva"))
     return out, b.file_name
+
+
+def looks_like_base_ge(file_bytes: bytes, file_name: str) -> bool:
+    """Vrai si le classeur est un fichier Base GE (« Site ID » + « Type de GE ») et non un fichier de clôture. Lecture .xlsx
+    seulement (un Closing est un .xlsb volumineux : jamais relu ici)."""
+    if not str(file_name).lower().endswith((".xlsx", ".xlsm")):
+        return False
+    try:
+        import io
+
+        import openpyxl
+
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), read_only=True, data_only=True)
+        try:
+            names = [_norm(n) for n in wb.sheetnames]
+            if any(n in ("synthese conso fuel", "output") for n in names):
+                return False
+            return any(find_header(list(ws.iter_rows(max_row=31, values_only=True))) for ws in wb.worksheets)
+        finally:
+            wb.close()
+    except Exception:  # noqa: BLE001 — classeur illisible : laissé au traitement habituel
+        return False

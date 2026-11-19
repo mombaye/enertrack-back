@@ -1468,3 +1468,37 @@ class BaseGeImportTests(MvpBase):
                  "D": {"type_ge": "FG Wilson P33-3U"}, "E": {"type_ge": "K22"}}
         G.add_prp(sites, gdb, "Closing.xlsb")
         self.assertEqual([sites[k]["prp_kva"] for k in "ABCDE"], [[20.0], [20.0], [30.0], None, [20.0]])   # P33-3U ≠ P33-3 : jamais approché
+
+
+class BaseGeUploadApiTests(BaseGeImportTests):
+    """API : la Base GE s'importe par /stock/imports/ (type BASE_GE) ; envoyée par erreur comme Closing → refus clair."""
+
+    def setUp(self):
+        super().setUp()
+        from django.contrib.auth import get_user_model
+        from rest_framework.test import APIClient
+
+        u = get_user_model().objects.create_superuser("admin_bge", "a@example.com", "x", role="admin")             if "role" in [f.name for f in get_user_model()._meta.fields] else get_user_model().objects.create_superuser("admin_bge", "a@example.com", "x")
+        self.api = APIClient()
+        self.api.force_authenticate(u)
+        self.data = self._xlsx([[None, "Site ID", "NOM", "Type de GE", "Puissance GE (KVA)"], [None, "DKR_0001", "S1", "SDMO - K22", 22]])
+
+    def test_upload_as_base_ge(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        r = self.api.post("/api/fuel-tracking/stock/imports/", {"file": SimpleUploadedFile("Base GE.xlsx", self.data), "source_type": "BASE_GE"}, format="multipart")
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertEqual((r.json()["source_type"], r.json()["rows_total"]), ("BASE_GE", 1))
+
+    def test_base_ge_sent_as_closing_is_refused(self):
+        from django.core.files.uploadedfile import SimpleUploadedFile
+
+        r = self.api.post("/api/fuel-tracking/configuration/closing/", {"file": SimpleUploadedFile("Base GE.xlsx", self.data), "mois": "2026-10"}, format="multipart")
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("Base GE", r.json()["detail"])
+
+    def test_import_and_priority(self):
+        pass
+
+    def test_genset_db_lookup_by_type_or_brand_and_type(self):
+        pass

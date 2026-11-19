@@ -905,6 +905,13 @@ class ClosingUploadView(APIView):
             return Response({"detail": "Fichier manquant."}, status=400)
         if not f.name.lower().endswith(P.ACCEPTED_EXT):
             return Response({"detail": "Format accepté : .xlsb, .xlsx, .xlsm (Closing « Synthèse Conso Fuel » ou Output App Fuel)."}, status=400)
+        from fuel_tracking.services.base_ge import looks_like_base_ge
+
+        head = f.read()
+        f.seek(0)
+        if looks_like_base_ge(head, f.name):
+            return Response({"detail": "Ce fichier est une « Base GE » (types de GE par site), pas un fichier de clôture : "
+                                       "l'importer avec la carte « Base GE » de cette page."}, status=400)
         mois = str(request.data.get("mois") or "").strip()
         if not mois:
             return Response({"detail": "Indiquer le mois couvert par le fichier (AAAA-MM)."}, status=400)
