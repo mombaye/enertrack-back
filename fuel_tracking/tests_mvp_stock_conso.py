@@ -1340,4 +1340,28 @@ class GeInfoTests(MvpBase):
         with mock.patch.object(S, "_guard_readings", return_value=({}, None)), mock.patch.object(G, "fetch_snowflake", side_effect=AssertionError("Snowflake lu")):
             S.enrich(rows)
         self.assertEqual(rows[0]["estimation_theorique"]["type_ge"], "K22")
-        self.assertEqual(rows[1]["estimation_theorique"], {"fabricant_ge": None, "type_ge": None, "source_ge": None})
+        self.assertTrue(all(v is None for v in rows[1]["estimation_theorique"].values()))   # site inconnu : tout n.d., jamais 0
+
+
+class PrpGensetDbTests(MvpBase):
+    """Puissance PRP (kVA) : GENSET DB du fichier de clôture, type de GE exact ; PRP (kW) = kVA × 0,8 ; ambigu → n.d."""
+
+    def test_parse_and_lookup(self):
+        from fuel_tracking.services import ge_info as G
+
+        rows = [["", "Manufacturer ", "Type", "Genset List", "Type de GE", "", "Voltage [V]", "No. of phases", "PRP [kVA]", "PRP [kW]"],
+                ["", "", "", "", "Site avec cuve et sans GE"],
+                ["", "SDMO", "", "", "D275", 275, 400, 3, 250, 200],
+                ["", "FG Wilson", "P110-3 (DSE4520)", "x", "P110-3 ", 110, 400, 3, 100, 80],
+                ["", "FG Wilson", "P110-3 (DSE7320)", "x", "P110-3 ", 110, 400, 3, 100, 80],   # même PRP : non ambigu
+                ["", "SDMO", "", "", "J220K", 220, 400, 3, 200, 160],
+                ["", "SDMO", "", "", "J220K", 220, 400, 3, 220, 176]]                          # 2 PRP : ambigu
+        gdb = G.parse_genset_db(rows)
+        self.assertEqual(gdb, {"D275": {250.0}, "P1103": {100.0}, "J220K": {200.0, 220.0}})
+        sites = {"A": {"type_ge": "p110-3"}, "B": {"type_ge": "D275 / J220K"}, "C": {"type_ge": "P33-3U"}, "D": {"type_ge": None}}
+        G.add_prp(sites, gdb, "Closing.xlsb")
+        self.assertEqual((sites["A"]["prp_kva"], sites["A"]["prp_kw"], sites["A"]["prp_source"]), ([100.0], [80.0], "GENSET DB (Closing.xlsb)"))
+        self.assertEqual((sites["B"]["prp_kva"], sites["B"]["prp_kw"]), ([250.0], [200.0]))
+        self.assertIn("ambigu", sites["B"]["prp_motif"])
+        self.assertEqual((sites["C"]["prp_kva"], sites["C"]["prp_motif"]), (None, "type « P33-3U » absent de GENSET DB"))
+        self.assertEqual((sites["D"]["prp_kva"], sites["D"]["prp_motif"]), (None, None))

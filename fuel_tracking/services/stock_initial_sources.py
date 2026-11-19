@@ -418,7 +418,8 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
             "compteur_retenu_h": cpt, "source_compteur": csrc,
         }
         # Bloc « ESTIMATION CONSOMMATION FUEL THÉORIQUE » : fabricant / type de GE (Snowflake, sinon ENOC)
-        r["estimation_theorique"] = {**{"fabricant_ge": None, "type_ge": None, "source_ge": None}, **(ge.get(r["site_id"].upper()) or {})}
+        r["estimation_theorique"] = {**{"fabricant_ge": None, "type_ge": None, "source_ge": None, "prp_kva": None, "prp_kw": None,
+                                        "prp_motif": None, "prp_source": None}, **(ge.get(r["site_id"].upper()) or {})}
         # Bloc « DONNÉES DE STOCK FINAL », à la Date de Relevé Finale de la ligne du fichier (seule date retenue ; absente → n.d.)
         line = (lines.get(r["site_id"]) or {}).get("fin") or {}
         df = _day((line.get("periode") or [None, None])[1])
