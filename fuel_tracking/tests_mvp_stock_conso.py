@@ -1002,54 +1002,63 @@ class StockInitialSourcesTests(OutputAppFuelImportTests):
         pass
 
 
-class FmsPartialReadTests(MvpBase):
-    """Vue du compteur FMS en erreur côté Snowflake : le niveau du capteur reste lu (lectures indépendantes)."""
+class FmsFromDailyFactsTests(MvpBase):
+    """Niveau FMS et compteur lus dans les faits journaliers en base (copiés de Snowflake chaque heure) : aucun appel Snowflake."""
 
-    def test_level_kept_when_counter_view_fails(self):
+    def _fact(self, data_id, site, d, lvl=None, hours=None):
+        from fuel_tracking.models import FuelSiteDailyFacts as F
+
+        return F.objects.create(country="Senegal", data_id=data_id, site_id=site, date=d,
+                                fms_level_l=None if lvl is None else Decimal(str(lvl)), dg_total_running_h=None if hours is None else Decimal(str(hours)))
+
+    def test_values_read_from_daily_facts_without_snowflake(self):
         from datetime import date
         from unittest import mock
 
-        from django.core.cache import cache
-
-        from fuel_tracking.models import FuelSiteInventory as INV
         from fuel_tracking.services import stock_initial_sources as S
 
-        INV.objects.create(country="SN", data_id=7, site_id="DKR_0001", dg_count=1)
-        cache.clear()
+        d = date(2026, 9, 30)
+        self._fact(1, "S_1", d, 634.6, 502.4833)
+        self._fact(2, "S_2", d)                      # synchronisé, capteur sans mesure : n.d., jamais 0
+        self._fact(3, "S_3", d, 100, 10)             # S_3 a deux DATA_ID contradictoires : aucune valeur
+        self._fact(4, "S_3", d, 120, 10)
+        with mock.patch("fuel_tracking.services.fuel_daily_facts_snowflake._connect", side_effect=AssertionError("Snowflake appelé")):
+            vals, err = S._snowflake_points({("S_1", d), ("S_2", d), ("S_3", d)})
+        self.assertIsNone(err)
+        self.assertEqual(vals, {("S_1", d): {"niveau_l": 634.6, "index_h": 502.48}, ("S_3", d): {"index_h": 10.0}})
 
-        class Cur:
-            def __init__(self):
-                self.n = 0
+    def test_day_not_synced_yet_is_reported(self):
+        from datetime import date
 
-            def execute(self, sql, params):
-                self.n += 1
-                self.sql = sql
-                if "GENSET_REPORT" in sql and fail_counter:
-                    raise RuntimeError("SQL compilation error")
+        from fuel_tracking.services import stock_initial_sources as S
 
-            def fetchall(self):
-                if "GENSET_REPORT" in self.sql:
-                    return [(7, date(2026, 9, 30), 502.4833)]
-                return [(7, date(2026, 9, 30), 634.6)]   # VW_FUEL_REPORT lue par DATA_ID
+        vals, err = S._snowflake_points({("S_1", date(2026, 9, 30))})
+        self.assertEqual(vals, {})
+        self.assertIn("30/09/2026 pas encore synchronisés", err)
 
-        conn = mock.Mock()
-        conn.cursor.return_value = Cur()
-        fail_counter = True
-        with mock.patch("fuel_tracking.services.fuel_daily_facts_snowflake._connect", return_value=conn):
-            vals, err = S._snowflake_points({("DKR_0001", date(2026, 9, 30))})
-        self.assertEqual(vals[("DKR_0001", date(2026, 9, 30))], {"niveau_l": 634.6})
-        self.assertIn("GENSET_REPORT", err)
-        # compteur lu dans GENSET_REPORT.TOTAL_DG_RUNNING_HOUR (heures cumulées du jour)
-        cache.clear()
-        fail_counter = False
-        conn.cursor.return_value = Cur()
-        with mock.patch("fuel_tracking.services.fuel_daily_facts_snowflake._connect", return_value=conn):
-            vals, err = S._snowflake_points({("DKR_0001", date(2026, 9, 30))})
-        self.assertEqual((vals[("DKR_0001", date(2026, 9, 30))], err), ({"niveau_l": 634.6, "index_h": 502.48}, None))
+    def test_snapshot_level_used_when_fact_has_no_level(self):
+        from datetime import date
+
+        from fuel_tracking.models import FuelStockSnapshot as SNAP
+        from fuel_tracking.services import stock_initial_sources as S
+
+        d = date(2026, 9, 30)
+        self._fact(1, "S_1", d, None, 7)
+        SNAP.objects.create(site_id="S_1", snapshot_year=2026, snapshot_month=9, stock_snowflake_l=Decimal("640.5"), stock_snowflake_date=d)
+        vals, _ = S._snowflake_points({("S_1", d)})
+        self.assertEqual(vals[("S_1", d)], {"niveau_l": 640.5, "index_h": 7.0})
+
+    def test_sync_query_reads_level_and_counter(self):
+        from fuel_tracking.services.fuel_daily_facts_snowflake import build_daily_facts_sql
+
+        sql = build_daily_facts_sql([1], with_tracker=False)
+        self.assertIn("MAX(LAST_VALID_LEVEL)", sql)
+        self.assertIn("MAX(TOTAL_DG_RUNNING_HOUR)", sql)
+        self.assertIn("g.total_h, f.fms_level", sql)
 
 
 class StockInitialPairCacheTests(MvpBase):
-    """Valeurs Snowflake / ENOC gardées par (site, jour) : changer de page ou de taille de page ne relit que ce qui manque."""
+    """Relevés de gardien ENOC gardés par (site, jour) : changer de page ou de taille de page ne relit que ce qui manque."""
 
     def test_only_missing_pairs_are_fetched(self):
         from datetime import date
@@ -1064,16 +1073,16 @@ class StockInitialPairCacheTests(MvpBase):
 
         def fake(pairs):
             calls.append(set(pairs))
-            return {p: {"niveau_l": 100.0} for p in pairs if p[0] != "S_3"}, None
+            return {p: {"litres": 100.0, "compteur": None} for p in pairs if p[0] != "S_3"}, None
 
         d = date(2026, 9, 30)
-        with mock.patch.object(S, "_fetch_snowflake", side_effect=fake):
-            a, err = S._snowflake_points({("S_1", d), ("S_2", d)})
-            b, _ = S._snowflake_points({("S_1", d), ("S_2", d), ("S_3", d)})   # 200 par page : seul S_3 est lu
+        with mock.patch.object(S, "_fetch_guard", side_effect=fake):
+            S._guard_readings({("S_1", d), ("S_2", d)})
+            b, err = S._guard_readings({("S_1", d), ("S_2", d), ("S_3", d)})   # 200 par page : seul S_3 est lu
         self.assertIsNone(err)
         self.assertEqual(calls, [{("S_1", d), ("S_2", d)}, {("S_3", d)}])
-        self.assertEqual((b[("S_1", d)]["niveau_l"], b[("S_3", d)]), (100.0, {}))   # S_3 lu, sans valeur : pas relu, jamais 0
-        self.assertEqual(S.missing_pairs({("S_3", d)}), {("S_3", d)})              # pas encore lu côté ENOC gardien
+        self.assertEqual((b[("S_1", d)]["litres"], b[("S_3", d)]), (100.0, {}))
+        self.assertEqual(S.missing_pairs({("S_3", d), ("S_9", d)}), {("S_9", d)})
 
     def test_failure_is_kept_with_message_but_retried_later(self):
         from datetime import date
@@ -1085,11 +1094,11 @@ class StockInitialPairCacheTests(MvpBase):
 
         cache.clear()
         d = date(2026, 9, 30)
-        with mock.patch.object(S, "_fetch_snowflake", return_value=({}, "Snowflake injoignable : valeurs FMS non lues.")) as f:
-            v1, e1 = S._snowflake_points({("S_1", d)})
-            v2, e2 = S._snowflake_points({("S_1", d)})
+        with mock.patch.object(S, "_fetch_guard", return_value=({}, "ENOC injoignable : relevés de gardien non lus.")) as f:
+            v1, e1 = S._guard_readings({("S_1", d)})
+            v2, e2 = S._guard_readings({("S_1", d)})
         self.assertEqual(f.call_count, 1)
-        self.assertEqual((v1, e1, e2), ({("S_1", d): {}}, "Snowflake injoignable : valeurs FMS non lues.", "Snowflake injoignable : valeurs FMS non lues."))
+        self.assertEqual((v1, e1, e2), ({("S_1", d): {}}, "ENOC injoignable : relevés de gardien non lus.", "ENOC injoignable : relevés de gardien non lus."))
 
     def test_fetch_false_never_reads_sources(self):
         from datetime import date
@@ -1100,8 +1109,8 @@ class StockInitialPairCacheTests(MvpBase):
         from fuel_tracking.services import stock_initial_sources as S
 
         cache.clear()
-        with mock.patch.object(S, "_fetch_snowflake") as f:
-            vals, err = S._snowflake_points({("S_9", date(2026, 9, 30))}, fetch=False)
+        with mock.patch.object(S, "_fetch_guard") as f:
+            vals, err = S._guard_readings({("S_9", date(2026, 9, 30))}, fetch=False)
         f.assert_not_called()
         self.assertEqual((vals, err), ({}, None))
 
@@ -1121,3 +1130,41 @@ class FmsSnapshotLevelTests(MvpBase):
         SNAP.objects.create(site_id="S_3", snapshot_year=2026, snapshot_month=9, stock_snowflake_l=Decimal("100"), stock_snowflake_date=d)
         SNAP.objects.create(site_id="S_3", stock_snowflake_l=Decimal("120"), stock_snowflake_date=d)   # contradictoire : aucune valeur
         self.assertEqual(S._snapshot_levels({("S_1", d), ("S_2", d), ("S_3", d)}), {("S_1", d): 640.5})
+
+
+class BackfillFmsLevelsTests(MvpBase):
+    """Reprise du niveau FMS : complète les faits existants, ne crée jamais de jour à moitié, Snowflake en lecture seule."""
+
+    def test_updates_existing_rows_only(self):
+        from datetime import date
+        from io import StringIO
+        from unittest import mock
+
+        from django.core.management import call_command
+
+        from fuel_tracking.models import FuelSiteDailyFacts as F, FuelSiteInventory as INV
+
+        INV.objects.create(country="Senegal", data_id=7, site_id="DKR_0001", dg_count=1)
+        F.objects.create(country="Senegal", data_id=7, site_id="DKR_0001", date=date(2026, 9, 30), dse_runtime_h=Decimal("5"))
+        sqls = []
+
+        class Cur:
+            def execute(self, sql, params):
+                sqls.append(sql)
+                self.sql = sql
+
+            def fetchall(self):
+                if "VW_FUEL_REPORT" in self.sql:
+                    return [(7, date(2026, 9, 30), 634.6), (7, date(2026, 9, 29), 650.0)]   # 29/09 : pas de ligne de faits
+                return [(7, date(2026, 9, 30), 502.4833)]
+
+        conn = mock.Mock()
+        conn.cursor.return_value = Cur()
+        out = StringIO()
+        with mock.patch("fuel_tracking.services.fuel_daily_facts_snowflake._connect", return_value=conn):
+            call_command("backfill_fms_levels", start=date(2026, 9, 29), end=date(2026, 9, 30), stdout=out)
+        row = F.objects.get(data_id=7, date=date(2026, 9, 30))
+        self.assertEqual((float(row.fms_level_l), float(row.dg_total_running_h), float(row.dse_runtime_h)), (634.6, 502.4833, 5.0))
+        self.assertFalse(F.objects.filter(date=date(2026, 9, 29)).exists())
+        self.assertIn("sync_fuel_daily_facts --start 2026-09-29", out.getvalue())
+        self.assertTrue(all(sql.lstrip().upper().startswith("SELECT") for sql in sqls))   # lecture seule

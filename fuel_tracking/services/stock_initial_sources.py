@@ -11,10 +11,12 @@ Sources (lecture seule ; ENOC et Snowflake ne sont jamais modifiés) :
   Qtité (Société de gardiennage)            ENOC, partie « Relevé de gardien » (collection fuel_level_readings), même site et même
                                             jour, valeur telle qu'enregistrée ; aucun relevé ce jour-là → vide (jamais d'estimation,
                                             jamais un fichier Loliforce/SCSS, jamais un autre jour) ;
-  Qtité (Fuel Sensor FMS)                   Snowflake VW_FUEL_REPORT.LAST_VALID_LEVEL du même jour ;
+  Qtité (Fuel Sensor FMS)                   VW_FUEL_REPORT.LAST_VALID_LEVEL du même jour, copié chaque heure dans les faits
+                                            journaliers (FuelSiteDailyFacts.fms_level_l) — jamais lu en direct pendant l'affichage ;
   Qtité retenue                             FMS si disponible, sinon relevé de terrain ;
   Compteur genset (Société de gardiennage)  compteur horaire porté par ce même relevé de gardien ENOC, s'il existe ;
-  Compteur genset (Index Compteur FMS)      Snowflake GENSET_REPORT.TOTAL_DG_RUNNING_HOUR (compteur horaire cumulé du jour) ;
+  Compteur genset (Index Compteur FMS)      GENSET_REPORT.TOTAL_DG_RUNNING_HOUR du jour, copié dans les faits journaliers
+                                            (FuelSiteDailyFacts.dg_total_running_h) ;
   Compteur retenu                           FMS si disponible, sinon gardiennage.
 Snowflake indisponible : les colonnes FMS restent vides (« n.d. »), jamais 0 ; l'écran ne casse pas.
 
@@ -145,84 +147,51 @@ def _snapshot_levels(pairs) -> dict:
     return {k: _f(next(iter(v))) for k, v in out.items() if len(v) == 1}   # valeurs contradictoires : aucune
 
 
-def _fetch_snowflake(pairs: set[tuple[str, date]]) -> tuple[dict[tuple[str, date], dict], str | None]:
-    """(site, jour) → {"niveau_l", "index_h"} lus dans Snowflake au jour exact (lecture seule). (valeurs, message d'erreur)."""
-    from fuel_tracking.models import FuelSiteInventory as INV
+def _fetch_snowflake(pairs) -> tuple[dict, str | None]:
+    """(site, jour) → {"niveau_l", "index_h"} lus dans NOTRE base : faits journaliers copiés depuis Snowflake par la synchro
+    horaire (VW_FUEL_REPORT, GENSET_REPORT). Aucun appel Snowflake ici : réponse en quelques millisecondes.
+
+    Faits du jour présents mais valeur NULL → le capteur n'a pas de mesure ce jour-là (n.d., jamais 0). Plusieurs DATA_ID
+    pour un même site avec des valeurs différentes → aucune valeur. Niveau absent des faits : niveau archivé par la synchro de
+    stock s'il date exactement de ce jour. Jour pas encore synchronisé du tout : message.
+    """
+    from fuel_tracking.models import FuelSiteDailyFacts as F
 
     if not pairs:
         return {}, None
-    data_ids = {sid: did for sid, did in INV.objects.filter(site_id__in={s for s, _ in pairs}).values_list("site_id", "data_id")}
-    out: dict[tuple[str, date], dict] = {}
-    errors = []
-    try:
-        from fuel_tracking.services.fuel_daily_facts_snowflake import ANALYTICS, FUEL_REPORT, _connect
-
-        days = sorted({d for _, d in pairs})
-        sites = sorted({s for s, _ in pairs})
-        ph_d = ",".join(["%s"] * len(days))
-        conn = _connect()
-    except Exception as e:  # noqa: BLE001 — Snowflake injoignable : colonnes FMS « n.d. », jamais bloquant
-        logger.warning("Snowflake injoignable pour les valeurs du stock initial : %s", e)
-        return {}, "Snowflake injoignable : valeurs FMS non lues."
-    try:
-        cur = conn.cursor()
-        # Requête bornée dans le temps (paramètre de SESSION, aucune écriture) : jamais de requête qui bloque indéfiniment.
-        try:
-            cur.execute(f"ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = {SF_TIMEOUT_S}")
-        except Exception:  # noqa: BLE001
-            pass
-        # 1. Niveau du capteur (Fuel Sensor FMS) — lu indépendamment du compteur. Filtre par DATA_ID, comme la synchro des faits
-        #    journaliers (le filtre par SITE_ID dépassait le délai de 120 s sur cette vue). Plusieurs lignes contradictoires le
-        #    même jour → aucune valeur (jamais un choix arbitraire).
-        # 1a. Niveaux déjà archivés par la synchro de stock (même vue VW_FUEL_REPORT, dernier niveau valide du mois) : retenus
-        #     seulement si leur date est EXACTEMENT le jour demandé — aucun appel Snowflake pour ces sites.
-        for k, v in _snapshot_levels(pairs).items():
-            out.setdefault(k, {})["niveau_l"] = v
-        rest = {sid for sid, d in pairs if "niveau_l" not in out.get((sid, d), {})}
-        ids_lvl = sorted({data_ids[s] for s in rest if s in data_ids})
-        if ids_lvl:
-            try:
-                by_id_lvl = {did: sid for sid, did in data_ids.items()}
-                cur.execute(f"SELECT DATA_ID, DATE, IFF(MIN(LAST_VALID_LEVEL) = MAX(LAST_VALID_LEVEL), MAX(LAST_VALID_LEVEL), NULL) "
-                            f"FROM {FUEL_REPORT}.VW_FUEL_REPORT WHERE DATA_ID IN ({','.join(['%s'] * len(ids_lvl))}) AND DATE IN ({ph_d}) "
-                            f"AND LAST_VALID_LEVEL IS NOT NULL GROUP BY DATA_ID, DATE", [*ids_lvl, *days])
-                for did, d, lvl in cur.fetchall():
-                    k = (by_id_lvl.get(int(did)) if str(did).isdigit() else by_id_lvl.get(did), _day(d))
-                    if k in pairs and lvl is not None:
-                        out.setdefault(k, {})["niveau_l"] = _f(lvl)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("VW_FUEL_REPORT illisible (niveau FMS) : %s", e)
-                slow = "timeout" in str(e).lower() or "canceled" in str(e).lower()
-                errors.append("niveau Fuel Sensor FMS pas encore lu (vue VW_FUEL_REPORT très lente côté Snowflake) : nouvel essai automatique"
-                              if slow else "niveau Fuel Sensor FMS non lu (VW_FUEL_REPORT en erreur côté Snowflake)")
-        # 2. Index compteur FMS : GENSET_REPORT.TOTAL_DG_RUNNING_HOUR (compteur horaire cumulé du GE, par site et par jour).
-        #    Remplace la vue GFMS_DATA_TRACKER_NC, cassée côté Snowflake ; lu indépendamment du niveau.
-        ids = sorted({data_ids[s] for s in sites if s in data_ids})
-        if ids:
-            try:
-                by_id = {did: sid for sid, did in data_ids.items()}
-                ph_i = ",".join(["%s"] * len(ids))
-                cur.execute(f"SELECT DATA_ID, DATE, TOTAL_DG_RUNNING_HOUR FROM {ANALYTICS}.GENSET_REPORT "
-                            f"WHERE DATA_ID IN ({ph_i}) AND DATE IN ({ph_d}) AND TOTAL_DG_RUNNING_HOUR IS NOT NULL", [*ids, *days])
-                for did, d, hours in cur.fetchall():
-                    k = (by_id.get(int(did)) if str(did).isdigit() else by_id.get(did), _day(d))
-                    if k in pairs and hours is not None:
-                        out.setdefault(k, {})["index_h"] = round(float(hours), 2)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("GENSET_REPORT illisible (index compteur FMS) : %s", e)
-                errors.append("index compteur FMS non lu (GENSET_REPORT en erreur côté Snowflake)")
-    finally:
-        conn.close()
-    return out, (("Snowflake : " + " ; ".join(errors) + ".") if errors else None)
+    found: dict = {}
+    synced_days = set()
+    for sid, d, lvl, hours in (F.objects.filter(site_id__in={s for s, _ in pairs}, date__in={d for _, d in pairs})
+                               .values_list("site_id", "date", "fms_level_l", "dg_total_running_h")):
+        synced_days.add(d)
+        if (sid, d) in pairs:
+            cur = found.setdefault((sid, d), {"niveau_l": set(), "index_h": set()})
+            if lvl is not None:
+                cur["niveau_l"].add(_f(lvl))
+            if hours is not None:
+                cur["index_h"].add(round(float(hours), 2))
+    out = {}
+    for k, v in found.items():
+        vals = {name: next(iter(x)) for name, x in v.items() if len(x) == 1}   # contradictoire → aucune valeur
+        if vals:
+            out[k] = vals
+    for k, lvl in _snapshot_levels(pairs).items():
+        if "niveau_l" not in out.get(k, {}):
+            out.setdefault(k, {})["niveau_l"] = lvl
+    missing_days = sorted({d for _, d in pairs} - synced_days)
+    err = None
+    if missing_days:
+        err = ("Snowflake : faits du " + ", ".join(d.strftime("%d/%m/%Y") for d in missing_days[:5])
+               + (" …" if len(missing_days) > 5 else "") + " pas encore synchronisés (valeurs FMS n.d.).")
+    return out, err
 
 
 # ── Cache par (site, jour) ────────────────────────────────────────────────────────────────────────────────────────────────
 # Chaque valeur lue (Snowflake FMS, ENOC gardien) est gardée par site et par jour de relevé : changer de page, passer à 200
 # par page ou à « Tous les sites » réutilise ce qui a déjà été lu. Les dates de relevé sont passées : valeurs stables (24 h).
 # Échec de lecture : gardé 10 min seulement, avec son message, pour réessayer ensuite sans bloquer chaque affichage.
-PAIR_TTL_OK, PAIR_TTL_ERR, FETCH_CHUNK = 24 * 3600, 600, 2000   # une requête pour tous les sites (coût de la vue ~fixe)
-SF_TIMEOUT_S = 420   # lecture faite en tâche de fond uniquement (jamais pendant l'affichage) : délai large mais borné
-PREFIX_SF, PREFIX_GUARD = "fuel-si:sf:v5", "fuel-si:guard:v2"   # v5 : anciens échecs (délai 120 s) ignorés
+PAIR_TTL_OK, PAIR_TTL_ERR, FETCH_CHUNK = 24 * 3600, 600, 2000
+PREFIX_GUARD = "fuel-si:guard:v2"   # relevés de gardien ENOC (MongoDB) : seule source encore lue hors de notre base
 
 
 def _pkey(prefix: str, site: str, day: date) -> str:
@@ -259,9 +228,9 @@ def _points(prefix: str, fetch_fn, pairs, fetch: bool = True):
 
 
 def _snowflake_points(pairs, fetch: bool = True):
-    """(site, jour) → {"niveau_l", "index_h"} : cache par paire, Snowflake relu seulement pour les paires manquantes."""
-    vals, err, _ = _points(PREFIX_SF, _fetch_snowflake, pairs, fetch)
-    return vals, err
+    """(site, jour) → {"niveau_l", "index_h"} : lecture directe des faits journaliers en base (rapide, toujours à jour de la
+    dernière synchro horaire ; pas de cache nécessaire). `fetch` est sans effet (conservé pour la compatibilité)."""
+    return _fetch_snowflake(pairs)
 
 
 def _guard_readings(pairs, fetch: bool = True):
@@ -275,15 +244,14 @@ def row_pairs(rows) -> set:
 
 
 def missing_pairs(pairs) -> set:
-    """Paires (site, jour) dont une valeur Snowflake ou ENOC n'est pas encore en cache."""
-    return _cached(PREFIX_SF, pairs)[1] | _cached(PREFIX_GUARD, pairs)[1]
+    """Paires (site, jour) dont le relevé de gardien ENOC n'est pas encore en cache (Snowflake : lu en base, jamais en attente)."""
+    return _cached(PREFIX_GUARD, pairs)[1]
 
 
 def warm_pairs(pairs) -> int:
-    """Lit (et met en cache) Snowflake et ENOC pour les paires manquantes. Retourne le nombre de paires lues."""
+    """Lit (et met en cache) les relevés de gardien ENOC des paires manquantes. Retourne le nombre de paires lues."""
     miss = missing_pairs(pairs)
     if miss:
-        _snowflake_points(miss)
         _guard_readings(miss)
     return len(miss)
 

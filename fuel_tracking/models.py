@@ -966,6 +966,11 @@ class FuelSiteDailyFacts(models.Model):
     # aucune baisse ni remplissage → 0 L mesuré ; sinon NULL (jour non mesurable, jamais 0).
     measured_conso_l = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True, help_text="Conso mesurée du jour (L), VW_FUEL_REPORT.")
     fuel_raw_points = models.IntegerField(null=True, blank=True, help_text="RAW_POINT_COUNT du jour (VW_FUEL_REPORT).")
+    # Suivi Conso (bloc « DONNÉES DE STOCK INITIAL ») : lus ici, jamais en direct dans Snowflake pendant l'affichage
+    fms_level_l = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True,
+                                      help_text="LAST_VALID_LEVEL du jour (L), VW_FUEL_REPORT. Valeurs contradictoires → NULL.")
+    dg_total_running_h = models.DecimalField(max_digits=16, decimal_places=4, null=True, blank=True,
+                                             help_text="TOTAL_DG_RUNNING_HOUR du jour (h, compteur cumulé), GENSET_REPORT. Contradictoire → NULL.")
 
     synced_at = models.DateTimeField(default=timezone.now)
 
