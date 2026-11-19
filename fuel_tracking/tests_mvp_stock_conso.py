@@ -1276,3 +1276,55 @@ class TerrainCounterParsingTests(MvpBase):
                 "Date de Relevé Finale", "Qtité laissée retenue", "Source de donnée de stock", "Relevé Visuel Compteur genset \n(relevé de terrain)"]
         r = parse_rows([head, ["DKR_0001", "X", "30/09/2026", 500, 324.42, 999, "28/10/2026", 300, "Relevé terrain", 400]])[0]
         self.assertEqual(r["compteur_terrain_initial_h"], 324.42)
+
+
+class GeInfoTests(MvpBase):
+    """Fabricant / type de GE : Snowflake (SITE_DG) d'abord, sinon ENOC (ge_assets), champ par champ ; jamais déduit."""
+
+    def test_rule_per_field_and_multiple_ge(self):
+        from fuel_tracking.services import ge_info as G
+
+        sf = {"S_1": [(2, "FG Wilson", "P22-1"), (1, "CATERPILLAR", "P33-3U")],   # 2 GE : ordre des GE
+              "S_2": [(1, None, "K22")]}                                        # type seul côté Snowflake
+        en = {"S_2": [("SDMO", "K22")], "S_3": [("AKSA", None)], "S_4": [(None, None)]}
+        out = G.build(sf, en)
+        self.assertEqual(out["S_1"], {"fabricant_ge": "CATERPILLAR / FG Wilson", "type_ge": "P33-3U / P22-1", "source_ge": G.SRC_SF})
+        self.assertEqual(out["S_2"], {"fabricant_ge": "SDMO", "type_ge": "K22", "source_ge": f"Fabricant : {G.SRC_ENOC} · Type : {G.SRC_SF}"})
+        self.assertEqual(out["S_3"], {"fabricant_ge": "AKSA", "type_ge": None, "source_ge": G.SRC_ENOC})
+        self.assertNotIn("S_4", out)
+        self.assertIsNone(G._clean("None"))
+
+    def test_snowflake_ignored_when_s_id_does_not_match_data_id(self):
+        from unittest import mock
+
+        from fuel_tracking.models import FuelSiteInventory as INV
+        from fuel_tracking.services import ge_info as G
+
+        INV.objects.create(country="Senegal", data_id=7, site_id="DKR_0001", dg_count=1)
+        cur = mock.Mock()
+        conn = mock.Mock()
+        conn.cursor.return_value = cur
+        with mock.patch("fuel_tracking.services.fuel_daily_facts_snowflake._connect", return_value=conn):
+            cur.fetchall.return_value = [(7, 1, "SDMO", "K22")]
+            out, meta = G.fetch_snowflake()
+            self.assertEqual((out, meta["taux"]), ({"DKR_0001": [(1, "SDMO", "K22")]}, 1.0))
+            cur.fetchall.return_value = [(7, 1, "SDMO", "K22"), (8, 1, "X", "Y"), (9, 1, "X", "Y")]   # 1 S_ID sur 3 rapproché
+            out, meta = G.fetch_snowflake()
+            self.assertEqual(out, {})
+            self.assertIn("Snowflake non utilisé", meta["ignore"])
+        self.assertTrue(cur.execute.call_args[0][0].lstrip().upper().startswith("SELECT"))   # lecture seule
+
+    def test_enrich_reads_cache_only(self):
+        from unittest import mock
+
+        from django.core.cache import cache
+
+        from fuel_tracking.services import ge_info as G
+        from fuel_tracking.services import stock_initial_sources as S
+
+        cache.set(G.CACHE_KEY, {"sites": {"DKR_0001": {"fabricant_ge": "SDMO", "type_ge": "K22", "source_ge": G.SRC_ENOC}}, "lu_le": "2026-11-19T10:00:00+00:00"})
+        rows = [{"site_id": "DKR_0001", "stock": {"bilan_id": None}}, {"site_id": "DKR_0002", "stock": {"bilan_id": None}}]
+        with mock.patch.object(S, "_guard_readings", return_value=({}, None)), mock.patch.object(G, "fetch_enoc", side_effect=AssertionError("ENOC lu")):
+            S.enrich(rows)
+        self.assertEqual(rows[0]["estimation_theorique"]["type_ge"], "K22")
+        self.assertEqual(rows[1]["estimation_theorique"], {"fabricant_ge": None, "type_ge": None, "source_ge": None})

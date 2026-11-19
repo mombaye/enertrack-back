@@ -388,6 +388,9 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
     pairs = row_pairs(rows)
     ravitaillement(rows)
     lines = _file_line_values(rows)
+    from fuel_tracking.services import ge_info as G
+
+    ge = (G.cached() or {}).get("sites") or {}
     guards, gerr = _guard_readings(pairs, fetch)
     sf, err = _snowflake_points(pairs, fetch)
     err = " ".join(m for m in (err, gerr) if m) or None
@@ -414,6 +417,8 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
             "retenue_l": retenue, "source": src, "compteur_terrain_h": cpt_terrain, "compteur_gardiennage_h": g.get("compteur"), "compteur_fms_h": idx,
             "compteur_retenu_h": cpt, "source_compteur": csrc,
         }
+        # Bloc « ESTIMATION CONSOMMATION FUEL THÉORIQUE » : fabricant / type de GE (Snowflake, sinon ENOC)
+        r["estimation_theorique"] = {**{"fabricant_ge": None, "type_ge": None, "source_ge": None}, **(ge.get(r["site_id"].upper()) or {})}
         # Bloc « DONNÉES DE STOCK FINAL », à la Date de Relevé Finale de la ligne du fichier (seule date retenue ; absente → n.d.)
         line = (lines.get(r["site_id"]) or {}).get("fin") or {}
         df = _day((line.get("periode") or [None, None])[1])

@@ -109,9 +109,15 @@ def _enrich_page(rows) -> tuple[str | None, int]:
 
     from fuel_tracking.services import stock_initial_sources as S
 
+    from fuel_tracking.services import ge_info as G
+
+    ge_pending = 0
+    if G.is_stale(G.cached()):
+        G.request_refresh()                      # fabricant / type de GE : relus en tâche de fond (toutes les 6 h au plus)
+        ge_pending = 0 if G.cached() else len(rows)
     miss = S.missing_pairs(S.row_pairs(rows))
     if len(miss) <= SYNC_MAX:
-        return S.enrich(rows), 0
+        return S.enrich(rows), ge_pending
     try:
         from fuel_tracking.tasks import warm_stock_initial_sources
 
@@ -121,7 +127,7 @@ def _enrich_page(rows) -> tuple[str | None, int]:
     except Exception:  # noqa: BLE001 — pas de file Celery : lecture directe (comportement d'avant)
         return S.enrich(rows), 0
     # valeurs déjà en cache affichées tout de suite ; le reste arrive au prochain rafraîchissement (l'interface relance seule)
-    return S.enrich(rows, fetch=False), len(S.missing_pairs(S.row_pairs(rows)))
+    return S.enrich(rows, fetch=False), max(ge_pending, len(S.missing_pairs(S.row_pairs(rows))))
 
 
 def warm_cache(months: int = 2) -> list[dict]:
@@ -142,7 +148,9 @@ def warm_cache(months: int = 2) -> list[dict]:
         last = first - timedelta(days=1)
         first = last.replace(day=1)
         periods.append((first, last))
-    done = []
+    from fuel_tracking.services import ge_info as G
+
+    done = [{"ge": G.refresh()}] if G.is_stale(G.cached()) else []
     for a, b in dict.fromkeys(periods):
         rows = _cached_build(a, b, {"date_debut": a.isoformat(), "date_fin": b.isoformat()})["rows"]
         done.append({"periode": f"{a}→{b}", "sites": len(rows), "lus": S.warm_pairs(S.row_pairs(rows))})

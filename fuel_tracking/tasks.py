@@ -307,3 +307,15 @@ def warm_conso_cache(self):
     except Exception:
         logger.exception("[fuel_tracking] Échec du préchauffage du Suivi Conso")
         return None
+
+
+@shared_task(bind=True, name="fuel_tracking.refresh_ge_info", soft_time_limit=600, time_limit=660)
+def refresh_ge_info(self):
+    """Fabricant et type de GE (Snowflake SITE_DG, sinon ENOC ge_assets ; lecture seule) mis en cache pour le Suivi Conso."""
+    from fuel_tracking.services.ge_info import refresh
+
+    try:
+        return refresh()
+    except Exception:
+        logger.exception("[fuel_tracking] Échec de la lecture du fabricant / type de GE")
+        return None

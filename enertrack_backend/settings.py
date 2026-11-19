@@ -222,6 +222,7 @@ CELERY_TASK_ROUTES = {
     "fuel_tracking.recompute_after_closing_withdrawal": {"queue": "interactive"},  # retrait d'un fichier (Configuration)
     "fuel_tracking.warm_stock_initial_sources": {"queue": "interactive"},  # valeurs FMS / ENOC d'une page du Suivi Conso
     "fuel_tracking.warm_conso_cache": {"queue": "interactive"},            # préchauffage de l'écran Suivi Conso
+    "fuel_tracking.refresh_ge_info": {"queue": "interactive"},             # fabricant / type de GE (Suivi Conso)
     "billing.*": {"queue": "interactive"},
     "certification.*": {"queue": "interactive"},
 }
