@@ -52,6 +52,7 @@ def find_header(rows) -> tuple[int, dict] | tuple[None, None]:
         idx = {
             "site": h.index("id du site"), "name": _col(h, "nom du site"),
             "date_initiale": i_ini, "stock_initial": _col(h, "qtité laissée à la date initiale (relevé de terrain)", i_ini),
+            "compteur_initial": _col(h, "relevé visuel compteur genset (relevé de terrain)", i_ini),
             "date_finale": i_fin, "stock_final": _col(h, "qtité laissée retenue", i_fin), "source_finale": _col(h, "source de donnée de stock", i_fin),
             "eydon": _col(h, "total livraison fuel eydon"), "carte_total": _col(h, "total livraison fuel carte total"),
             "ajout": _col(h, "total ajout"), "retrait": _col(h, "total retrait"), "ponction": _col(h, "total ponction"),
@@ -88,6 +89,7 @@ def parse_rows(rows) -> list[dict]:
             "livraison_eydon_l": num("eydon"), "livraison_carte_total_l": num("carte_total"), "ajout_l": num("ajout"), "retrait_l": num("retrait"),
             "ponction_l": num("ponction"), "vole_l": num("vol"), "vidange_l": num("vidange"), "variation_ops_l": num("variation"),
             "conso_theorique_ops_l": num("cph_l"), "source_conso_theorique_ops": get("cph_source"),
+            "compteur_terrain_initial_h": num("compteur_initial") if idx.get("compteur_initial") is not None and idx["compteur_initial"] < idx["date_finale"] else None,
         })
     return out
 
@@ -170,7 +172,8 @@ def process_output_file(batch, rows, file_name: str, resolver, tanks_of) -> dict
                    "ponction_l": r["ponction_l"], "vole_l": r["vole_l"], "vidange_l": r["vidange_l"],
                    "ponction_corrigee": True,  # rajout_retrait_l n'inclut pas la ponction (voir fuel_post_deploy, correctif du 17/11)
                    "conso_closing_l": r["variation_ops_l"], "conso_theorique_ops_l": r["conso_theorique_ops_l"],
-                   "source_conso_theorique_ops": r["source_conso_theorique_ops"]}
+                   "source_conso_theorique_ops": r["source_conso_theorique_ops"],
+                   "compteur_terrain_initial_h": r.get("compteur_terrain_initial_h")}
         for kind, value, d in (("initial", r["stock_initial_l"], r["date_initiale"]), ("final", r["stock_final_l"], r["date_finale"])):
             if value is None or d is None:
                 stats["stocks_absents"] += 1
@@ -217,3 +220,44 @@ def process_output_file(batch, rows, file_name: str, resolver, tanks_of) -> dict
             obs.save()
             stats["stocks_importes"] += 1
     return stats
+
+
+def backfill_terrain_counters() -> int:
+    """Fichiers de clôture importés avant l'ajout du compteur : relit la copie d'archive (Closing ou Output App Fuel) et complète
+    le contexte des relevés de clôture avec « Relevé Visuel Compteur genset (relevé de terrain) » à la date initiale.
+    Idempotent (lot marqué). Lecture seule de l'archive ; aucune valeur inventée (case vide du fichier → rien)."""
+    from pathlib import Path
+
+    from fuel_tracking.models import FuelImportBatch, FuelStockObservation as Obs
+    from fuel_tracking.services.stock_file_analysis import CLOSING_SHEET, closing_stock_rows
+    from fuel_tracking.services.stock_import_files import iter_sheets
+    from fuel_tracking.services.stock_registry import SiteResolver
+
+    done = 0
+    for b in FuelImportBatch.objects.filter(source_type="CLOSING").exclude(status__in=("REJECTED", "FAILED")):
+        st = (b.summary or {}).get("stocks_closing") or {}
+        if "compteur_terrain_repris" in st or not b.archive_path or not Path(b.archive_path).is_file():
+            continue
+        oaf = st.get("format") == FILE_LABEL
+        recs = []
+        for _n, rows in iter_sheets(Path(b.archive_path).read_bytes(), b.file_name, only={SHEET if oaf else CLOSING_SHEET}):
+            recs = parse_rows(list(rows)) if oaf else closing_stock_rows(list(rows))[0]
+        resolver = SiteResolver()
+        by_key = {}
+        for r in recs:
+            sid = resolver.resolve(r["site"])
+            if sid and r.get("date_initiale") and r.get("compteur_terrain_initial_h") is not None:
+                by_key[(sid.upper(), r["date_initiale"].isoformat()[:10])] = r["compteur_terrain_initial_h"]
+        upd = []
+        for o in Obs.objects.filter(batch=b, source_type="CLOSING").only("pk", "site_id", "source_context"):
+            ctx = o.source_context if isinstance(o.source_context, dict) else {}
+            per = ctx.get("periode") or [None]
+            v = by_key.get(((o.site_id or "").upper(), str(per[0] or "")[:10]))
+            if v is not None and ctx.get("compteur_terrain_initial_h") != v:
+                o.source_context = {**ctx, "compteur_terrain_initial_h": v}
+                upd.append(o)
+        Obs.objects.bulk_update(upd, ["source_context"], batch_size=1000)
+        b.summary = {**(b.summary or {}), "stocks_closing": {**st, "compteur_terrain_repris": len(upd)}}
+        b.save(update_fields=["summary"])
+        done += 1
+    return done

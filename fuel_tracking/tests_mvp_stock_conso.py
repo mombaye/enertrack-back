@@ -977,6 +977,50 @@ class StockInitialSourcesTests(OutputAppFuelImportTests):
         S.ravitaillement(rows)
         self.assertTrue(all(rows[0]["ravitaillement"][k] is None for k in S.RAV_KEYS))   # pas de dates de fichier : vide, jamais 0
 
+    def _set_terrain_counter(self, rows, value, periode_start=None):
+        """Compteur de terrain du fichier sur les relevés de clôture du bilan (comme après import / reprise)."""
+        from fuel_tracking.models import FuelStockBalance as B
+
+        b = B.objects.get(pk=rows[0]["stock"]["bilan_id"])
+        for d in (b.stock_initial_detail, b.stock_final_detail):
+            o = Obs.objects.get(pk=d["observation_id"])
+            ctx = dict(o.source_context or {})
+            if periode_start:
+                ctx["periode"] = [periode_start, (ctx.get("periode") or [None, None])[1]]
+            o.source_context = {**ctx, "compteur_terrain_initial_h": value}
+            o.save(update_fields=["source_context"])
+
+    def test_retained_counter_order_fms_then_guard_then_terrain(self):
+        from datetime import date
+        from unittest import mock
+
+        from fuel_tracking.services import stock_initial_sources as S
+
+        d = date(2026, 9, 30)
+        cases = [({"index_h": 5000.0}, {"compteur": 1234.0}, (5000.0, S.SRC_INDEX_FMS)),
+                 ({}, {"compteur": 1234.0}, (1234.0, S.SRC_GUARD)),
+                 ({}, {}, (777.5, S.SRC_TERRAIN))]
+        for fms, guard, expected in cases:
+            rows = self._rows()
+            self._set_terrain_counter(rows, 777.5)
+            with mock.patch.object(S, "_snowflake_points", return_value=({("DKR_0001", d): fms}, None)),                     mock.patch.object(S, "_guard_readings", return_value=({("DKR_0001", d): guard}, None)):
+                S.enrich(rows)
+            x = rows[0]["stock_initial_sources"]
+            self.assertEqual(x["compteur_terrain_h"], 777.5)
+            self.assertEqual((x["compteur_retenu_h"], x["source_compteur"]), expected)
+
+    def test_terrain_counter_of_another_file_line_never_used(self):
+        from unittest import mock
+
+        from fuel_tracking.services import stock_initial_sources as S
+
+        rows = self._rows()
+        self._set_terrain_counter(rows, 2137.41, periode_start="2026-07-15")   # ligne d'une autre période
+        with mock.patch.object(S, "_snowflake_points", return_value=({}, None)), mock.patch.object(S, "_guard_readings", return_value=({}, None)):
+            S.enrich(rows)
+        x = rows[0]["stock_initial_sources"]
+        self.assertEqual((x["compteur_terrain_h"], x["compteur_retenu_h"], x["source_compteur"]), (None, None, None))
+
     def test_fms_has_priority(self):
         from datetime import date
         from unittest import mock
@@ -1168,3 +1212,24 @@ class BackfillFmsLevelsTests(MvpBase):
         self.assertFalse(F.objects.filter(date=date(2026, 9, 29)).exists())
         self.assertIn("sync_fuel_daily_facts --start 2026-09-29", out.getvalue())
         self.assertTrue(all(sql.lstrip().upper().startswith("SELECT") for sql in sqls))   # lecture seule
+
+
+class TerrainCounterParsingTests(MvpBase):
+    """Compteur genset relevé sur le terrain à la date initiale : lu dans le Closing et dans l'Output App Fuel."""
+
+    def test_closing_reads_counter_of_initial_block_only(self):
+        from fuel_tracking.services.stock_file_analysis import closing_stock_rows
+
+        head = ["ID du site", "Date de Relevé Initiale", "Qtité laissée à la date du relevé", "Relevé Visuel Compteur genset  à la date de relevé",
+                "Date de Relevé Finale", "Qtité laissée à la date du relevé", "Relevé Visuel Compteur genset  à la date de relevé"]
+        rows, _ = closing_stock_rows([head, ["DKR_0001", "30/09/2026", 500, 1200.5, "28/10/2026", 300, 1300]])
+        self.assertEqual(rows[0]["compteur_terrain_initial_h"], 1200.5)
+
+    def test_output_app_fuel_reads_terrain_counter(self):
+        from fuel_tracking.services.output_app_fuel import parse_rows
+
+        head = ["ID du site", "Nom du site", "Date de Relevé Initiale", "Qtité laissée à la date initiale (relevé de terrain)",
+                "Relevé Visuel Compteur genset \n(relevé de terrain)", "Relevé Visuel Compteur genset \n(Société de gardiennage)",
+                "Date de Relevé Finale", "Qtité laissée retenue", "Source de donnée de stock", "Relevé Visuel Compteur genset \n(relevé de terrain)"]
+        r = parse_rows([head, ["DKR_0001", "X", "30/09/2026", 500, 324.42, 999, "28/10/2026", 300, "Relevé terrain", 400]])[0]
+        self.assertEqual(r["compteur_terrain_initial_h"], 324.42)

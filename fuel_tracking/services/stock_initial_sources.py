@@ -17,7 +17,9 @@ Sources (lecture seule ; ENOC et Snowflake ne sont jamais modifiés) :
   Compteur genset (Société de gardiennage)  compteur horaire porté par ce même relevé de gardien ENOC, s'il existe ;
   Compteur genset (Index Compteur FMS)      GENSET_REPORT.TOTAL_DG_RUNNING_HOUR du jour, copié dans les faits journaliers
                                             (FuelSiteDailyFacts.dg_total_running_h) ;
-  Compteur retenu                           FMS si disponible, sinon gardiennage.
+  Compteur genset (relevé de terrain)       fichier de clôture (Closing « Relevé Visuel Compteur genset à la date de relevé »,
+                                            Output App Fuel « … (relevé de terrain) »), ligne du site, date initiale ;
+  Compteur retenu                           Index Compteur FMS, sinon Société de gardiennage, sinon relevé de terrain.
 Snowflake indisponible : les colonnes FMS restent vides (« n.d. »), jamais 0 ; l'écran ne casse pas.
 
 Bloc « DONNÉES DE RAVITAILLEMENT » (6 colonnes) : TOUT vient d'ENOC (lecture seule), sur la plage de dates de la ligne du
@@ -333,6 +335,35 @@ def ravitaillement(rows: list[dict]) -> None:
                                "date_finale_fichier": _file_final_date(r, details)}
 
 
+def _terrain_counters(rows) -> dict:
+    """site → compteur genset relevé sur le terrain à la date initiale, lu sur le relevé du fichier de clôture retenu par le bilan
+    (contexte du relevé, toujours à jour même si le bilan a été calculé avant la reprise du compteur).
+    Seule la ligne de fichier dont la « Date de Relevé Initiale » est celle du site compte : un relevé partagé avec le fichier du
+    mois précédent (même site, date, valeur) porte le contexte de CE fichier-là, jamais repris pour ce mois."""
+    from fuel_tracking.models import FuelStockBalance as B, FuelStockObservation as Obs
+
+    ids = [r["stock"].get("bilan_id") for r in rows if r["stock"].get("bilan_id")]
+    obs_of = {}
+    for pk, ini, fin in B.objects.filter(pk__in=ids).values_list("pk", "stock_initial_detail", "stock_final_detail"):
+        for x in (fin, ini):
+            if isinstance(x, dict) and x.get("source") == "CLOSING" and x.get("observation_id"):
+                obs_of.setdefault(pk, []).append(x["observation_id"])
+    ctx = dict(Obs.objects.filter(pk__in=[o for v in obs_of.values() for o in v]).values_list("pk", "source_context"))
+    out = {}
+    for r in rows:
+        d0 = str(r["stock"].get("date_initial") or "")[:10]
+        for n, oid in enumerate(obs_of.get(r["stock"].get("bilan_id"), [])):
+            c = ctx.get(oid) if isinstance(ctx.get(oid), dict) else {}
+            # stock initial non exploitable (pas de date) : seule la ligne du stock final (= ligne du fichier du mois) est retenue
+            if (str((c.get("periode") or [None])[0] or "")[:10] != d0) if d0 else n > 0:
+                continue   # contexte d'une autre ligne de fichier (autre période) : jamais repris
+            v = c.get("compteur_terrain_initial_h")
+            if v is not None:
+                out[r["site_id"]] = _f(v)
+                break
+    return out
+
+
 def enrich(rows: list[dict], fetch: bool = True) -> str | None:
     """Ajoute à chaque ligne du tableau les blocs « inventaire » et « stock_initial_sources ». Retourne un message si Snowflake a échoué."""
     from core.models import Site
@@ -346,6 +377,7 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
     grid = {sid.upper(): g for sid, g in INV.objects.filter(site_id__in=ids).values_list("site_id", "grid_supply")}
     pairs = row_pairs(rows)
     ravitaillement(rows)
+    terrain_cpt = _terrain_counters(rows)
     guards, gerr = _guard_readings(pairs, fetch)
     sf, err = _snowflake_points(pairs, fetch)
     err = " ".join(m for m in (err, gerr) if m) or None
@@ -363,10 +395,13 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
         p = sf.get((r["site_id"], d), {}) if d else {}
         fms, idx = p.get("niveau_l"), p.get("index_h")
         retenue, src = (fms, SRC_FMS) if fms is not None else ((terrain, SRC_TERRAIN) if terrain is not None else (None, None))
-        cpt, csrc = (idx, SRC_INDEX_FMS) if idx is not None else ((g.get("compteur"), SRC_GUARD) if g.get("compteur") is not None else (None, None))
+        cpt_terrain = terrain_cpt.get(r["site_id"])
+        # ordre : Index Compteur FMS → Société de gardiennage → relevé de terrain du fichier de clôture
+        cpt, csrc = next(((v, s) for v, s in ((idx, SRC_INDEX_FMS), (g.get("compteur"), SRC_GUARD), (cpt_terrain, SRC_TERRAIN)) if v is not None),
+                         (None, None))
         r["stock_initial_sources"] = {
             "date": d.isoformat() if d else None, "terrain_l": terrain, "gardiennage_l": g.get("litres"), "fms_l": fms,
-            "retenue_l": retenue, "source": src, "compteur_gardiennage_h": g.get("compteur"), "compteur_fms_h": idx,
+            "retenue_l": retenue, "source": src, "compteur_terrain_h": cpt_terrain, "compteur_gardiennage_h": g.get("compteur"), "compteur_fms_h": idx,
             "compteur_retenu_h": cpt, "source_compteur": csrc,
         }
     return err

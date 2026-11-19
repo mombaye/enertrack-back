@@ -92,6 +92,7 @@ def closing_stock_rows(rows) -> tuple[list[dict], dict]:
                 h_idx = {
                     "site": header.index("id du site"), "nb_ge": _first_idx(header, "nombre de ge installé"),
                     "date_initiale": i0, "stock_initial": _first_idx(header, "qtité laissée à la date du relevé", i0 + 1, i1),
+                    "compteur_initial": _first_idx(header, "relevé visuel compteur genset", i0 + 1, i1),
                     # Format 2026 du Closing : « Total Livraison » remplace « Qtité totale livrée ».
                     "livre": _first_idx(header, "qtité totale livrée", i0 + 1, i1) or _first_idx(header, "total livraison", i0 + 1, i1),
                     "rajout_retrait": _first_idx(header, "qté rajoutée ou retirée", i0 + 1, i1),
@@ -116,6 +117,7 @@ def closing_stock_rows(rows) -> tuple[list[dict], dict]:
             "vole_l": F.parse_number(get("vole")), "vidange_l": F.parse_number(get("vidange")),
             "conso_closing_l": F.parse_number(get("conso_closing")), "conso_niveau_l": F.parse_number(get("conso_niveau")),
             "nb_ge": F.parse_number(get("nb_ge")),
+            "compteur_terrain_initial_h": F.parse_number(get("compteur_initial")),
         })
     diag = {k: (None if v is None else (header[v] if header and v < len(header) else None)) for k, v in (h_idx or {}).items()} if header else None
     return out, {"colonnes_utilisees": diag, "en_tete_trouve": header is not None}

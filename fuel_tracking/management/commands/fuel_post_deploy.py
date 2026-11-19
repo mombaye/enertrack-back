@@ -28,7 +28,19 @@ class Command(BaseCommand):
         self._ponctions_output(w, dry_run)
         self._sans_ge_output(w, dry_run)
         self._kpis_closing(w, dry_run)
+        self._compteurs_terrain(w, dry_run)
         self._warm(w, dry_run)
+
+    def _compteurs_terrain(self, w, dry_run):
+        """8. Fichiers de clôture déjà importés : compteur genset relevé sur le terrain à la date initiale (relu dans l'archive)."""
+        if dry_run:
+            return
+        try:
+            from fuel_tracking.services.output_app_fuel import backfill_terrain_counters
+
+            w(f"Fichiers de clôture : compteur de terrain repris pour {backfill_terrain_counters()} lot(s).")
+        except Exception as e:  # ne jamais empêcher le démarrage du service
+            w(f"Fichiers de clôture : reprise du compteur de terrain impossible ({e}).")
 
     def _warm(self, w, dry_run):
         """7. Préchauffe l'écran Suivi Conso (calcul + valeurs Snowflake / ENOC) : premier affichage sans attente après déploiement."""
