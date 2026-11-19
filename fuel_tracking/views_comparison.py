@@ -19,6 +19,64 @@ from fuel_tracking.services import conso_comparison as C
 from fuel_tracking.services.period_utils import available_periods, default_period, to_day
 
 
+def _base_ge_reference(site_ids):
+    """Dernier type GE importé par site, lu sur les lignes du lot Base GE.
+
+    Les données brutes du lot couvrent également les sites sans ligne mensuelle
+    FuelConsommationMonthly, et sont donc la source de vérité pour cet affichage.
+    """
+    from fuel_tracking.models import FuelImportBatch, FuelImportRow
+
+    if not site_ids:
+        return {}
+    batch = (FuelImportBatch.objects.filter(source_type="BASE_GE", status__in=("ACCEPTED", "VALIDATION_REQUIRED"))
+             .order_by("-received_at", "-id").first())
+    if batch is None:
+        return {}
+
+    wanted = {_site_key(site_id) for site_id in site_ids}
+    result = {}
+    # Read all rows in the most recent (typically ~469-row) reference batch:
+    # resolved IDs are preferred, raw IDs cover sites missing from core.Site.
+    rows = FuelImportRow.objects.filter(batch=batch).order_by("row_number", "id")
+    for row in rows.iterator():
+        payload = row.raw_payload or {}
+        site_id = row.site_id_resolved or payload.get("site_id") or row.site_id_raw
+        key = _site_key(site_id)
+        if not key or key not in wanted or row.validation_status == "REJECTED":
+            continue
+        ge_type = str(payload.get("type_ge") or "").strip()
+        if not ge_type:
+            continue
+        manufacturer = str(payload.get("fabricant_ge") or "").strip() or _manufacturer_from_label(ge_type)
+        # Workbook order determines duplicate handling: last valid row wins.
+        result[key] = {"type_ge": ge_type, "fabricant_ge": manufacturer, "source_ge": "Base GE"}
+    return result
+
+
+def _site_key(value):
+    if value is None:
+        return None
+    return str(value).strip().replace(" ", "").replace("-", "_").replace(".", "_").upper() or None
+
+
+def _manufacturer_from_label(label: str) -> str:
+    """Derive a manufacturer when Type de GE contains a known make + model."""
+    import re
+
+    value = " ".join(label.split())
+    known = (
+        "JOHN DEERE", "FG WILSON", "CATERPILLAR", "MITSUBISHI", "LISTER PETTER",
+        "HIMOINSA", "BAUDOUIN", "CUMMINS", "PERKINS", "KOHLER", "GENERAC", "DOOSAN",
+        "YANMAR", "VOLVO", "DENYO", "SDMO", "JCB", "MTU", "CAT",
+    )
+    for manufacturer in known:
+        if re.match(rf"^{re.escape(manufacturer)}(?:\b|[- ])", value, flags=re.IGNORECASE):
+            return value[:len(manufacturer)]
+    # Do not discard information if a new manufacturer is not in this list.
+    return value
+
+
 def _period(p):
     d_from, d_to = to_day(p.get("date_debut") or p.get("start")), to_day(p.get("date_fin") or p.get("end"))
     if d_from and d_to:
@@ -44,6 +102,28 @@ class ConsommationsView(APIView):
             return Response({"detail": "Aucun bilan de stock calculé : lancez le calcul des bilans.", "rows": [], "total": 0, "periode": None}, status=200)
         data = C.build(d_from, d_to, p)
         rows = data.pop("rows")
+
+        # Le dernier import Base GE est un référentiel courant et prime sur les
+        # libellés historiques CPH affichés pour le site.
+        base_ge = _base_ge_reference({row["site_id"] for row in rows})
+        for row in rows:
+            ref = base_ge.get(_site_key(row["site_id"]))
+            cph_label = (row.get("modele_ge") or "").strip()
+            if ref:
+                row["estimation_theorique"] = {
+                    "fabricant_ge": ref["fabricant_ge"],
+                    "type_ge": ref["type_ge"],
+                    "source_ge": ref["source_ge"],
+                }
+            elif cph_label:
+                row["estimation_theorique"] = {
+                    "fabricant_ge": _manufacturer_from_label(cph_label),
+                    "type_ge": cph_label,
+                    "source_ge": "Inventaire CPH (Snowflake / ENOC)",
+                }
+            else:
+                row["estimation_theorique"] = {"fabricant_ge": None, "type_ge": None, "source_ge": None}
+
         try:
             size = max(1, min(int(p.get("page_size", 50)), 200))
             page = max(1, int(p.get("page", 1)))
