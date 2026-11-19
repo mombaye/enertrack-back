@@ -1283,20 +1283,23 @@ class TerrainCounterParsingTests(MvpBase):
 
 
 class GeInfoTests(MvpBase):
-    """Fabricant / type de GE : Snowflake SITE_DG uniquement ; valeur absente → n.d. (jamais déduite ni reprise d'ailleurs)."""
+    """Fabricant / type de GE, champ par champ : Snowflake SITE_DG, puis historique SITE_DG_DAILY, puis ENOC ; jamais déduit."""
 
-    def test_snowflake_only_and_multiple_ge(self):
+    def test_order_per_field_and_source(self):
         from fuel_tracking.services import ge_info as G
 
-        sf = {"S_1": [(2, "FG Wilson", "P22-1"), (1, "CATERPILLAR", "P33-3U")],   # 2 GE : ordre des GE
-              "S_2": [(1, None, "K22")],                                        # fabricant absent : n.d.
-              "S_4": [(1, "None", None)]}                                       # rien d'exploitable
-        out = G.build(sf)
+        sf = {"S_1": [(2, ("FG Wilson", G.SRC_SF), ("P22-1", G.SRC_SF)), (1, ("CATERPILLAR", G.SRC_SF), ("P33-3U", G.SRC_SF))],
+              "S_2": [(1, (None, None), ("K22", G.SRC_SF))],                        # fabricant absent de Snowflake
+              "S_3": [(1, ("Olympian", G.SRC_SF_HIST), ("GEP22-2", G.SRC_SF_HIST))]}  # retrouvé dans l'historique
+        en = {"S_1": [("SDMO", "K22")], "S_2": [("SDMO", "K22")], "S_4": [("AKSA", "AP33")], "S_5": [("None", None)]}
+        out = G.build(sf, en)
         self.assertEqual(out["S_1"], {"fabricant_ge": "CATERPILLAR / FG Wilson", "type_ge": "P33-3U / P22-1", "source_ge": G.SRC_SF})
-        self.assertEqual(out["S_2"], {"fabricant_ge": None, "type_ge": "K22", "source_ge": G.SRC_SF})
-        self.assertNotIn("S_4", out)
+        self.assertEqual(out["S_2"], {"fabricant_ge": "SDMO", "type_ge": "K22", "source_ge": f"Fabricant : {G.SRC_ENOC} · Type : {G.SRC_SF}"})
+        self.assertEqual(out["S_3"]["source_ge"], G.SRC_SF_HIST)
+        self.assertEqual(out["S_4"], {"fabricant_ge": "AKSA", "type_ge": "AP33", "source_ge": G.SRC_ENOC})
+        self.assertNotIn("S_5", out)
 
-    def test_snowflake_join_on_site_esco_id_with_guard(self):
+    def test_snowflake_current_then_history_with_guard(self):
         from unittest import mock
 
         from fuel_tracking.services import ge_info as G
@@ -1305,19 +1308,24 @@ class GeInfoTests(MvpBase):
         conn = mock.Mock()
         conn.cursor.return_value = cur
         with mock.patch("fuel_tracking.services.fuel_daily_facts_snowflake._connect", return_value=conn):
-            # (S_ID, NOM, VENDOR, GENSET_TYPE, SITE_ID rattaché, nb de SITE_ID pour ce S_ID)
-            cur.fetchall.return_value = [(10, 1, "SDMO", "K22", "DKR_0001", 1), (10, 2, "AKSA", "AP33", "DKR_0001", 1),
-                                         (11, 1, "FG Wilson", "P22-1", None, 2)]   # S_ID ambigu : jamais utilisé
+            # (S_ID, NOM, VENDOR, GENSET_TYPE, VENDOR historique, TYPE historique, SITE_ID, nb de SITE_ID)
+            cur.fetchall.return_value = [(10, 1, "SDMO", None, "Kohler", "J88K", "DKR_0001", 1),
+                                         (11, 1, None, None, "Olympian", "GEP22-2", "DKR_0002", 1),
+                                         (12, 1, "X", "Y", None, None, None, 2)]   # S_ID ambigu : jamais utilisé
             out, meta = G.fetch_snowflake()
-            self.assertEqual(out, {"DKR_0001": [(1, "SDMO", "K22"), (2, "AKSA", "AP33")]})
-            self.assertEqual((meta["s_id"], meta["rapproches"]), (2, 1))
-            cur.fetchall.return_value = [(10, 1, "SDMO", "K22", None, 0), (11, 1, "X", "Y", None, 0), (12, 1, "X", "Y", "DKR_0002", 1)]
+            self.assertEqual(out["DKR_0001"], [(1, ("SDMO", G.SRC_SF), ("J88K", G.SRC_SF_HIST))])
+            self.assertEqual(out["DKR_0002"], [(1, ("Olympian", G.SRC_SF_HIST), ("GEP22-2", G.SRC_SF_HIST))])
+            self.assertEqual(len(out), 2)
+            cur.fetchall.return_value = [(10, 1, "A", "B", None, None, None, 0), (11, 1, "A", "B", None, None, None, 0),
+                                         (12, 1, "A", "B", None, None, "DKR_0003", 1)]
             out, meta = G.fetch_snowflake()   # 1 S_ID sur 3 rattaché : garde-fou
             self.assertEqual(out, {})
-            self.assertIn("non rattachés", meta["ignore"])
+            self.assertIn("Snowflake non utilisé", meta["ignore"])
         sql = cur.execute.call_args[0][0]
-        self.assertIn("e.ID = d.S_ID", sql)
-        self.assertTrue(sql.lstrip().upper().startswith("SELECT"))   # lecture seule
+        self.assertIn("e.ID = g.s_id", sql)
+        self.assertIn("SITE_DG_DAILY", sql)
+        self.assertTrue(sql.lstrip().upper().startswith("WITH"))
+        self.assertNotRegex(sql.upper(), r"(INSERT|UPDATE|DELETE|MERGE|CREATE|DROP)")   # lecture seule
 
     def test_enrich_reads_cache_only(self):
         from unittest import mock
