@@ -82,15 +82,8 @@ def process_base_ge_file(batch, file_bytes: bytes, file_name: str) -> dict:
         out.append(Row(batch=batch, sheet_name=name, row_number=k, raw_payload=raw, site_id_raw=site_raw, site_id_resolved=resolved,
                        validation_status=status, messages=msgs, row_fingerprint=F.fingerprint("BASE_GE", key, typ)))
     Row.objects.bulk_create(out, batch_size=1000)
-    try:   # le Suivi Conso relit le type de GE au prochain affichage
-        from django.core.cache import cache
-
-        from fuel_tracking.services import ge_info as G
-
-        cache.delete(G.CACHE_KEY)
-        cache.delete(G.CACHE_KEY + ":lock")
-    except Exception:  # noqa: BLE001
-        pass
+    # Pas de vidage de cache : le Suivi Conso lit le dernier fichier Base GE en base à chaque affichage (ge_info.sites_info) ;
+    # les puissances GENSET DB et les données Snowflake / ENOC en cache restent disponibles.
     return stats
 
 

@@ -1354,12 +1354,14 @@ class GeInfoTests(MvpBase):
         from fuel_tracking.services import ge_info as G
         from fuel_tracking.services import stock_initial_sources as S
 
-        cache.set(G.CACHE_KEY, {"sites": {"DKR_0001": {"fabricant_ge": "SDMO", "type_ge": "K22", "source_ge": G.SRC_SF}}, "lu_le": "2026-11-19T10:00:00+00:00"})
+        cache.set(G.CACHE_KEY, {"raw": {"sf": {"DKR_0001": [(1, ("SDMO", G.SRC_SF), ("K22", G.SRC_SF))]}, "enoc": {}, "gdb": {"K22": {20.0}},
+                                        "gdb_meta": {"fichier": "Closing sept.xlsb"}}, "lu_le": "2026-11-19T10:00:00+00:00"})
         rows = [{"site_id": "DKR_0001", "stock": {"bilan_id": None}}, {"site_id": "DKR_0002", "stock": {"bilan_id": None}}]
         with mock.patch.object(S, "_guard_readings", return_value=({}, None)), mock.patch.object(G, "fetch_snowflake", side_effect=AssertionError("Snowflake lu")):
             S.enrich(rows)
         self.assertEqual(rows[0]["estimation_theorique"]["type_ge"], "K22")
         self.assertTrue(all(v is None for v in rows[1]["estimation_theorique"].values()))   # site inconnu : tout n.d., jamais 0
+        self.assertEqual((rows[0]["estimation_theorique"]["prp_kva"], rows[0]["estimation_theorique"]["prp_kw"]), ([20.0], [16.0]))
 
 
 class PrpGensetDbTests(MvpBase):
@@ -1544,6 +1546,30 @@ class DuplicateAcrossTypesTests(BaseGeImportTests):
         self.assertEqual(b.rows_total, 1)
         again = P.process_bytes(data, "Base GE.xlsx", "BASE_GE", origin="UPLOAD")      # même fichier, même type, déjà importé
         self.assertEqual((again.status, again.duplicate_of_id), ("REJECTED", b.pk))
+
+    def test_import_and_priority(self):
+        pass
+
+    def test_genset_db_lookup_by_type_or_brand_and_type(self):
+        pass
+
+
+class BaseGeLiveTests(BaseGeImportTests):
+    """Dès l'import du fichier Base GE, fabricant et type apparaissent dans le Suivi Conso (sans attendre une relecture)."""
+
+    def test_new_import_visible_immediately(self):
+        from django.core.cache import cache
+
+        from fuel_tracking.services import ge_info as G
+        from fuel_tracking.services import stock_import_pipeline as P
+
+        cache.set(G.CACHE_KEY, {"raw": {"sf": {}, "enoc": {}, "gdb": {"K22": {20.0}, "K33": {30.0}}, "gdb_meta": {"fichier": "Closing.xlsb"}},
+                                "lu_le": "2026-11-19T10:00:00+00:00"})
+        P.process_bytes(self._xlsx([[None, "Site ID", "NOM", "Type de GE"], [None, "DKR_0001", "S1", "SDMO - K22"]]), "Base GE v1.xlsx", "BASE_GE", origin="UPLOAD")
+        self.assertEqual(G.sites_info(["DKR_0001"])["DKR_0001"]["type_ge"], "SDMO - K22")
+        P.process_bytes(self._xlsx([[None, "Site ID", "NOM", "Type de GE"], [None, "DKR_0001", "S1", "SDMO - K33"]]), "Base GE v2.xlsx", "BASE_GE", origin="UPLOAD")
+        x = G.sites_info(["DKR_0001"])["DKR_0001"]
+        self.assertEqual((x["fabricant_ge"], x["type_ge"], x["prp_kva"], x["prp_kw"]), ("SDMO", "SDMO - K33", [30.0], [24.0]))   # dernier fichier
 
     def test_import_and_priority(self):
         pass

@@ -12,7 +12,8 @@ Ordre, CHAMP PAR CHAMP (fabricant et type choisis indépendamment), jamais de d�
 Rattachement Snowflake : S_ID = identifiant interne du site → SITE_ESCO_CURRENT.ID → SITE_ID (jointure dans Snowflake ;
 S_ID n'est PAS le DATA_ID). Plusieurs GE sur un site : valeurs distinctes jointes par « / » dans l'ordre des GE.
 
-Puissance PRP (kVA) : feuille « GENSET DB » du dernier fichier de clôture importé (copie d'archive), colonne « PRP [kVA] » de
+Puissance PRP (kVA) : feuille « GENSET DB » du Closing de référence (FUEL_GENSET_DB_MONTH, défaut 2026-09 = Closing de
+septembre ; à défaut le dernier fichier de clôture qui la contient), copie d'archive, colonne « PRP [kVA] » de
 la ligne dont le « Type de GE » correspond EXACTEMENT au type du site (casse, espaces et ponctuation ignorés ; « P33-3U » ≠
 « P33-3 »). Type présent plusieurs fois avec des PRP différentes : ambigu, aucune valeur. Puissance PRP (kW) = kVA × 0,8.
 
@@ -29,7 +30,7 @@ from django.core.cache import cache
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
-CACHE_KEY = "fuel-ge-info:v8"   # v8 : fabricant aussi lu dans le libellé du fichier Base GE
+CACHE_KEY = "fuel-ge-info:v9"   # v9 : données brutes en cache ; Base GE lue en direct à chaque affichage
 KW_PER_KVA = 0.8                 # Puissance PRP (kW) = Puissance PRP (kVA) × 0,8 (constante fixe)
 CACHE_TTL = 48 * 3600
 REFRESH_AFTER_S = 6 * 3600
@@ -191,7 +192,8 @@ def refresh() -> dict:
     brands = known_brands([t for t, _k in base.values()], gdb_meta.get("fabricants") or [])
     sites = build(sf, en, base, base_file, brands)
     add_prp(sites, gdb, gdb_meta.get("fichier"))
-    data = {"sites": sites, "meta": {**meta, "sites_enoc": len(en), "base_ge": {"fichier": base_file, "sites": len(base)},
+    data = {"sites": sites, "raw": {"sf": sf, "enoc": en, "gdb": gdb, "gdb_meta": gdb_meta},
+            "meta": {**meta, "sites_enoc": len(en), "base_ge": {"fichier": base_file, "sites": len(base)},
                                      "genset_db": gdb_meta, "erreurs": errors},
             "lu_le": timezone.now().isoformat()}
     cache.set(CACHE_KEY, data, CACHE_TTL)
@@ -267,8 +269,14 @@ def fetch_genset_db() -> tuple[dict, dict]:
     from fuel_tracking.models import FuelImportBatch
     from fuel_tracking.services.stock_import_files import iter_sheets
 
-    for b in (FuelImportBatch.objects.filter(source_type="CLOSING").exclude(status__in=("REJECTED", "FAILED"))
-              .exclude(archive_path=None).order_by("-received_at")):
+    from django.conf import settings
+
+    from fuel_tracking.services.stock_period_balance import reference_batches
+
+    ref = [x for x in reference_batches(getattr(settings, "FUEL_GENSET_DB_MONTH", "2026-09"))]
+    qs = list(FuelImportBatch.objects.filter(source_type="CLOSING").exclude(status__in=("REJECTED", "FAILED"))
+              .exclude(archive_path=None).order_by("-received_at"))
+    for b in sorted(qs, key=lambda x: (x.pk not in ref, ref.index(x.pk) if x.pk in ref else 0)):   # Closing de référence d'abord
         if not Path(b.archive_path).is_file():
             continue
         gdb, mfs = {}, set()
@@ -309,3 +317,22 @@ def _lookup_keys(label: str) -> list[str]:
     if len(parts) == 2 and parts[1].strip():
         keys.append(_key(parts[1]))
     return keys
+
+
+def sites_info(site_ids) -> dict:
+    """site → fabricant / type / source / PRP, calculés À L'AFFICHAGE pour ces sites : fichier Base GE lu en base (toujours le
+    dernier importé, sans attendre de relecture), Snowflake / ENOC / GENSET DB repris du cache (relus en tâche de fond)."""
+    from fuel_tracking.services.base_ge import known_brands, latest_types
+
+    ids = {str(s).upper() for s in site_ids}
+    data = cached() or {}
+    raw = data.get("raw") or {}
+    sf = {k: v for k, v in (raw.get("sf") or {}).items() if k in ids}
+    en = {k: v for k, v in (raw.get("enoc") or {}).items() if k in ids}
+    base_all, base_file = latest_types()
+    base = {k: v for k, v in base_all.items() if k in ids}
+    gdb_meta = raw.get("gdb_meta") or {}
+    brands = known_brands([t for t, _k in base_all.values()], gdb_meta.get("fabricants") or [])
+    sites = build(sf, en, base, base_file, brands)
+    add_prp(sites, raw.get("gdb") or {}, gdb_meta.get("fichier"))
+    return sites

@@ -467,6 +467,8 @@ FUEL_MVP_IGNORE_VALIDATION = os.getenv("FUEL_MVP_IGNORE_VALIDATION", "true").str
 # Stock initial : avant cette date, fichier de clôture (Closing) = historique ; à partir de cette date, stock final du bilan
 # précédent calculé par l'application (repli : dernier Closing connu, avec réserve).
 FUEL_APP_STOCK_START = os.getenv("FUEL_APP_STOCK_START", "2026-11-01")
+# Mois du Closing dont la feuille « GENSET DB » donne la Puissance PRP par type de GE (Suivi Conso)
+FUEL_GENSET_DB_MONTH = os.getenv("FUEL_GENSET_DB_MONTH", "2026-09")
 # Stock final : relevé le plus récent parmi ces sources (ordre = priorité à date égale). ENOC = niveaux avant / après ravitaillement.
 # ENOC_TERRAIN / ENOC_GARDIENNAGE : à ajouter dès que leurs collections Mongo sont raccordées.
 FUEL_FINAL_STOCK_SOURCES = [x.strip() for x in os.getenv("FUEL_FINAL_STOCK_SOURCES", "ENOC_TERRAIN,ENOC_GARDIENNAGE,ENOC").split(",") if x.strip()]

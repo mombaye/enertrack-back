@@ -417,7 +417,7 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
     lines = _file_line_values(rows)
     from fuel_tracking.services import ge_info as G
 
-    ge = (G.cached() or {}).get("sites") or {}
+    ge = G.sites_info(r["site_id"] for r in rows)   # Base GE en direct (dernier fichier importé) + sources en cache
     guards, gerr = _guard_readings(pairs, fetch)
     sf, err = _snowflake_points(pairs, fetch)
     err = " ".join(m for m in (err, gerr) if m) or None
