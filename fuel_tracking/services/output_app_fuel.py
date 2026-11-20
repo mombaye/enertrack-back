@@ -55,6 +55,7 @@ def find_header(rows) -> tuple[int, dict] | tuple[None, None]:
             "compteur_initial": _col(h, "relevé visuel compteur genset (relevé de terrain)", i_ini),
             "stock_final_terrain": _col(h, "qtité laissée à la date finale (relevé de terrain)", i_fin),
             "compteur_final": _col(h, "relevé visuel compteur genset (relevé de terrain)", i_fin),
+            "tm_terrain": _col(h, "temps de marche ge (relevé de terrain)"),
             "date_finale": i_fin, "stock_final": _col(h, "qtité laissée retenue", i_fin), "source_finale": _col(h, "source de donnée de stock", i_fin),
             "eydon": _col(h, "total livraison fuel eydon"), "carte_total": _col(h, "total livraison fuel carte total"),
             "ajout": _col(h, "total ajout"), "retrait": _col(h, "total retrait"), "ponction": _col(h, "total ponction"),
@@ -93,6 +94,7 @@ def parse_rows(rows) -> list[dict]:
             "conso_theorique_ops_l": num("cph_l"), "source_conso_theorique_ops": get("cph_source"),
             "compteur_terrain_initial_h": num("compteur_initial") if idx.get("compteur_initial") is not None and idx["compteur_initial"] < idx["date_finale"] else None,
             "stock_terrain_final_l": num("stock_final_terrain"), "compteur_terrain_final_h": num("compteur_final"),
+            "temps_marche_terrain_h": num("tm_terrain"),
         })
     return out
 
@@ -177,7 +179,8 @@ def process_output_file(batch, rows, file_name: str, resolver, tanks_of) -> dict
                    "conso_closing_l": r["variation_ops_l"], "conso_theorique_ops_l": r["conso_theorique_ops_l"],
                    "source_conso_theorique_ops": r["source_conso_theorique_ops"],
                    "compteur_terrain_initial_h": r.get("compteur_terrain_initial_h"),
-                   "stock_terrain_final_l": r.get("stock_terrain_final_l"), "compteur_terrain_final_h": r.get("compteur_terrain_final_h")}
+                   "stock_terrain_final_l": r.get("stock_terrain_final_l"), "compteur_terrain_final_h": r.get("compteur_terrain_final_h"),
+                   "temps_marche_terrain_h": r.get("temps_marche_terrain_h")}
         for kind, value, d in (("initial", r["stock_initial_l"], r["date_initiale"]), ("final", r["stock_final_l"], r["date_finale"])):
             if value is None or d is None:
                 stats["stocks_absents"] += 1
@@ -241,14 +244,14 @@ def backfill_terrain_counters() -> int:
     done = 0
     for b in FuelImportBatch.objects.filter(source_type="CLOSING").exclude(status__in=("REJECTED", "FAILED")):
         st = (b.summary or {}).get("stocks_closing") or {}
-        if "terrain_repris_v2" in st or not b.archive_path or not Path(b.archive_path).is_file():
+        if "terrain_repris_v3" in st or not b.archive_path or not Path(b.archive_path).is_file():
             continue
         oaf = st.get("format") == FILE_LABEL
         recs = []
         for _n, rows in iter_sheets(Path(b.archive_path).read_bytes(), b.file_name, only={SHEET if oaf else CLOSING_SHEET}):
             recs = parse_rows(list(rows)) if oaf else closing_stock_rows(list(rows))[0]
         resolver = SiteResolver()
-        keys = ("compteur_terrain_initial_h", "stock_terrain_final_l", "compteur_terrain_final_h")
+        keys = ("compteur_terrain_initial_h", "stock_terrain_final_l", "compteur_terrain_final_h", "temps_marche_terrain_h")
         by_key = {}
         for r in recs:
             sid = resolver.resolve(r["site"])
@@ -264,7 +267,7 @@ def backfill_terrain_counters() -> int:
                 o.source_context = {**ctx, **v}
                 upd.append(o)
         Obs.objects.bulk_update(upd, ["source_context"], batch_size=1000)
-        b.summary = {**(b.summary or {}), "stocks_closing": {**st, "terrain_repris_v2": len(upd)}}
+        b.summary = {**(b.summary or {}), "stocks_closing": {**st, "terrain_repris_v3": len(upd)}}
         b.save(update_fields=["summary"])
         done += 1
     return done

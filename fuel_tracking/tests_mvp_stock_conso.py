@@ -1576,3 +1576,66 @@ class BaseGeLiveTests(BaseGeImportTests):
 
     def test_genset_db_lookup_by_type_or_brand_and_type(self):
         pass
+
+
+class RuntimeFmsTests(MvpBase):
+    """Temps de marche GE sur la plage du fichier (lendemain de la date initiale → date finale) depuis les faits Snowflake."""
+
+    def test_dg_on_and_rectifier_sums(self):
+        from datetime import date, timedelta
+
+        from fuel_tracking.models import FuelSiteDailyFacts as F, FuelSiteInventory as INV
+        from fuel_tracking.services import stock_initial_sources as S
+
+        INV.objects.create(country="Senegal", data_id=1, site_id="OFF_1", grid_supply="OFF GRID", dg_count=1)
+        INV.objects.create(country="Senegal", data_id=2, site_id="ON_1", grid_supply="ON GRID", dg_count=1)
+        d0 = date(2026, 9, 30)
+        for sid, did in (("OFF_1", 1), ("ON_1", 2)):
+            for k, (dg, act) in enumerate([(5, 60), (30, 12), (2.5, 24), (None, None)]):   # 30 h : hors bornes, écarté
+                F.objects.create(country="Senegal", data_id=did, site_id=sid, date=d0 + timedelta(days=k), dg_on_runtime_h=dg,
+                                 rectifier_slots=288 if act is not None else None, rectifier_active_slots=act)
+        rows = [{"site_id": sid, "stock": {"date_initial": "2026-09-30", "date_final": "2026-10-03"}} for sid in ("OFF_1", "ON_1")]
+        lines = {sid: {"ini": {"periode": ["2026-09-30", "2026-10-03"]}, "fin": {"periode": ["2026-09-30", "2026-10-03"]}} for sid in ("OFF_1", "ON_1")}
+        out = S._fms_runtimes(rows, lines)
+        # jour initial (30/09, 5 h) exclu ; 01/10 : 30 h écarté ; 02/10 : 2,5 h ; 03/10 : absent
+        self.assertEqual((out["OFF_1"]["dg_on"], out["OFF_1"]["dg_on_jours"], out["OFF_1"]["jours"]), (2.5, 1, 3))
+        self.assertEqual((out["OFF_1"]["rect"], out["OFF_1"]["rect_jours"]), (3.0, 2))              # (12 + 24) × 5 min
+        self.assertIsNone(out["ON_1"]["rect"])
+        self.assertTrue(out["ON_1"]["rect_motif"].startswith("site raccordé au réseau"))
+
+
+
+class RuntimeTableTests(OutputAppFuelImportTests):
+    """Temps de marche (relevé de terrain du fichier, Index Compteur FMS) dans le tableau."""
+
+    _rows = StockInitialSourcesTests._rows
+
+    def test_import_and_october_balance(self):
+        pass
+
+    def test_strict_rule_rejects_readings_after_boundary(self):
+        pass
+
+    def test_sites_without_genset_excluded_from_health(self):
+        pass
+
+    def test_files_give_stocks_only_movements_from_enoc(self):
+        pass
+
+    def test_terrain_and_index_runtimes_in_table(self):
+        from unittest import mock
+
+        from fuel_tracking.models import FuelStockBalance as B
+        from fuel_tracking.services import stock_initial_sources as S
+
+        rows = self._rows()
+        b = B.objects.get(pk=rows[0]["stock"]["bilan_id"])
+        for dd in (b.stock_initial_detail, b.stock_final_detail):
+            o = Obs.objects.get(pk=dd["observation_id"])
+            o.source_context = {**o.source_context, "temps_marche_terrain_h": 120.5}
+            o.save(update_fields=["source_context"])
+        di, df = date(2026, 9, 30), date.fromisoformat(o.source_context["periode"][1])
+        with mock.patch.object(S, "_guard_readings", return_value=({}, None)),                 mock.patch.object(S, "_snowflake_points", return_value=({("DKR_0001", di): {"index_h": 1000.0}, ("DKR_0001", df): {"index_h": 1130.25}}, None)):
+            S.enrich(rows)
+        e = rows[0]["estimation_theorique"]
+        self.assertEqual((e["tm_terrain_h"], e["tm_index_fms_h"]), (120.5, 130.25))

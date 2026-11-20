@@ -401,6 +401,50 @@ def _file_line_values(rows) -> dict:
     return out
 
 
+def _fms_runtimes(rows, lines) -> dict:
+    """site → temps de marche GE (h) sur la plage du fichier (lendemain de la date initiale → date finale), depuis les faits
+    journaliers Snowflake en base : « Alarme day_dg_on » (GENSET_REPORT.DG_RUNTIME_CALCULATED) et « Alarme day_rectifier_on »
+    (créneaux 5 min redresseur actif, RECTIFIER_EFFICIENCY_STATUS — sites off-grid seulement, comme le moteur CPH). Jour hors
+    0-24 h ou absent : non compté (nombre de jours renseignés conservé) ; aucun jour : n.d., jamais 0."""
+    from fuel_tracking.models import FuelSiteDailyFacts as F, FuelSiteInventory as INV
+    from fuel_tracking.services.cph_engine import RUNTIME_MAX_H, SLOT_H, is_off_grid
+
+    span = {}
+    for r in rows:
+        sid = r["site_id"].upper()
+        li, lf = (lines.get(r["site_id"]) or {}).get("ini") or {}, (lines.get(r["site_id"]) or {}).get("fin") or {}
+        d0 = _day((li.get("periode") or [None])[0]) or _day(r["stock"].get("date_initial"))
+        d1 = _day(((lf.get("periode") or [None, None]) + [None])[1]) or _day(r["stock"].get("date_final"))
+        if d0 and d1 and d1 > d0:
+            span[sid] = (d0, d1)
+    if not span:
+        return {}
+    grid = {s.upper(): g for s, g in INV.objects.filter(site_id__in=list(span)).values_list("site_id", "grid_supply")}
+    lo, hi = min(a for a, _ in span.values()), max(b for _, b in span.values())
+    acc = {s: {"dg_on": 0.0, "dg_on_jours": 0, "rect": 0.0, "rect_jours": 0} for s in span}
+    for sid, d, dg_on, slots, active in (F.objects.filter(site_id__in=list(span), date__gt=lo, date__lte=hi)
+                                         .values_list("site_id", "date", "dg_on_runtime_h", "rectifier_slots", "rectifier_active_slots")):
+        s = sid.upper()
+        d0, d1 = span.get(s, (None, None))
+        if not d0 or not (d0 < d <= d1):
+            continue
+        if dg_on is not None and 0 <= dg_on <= RUNTIME_MAX_H:
+            acc[s]["dg_on"] += float(dg_on)
+            acc[s]["dg_on_jours"] += 1
+        if is_off_grid(grid.get(s)) is True and slots and active is not None and active * SLOT_H <= RUNTIME_MAX_H:
+            acc[s]["rect"] += float(active * SLOT_H)
+            acc[s]["rect_jours"] += 1
+    out = {}
+    for s, a in acc.items():
+        off = is_off_grid(grid.get(s))
+        out[s] = {"jours": (span[s][1] - span[s][0]).days,
+                  "dg_on": round(a["dg_on"], 2) if a["dg_on_jours"] else None, "dg_on_jours": a["dg_on_jours"],
+                  "rect": round(a["rect"], 2) if a["rect_jours"] else None, "rect_jours": a["rect_jours"],
+                  "rect_motif": None if off is True else ("site raccordé au réseau : redresseur non représentatif du GE" if off is False
+                                                         else "type de raccordement inconnu (inventaire Snowflake)")}
+    return out
+
+
 def enrich(rows: list[dict], fetch: bool = True) -> str | None:
     """Ajoute à chaque ligne du tableau les blocs « inventaire » et « stock_initial_sources ». Retourne un message si Snowflake a échoué."""
     from core.models import Site
@@ -415,6 +459,7 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
     pairs = row_pairs(rows)
     ravitaillement(rows)
     lines = _file_line_values(rows)
+    runtimes = _fms_runtimes(rows, lines)
     from fuel_tracking.services import ge_info as G
 
     ge = G.sites_info(r["site_id"] for r in rows)   # Base GE en direct (dernier fichier importé) + sources en cache
@@ -447,6 +492,28 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
         # Bloc « ESTIMATION CONSOMMATION FUEL THÉORIQUE » : fabricant / type de GE (Snowflake, sinon ENOC)
         r["estimation_theorique"] = {**{"fabricant_ge": None, "type_ge": None, "source_ge": None, "prp_kva": None, "prp_kw": None,
                                         "prp_motif": None, "prp_source": None}, **(ge.get(r["site_id"].upper()) or {})}
+        # Temps de marche GE (bloc ESTIMATION) — plage du fichier : lendemain de la date initiale → date finale
+        rt = runtimes.get(r["site_id"].upper()) or {}
+        li, lf = (lines.get(r["site_id"]) or {}).get("ini") or {}, (lines.get(r["site_id"]) or {}).get("fin") or {}
+        tm_terrain, tm_terrain_motif = None, None
+        if "Output App Fuel" in (lf.get("fichier"), li.get("fichier")) or "temps_marche_terrain_h" in lf or "temps_marche_terrain_h" in li:
+            # Output App Fuel : colonne « Temps de marche GE (relevé de terrain) » reprise telle quelle (vide → n.d.)
+            tm_terrain = _f(lf.get("temps_marche_terrain_h") if lf.get("temps_marche_terrain_h") is not None else li.get("temps_marche_terrain_h"))
+        else:
+            # Closing (pas de colonne « temps de marche ») : compteur de terrain final − initial, tous deux lus dans le fichier ;
+            # écart impossible sur la période (> 24 h par jour) : non affiché, raison au survol
+            ci, cf = _f(li.get("compteur_terrain_initial_h")), _f(lf.get("compteur_terrain_final_h"))
+            if ci is not None and cf is not None and cf >= ci:
+                jours = rt.get("jours") or 0
+                if jours and cf - ci > 24 * jours:
+                    tm_terrain_motif = f"compteurs du fichier incohérents ({cf - ci:.0f} h sur {jours} jours)"
+                else:
+                    tm_terrain = round(cf - ci, 2)
+        fi, ff = r["stock_initial_sources"].get("compteur_fms_h"), None
+        r["estimation_theorique"].update(
+            tm_dg_on_h=rt.get("dg_on"), tm_dg_on_jours=rt.get("dg_on_jours"),
+            tm_rectifier_h=rt.get("rect"), tm_rectifier_jours=rt.get("rect_jours"), tm_rectifier_motif=rt.get("rect_motif"),
+            tm_jours_periode=rt.get("jours"), tm_terrain_h=tm_terrain, tm_terrain_motif=tm_terrain_motif)
         # Bloc « DONNÉES DE STOCK FINAL », à la Date de Relevé Finale de la ligne du fichier (seule date retenue ; absente → n.d.)
         line = (lines.get(r["site_id"]) or {}).get("fin") or {}
         df = _day((line.get("periode") or [None, None])[1])
@@ -464,6 +531,9 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
             "retenue_l": ret_f, "source": src_f, "compteur_terrain_h": cpt_terrain_f, "compteur_gardiennage_h": gf.get("compteur"),
             "compteur_fms_h": pf.get("index_h"), "compteur_retenu_h": cpt_f, "source_compteur": csrc_f,
         }
+        # Temps de marche GE (Index Compteur FMS) = compteur FMS à la date finale − compteur FMS à la date initiale
+        ff = pf.get("index_h")
+        r["estimation_theorique"]["tm_index_fms_h"] = round(ff - fi, 2) if fi is not None and ff is not None and ff >= fi else None
     return err
 
 
