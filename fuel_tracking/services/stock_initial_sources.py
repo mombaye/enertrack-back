@@ -551,6 +551,11 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
         # Temps de marche GE (Index Compteur FMS) = compteur FMS à la date finale − compteur FMS à la date initiale
         ff = pf.get("index_h")
         r["estimation_theorique"]["tm_index_fms_h"] = round(ff - fi, 2) if fi is not None and ff is not None and ff >= fi else None
+        # Source de donnée Temps de marche GE : ordre appliqué par Ops dans le fichier Output App Fuel d'octobre (vérifié sur
+        # 400 sites) : Index Compteur FMS → relevé de terrain → Alarme day_dg_on FMS → Alarme day_rectifier_on FMS.
+        e = r["estimation_theorique"]
+        e["tm_retenu_h"], e["tm_source"] = _first_of((e.get("tm_index_fms_h"), "FMS"), (e.get("tm_terrain_h"), "relevé de terrain"),
+                                                    (e.get("tm_dg_on_h"), "Alarme day_dg_on FMS"), (e.get("tm_rectifier_h"), "Alarme day_rectifier_on FMS"))
     return err
 
 

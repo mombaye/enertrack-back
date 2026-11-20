@@ -1686,3 +1686,19 @@ class TotalsRowTests(MvpBase):
         self.assertEqual(t["estimation_theorique"]["tm_terrain_h"], {"total": 7.5, "sites": 2})
         self.assertEqual(t["ravitaillement"]["eydon_l"], {"total": None, "sites": 0})
         self.assertNotIn("stock_initial_sources", rows[0])                      # lignes affichées non modifiées
+
+
+class RuntimeSourceTests(MvpBase):
+    """Source de donnée Temps de marche GE : Index Compteur FMS → relevé de terrain → day_dg_on → day_rectifier_on (ordre Ops)."""
+
+    def test_order(self):
+        from fuel_tracking.services.stock_initial_sources import _first_of
+
+        def src(index=None, terrain=None, dg_on=None, rect=None):
+            return _first_of((index, "FMS"), (terrain, "relevé de terrain"), (dg_on, "Alarme day_dg_on FMS"), (rect, "Alarme day_rectifier_on FMS"))
+
+        self.assertEqual(src(index=326.1, terrain=300, dg_on=4.3, rect=8.5), (326.1, "FMS"))
+        self.assertEqual(src(terrain=0.0, dg_on=4.3, rect=8.5), (0.0, "relevé de terrain"))          # 0 h est une vraie valeur
+        self.assertEqual(src(dg_on=4.3, rect=8.5), (4.3, "Alarme day_dg_on FMS"))
+        self.assertEqual(src(rect=8.5), (8.5, "Alarme day_rectifier_on FMS"))
+        self.assertEqual(src(), (None, None))
