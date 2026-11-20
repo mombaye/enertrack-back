@@ -458,6 +458,59 @@ def _fms_runtimes(rows, lines) -> dict:
     return out
 
 
+def _power_medians(rows, lines, kinds: dict, kva: dict) -> dict:
+    """site → puissances médianes mesurées (kW) sur la plage du fichier (lendemain de la date initiale → date finale), depuis les
+    faits journaliers Snowflake en base (aucun appel Snowflake) :
+      redresseur : médiane des P_DC journalières (RECTIFIER_EFFICIENCY_STATUS) ;
+      grid       : médiane des puissances AC journalières (AC_METER, W ÷ 1 000), mesures > 0 ;
+      générateur : algorithme du moteur CPH (cph_power_v2) sur la période — outdoor P_DC ÷ rendement, indoor puissance Grid,
+                   plafond 105 % × kVA × 0,8 ; kVA = fichier Base GE, sinon PRP (GENSET DB).
+    Aucune mesure : n.d. (jamais 0) avec la raison."""
+    from statistics import median
+
+    from fuel_tracking.models import FuelSiteDailyFacts as F
+    from fuel_tracking.services import cph_power_v2 as PW
+    from fuel_tracking.services.cph_engine import _build_power_samples
+
+    span = {r["site_id"].upper(): file_dates(r, lines) for r in rows}
+    span = {k: v for k, v in span.items() if v[0] and v[1] and v[1] > v[0]}
+    if not span:
+        return {}
+    lo, hi = min(a for a, _ in span.values()), max(b for _, b in span.values())
+    facts: dict = {}
+    for f in (F.objects.filter(site_id__in=list(span), date__gt=lo, date__lte=hi)
+              .values("site_id", "date", "p_dc_day_kw", "p_dc_ge_tracker_kw", "p_dc_rect_active_kw", "eff_ge_tracker",
+                      "eff_rect_active", "ac_active_power_avg_w")):
+        sid = f["site_id"].upper()
+        d0, d1 = span.get(sid, (None, None))
+        if d0 and d0 < f["date"] <= d1:
+            facts.setdefault(sid, {})[f["date"]] = f   # plusieurs DATA_ID pour un site : dernier lu (rare)
+    out = {}
+    for sid, (d0, d1) in span.items():
+        fx = facts.get(sid) or {}
+        rect = [float(f["p_dc_day_kw"]) for f in fx.values() if f["p_dc_day_kw"] is not None and f["p_dc_day_kw"] >= 0]
+        grid = [float(f["ac_active_power_avg_w"]) / 1000 for f in fx.values() if f["ac_active_power_avg_w"] is not None and f["ac_active_power_avg_w"] > 0]
+        kind = kinds.get(sid)
+        spec = PW.SiteSpec(site_id=sid, typology=PW.INDOOR if kind == "Indoor" else PW.OUTDOOR, nominal_kva=kva.get(sid))
+        ge, ge_motif = None, None
+        if spec.nominal_kva is None:
+            ge_motif = "puissance nominale du GE inconnue (fichier Base GE / GENSET DB)"
+        else:
+            p_ge, n, _days, _vals, _rej, why = PW._aggregate(_build_power_samples(sid, fx, None), spec)
+            cap = PW.cap_kw(spec.nominal_kva)
+            if p_ge is None:
+                ge_motif = {"AUCUNE_MESURE_P_DC_QUALIFIEE": "aucune mesure P_DC qualifiée (redresseur) sur la période",
+                            "AUCUNE_MESURE_GRID_QUALIFIEE": "aucune mesure Grid qualifiée sur la période"}.get(why, why)
+            elif cap is not None and p_ge > cap:
+                ge_motif = f"puissance calculée {p_ge:.1f} kW au-delà de 105 % × kVA × 0,8 ({cap:.1f} kW)"
+            else:
+                ge = round(p_ge, 2)
+        out[sid] = {"p_rect_kw": round(median(rect), 2) if rect else None, "p_rect_jours": len(rect),
+                    "p_grid_kw": round(median(grid), 2) if grid else None, "p_grid_jours": len(grid),
+                    "p_ge_kw": ge, "p_ge_motif": ge_motif}
+    return out
+
+
 def enrich(rows: list[dict], fetch: bool = True) -> str | None:
     """Ajoute à chaque ligne du tableau les blocs « inventaire » et « stock_initial_sources ». Retourne un message si Snowflake a échoué."""
     from core.models import Site
@@ -473,6 +526,19 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
     pairs = row_pairs(rows, lines)
     ravitaillement(rows)
     runtimes = _fms_runtimes(rows, lines)
+    _ge_now = __import__("fuel_tracking.services.ge_info", fromlist=["x"]).sites_info(r["site_id"] for r in rows)
+    from fuel_tracking.services.base_ge import latest_types as _latest_types
+
+    _base_kva = {k: v[1] for k, v in _latest_types()[0].items() if v[1]}
+    _kinds = {}
+    from core.models import Site as _Site
+
+    for _sid, _a, _b in _Site.objects.filter(site_id__in=[r["site_id"] for r in rows]).values_list("site_id", "installed_site_type", "site_type"):
+        _k = _a or _b
+        _kinds[_sid.upper()] = {"INDOOR": "Indoor", "OUTDOOR": "Outdoor"}.get(_k, _k)
+    _kva = {s: float(_base_kva[s]) if s in _base_kva else (sum((_ge_now.get(s) or {}).get("prp_kva") or []) or None)
+            for s in {r["site_id"].upper() for r in rows}}
+    powers = _power_medians(rows, lines, _kinds, _kva)
     from fuel_tracking.services import ge_info as G
 
     ge = G.sites_info(r["site_id"] for r in rows)   # Base GE en direct (dernier fichier importé) + sources en cache
@@ -532,6 +598,11 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
             tm_dg_on_h=rt.get("dg_on"), tm_dg_on_jours=rt.get("dg_on_jours"),
             tm_rectifier_h=rt.get("rect"), tm_rectifier_jours=rt.get("rect_jours"), tm_rectifier_motif=rt.get("rect_motif"),
             tm_jours_periode=rt.get("jours"), tm_terrain_h=tm_terrain, tm_terrain_motif=tm_terrain_motif)
+        # Puissances médianes mesurées (bloc ESTIMATION) — plage du fichier, faits journaliers Snowflake en base
+        pw = powers.get(r["site_id"].upper()) or {}
+        r["estimation_theorique"].update(p_rect_kw=pw.get("p_rect_kw"), p_rect_jours=pw.get("p_rect_jours"),
+                                         p_ge_kw=pw.get("p_ge_kw"), p_ge_motif=pw.get("p_ge_motif"),
+                                         p_grid_kw=pw.get("p_grid_kw"), p_grid_jours=pw.get("p_grid_jours"))
         # Bloc « DONNÉES DE STOCK FINAL », à la Date de Relevé Finale de la ligne du fichier (seule date retenue ; absente → n.d.)
         line = (lines.get(r["site_id"]) or {}).get("fin") or {}
         df = _day((line.get("periode") or [None, None])[1])   # Date de Relevé Finale du fichier (absente → n.d.)
