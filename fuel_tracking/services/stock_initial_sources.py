@@ -576,7 +576,7 @@ TOTAL_FIELDS = {
     "ravitaillement": ("eydon_l", "carte_total_l", "ajout_l", "retrait_l", "vole_l", "fuite_l"),
     "stock_final_sources": ("terrain_l", "gardiennage_l", "fms_l", "retenue_l", "compteur_terrain_h", "compteur_gardiennage_h",
                             "compteur_fms_h", "compteur_retenu_h"),
-    "estimation_theorique": ("prp_kva", "prp_kw", "tm_dg_on_h", "tm_rectifier_h", "tm_terrain_h", "tm_index_fms_h"),
+    "estimation_theorique": ("prp_kva", "prp_kw", "tm_dg_on_h", "tm_rectifier_h", "tm_terrain_h", "tm_index_fms_h", "tm_retenu_h"),
 }
 
 
