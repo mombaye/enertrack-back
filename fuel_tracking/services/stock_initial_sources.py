@@ -272,9 +272,11 @@ def _guard_readings(pairs, fetch: bool = True):
     return vals, err
 
 
-def row_pairs(rows) -> set:
-    """(site, jour) des relevés initial ET final de chaque ligne (valeurs gardien / FMS lues à ces deux dates)."""
-    return {(r["site_id"], _day(r["stock"].get(k))) for r in rows for k in ("date_initial", "date_final") if r["stock"].get(k)}
+def row_pairs(rows, lines: dict | None = None) -> set:
+    """(site, jour) aux Date de Relevé Initiale ET Finale de la ligne du fichier de chaque site (valeurs gardien / FMS lues à ces
+    deux dates) ; à défaut, dates du bilan."""
+    lines = lines if lines is not None else _file_line_values(rows)
+    return {(r["site_id"], d) for r in rows for d in file_dates(r, lines) if d}
 
 
 def missing_pairs(pairs) -> set:
@@ -381,24 +383,36 @@ def _file_line_values(rows) -> dict:
 
     sites = {r["site_id"] for r in rows}
     lines: dict = {}
-    for sid, c in (Obs.objects.filter(source_type="CLOSING", site_id__in=sites).exclude(validation_status="REJECTED")
-                   .values_list("site_id", "source_context")):
+    for sid, c, at, lit, val, unit in (Obs.objects.filter(source_type="CLOSING", site_id__in=sites).exclude(validation_status="REJECTED")
+                                       .values_list("site_id", "source_context", "observation_datetime", "level_liters", "level_value", "level_unit")):
         if isinstance(c, dict) and c.get("type") == "closing_periode" and c.get("periode"):
             per = (list(c["periode"]) + [None, None])[:2]
             key = (str(per[0] or "")[:10], str(per[1] or "")[:10])   # une entrée par ligne de fichier (relevés initial + final fusionnés)
             cur = lines.setdefault(sid, {}).setdefault(key, {})
             cur.update({k: v for k, v in c.items() if v is not None or k not in cur})
+            niveau = lit if lit is not None else (val if unit == "L" else None)
+            jour = str(at.date() if at else "")[:10]
+            if niveau is not None and jour == key[0]:
+                cur["_niveau_initial_l"] = float(niveau)   # relevé de la Date de Relevé Initiale de cette ligne
+            if niveau is not None and jour == key[1]:
+                cur["_niveau_final_l"] = float(niveau)
     out = {}
     for r in rows:
         d0, d1 = str(r["stock"].get("date_initial") or "")[:10], str(r["stock"].get("date_final") or "")[:10]
         cand = lines.get(r["site_id"], {})
-        both = cand.get((d0, d1)) if d0 and d1 else None
-        fin = both or next((c for (a, b), c in sorted(cand.items()) if d1 and b == d1), None)
-        ini = both or (next((c for (a, b), c in sorted(cand.items()) if a == d0), None) if d0 else fin)
-        if fin is None and not d1:
-            fin = ini   # bilan sans date finale : valeurs finales de la même ligne de fichier (dates du fichier)
-        out[r["site_id"]] = {"ini": ini or {}, "fin": fin or {}}
+        # ligne du fichier de la période : mêmes dates que le bilan, sinon même Date de Relevé Finale, sinon même Date de
+        # Relevé Initiale. Ses DEUX dates font foi pour tout le tableau (stock initial, ravitaillement, temps de marche, final).
+        line = (cand.get((d0, d1)) if d0 and d1 else None) \
+            or next((c for (a, b), c in sorted(cand.items()) if d1 and b == d1), None) \
+            or next((c for (a, b), c in sorted(cand.items()) if d0 and a == d0), None)
+        out[r["site_id"]] = {"ini": line or {}, "fin": line or {}}
     return out
+
+
+def file_dates(r: dict, lines: dict) -> tuple[date | None, date | None]:
+    """(Date de Relevé Initiale, Date de Relevé Finale) de la ligne du fichier du site ; à défaut, dates du bilan."""
+    per = (((lines.get(r["site_id"]) or {}).get("fin") or {}).get("periode") or [None, None]) + [None, None]
+    return _day(per[0]) or _day(r["stock"].get("date_initial")), _day(per[1]) or _day(r["stock"].get("date_final"))
 
 
 def _fms_runtimes(rows, lines) -> dict:
@@ -413,8 +427,7 @@ def _fms_runtimes(rows, lines) -> dict:
     for r in rows:
         sid = r["site_id"].upper()
         li, lf = (lines.get(r["site_id"]) or {}).get("ini") or {}, (lines.get(r["site_id"]) or {}).get("fin") or {}
-        d0 = _day((li.get("periode") or [None])[0]) or _day(r["stock"].get("date_initial"))
-        d1 = _day(((lf.get("periode") or [None, None]) + [None])[1]) or _day(r["stock"].get("date_final"))
+        d0, d1 = file_dates(r, lines)
         if d0 and d1 and d1 > d0:
             span[sid] = (d0, d1)
     if not span:
@@ -456,9 +469,9 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
         "site_id", "zone", "site_type", "installed_site_type", "ordered_typology", "billing_typology")}
     zones = dict(Site.ZONE_CHOICES)
     grid = {sid.upper(): g for sid, g in INV.objects.filter(site_id__in=ids).values_list("site_id", "grid_supply")}
-    pairs = row_pairs(rows)
-    ravitaillement(rows)
     lines = _file_line_values(rows)
+    pairs = row_pairs(rows, lines)
+    ravitaillement(rows)
     runtimes = _fms_runtimes(rows, lines)
     from fuel_tracking.services import ge_info as G
 
@@ -474,8 +487,12 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
             "indoor_outdoor": {"INDOOR": "Indoor", "OUTDOOR": "Outdoor"}.get(kind, kind),
             "on_grid": grid.get(r["site_id"].upper()), "typologie_cible": s.get("ordered_typology"), "typologie_facturee": s.get("billing_typology"),
         }
-        d = _day(r["stock"].get("date_initial"))
-        terrain = r["stock"].get("initial_l") if (r["stock"].get("source_initial") or "").lower() == "closing" else None
+        # Date de Relevé Initiale de la ligne du fichier du site (jamais une autre date) ; quantité de terrain = relevé de cette ligne
+        d = file_dates(r, lines)[0]
+        li0 = (lines.get(r["site_id"]) or {}).get("ini") or {}
+        terrain = (_f(li0.get("_niveau_initial_l")) if li0.get("_niveau_initial_l") is not None
+                   else (r["stock"].get("initial_l") if (r["stock"].get("source_initial") or "").lower() == "closing"
+                         and str(d or "") == str(_day(r["stock"].get("date_initial")) or "") else None))
         g = guards.get((r["site_id"], d), {}) if d else {}
         p = sf.get((r["site_id"], d), {}) if d else {}
         fms, idx = p.get("niveau_l"), p.get("index_h")
@@ -516,7 +533,7 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
             tm_jours_periode=rt.get("jours"), tm_terrain_h=tm_terrain, tm_terrain_motif=tm_terrain_motif)
         # Bloc « DONNÉES DE STOCK FINAL », à la Date de Relevé Finale de la ligne du fichier (seule date retenue ; absente → n.d.)
         line = (lines.get(r["site_id"]) or {}).get("fin") or {}
-        df = _day((line.get("periode") or [None, None])[1])
+        df = _day((line.get("periode") or [None, None])[1])   # Date de Relevé Finale du fichier (absente → n.d.)
         gf = guards.get((r["site_id"], df), {}) if df else {}
         pf = sf.get((r["site_id"], df), {}) if df else {}
         # quantité de terrain : colonne du fichier (Output App Fuel « relevé de terrain », Closing « Qtité laissée à la date du relevé »)

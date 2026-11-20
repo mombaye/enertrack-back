@@ -1009,17 +1009,37 @@ class StockInitialSourcesTests(OutputAppFuelImportTests):
             self.assertEqual(x["compteur_terrain_h"], 777.5)
             self.assertEqual((x["compteur_retenu_h"], x["source_compteur"]), expected)
 
-    def test_terrain_counter_of_another_file_line_never_used(self):
+    def test_file_line_dates_rule_for_stock_initial(self):
+        """Ligne du fichier de la période (même Date de Relevé Finale) : SA Date de Relevé Initiale fait foi (cas KLD_0530 :
+        ligne 15/07 → 29/10 alors que le bilan démarre au 01/10) ; compteur et date affichés sont ceux de cette ligne."""
         from unittest import mock
 
         from fuel_tracking.services import stock_initial_sources as S
 
         rows = self._rows()
-        self._set_terrain_counter(rows, 2137.41, periode_start="2026-07-15")   # ligne d'une autre période
+        self._set_terrain_counter(rows, 2137.41, periode_start="2026-07-15")
         with mock.patch.object(S, "_snowflake_points", return_value=({}, None)), mock.patch.object(S, "_guard_readings", return_value=({}, None)):
             S.enrich(rows)
         x = rows[0]["stock_initial_sources"]
-        self.assertEqual((x["compteur_terrain_h"], x["compteur_retenu_h"], x["source_compteur"]), (None, None, None))
+        self.assertEqual((x["date"], x["compteur_terrain_h"], x["source_compteur"]), ("2026-07-15", 2137.41, S.SRC_TERRAIN))
+
+    def test_terrain_counter_of_another_period_never_used(self):
+        """Ligne d'une AUTRE période (autres dates initiale et finale) : jamais reprise."""
+        from unittest import mock
+
+        from fuel_tracking.models import FuelStockBalance as B
+        from fuel_tracking.services import stock_initial_sources as S
+
+        rows = self._rows()
+        b = B.objects.get(pk=rows[0]["stock"]["bilan_id"])
+        for d in (b.stock_initial_detail, b.stock_final_detail):
+            o = Obs.objects.get(pk=d["observation_id"])
+            o.source_context = {**o.source_context, "periode": ["2026-06-01", "2026-06-30"], "compteur_terrain_initial_h": 999.0}
+            o.save(update_fields=["source_context"])
+        with mock.patch.object(S, "_snowflake_points", return_value=({}, None)), mock.patch.object(S, "_guard_readings", return_value=({}, None)):
+            S.enrich(rows)
+        x = rows[0]["stock_initial_sources"]
+        self.assertEqual((x["compteur_terrain_h"], x["compteur_retenu_h"]), (None, None))
 
     def test_final_block_order_fms_then_guard_then_terrain(self):
         from unittest import mock
