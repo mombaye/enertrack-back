@@ -1741,19 +1741,25 @@ class PowerMediansTests(MvpBase):
         from fuel_tracking.services import stock_initial_sources as S
 
         d0 = date(2026, 9, 30)
-        days = [(4.0, 0.9, 5000), (5.0, 0.9, 6000), (6.0, 0.9, None), (None, None, 0)]   # (P_DC kW, rendement, AC W)
-        for k, (pdc, eff, ac) in enumerate(days):
+        # (P_DC kW, AC kW, Day DG On h, production GE kWh)
+        days = [(4.0, 24.0, 10, 47.5), (5.0, 26.0, 8, 30), (6.0, None, 0, 0), (None, 0, 2, 50)]
+        for k, (pdc, ac, h, kwh) in enumerate(days):
             F.objects.create(country="Senegal", data_id=1, site_id="OUT_1", date=d0 + timedelta(days=k + 1), p_dc_day_kw=pdc,
-                             p_dc_rect_active_kw=pdc, eff_rect_active=eff, ac_active_power_avg_w=ac)
-        F.objects.create(country="Senegal", data_id=1, site_id="OUT_1", date=d0, p_dc_day_kw=99, p_dc_rect_active_kw=99, eff_rect_active=0.9)  # jour initial exclu
+                             ac_active_power_avg_w=ac, dg_on_runtime_h=h, dg_production_kwh=kwh)
+        F.objects.create(country="Senegal", data_id=1, site_id="OUT_1", date=d0, p_dc_day_kw=99, ac_active_power_avg_w=99,
+                         dg_on_runtime_h=1, dg_production_kwh=99)   # jour initial exclu
         rows = [{"site_id": "OUT_1", "stock": {"date_initial": "2026-09-30", "date_final": "2026-10-04"}}]
         lines = {"OUT_1": {"ini": {"periode": ["2026-09-30", "2026-10-04"]}, "fin": {"periode": ["2026-09-30", "2026-10-04"]}}}
-        out = S._power_medians(rows, lines, {"OUT_1": "Outdoor"}, {"OUT_1": 22.0})["OUT_1"]
+        out = S._power_medians(rows, lines, {}, {"OUT_1": 22.0})["OUT_1"]
         self.assertEqual((out["p_rect_kw"], out["p_rect_jours"]), (5.0, 3))
-        self.assertEqual((out["p_grid_kw"], out["p_grid_jours"]), (5.5, 2))                 # 0 W non compté (jamais 0 kW)
-        self.assertEqual(out["p_ge_kw"], round(5.0 / 0.9, 2))                               # outdoor : P_DC / rendement
-        nok = S._power_medians(rows, lines, {"OUT_1": "Outdoor"}, {"OUT_1": None})["OUT_1"]
-        self.assertIsNone(nok["p_ge_kw"])
-        self.assertIn("nominale", nok["p_ge_motif"])
-        indoor = S._power_medians(rows, lines, {"OUT_1": "Indoor"}, {"OUT_1": 22.0})["OUT_1"]
-        self.assertEqual(indoor["p_ge_kw"], 5.5)                                            # indoor : puissance Grid mesurée
+        self.assertEqual((out["p_grid_kw"], out["p_grid_jours"]), (25.0, 2))   # AC_METER déjà en kW ; 0 non compté
+        # GE : kWh ÷ h des jours de marche ; 25 kW > 105 % × 22 kVA × 0,8 écarté ; jour à 0 h ignoré
+        self.assertEqual((out["p_ge_kw"], out["p_ge_jours"]), (4.25, 2))
+        sans_kva = S._power_medians(rows, lines, {}, {})["OUT_1"]
+        self.assertEqual((sans_kva["p_ge_kw"], sans_kva["p_ge_jours"]), (4.75, 3))
+        F.objects.create(country="Senegal", data_id=2, site_id="ARR_1", date=date(2026, 10, 2), dg_on_runtime_h=0, dg_production_kwh=0)
+        arr = S._power_medians([{**rows[0], "site_id": "ARR_1"}], {"ARR_1": lines["OUT_1"]}, {}, {})["ARR_1"]
+        self.assertIsNone(arr["p_ge_kw"])
+        self.assertIn("arrêt", arr["p_ge_motif"])
+        vide = S._power_medians([{**rows[0], "site_id": "VID_1"}], {"VID_1": lines["OUT_1"]}, {}, {})["VID_1"]
+        self.assertIn("aucune donnée GENSET_REPORT", vide["p_ge_motif"])
