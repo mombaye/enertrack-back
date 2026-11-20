@@ -557,3 +557,36 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
 def _first_of(*candidates):
     """Première valeur présente (jamais 0 par défaut), avec sa source ; (None, None) si aucune."""
     return next(((v, s) for v, s in candidates if v is not None), (None, None))
+
+
+# ── Ligne de totaux du tableau (comme la ligne SUBTOTAL du fichier Output App Fuel / Closing) ──
+TOTAL_FIELDS = {
+    "stock_initial_sources": ("terrain_l", "gardiennage_l", "fms_l", "retenue_l", "compteur_terrain_h", "compteur_gardiennage_h",
+                              "compteur_fms_h", "compteur_retenu_h"),
+    "ravitaillement": ("eydon_l", "carte_total_l", "ajout_l", "retrait_l", "vole_l", "fuite_l"),
+    "stock_final_sources": ("terrain_l", "gardiennage_l", "fms_l", "retenue_l", "compteur_terrain_h", "compteur_gardiennage_h",
+                            "compteur_fms_h", "compteur_retenu_h"),
+    "estimation_theorique": ("prp_kva", "prp_kw", "tm_dg_on_h", "tm_rectifier_h", "tm_terrain_h", "tm_index_fms_h"),
+}
+
+
+def totals(rows: list[dict]) -> dict:
+    """Totaux de chaque colonne chiffrée sur TOUS les sites du filtre (et non la seule page) : {bloc: {champ: {total, sites}}}.
+    Valeurs lues comme à l'affichage, sans aucun appel à Snowflake / ENOC (cache uniquement). Case « n.d. » : non comptée
+    (jamais 0) ; `sites` = nombre de sites ayant une valeur. Plusieurs GE sur un site : leurs puissances sont additionnées."""
+    import copy
+
+    rows = copy.deepcopy(rows)
+    enrich(rows, fetch=False)
+    out: dict = {}
+    for bloc, champs in TOTAL_FIELDS.items():
+        for champ in champs:
+            vals = []
+            for r in rows:
+                v = (r.get(bloc) or {}).get(champ)
+                if isinstance(v, list):
+                    v = sum(x for x in v if x is not None) if any(x is not None for x in v) else None
+                if isinstance(v, (int, float)):
+                    vals.append(float(v))
+            out.setdefault(bloc, {})[champ] = {"total": round(sum(vals), 2) if vals else None, "sites": len(vals)}
+    return out

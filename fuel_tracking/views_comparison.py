@@ -51,6 +51,7 @@ class ConsommationsView(APIView):
             size, page = 50, 1
         data["total"] = len(rows)
         data["page"], data["page_size"] = page, size
+        data["totaux"] = _cached_totals(d_from, d_to, p, rows)   # ligne de totaux : tous les sites du filtre
         data["rows"] = rows[(page - 1) * size: page * size]
         # Blocs « INVENTAIRE », « DONNÉES DE STOCK INITIAL » et « RAVITAILLEMENT » pour la page affichée seulement.
         # Les valeurs Snowflake / ENOC déjà en cache s'affichent tout de suite ; celles qui manquent sont lues EN TÂCHE DE FOND
@@ -159,6 +160,42 @@ def warm_cache(months: int = 2) -> list[dict]:
             S.request_fact_days(missing)
             done[-1]["jours_snowflake_a_synchroniser"] = [d.isoformat() for d in missing]
     return done
+
+
+def _cached_totals(d_from, d_to, p, rows):
+    """Totaux de colonnes (ligne du haut du tableau) sur tous les sites du filtre, en cache 10 min : clé = période + filtres +
+    version des données + dernier fichier Base GE + dernière relecture GE (tout changement de source change la clé)."""
+    import hashlib
+    import json
+
+    from django.core.cache import cache
+
+    from fuel_tracking.models import FuelImportBatch
+    from fuel_tracking.services import ge_info as G
+    from fuel_tracking.services import stock_initial_sources as S
+
+    params = {k: v for k, v in (p.dict() if hasattr(p, "dict") else dict(p)).items() if k not in ("page", "page_size")}
+    base = FuelImportBatch.objects.filter(source_type="BASE_GE").order_by("-received_at").values_list("pk", flat=True).first()
+    raw = json.dumps([str(d_from), str(d_to), sorted(params.items()), _data_version(), base, (G.cached() or {}).get("lu_le")], default=str)
+    key = "fuel-conso-totaux:" + hashlib.sha1(raw.encode()).hexdigest()
+    try:
+        hit = cache.get(key)
+    except Exception:  # noqa: BLE001
+        hit = None
+    if hit is not None:
+        return hit
+    try:
+        out = S.totals(rows)
+    except Exception:  # noqa: BLE001 — jamais bloquant : le tableau s'affiche sans la ligne de totaux
+        import logging
+
+        logging.getLogger(__name__).exception("Totaux du Suivi Conso impossibles")
+        return None
+    try:
+        cache.set(key, out, 600)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 def _cached_build(d_from, d_to, p):

@@ -1659,3 +1659,30 @@ class RuntimeTableTests(OutputAppFuelImportTests):
             S.enrich(rows)
         e = rows[0]["estimation_theorique"]
         self.assertEqual((e["tm_terrain_h"], e["tm_index_fms_h"]), (120.5, 130.25))
+
+
+class TotalsRowTests(MvpBase):
+    """Ligne de totaux : somme sur tous les sites du filtre ; « n.d. » non compté (jamais 0) ; puissances de plusieurs GE additionnées."""
+
+    def test_totals(self):
+        from unittest import mock
+
+        from fuel_tracking.services import stock_initial_sources as S
+
+        def fake_enrich(rows, fetch=True):
+            vals = [(100.0, [20.0, 30.0], 5.5), (None, None, None), (250.5, [30.0], 2.0)]
+            for r, (t, kva, h) in zip(rows, vals):
+                r["stock_initial_sources"] = {"terrain_l": t}
+                r["estimation_theorique"] = {"prp_kva": kva, "tm_terrain_h": h}
+            return None
+
+        rows = [{"site_id": f"S_{i}", "stock": {}} for i in range(3)]
+        with mock.patch.object(S, "enrich", side_effect=fake_enrich) as en:
+            t = S.totals(rows)
+        en.assert_called_once()
+        self.assertFalse(en.call_args.kwargs.get("fetch", True))           # jamais d'appel Snowflake / ENOC pour les totaux
+        self.assertEqual(t["stock_initial_sources"]["terrain_l"], {"total": 350.5, "sites": 2})
+        self.assertEqual(t["estimation_theorique"]["prp_kva"], {"total": 80.0, "sites": 2})
+        self.assertEqual(t["estimation_theorique"]["tm_terrain_h"], {"total": 7.5, "sites": 2})
+        self.assertEqual(t["ravitaillement"]["eydon_l"], {"total": None, "sites": 0})
+        self.assertNotIn("stock_initial_sources", rows[0])                      # lignes affichées non modifiées
