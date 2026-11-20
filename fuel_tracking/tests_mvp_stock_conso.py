@@ -1652,7 +1652,8 @@ class RuntimeTableTests(OutputAppFuelImportTests):
         b = B.objects.get(pk=rows[0]["stock"]["bilan_id"])
         for dd in (b.stock_initial_detail, b.stock_final_detail):
             o = Obs.objects.get(pk=dd["observation_id"])
-            o.source_context = {**o.source_context, "temps_marche_terrain_h": 120.5}
+            o.source_context = {**o.source_context, "temps_marche_terrain_h": 999.0,   # colonne de résultat du fichier : ignorée
+                                "compteur_terrain_initial_h": 1000.0, "compteur_terrain_final_h": 1120.5}
             o.save(update_fields=["source_context"])
         di, df = date(2026, 9, 30), date.fromisoformat(o.source_context["periode"][1])
         with mock.patch.object(S, "_guard_readings", return_value=({}, None)),                 mock.patch.object(S, "_snowflake_points", return_value=({("DKR_0001", di): {"index_h": 1000.0}, ("DKR_0001", df): {"index_h": 1130.25}}, None)):
@@ -1702,3 +1703,29 @@ class RuntimeSourceTests(MvpBase):
         self.assertEqual(src(dg_on=4.3, rect=8.5), (4.3, "Alarme day_dg_on FMS"))
         self.assertEqual(src(rect=8.5), (8.5, "Alarme day_rectifier_on FMS"))
         self.assertEqual(src(), (None, None))
+
+
+class RuntimeCounterDiffTests(MvpBase):
+    """Temps de marche = relevé final − relevé initial ; impossible (négatif, > 24 h / jour, relevé manquant) → n.d. + raison."""
+
+    def _run(self, ci, cf, jours=30):
+        from datetime import date, timedelta
+        from unittest import mock
+
+        from fuel_tracking.services import stock_initial_sources as S
+
+        d0 = date(2026, 9, 30)
+        r = {"site_id": "S_1", "stock": {"bilan_id": None, "date_initial": d0.isoformat(), "date_final": (d0 + timedelta(days=jours)).isoformat()}}
+        line = {"periode": [d0.isoformat(), (d0 + timedelta(days=jours)).isoformat()], "compteur_terrain_initial_h": ci, "compteur_terrain_final_h": cf}
+        with mock.patch.object(S, "_file_line_values", return_value={"S_1": {"ini": line, "fin": line}}),                 mock.patch.object(S, "_guard_readings", return_value=({}, None)), mock.patch.object(S, "_snowflake_points", return_value=({}, None)),                 mock.patch.object(S, "ravitaillement"):
+            S.enrich([r])
+        e = r["estimation_theorique"]
+        return e["tm_terrain_h"], e["tm_terrain_motif"]
+
+    def test_rules(self):
+        self.assertEqual(self._run(744.44, 1448.52, 35), (704.08, None))              # KLD_0203 : 704,08 h (fichier : 740,08)
+        self.assertIsNone(self._run(500, 400)[0])
+        self.assertIn("inférieur", self._run(500, 400)[1])
+        self.assertIn("incohérent", self._run(0, 14494, 35)[1])
+        self.assertIn("absent", self._run(None, 400)[1])
+        self.assertEqual(self._run(None, None), (None, None))

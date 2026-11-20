@@ -512,20 +512,21 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
         # Temps de marche GE (bloc ESTIMATION) — plage du fichier : lendemain de la date initiale → date finale
         rt = runtimes.get(r["site_id"].upper()) or {}
         li, lf = (lines.get(r["site_id"]) or {}).get("ini") or {}, (lines.get(r["site_id"]) or {}).get("fin") or {}
+        # Temps de marche GE (relevé de terrain) = Relevé Visuel Compteur genset (relevé de terrain) à la date finale − à la date
+        # initiale, les deux relevés affichés dans le tableau (mêmes valeurs que le fichier). Jamais repris d'une colonne de
+        # résultat (ex. KLD_0203 : fichier 740,08 h alors que 1 448,52 − 744,44 = 704,08 h). Relevé manquant, compteur final
+        # inférieur à l'initial ou écart > 24 h par jour : n.d., raison au survol.
         tm_terrain, tm_terrain_motif = None, None
-        if "Output App Fuel" in (lf.get("fichier"), li.get("fichier")) or "temps_marche_terrain_h" in lf or "temps_marche_terrain_h" in li:
-            # Output App Fuel : colonne « Temps de marche GE (relevé de terrain) » reprise telle quelle (vide → n.d.)
-            tm_terrain = _f(lf.get("temps_marche_terrain_h") if lf.get("temps_marche_terrain_h") is not None else li.get("temps_marche_terrain_h"))
+        ci, cf = _f(li.get("compteur_terrain_initial_h")), _f(lf.get("compteur_terrain_final_h"))
+        jours = rt.get("jours") or 0
+        if ci is None or cf is None:
+            tm_terrain_motif = "relevé de terrain initial ou final absent du fichier" if (ci is None) != (cf is None) else None
+        elif cf < ci:
+            tm_terrain_motif = f"compteur final ({cf:g} h) inférieur au compteur initial ({ci:g} h)"
+        elif jours and cf - ci > 24 * jours:
+            tm_terrain_motif = f"écart des compteurs incohérent ({cf - ci:.0f} h sur {jours} jours)"
         else:
-            # Closing (pas de colonne « temps de marche ») : compteur de terrain final − initial, tous deux lus dans le fichier ;
-            # écart impossible sur la période (> 24 h par jour) : non affiché, raison au survol
-            ci, cf = _f(li.get("compteur_terrain_initial_h")), _f(lf.get("compteur_terrain_final_h"))
-            if ci is not None and cf is not None and cf >= ci:
-                jours = rt.get("jours") or 0
-                if jours and cf - ci > 24 * jours:
-                    tm_terrain_motif = f"compteurs du fichier incohérents ({cf - ci:.0f} h sur {jours} jours)"
-                else:
-                    tm_terrain = round(cf - ci, 2)
+            tm_terrain = round(cf - ci, 2)
         fi, ff = r["stock_initial_sources"].get("compteur_fms_h"), None
         r["estimation_theorique"].update(
             tm_dg_on_h=rt.get("dg_on"), tm_dg_on_jours=rt.get("dg_on_jours"),
@@ -550,7 +551,11 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
         }
         # Temps de marche GE (Index Compteur FMS) = compteur FMS à la date finale − compteur FMS à la date initiale
         ff = pf.get("index_h")
+        # Temps de marche GE (Index Compteur FMS) = Relevé Visuel Compteur genset (Index Compteur FMS) final − initial (relevés affichés)
         r["estimation_theorique"]["tm_index_fms_h"] = round(ff - fi, 2) if fi is not None and ff is not None and ff >= fi else None
+        r["estimation_theorique"]["tm_index_fms_motif"] = (None if fi is not None and ff is not None and ff >= fi else
+                                                         "relevé FMS initial ou final absent" if (fi is None) != (ff is None) else
+                                                         f"compteur FMS final ({ff:g} h) inférieur à l'initial ({fi:g} h)" if fi is not None and ff is not None else None)
         # Source de donnée Temps de marche GE : ordre appliqué par Ops dans le fichier Output App Fuel d'octobre (vérifié sur
         # 400 sites) : Index Compteur FMS → relevé de terrain → Alarme day_dg_on FMS → Alarme day_rectifier_on FMS.
         e = r["estimation_theorique"]
