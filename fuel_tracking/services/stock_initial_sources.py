@@ -418,8 +418,10 @@ def file_dates(r: dict, lines: dict) -> tuple[date | None, date | None]:
 def _fms_runtimes(rows, lines) -> dict:
     """site → temps de marche GE (h) sur la plage du fichier (lendemain de la date initiale → date finale), depuis les faits
     journaliers Snowflake en base : « Alarme day_dg_on » (GENSET_REPORT.DG_RUNTIME_CALCULATED) et « Alarme day_rectifier_on »
-    (créneaux 5 min redresseur actif, RECTIFIER_EFFICIENCY_STATUS — sites off-grid seulement, comme le moteur CPH). Jour hors
-    0-24 h ou absent : non compté (nombre de jours renseignés conservé) ; aucun jour : n.d., jamais 0."""
+    (règle de l'équipe data : créneaux 5 min au statut Good / Aged / Warning × 5/60 h, Down = 0 — RECTIFIER_EFFICIENCY_STATUS
+    joint sur DATA_ID, tous les sites ; disponibilité = créneaux reçus ÷ 288 par jour). Jour hors 0-24 h ou absent : non compté
+    (nombre de jours renseignés conservé) ; aucun jour : n.d., jamais 0. Sur un site raccordé au réseau, ces heures couvrent
+    réseau + GE : affichées, mais jamais retenues comme temps de marche GE."""
     from fuel_tracking.models import FuelSiteDailyFacts as F, FuelSiteInventory as INV
     from fuel_tracking.services.cph_engine import RUNTIME_MAX_H, SLOT_H, is_off_grid
 
@@ -434,7 +436,7 @@ def _fms_runtimes(rows, lines) -> dict:
         return {}
     grid = {s.upper(): g for s, g in INV.objects.filter(site_id__in=list(span)).values_list("site_id", "grid_supply")}
     lo, hi = min(a for a, _ in span.values()), max(b for _, b in span.values())
-    acc = {s: {"dg_on": 0.0, "dg_on_jours": 0, "rect": 0.0, "rect_jours": 0} for s in span}
+    acc = {s: {"dg_on": 0.0, "dg_on_jours": 0, "rect": 0.0, "rect_jours": 0, "rect_slots": 0} for s in span}
     for sid, d, dg_on, slots, active in (F.objects.filter(site_id__in=list(span), date__gt=lo, date__lte=hi)
                                          .values_list("site_id", "date", "dg_on_runtime_h", "rectifier_slots", "rectifier_active_slots")):
         s = sid.upper()
@@ -444,17 +446,19 @@ def _fms_runtimes(rows, lines) -> dict:
         if dg_on is not None and 0 <= dg_on <= RUNTIME_MAX_H:
             acc[s]["dg_on"] += float(dg_on)
             acc[s]["dg_on_jours"] += 1
-        if is_off_grid(grid.get(s)) is True and slots and active is not None and active * SLOT_H <= RUNTIME_MAX_H:
+        if slots and active is not None and active * SLOT_H <= RUNTIME_MAX_H:
             acc[s]["rect"] += float(active * SLOT_H)
             acc[s]["rect_jours"] += 1
+            acc[s]["rect_slots"] += int(slots)
     out = {}
     for s, a in acc.items():
         off = is_off_grid(grid.get(s))
         out[s] = {"jours": (span[s][1] - span[s][0]).days,
                   "dg_on": round(a["dg_on"], 2) if a["dg_on_jours"] else None, "dg_on_jours": a["dg_on_jours"],
                   "rect": round(a["rect"], 2) if a["rect_jours"] else None, "rect_jours": a["rect_jours"],
-                  "rect_motif": None if off is True else ("site raccordé au réseau : redresseur non représentatif du GE" if off is False
-                                                         else "type de raccordement inconnu (inventaire Snowflake)")}
+                  "rect_dispo_pct": round(100 * a["rect_slots"] / (288 * (span[s][1] - span[s][0]).days), 1),
+                  "rect_off_grid": off,
+                  "rect_motif": None if a["rect_jours"] else "aucune donnée redresseur (RECTIFIER_EFFICIENCY_STATUS) sur la période"}
     return out
 
 
@@ -605,6 +609,7 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
         r["estimation_theorique"].update(
             tm_dg_on_h=rt.get("dg_on"), tm_dg_on_jours=rt.get("dg_on_jours"),
             tm_rectifier_h=rt.get("rect"), tm_rectifier_jours=rt.get("rect_jours"), tm_rectifier_motif=rt.get("rect_motif"),
+            tm_rectifier_dispo_pct=rt.get("rect_dispo_pct"), tm_rectifier_off_grid=rt.get("rect_off_grid"),
             tm_jours_periode=rt.get("jours"), tm_terrain_h=tm_terrain, tm_terrain_motif=tm_terrain_motif)
         # Puissances médianes mesurées (bloc ESTIMATION) — plage du fichier, faits journaliers Snowflake en base
         pw = powers.get(r["site_id"].upper()) or {}
@@ -639,7 +644,10 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
         # 400 sites) : Index Compteur FMS → relevé de terrain → Alarme day_dg_on FMS → Alarme day_rectifier_on FMS.
         e = r["estimation_theorique"]
         e["tm_retenu_h"], e["tm_source"] = _first_of((e.get("tm_index_fms_h"), "FMS"), (e.get("tm_terrain_h"), "relevé de terrain"),
-                                                    (e.get("tm_dg_on_h"), "Alarme day_dg_on FMS"), (e.get("tm_rectifier_h"), "Alarme day_rectifier_on FMS"))
+                                                    (e.get("tm_dg_on_h"), "Alarme day_dg_on FMS"),
+                                                    # redresseur retenu seulement hors réseau (sinon heures réseau + GE)
+                                                    (e.get("tm_rectifier_h") if e.get("tm_rectifier_off_grid") is True else None,
+                                                     "Alarme day_rectifier_on FMS"))
     return err
 
 

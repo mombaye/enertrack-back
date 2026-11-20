@@ -1620,8 +1620,15 @@ class RuntimeFmsTests(MvpBase):
         # jour initial (30/09, 5 h) exclu ; 01/10 : 30 h écarté ; 02/10 : 2,5 h ; 03/10 : absent
         self.assertEqual((out["OFF_1"]["dg_on"], out["OFF_1"]["dg_on_jours"], out["OFF_1"]["jours"]), (2.5, 1, 3))
         self.assertEqual((out["OFF_1"]["rect"], out["OFF_1"]["rect_jours"]), (3.0, 2))              # (12 + 24) × 5 min
-        self.assertIsNone(out["ON_1"]["rect"])
-        self.assertTrue(out["ON_1"]["rect_motif"].startswith("site raccordé au réseau"))
+        # règle équipe data : tous les sites (réseau compris) ; disponibilité = créneaux reçus ÷ (288 × 3 jours)
+        self.assertEqual((out["ON_1"]["rect"], out["ON_1"]["rect_off_grid"]), (3.0, False))
+        self.assertEqual((out["OFF_1"]["rect_off_grid"], out["OFF_1"]["rect_dispo_pct"]), (True, round(100 * 576 / 864, 1)))
+        self.assertIsNone(out["OFF_1"]["rect_motif"])
+        # temps retenu : heures redresseur seulement hors réseau
+        for sid, attendu in (("OFF_1", (3.0, "Alarme day_rectifier_on FMS")), ("ON_1", (None, None))):
+            e = {"tm_rectifier_h": out[sid]["rect"], "tm_rectifier_off_grid": out[sid]["rect_off_grid"]}
+            self.assertEqual(S._first_of((e["tm_rectifier_h"] if e["tm_rectifier_off_grid"] is True else None,
+                                          "Alarme day_rectifier_on FMS")), attendu)
 
 
 
