@@ -1527,3 +1527,26 @@ class BaseGeBrandTests(MvpBase):
                          ("FG Wilson", "FG Wilson P33-3U", "Fichier Base GE (Base GE.xlsx)"))
         self.assertEqual((out["S_2"]["fabricant_ge"], out["S_2"]["source_ge"]),                       # pas de marque dans « PA50 »
                          ("Kohler", f"Fabricant : {G.SRC_SF} · Type : Fichier Base GE (Base GE.xlsx)"))
+
+
+class DuplicateAcrossTypesTests(BaseGeImportTests):
+    """Même fichier : un lot en échec, rejeté ou d'un autre type ne bloque jamais un nouvel import ; un lot réussi du même type, si."""
+
+    def test_failed_closing_does_not_block_base_ge(self):
+        from fuel_tracking.models import FuelImportBatch as B
+        from fuel_tracking.services import stock_import_pipeline as P
+
+        data = self._xlsx([[None, "Site ID", "NOM", "Type de GE"], [None, "DKR_0001", "S1", "SDMO - K22"]])
+        first = P.process_bytes(data, "Base GE.xlsx", "CLOSING", origin="UPLOAD")      # envoyé par erreur comme Closing
+        B.objects.filter(pk=first.pk).update(status=B.Status.FAILED)                   # « Échec technique » (cas prod lot #268)
+        b = P.process_bytes(data, "Base GE.xlsx", "BASE_GE", origin="UPLOAD")
+        self.assertIsNone(b.duplicate_of_id)
+        self.assertEqual(b.rows_total, 1)
+        again = P.process_bytes(data, "Base GE.xlsx", "BASE_GE", origin="UPLOAD")      # même fichier, même type, déjà importé
+        self.assertEqual((again.status, again.duplicate_of_id), ("REJECTED", b.pk))
+
+    def test_import_and_priority(self):
+        pass
+
+    def test_genset_db_lookup_by_type_or_brand_and_type(self):
+        pass

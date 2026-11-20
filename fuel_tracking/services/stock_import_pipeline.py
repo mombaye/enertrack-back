@@ -62,12 +62,17 @@ def _unique(dest: Path) -> Path:
         i += 1
 
 
-def find_duplicate(file_hash: str):
+def find_duplicate(file_hash: str, source_type: str | None = None):
     from fuel_tracking.models import FuelImportBatch as B
 
     # Un lot retiré depuis la rubrique Configuration (summary["annulation"]) ne bloque plus la réimportation du même fichier.
-    return (B.objects.filter(file_hash=file_hash, duplicate_of__isnull=True).exclude(summary__has_key="annulation")
-            .order_by("received_at").first())
+    # Ne bloque pas non plus : un lot en échec ou rejeté (aucune donnée importée), ni un lot d'un AUTRE type de source
+    # (ex. Base GE envoyée par erreur comme Closing, puis renvoyée par la bonne carte).
+    qs = (B.objects.filter(file_hash=file_hash, duplicate_of__isnull=True).exclude(summary__has_key="annulation")
+          .exclude(status__in=(B.Status.FAILED, B.Status.REJECTED)))
+    if source_type:
+        qs = qs.filter(source_type=source_type)
+    return qs.order_by("received_at").first()
 
 
 def write_report(batch, folder: Path) -> Path | None:
@@ -161,7 +166,7 @@ def process_bytes(data: bytes, file_name: str, source_type: str, *, origin: str 
                              relaunch_of=relaunch_of, relaunch_reason=relaunch_reason)
     r = ensure_dirs() if move_files else None
 
-    dup = None if relaunch_of else find_duplicate(file_hash)
+    dup = None if relaunch_of else find_duplicate(file_hash, source_type)
     if dup is not None and dup.pk != batch.pk:
         batch.duplicate_of = dup
         batch.status = B.Status.REJECTED
