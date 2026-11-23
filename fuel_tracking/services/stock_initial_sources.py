@@ -468,9 +468,16 @@ def _power_medians(rows, lines, kinds: dict, kva: dict) -> dict:
       redresseur : médiane des P_DC journalières (RECTIFIER_EFFICIENCY_STATUS) ;
       grid       : médiane des puissances AC journalières (AC_METER.ACT_ACTIVE_POWER_AVG, déjà en kW), mesures > 0 ;
       générateur : médiane, sur les jours où le GE a tourné, de DG_PRODUCTION_KWH ÷ DG_RUNTIME_CALCULATED (GENSET_REPORT) ;
-                   jour au-delà de 105 % × kVA × 0,8 écarté (kVA = fichier Base GE, sinon PRP GENSET DB).
+                   jour au-delà de 105 % × kVA × 0,8 écarté (kVA = fichier Base GE, sinon PRP GENSET DB) ;
+      load DC telco : médiane des LOAD_W journaliers (AVERAGE_LOAD, W → kW), mesures > 0 ;
+      recharge batterie : 1. télémétrie 5 min (VW_GFMS_METRICS) : médiane des médianes journalières de courant de charge
+                   × tension batterie (créneaux en charge), 0 W = jour mesuré sans charge ;
+                   2. repli si aucun jour de télémétrie : médiane de Ah chargés × tension ÷ 24 h (BATTERY_REPORT), jour écarté
+                   si Ah chargés > facteur × Ah déchargés + marge (FUEL_BATTERY_CHARGE_*) ; 0 = batterie non rechargée (compté).
     Aucune mesure : n.d. (jamais 0) avec la raison."""
     from statistics import median
+
+    from django.conf import settings
 
     from fuel_tracking.models import FuelSiteDailyFacts as F
     from fuel_tracking.services import cph_power_v2 as PW
@@ -484,14 +491,38 @@ def _power_medians(rows, lines, kinds: dict, kva: dict) -> dict:
     facts: dict = {}
     for f in (F.objects.filter(site_id__in=list(span), date__gt=lo, date__lte=hi)
               .values("site_id", "date", "p_dc_day_kw", "p_dc_ge_tracker_kw", "p_dc_rect_active_kw", "eff_ge_tracker",
-                      "eff_rect_active", "ac_active_power_avg_w", "dg_on_runtime_h", "dg_production_kwh")):
+                      "eff_rect_active", "ac_active_power_avg_w", "dg_on_runtime_h", "dg_production_kwh", "load_dc_w",
+                      "battery_charge_ah", "battery_discharge_ah", "battery_charge_w")):
         sid = f["site_id"].upper()
         d0, d1 = span.get(sid, (None, None))
         if d0 and d0 < f["date"] <= d1:
             facts.setdefault(sid, {})[f["date"]] = f   # plusieurs DATA_ID pour un site : dernier lu (rare)
+    volt = float(getattr(settings, "FUEL_BATTERY_CHARGE_VOLTAGE_V", 53.5))
+    b_fact = float(getattr(settings, "FUEL_BATTERY_CHARGE_MAX_FACTOR", 3))
+    b_marge = float(getattr(settings, "FUEL_BATTERY_CHARGE_MAX_MARGIN_AH", 500))
     out = {}
     for sid, (d0, d1) in span.items():
         fx = facts.get(sid) or {}
+        load = [float(f["load_dc_w"]) / 1000 for f in fx.values() if f["load_dc_w"] is not None and f["load_dc_w"] > 0]
+        batt5 = [float(f["battery_charge_w"]) / 1000 for f in fx.values() if f["battery_charge_w"] is not None and f["battery_charge_w"] >= 0]
+        batt, batt_ecart = [], 0
+        for f in ([] if batt5 else fx.values()):   # repli BATTERY_REPORT seulement sans télémétrie 5 min
+            ch, dis = f["battery_charge_ah"], f["battery_discharge_ah"]
+            if ch is None or ch < 0:
+                continue
+            if float(ch) > b_fact * float(dis or 0) + b_marge:
+                batt_ecart += 1   # valeur BATTERY_REPORT aberrante (recharge sans décharge correspondante) : écartée
+                continue
+            batt.append(float(ch) * volt / 24 / 1000)
+        batt_src = "VW_GFMS_METRICS (courant de charge × tension, 5 min)" if batt5 else ("BATTERY_REPORT (Ah × tension ÷ 24 h)" if batt else None)
+        batt = batt5 or batt
+        if batt:
+            batt_motif = None
+        elif batt_ecart:
+            batt_motif = (f"{batt_ecart} jour(s) écarté(s) : Ah chargés > {b_fact:g} × Ah déchargés + {b_marge:g} Ah "
+                          "(valeur BATTERY_REPORT incohérente)")
+        else:
+            batt_motif = "aucune donnée BATTERY_REPORT sur la période"
         rect = [float(f["p_dc_day_kw"]) for f in fx.values() if f["p_dc_day_kw"] is not None and f["p_dc_day_kw"] >= 0]
         # AC_METER.ACT_ACTIVE_POWER_AVG est déjà en kW (vérifié en prod : BKL_0086 ≈ 24 kW brut) — aucune division
         grid = [float(f["ac_active_power_avg_w"]) for f in fx.values() if f["ac_active_power_avg_w"] is not None and f["ac_active_power_avg_w"] > 0]
@@ -519,7 +550,11 @@ def _power_medians(rows, lines, kinds: dict, kva: dict) -> dict:
                 ge_motif = "aucune donnée GENSET_REPORT sur la période"
         out[sid] = {"p_rect_kw": round(median(rect), 2) if rect else None, "p_rect_jours": len(rect),
                     "p_grid_kw": round(median(grid), 2) if grid else None, "p_grid_jours": len(grid),
-                    "p_ge_kw": ge, "p_ge_jours": len(ge_days), "p_ge_motif": ge_motif}
+                    "p_ge_kw": ge, "p_ge_jours": len(ge_days), "p_ge_motif": ge_motif,
+                    "p_load_dc_kw": round(median(load), 2) if load else None, "p_load_dc_jours": len(load),
+                    "p_load_dc_motif": None if load else "aucune donnée AVERAGE_LOAD (load DC) sur la période",
+                    "p_batt_kw": round(median(batt), 2) if batt else None, "p_batt_jours": len(batt),
+                    "p_batt_ecartes": batt_ecart, "p_batt_motif": batt_motif, "p_batt_source": batt_src}
     return out
 
 
@@ -615,7 +650,11 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
         pw = powers.get(r["site_id"].upper()) or {}
         r["estimation_theorique"].update(p_rect_kw=pw.get("p_rect_kw"), p_rect_jours=pw.get("p_rect_jours"),
                                          p_ge_kw=pw.get("p_ge_kw"), p_ge_jours=pw.get("p_ge_jours"), p_ge_motif=pw.get("p_ge_motif"),
-                                         p_grid_kw=pw.get("p_grid_kw"), p_grid_jours=pw.get("p_grid_jours"))
+                                         p_grid_kw=pw.get("p_grid_kw"), p_grid_jours=pw.get("p_grid_jours"),
+                                         p_load_dc_kw=pw.get("p_load_dc_kw"), p_load_dc_jours=pw.get("p_load_dc_jours"),
+                                         p_load_dc_motif=pw.get("p_load_dc_motif"), p_batt_kw=pw.get("p_batt_kw"),
+                                         p_batt_jours=pw.get("p_batt_jours"), p_batt_ecartes=pw.get("p_batt_ecartes"),
+                                         p_batt_motif=pw.get("p_batt_motif"), p_batt_source=pw.get("p_batt_source"))
         # Bloc « DONNÉES DE STOCK FINAL », à la Date de Relevé Finale de la ligne du fichier (seule date retenue ; absente → n.d.)
         line = (lines.get(r["site_id"]) or {}).get("fin") or {}
         df = _day((line.get("periode") or [None, None])[1])   # Date de Relevé Finale du fichier (absente → n.d.)

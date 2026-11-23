@@ -971,6 +971,17 @@ class FuelSiteDailyFacts(models.Model):
                                       help_text="LAST_VALID_LEVEL du jour (L), VW_FUEL_REPORT. Valeurs contradictoires → NULL.")
     dg_total_running_h = models.DecimalField(max_digits=16, decimal_places=4, null=True, blank=True,
                                              help_text="TOTAL_DG_RUNNING_HOUR du jour (h, compteur cumulé), GENSET_REPORT. Contradictoire → NULL.")
+    # Suivi Conso (bloc « ESTIMATION ») : puissances médianes Load DC telco et recharge batterie
+    load_dc_w = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True,
+                                    help_text="LOAD_W du jour (W, load DC telco moyen), AVERAGE_LOAD. Contradictoire → NULL.")
+    battery_charge_ah = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True,
+                                            help_text="BATTERY_CHARGE_CURRENT_DAY_AH du jour (Ah), BATTERY_REPORT. Contradictoire → NULL.")
+    battery_discharge_ah = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True,
+                                               help_text="BATTERY_DISCHARGE_CURRENT_DAY_AH du jour (Ah), BATTERY_REPORT. Contradictoire → NULL.")
+    battery_charge_w = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True,
+                                           help_text="Médiane du jour de courant de charge × tension batterie (W), créneaux 5 min en "
+                                                     "charge, VW_GFMS_METRICS ; 0 si mesuré sans charge ; NULL si non mesuré.")
+    battery_charge_slots = models.IntegerField(null=True, blank=True, help_text="Créneaux 5 min en charge (courant > 0) du jour.")
 
     synced_at = models.DateTimeField(default=timezone.now)
 

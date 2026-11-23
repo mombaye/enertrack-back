@@ -477,6 +477,11 @@ FUEL_FINAL_STOCK_SOURCES = [x.strip() for x in os.getenv("FUEL_FINAL_STOCK_SOURC
 FUEL_BALANCE_CLOSING_POST_BOUNDARY_DAYS = int(os.getenv("FUEL_BALANCE_CLOSING_POST_BOUNDARY_DAYS", "6"))
 # Variation négative d'au plus N litres = écart d'arrondi des stocks fichier → 0 L (pas CONSO_NEGATIVE).
 FUEL_BALANCE_NEGATIVE_TOLERANCE_L = float(os.getenv("FUEL_BALANCE_NEGATIVE_TOLERANCE_L", "1"))
+# Suivi Conso — Puissance médiane recharge batterie (décision du 23/11/2026) : W du jour = Ah chargés × tension ÷ 24 h ;
+# jour écarté si Ah chargés > FACTEUR × Ah déchargés + MARGE (valeurs BATTERY_REPORT aberrantes). À valider équipe data.
+FUEL_BATTERY_CHARGE_VOLTAGE_V = float(os.getenv("FUEL_BATTERY_CHARGE_VOLTAGE_V", "53.5"))
+FUEL_BATTERY_CHARGE_MAX_FACTOR = float(os.getenv("FUEL_BATTERY_CHARGE_MAX_FACTOR", "3"))
+FUEL_BATTERY_CHARGE_MAX_MARGIN_AH = float(os.getenv("FUEL_BATTERY_CHARGE_MAX_MARGIN_AH", "500"))
 # Mois de RÉFÉRENCE (optionnel) : le bilan affiche TELLE QUELLE la ligne du fichier Closing. Décision du 18/11/2026 : aucun mois de
 # référence — septembre et octobre sont CALCULÉS par le programme (stocks des fichiers, mouvements ENOC). Ex. pour réactiver : "2026-09".
 FUEL_CLOSING_REFERENCE_PERIODS = [m.strip() for m in os.getenv("FUEL_CLOSING_REFERENCE_PERIODS", "").split(",") if m.strip()]

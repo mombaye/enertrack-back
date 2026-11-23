@@ -1164,6 +1164,14 @@ class FmsFromDailyFactsTests(MvpBase):
         self.assertIn("MAX(LAST_VALID_LEVEL)", sql)
         self.assertIn("MAX(TOTAL_DG_RUNNING_HOUR)", sql)
         self.assertIn("g.total_h, f.fms_level", sql)
+        # Load DC telco (AVERAGE_LOAD, joint sur ID = DATA_ID) et Ah batterie (BATTERY_REPORT)
+        self.assertIn("DB_GFMS_PROD.GOLD.AVERAGE_LOAD", sql)
+        self.assertIn("DB_GFMS_ANALYTICS_PROD.GOLD.BATTERY_REPORT", sql)
+        self.assertIn("ld.load_w, b.charge_ah, b.discharge_ah, bd.batt_charge_w", sql)
+        self.assertIn("IM_CURRENT_BATTERY_CHARGE_VALUE", build_daily_facts_sql([1]))
+        sans_5min = build_daily_facts_sql([1], with_battery_5min=False)
+        self.assertNotIn("VW_GFMS_METRICS", sans_5min)
+        self.assertIn("bd.batt_charge_w", sans_5min)   # mêmes colonnes, toujours NULL
 
 
 class StockInitialPairCacheTests(MvpBase):
@@ -1797,3 +1805,39 @@ class PowerMediansTests(MvpBase):
         self.assertIn("arrêt", arr["p_ge_motif"])
         vide = S._power_medians([{**rows[0], "site_id": "VID_1"}], {"VID_1": lines["OUT_1"]}, {}, {})["VID_1"]
         self.assertIn("aucune donnée GENSET_REPORT", vide["p_ge_motif"])
+        self.assertEqual((vide["p_load_dc_kw"], vide["p_batt_kw"]), (None, None))
+        self.assertIn("AVERAGE_LOAD", vide["p_load_dc_motif"])
+        self.assertIn("BATTERY_REPORT", vide["p_batt_motif"])
+
+    def test_load_dc_et_recharge_batterie(self):
+        """Load DC = médiane LOAD_W (W → kW, 0 non compté) ; recharge = Ah × 53,5 V ÷ 24 h, jour aberrant écarté."""
+        from datetime import date
+
+        from fuel_tracking.models import FuelSiteDailyFacts as F
+        from fuel_tracking.services import stock_initial_sources as S
+
+        # (jour, LOAD_W, Ah chargés, Ah déchargés)
+        for d, lw, ch, dis in [(1, 2000, 240, 200), (2, 3000, 480, 400), (3, 0, 0, 0), (4, 2500, 19670, 0), (5, None, None, None)]:
+            F.objects.create(country="Senegal", data_id=3, site_id="BAT_1", date=date(2026, 10, d), load_dc_w=lw,
+                             battery_charge_ah=ch, battery_discharge_ah=dis)
+        F.objects.create(country="Senegal", data_id=3, site_id="BAT_1", date=date(2026, 9, 30), load_dc_w=99999,
+                         battery_charge_ah=9999, battery_discharge_ah=9999)   # jour initial exclu
+        rows = [{"site_id": "BAT_1", "stock": {"date_initial": "2026-09-30", "date_final": "2026-10-05"}}]
+        lines = {"BAT_1": {"ini": {"periode": ["2026-09-30", "2026-10-05"]}, "fin": {"periode": ["2026-09-30", "2026-10-05"]}}}
+        out = S._power_medians(rows, lines, {}, {})["BAT_1"]
+        self.assertEqual((out["p_load_dc_kw"], out["p_load_dc_jours"], out["p_load_dc_motif"]), (2.5, 3, None))
+        # 240 Ah × 53,5 / 24 = 535 W ; 480 Ah → 1 070 W ; 0 Ah → 0 W (compté) ; 19 670 Ah > 3 × 0 + 500 → écarté
+        self.assertEqual((out["p_batt_kw"], out["p_batt_jours"], out["p_batt_ecartes"]), (0.54, 3, 1))
+        self.assertIn("BATTERY_REPORT", out["p_batt_source"])
+        # Télémétrie 5 min présente : prioritaire (médiane des médianes journalières I × V), BATTERY_REPORT ignoré
+        F.objects.filter(site_id="BAT_1", date=date(2026, 10, 1)).update(battery_charge_w=1200)
+        F.objects.filter(site_id="BAT_1", date=date(2026, 10, 2)).update(battery_charge_w=0)
+        F.objects.filter(site_id="BAT_1", date=date(2026, 10, 3)).update(battery_charge_w=1800)
+        cinq = S._power_medians(rows, lines, {}, {})["BAT_1"]
+        self.assertEqual((cinq["p_batt_kw"], cinq["p_batt_jours"], cinq["p_batt_ecartes"]), (1.2, 3, 0))
+        self.assertIn("VW_GFMS_METRICS", cinq["p_batt_source"])
+        F.objects.filter(site_id="BAT_1").update(battery_charge_w=None)
+        F.objects.filter(site_id="BAT_1", date__lte=date(2026, 10, 3)).delete()
+        seul_aberrant = S._power_medians(rows, lines, {}, {})["BAT_1"]
+        self.assertIsNone(seul_aberrant["p_batt_kw"])
+        self.assertIn("1 jour(s) écarté(s)", seul_aberrant["p_batt_motif"])

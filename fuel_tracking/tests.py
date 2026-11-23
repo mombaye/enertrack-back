@@ -620,8 +620,10 @@ class DailyFactsSqlTests(SimpleTestCase):
         with mock.patch.object(SF, "_connect", return_value=conn):
             rows = SF.fetch_daily_facts([1], date(2026, 11, 10), date(2026, 11, 11), "Senegal", warnings=warnings)
         self.assertEqual(rows, [])
-        self.assertEqual(len(warnings), 1)
+        self.assertEqual(len(warnings), 2)   # compteur horaire + télémétrie batterie 5 min, synchro poursuivie sans elles
         self.assertIn("GFMS_DATA_TRACKER_NC illisible", warnings[0])
+        self.assertIn("VW_GFMS_METRICS illisible", warnings[1])
+        self.assertNotIn("VW_GFMS_METRICS", executed[-1])
         self.assertIn("002057", warnings[0])
         self.assertNotIn("GFMS_DATA_TRACKER_NC", executed[-1])
         conn.close.assert_called_once()

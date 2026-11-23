@@ -14,6 +14,10 @@ Sources :
   DB_GFMS_PROD.GOLD.RECTIFIER_EFFICIENCY_STATUS       P_DC, rendement, statut (5 min)
   DB_GFMS_ANALYTICS_PROD.GOLD.AC_METER                ACT_ACTIVE_POWER_AVG (W), ACT_ENERGY_P
   DB_GFMS_ANALYTICS_DEV.GOLD.VW_FUEL_REPORT           conso MESURÉE du jour (même filtre strict que la conso mensuelle)
+  DB_GFMS_PROD.GOLD.AVERAGE_LOAD                      LOAD_W : load DC telco moyen du jour (W)
+  DB_GFMS_ANALYTICS_PROD.GOLD.BATTERY_REPORT          Ah chargés / déchargés du jour (batterie) — repli
+  DB_GFMS_ANALYTICS_DEV.GOLD.VW_GFMS_METRICS          courant de charge × tension batterie (5 min) — vue en
+                                                      erreur 002057 au 23/11/2026 : détectée, synchro sans elle
 VW_INVOICE_DATA_REPORT n'est volontairement PAS utilisé (instruction §0).
 """
 from __future__ import annotations
@@ -29,6 +33,9 @@ logger = logging.getLogger(__name__)
 PROD = "DB_GFMS_PROD.GOLD"
 ANALYTICS = "DB_GFMS_ANALYTICS_PROD.GOLD"
 FUEL_REPORT = "DB_GFMS_ANALYTICS_DEV.GOLD"  # VW_FUEL_REPORT (cf. fuel_consommation_snowflake.py)
+METRICS = "DB_GFMS_ANALYTICS_DEV.GOLD"      # VW_GFMS_METRICS (télémétrie 5 min)
+# Puissance de recharge batterie (5 min) : créneau retenu si courant de charge > 0 et tension plausible (système 48 V)
+BATTERY_V_MIN, BATTERY_V_MAX = 40, 60
 DATA_ID_CHUNK = 200
 
 # Unités — À CONFIRMER avec `manage.py diagnose_cph_sources` avant la mise en
@@ -161,12 +168,48 @@ fuel AS (
       AND (%(country)s IS NULL OR COUNTRY = %(country)s)
     GROUP BY DATA_ID, DATE
 ),
+load_dc AS (
+    -- Load DC telco moyen du jour (W). Doublon contradictoire → NULL.
+    SELECT ID AS data_id, DATE AS day, IFF(MIN(LOAD_W) = MAX(LOAD_W), MAX(LOAD_W), NULL) AS load_w
+    FROM {prod}.AVERAGE_LOAD
+    WHERE DATE >= %(d_start)s AND DATE <= %(d_end)s AND ID IN ({ids})
+    GROUP BY ID, DATE
+),
+battery AS (
+    -- Ah chargés / déchargés du jour (BATTERY_REPORT). Doublon contradictoire → NULL.
+    SELECT DATA_ID AS data_id, DATE AS day,
+           IFF(MIN(BATTERY_CHARGE_CURRENT_DAY_AH) = MAX(BATTERY_CHARGE_CURRENT_DAY_AH), MAX(BATTERY_CHARGE_CURRENT_DAY_AH), NULL) AS charge_ah,
+           IFF(MIN(BATTERY_DISCHARGE_CURRENT_DAY_AH) = MAX(BATTERY_DISCHARGE_CURRENT_DAY_AH), MAX(BATTERY_DISCHARGE_CURRENT_DAY_AH), NULL) AS discharge_ah
+    FROM {analytics}.BATTERY_REPORT
+    WHERE DATE >= %(d_start)s AND DATE <= %(d_end)s AND DATA_ID IN ({ids})
+    GROUP BY DATA_ID, DATE
+),
+batt_slots AS (
+    -- Puissance de recharge batterie par créneau 5 min = IM_CURRENT_BATTERY_CHARGE_VALUE (A) × IM_BATTERY_VOLTAGE_VALUE (V)
+    SELECT ID AS data_id, TIME_SLICE("TIMESTAMP", 5, 'MINUTE') AS slot,
+           AVG(IM_CURRENT_BATTERY_CHARGE_VALUE) AS i_a, AVG(IM_BATTERY_VOLTAGE_VALUE) AS v_v
+    FROM {metrics}.VW_GFMS_METRICS
+    WHERE "TIMESTAMP" >= %(d_start)s::TIMESTAMP_NTZ
+      AND "TIMESTAMP" < DATEADD('day', 1, %(d_end)s::TIMESTAMP_NTZ)
+      AND ID IN ({ids}) AND IM_CURRENT_BATTERY_CHARGE_VALUE IS NOT NULL
+      AND IM_BATTERY_VOLTAGE_VALUE BETWEEN {v_min} AND {v_max}
+    GROUP BY ID, TIME_SLICE("TIMESTAMP", 5, 'MINUTE')
+),
+batt_daily AS (
+    -- Médiane du jour sur les créneaux en charge (I > 0) ; mesures présentes sans aucune charge → 0 W ; aucune mesure → NULL
+    SELECT data_id, CAST(slot AS DATE) AS day, COUNT(*) AS batt_slots, COUNT_IF(i_a > 0) AS batt_charge_slots,
+           IFF(COUNT_IF(i_a > 0) > 0, MEDIAN(IFF(i_a > 0, i_a * v_v, NULL)), 0) AS batt_charge_w
+    FROM batt_slots GROUP BY data_id, CAST(slot AS DATE)
+),
 universe AS (
     SELECT data_id, day FROM genset
     UNION SELECT data_id, day FROM tracker_daily
     UNION SELECT data_id, day FROM rect_daily
     UNION SELECT data_id, day FROM ac
     UNION SELECT data_id, day FROM fuel
+    UNION SELECT data_id, day FROM load_dc
+    UNION SELECT data_id, day FROM battery
+    UNION SELECT data_id, day FROM batt_daily
 )
 SELECT u.data_id, u.day,
        g.dse_h, g.dg_on_h, g.prod_kwh,
@@ -174,13 +217,17 @@ SELECT u.data_id, u.day,
        rd.slots, rd.active_slots, rd.p_dc_ge_tracker_kw, rd.eff_ge_tracker,
        rd.p_dc_rect_active_kw, rd.eff_rect_active, rd.p_dc_day_kw, rd.eff_day,
        a.ac_w, a.ac_energy, a.ac_points,
-       f.measured_l, f.raw_points, g.total_h, f.fms_level
+       f.measured_l, f.raw_points, g.total_h, f.fms_level,
+       ld.load_w, b.charge_ah, b.discharge_ah, bd.batt_charge_w, bd.batt_charge_slots
 FROM universe u
 LEFT JOIN genset g ON g.data_id = u.data_id AND g.day = u.day
 LEFT JOIN tracker_daily td ON td.data_id = u.data_id AND td.day = u.day
 LEFT JOIN rect_daily rd ON rd.data_id = u.data_id AND rd.day = u.day
 LEFT JOIN ac a ON a.data_id = u.data_id AND a.day = u.day
 LEFT JOIN fuel f ON f.data_id = u.data_id AND f.day = u.day
+LEFT JOIN load_dc ld ON ld.data_id = u.data_id AND ld.day = u.day
+LEFT JOIN battery b ON b.data_id = u.data_id AND b.day = u.day
+LEFT JOIN batt_daily bd ON bd.data_id = u.data_id AND bd.day = u.day
 """
 
 
@@ -197,7 +244,17 @@ tracker_on_slots AS (
 """
 
 
-def build_daily_facts_sql(data_ids: list[int], with_tracker: bool = True) -> str:
+# Télémétrie batterie 5 min indisponible (VW_GFMS_METRICS en erreur) : mêmes colonnes, aucune ligne → recharge batterie
+# lue dans BATTERY_REPORT (repli Ah) ; jamais 0.
+NO_BATT_CTES = """batt_daily AS (
+    SELECT NULL::NUMBER AS data_id, NULL::DATE AS day, NULL::NUMBER AS batt_slots,
+           NULL::NUMBER AS batt_charge_slots, NULL::FLOAT AS batt_charge_w
+    WHERE FALSE
+),
+"""
+
+
+def build_daily_facts_sql(data_ids: list[int], with_tracker: bool = True, with_battery_5min: bool = True) -> str:
     # DATA_ID sont des entiers issus de Snowflake (jamais une saisie utilisateur).
     ids = ",".join(str(int(d)) for d in data_ids)
     statuses = ",".join(f"'{s}'" for s in RECTIFIER_ACTIVE_STATUSES)
@@ -205,16 +262,25 @@ def build_daily_facts_sql(data_ids: list[int], with_tracker: bool = True) -> str
     if not with_tracker:
         a, b = sql.index("tracker_iv AS ("), sql.index("rect_slots AS (")
         sql = sql[:a] + NO_TRACKER_CTES + sql[b:]
-    return sql.format(analytics=ANALYTICS, prod=PROD, fuel_report=FUEL_REPORT, ids=ids, active_statuses=statuses)
+    if not with_battery_5min:
+        a, b = sql.index("batt_slots AS ("), sql.index("universe AS (")
+        sql = sql[:a] + NO_BATT_CTES + sql[b:]
+    return sql.format(analytics=ANALYTICS, prod=PROD, fuel_report=FUEL_REPORT, metrics=METRICS, ids=ids,
+                      active_statuses=statuses, v_min=BATTERY_V_MIN, v_max=BATTERY_V_MAX)
+
+
+def view_status(cur, view: str) -> str | None:
+    """None si la vue est lisible, sinon le message d'erreur Snowflake (lecture seule, aucune ligne lue)."""
+    try:
+        cur.execute(f"SELECT 1 FROM {view} LIMIT 0")
+        return None
+    except Exception as e:  # erreur de compilation de la vue, droit manquant…
+        return str(e).splitlines()[0][:300]
 
 
 def tracker_status(cur) -> str | None:
     """None si GFMS_DATA_TRACKER_NC est lisible, sinon le message d'erreur Snowflake (lecture seule, aucune ligne lue)."""
-    try:
-        cur.execute(f"SELECT 1 FROM {PROD}.GFMS_DATA_TRACKER_NC LIMIT 0")
-        return None
-    except Exception as e:  # erreur de compilation de la vue, droit manquant…
-        return str(e).splitlines()[0][:300]
+    return view_status(cur, f"{PROD}.GFMS_DATA_TRACKER_NC")
 
 
 def fetch_daily_facts(data_ids: list[int], d_start: date, d_end: date, country: str | None = None,
@@ -233,15 +299,23 @@ def fetch_daily_facts(data_ids: list[int], d_start: date, d_end: date, country: 
             logger.warning("[fuel_daily_facts] %s", msg)
             if warnings is not None and msg not in warnings:
                 warnings.append(msg)
+        batt_err = view_status(cur, f"{METRICS}.VW_GFMS_METRICS")
+        if batt_err:
+            msg = ("Télémétrie batterie 5 min VW_GFMS_METRICS illisible, recharge batterie calculée sur BATTERY_REPORT "
+                   f"(Ah ÷ 24 h) : {batt_err}")
+            logger.warning("[fuel_daily_facts] %s", msg)
+            if warnings is not None and msg not in warnings:
+                warnings.append(msg)
         for i in range(0, len(data_ids), DATA_ID_CHUNK):
             chunk = data_ids[i:i + DATA_ID_CHUNK]
-            cur.execute(build_daily_facts_sql(chunk, with_tracker=tracker_err is None), {
+            cur.execute(build_daily_facts_sql(chunk, with_tracker=tracker_err is None, with_battery_5min=batt_err is None), {
                 "d_start": d_start, "d_end": d_end, "country": country,
                 "p_dc_div": float(P_DC_TO_KW_DIVISOR), "eff_div": float(EFFICIENCY_TO_RATIO_DIVISOR),
             })
             for (data_id, day, dse_h, dg_on_h, prod_kwh, tracker_h, covered_min, ge_on_slots,
                  slots, active_slots, p_dc_ge, eff_ge, p_dc_act, eff_act, p_dc_day, eff_day,
-                 ac_w, ac_energy, ac_points, measured_l, raw_points, total_h, fms_level) in cur.fetchall():
+                 ac_w, ac_energy, ac_points, measured_l, raw_points, total_h, fms_level,
+                 load_w, charge_ah, discharge_ah, batt_w, batt_slots) in cur.fetchall():
                 rows.append({
                     "data_id": int(data_id), "date": day,
                     "dse_runtime_h": _dec(dse_h), "dg_on_runtime_h": _dec(dg_on_h), "dg_production_kwh": _dec(prod_kwh),
@@ -258,6 +332,10 @@ def fetch_daily_facts(data_ids: list[int], d_start: date, d_end: date, country: 
                     "measured_conso_l": _dec(measured_l),
                     "fuel_raw_points": int(raw_points) if raw_points is not None else None,
                     "dg_total_running_h": _dec(total_h), "fms_level_l": _dec(fms_level),
+                    "load_dc_w": _dec(load_w), "battery_charge_ah": _dec(charge_ah),
+                    "battery_discharge_ah": _dec(discharge_ah),
+                    "battery_charge_w": _dec(batt_w),
+                    "battery_charge_slots": int(batt_slots) if batt_slots is not None else None,
                 })
     finally:
         conn.close()
