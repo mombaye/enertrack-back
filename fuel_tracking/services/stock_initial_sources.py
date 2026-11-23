@@ -494,7 +494,7 @@ def _power_medians(rows, lines, kinds: dict, kva: dict) -> dict:
                       "battery_telemetry_points", "battery_charge_slots", "battery_charge_median_kw",
                       "battery_charge_median_current_a", "battery_charge_median_voltage_v", "battery_charge_values_kw",
                       "rect_power_points",
-                      "rect_power_median_kw", "rect_power_values_kw")):
+                      "rect_power_median_kw", "rect_power_values_kw", "measured_conso_l")):
         sid = f["site_id"].upper()
         d0, d1 = span.get(sid, (None, None))
         if d0 and d0 < f["date"] <= d1:
@@ -534,7 +534,92 @@ def _power_medians(rows, lines, kinds: dict, kva: dict) -> dict:
                     "p_ge_kw": ge, "p_ge_jours": len(ge_days), "p_ge_motif": ge_motif,
                     "p_load_dc_kw": round(median(load), 2) if load else None, "p_load_dc_jours": len(load),
                     "p_load_dc_motif": None if load else "aucune donnée AVERAGE_LOAD (load DC) sur la période",
-                    **bp}
+                    **bp, **_fuel_sensor_conso(fx.values(), (d1 - d0).days)}
+    return out
+
+
+def _fuel_sensor_conso(facts, nb_jours: int) -> dict:
+    """Conso Snowflake (fuel sensor) sur la période : somme des consommations mesurées du jour (VW_FUEL_REPORT, filtre strict
+    QUALITY_STATUS = 'OK', VALID_POINT_COUNT ≥ 2 ; jour sans baisse = 0 L mesuré, jour non mesurable = NULL, non compté).
+    Aucun jour mesurable → null avec la raison (jamais 0). Jours manquants → réserve (somme partielle)."""
+    vals = [float(f["measured_conso_l"]) for f in facts if f.get("measured_conso_l") is not None]
+    if not vals:
+        return {"conso_fuel_sensor_l": None, "conso_fuel_sensor_jours": 0, "conso_fuel_sensor_jours_periode": nb_jours,
+                "conso_fuel_sensor_motif": "aucun jour mesurable par le fuel sensor (VW_FUEL_REPORT) sur la période",
+                "conso_fuel_sensor_reserve": False}
+    manque = max(nb_jours - len(vals), 0)
+    return {"conso_fuel_sensor_l": round(sum(vals), 2), "conso_fuel_sensor_jours": len(vals),
+            "conso_fuel_sensor_jours_periode": nb_jours,
+            "conso_fuel_sensor_motif": f"{manque} jour(s) sur {nb_jours} sans mesure fuel sensor : somme partielle" if manque else None,
+            "conso_fuel_sensor_reserve": bool(manque)}
+
+
+# Sélection de la puissance retenue et consommation théorique (bloc ESTIMATION)
+SEL_SRC_GE, SEL_SRC_RECT = "PUISSANCE_MEDIANE_GE", "PUISSANCE_MEDIANE_REDRESSEUR"
+SEL_SRC_LOAD_BATT, SEL_SRC_LOAD = "LOAD_DC_PLUS_RECHARGE_BATTERIE", "LOAD_DC_SEUL"
+TAUX_CHARGE_MAX = 1.05            # au-delà de 105 % de la PRP : puissance incohérente avec le GE, aucune conso calculée
+TAUX_CHARGE_EXTRAPOLATION = 0.5   # en dessous de 50 % : extrapolation de la parabole (points 50 / 75 / 100 %)
+
+
+def theoretical_conso(e: dict) -> dict:
+    """Bloc ESTIMATION, à partir des champs déjà calculés de la ligne :
+    1. puissance retenue = max(Puissance médiane GE, Puissance médiane redresseur) — la médiane redresseur est déjà
+       P_DC ÷ rendement mesuré (règle équipe data), elle n'est pas redivisée ; si aucune des deux : Load DC telco +
+       Recharge batterie (Load DC seul, avec réserve, tant que la recharge batterie est n.d.) ;
+    2. taux de charge = puissance retenue ÷ Puissance PRP (kW) du GE ;
+    3. CPH (L/h) = a·x² + b·x + c (x = taux de charge en fraction, a, b, c de GENSET DB selon le type de GE) ;
+       conso théorique (L) = CPH × Temps de marche GE retenu.
+    Une étape impossible → null avec la raison, jamais 0."""
+    out = {"p_retenue_kw": None, "p_retenue_source": None, "p_retenue_motif": None, "p_retenue_reserve": False,
+           "taux_charge": None, "taux_charge_motif": None, "cph_l_h": None, "cph_a": None, "cph_b": None, "cph_c": None,
+           "cph_extrapolation": False, "conso_theorique_l": None, "conso_theorique_motif": None}
+    ge, rect = e.get("p_ge_kw"), e.get("p_rect_kw")
+    cand = [(v, src) for v, src in ((ge, SEL_SRC_GE), (rect, SEL_SRC_RECT)) if v is not None and v > 0]
+    if cand:
+        out["p_retenue_kw"], out["p_retenue_source"] = max(cand, key=lambda x: x[0])
+    elif e.get("p_load_dc_kw") is not None:
+        batt = e.get("p_batt_kw")
+        out["p_retenue_kw"] = round(e["p_load_dc_kw"] + (batt or 0), 2)
+        out["p_retenue_source"] = SEL_SRC_LOAD_BATT if batt is not None else SEL_SRC_LOAD
+        if batt is None:
+            out["p_retenue_reserve"] = True
+            out["p_retenue_motif"] = "recharge batterie n.d. : Load DC telco seul (puissance probablement sous-estimée)"
+    else:
+        out["p_retenue_motif"] = "aucune puissance médiane (GE, redresseur, load DC) sur la période"
+        out["taux_charge_motif"] = out["conso_theorique_motif"] = "puissance retenue n.d."
+        return out
+    p = out["p_retenue_kw"]
+    prp, curves = e.get("prp_kw") or [], e.get("courbes_cph") or []
+    if len(prp) > 1 or len(curves) > 1:
+        out["taux_charge_motif"] = out["conso_theorique_motif"] = "plusieurs GE sur le site : GE en marche non identifié"
+        return out
+    if not prp:
+        out["taux_charge_motif"] = out["conso_theorique_motif"] = "Puissance PRP (kW) n.d." + (f" ({e['prp_motif']})" if e.get("prp_motif") else "")
+        return out
+    x = p / prp[0]
+    if x > TAUX_CHARGE_MAX:
+        out["taux_charge_motif"] = out["conso_theorique_motif"] = (
+            f"puissance retenue {p:g} kW > 105 % de la PRP ({prp[0]:g} kW) : incohérente avec le GE")
+        return out
+    out["taux_charge"] = round(x, 4)
+    abc = curves[0] if curves else None
+    if not abc:
+        out["conso_theorique_motif"] = f"courbe a, b, c du type « {e.get('type_ge')} » absente ou ambiguë dans GENSET DB"
+        return out
+    a, b, c = abc
+    out["cph_a"], out["cph_b"], out["cph_c"] = a, b, c
+    cph = a * x * x + b * x + c
+    out["cph_extrapolation"] = x < TAUX_CHARGE_EXTRAPOLATION
+    if cph <= 0:
+        out["conso_theorique_motif"] = f"CPH ≤ 0 à {x * 100:.1f} % de charge (hors domaine de la courbe)"
+        return out
+    out["cph_l_h"] = round(cph, 3)
+    if e.get("tm_retenu_h") is None:
+        out["conso_theorique_motif"] = "Temps de marche GE retenu n.d."
+        return out
+    out["conso_theorique_l"] = round(cph * e["tm_retenu_h"], 2)
+    if out["cph_extrapolation"]:
+        out["conso_theorique_motif"] = "charge < 50 % : estimation mathématique (extrapolation de la courbe)"
     return out
 
 
@@ -727,7 +812,10 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
                                          **{k: pw.get(k) for k in ("p_batt_kw", "p_batt_jours", "p_batt_median_day_kw",
                                                                    "p_batt_median_period_kw", "p_batt_current_a", "p_batt_voltage_v",
                                                                    "p_batt_dispo_pct", "p_batt_pos", "p_batt_source",
-                                                                   "p_batt_motif", "p_batt_reserve")})
+                                                                   "p_batt_motif", "p_batt_reserve",
+                                                                   "conso_fuel_sensor_l", "conso_fuel_sensor_jours",
+                                                                   "conso_fuel_sensor_jours_periode", "conso_fuel_sensor_motif",
+                                                                   "conso_fuel_sensor_reserve")})
         # Bloc « DONNÉES DE STOCK FINAL », à la Date de Relevé Finale de la ligne du fichier (seule date retenue ; absente → n.d.)
         line = (lines.get(r["site_id"]) or {}).get("fin") or {}
         df = _day((line.get("periode") or [None, None])[1])   # Date de Relevé Finale du fichier (absente → n.d.)
@@ -760,6 +848,7 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
                                                     # redresseur retenu seulement hors réseau (sinon heures réseau + GE)
                                                     (e.get("tm_rectifier_h") if e.get("tm_rectifier_off_grid") is True else None,
                                                      "Alarme day_rectifier_on FMS"))
+        e.update(theoretical_conso(e))
     return err
 
 
@@ -775,7 +864,8 @@ TOTAL_FIELDS = {
     "ravitaillement": ("eydon_l", "carte_total_l", "ajout_l", "retrait_l", "vole_l", "fuite_l"),
     "stock_final_sources": ("terrain_l", "gardiennage_l", "fms_l", "retenue_l", "compteur_terrain_h", "compteur_gardiennage_h",
                             "compteur_fms_h", "compteur_retenu_h"),
-    "estimation_theorique": ("prp_kva", "prp_kw", "tm_dg_on_h", "tm_rectifier_h", "tm_terrain_h", "tm_index_fms_h", "tm_retenu_h"),
+    "estimation_theorique": ("prp_kva", "prp_kw", "tm_dg_on_h", "tm_rectifier_h", "tm_terrain_h", "tm_index_fms_h", "tm_retenu_h",
+                             "conso_theorique_l", "conso_fuel_sensor_l"),
 }
 
 

@@ -195,13 +195,15 @@ def refresh() -> dict:
             errors.append("GENSET DB : aucune feuille « GENSET DB » exploitable dans les fichiers de clôture.")
         prev = (cached() or {}).get("raw") or {}
         if prev.get("gdb"):   # dernière lecture réussie conservée : une archive momentanément inaccessible n'efface pas la PRP
-            gdb, gdb_meta = prev["gdb"], {**(prev.get("gdb_meta") or {}), "conservee": True}
+            gdb, gdb_meta = prev["gdb"], {**(prev.get("gdb_meta") or {}), "conservee": True, "courbes": prev.get("gdb_curves") or {}}
+    curves = gdb_meta.pop("courbes", None) or {}   # courbes CPH en cache à part (le résumé « meta » reste lisible)
+    gdb_meta["courbes_cph"] = len(curves)
     from fuel_tracking.services.base_ge import known_brands
 
     brands = known_brands([t for t, _k in base.values()], gdb_meta.get("fabricants") or [])
     sites = build(sf, en, base, base_file, brands)
-    add_prp(sites, gdb, gdb_meta.get("fichier"))
-    data = {"sites": sites, "raw": {"sf": sf, "enoc": en, "gdb": gdb, "gdb_meta": gdb_meta},
+    add_prp(sites, gdb, gdb_meta.get("fichier"), curves)
+    data = {"sites": sites, "raw": {"sf": sf, "enoc": en, "gdb": gdb, "gdb_meta": gdb_meta, "gdb_curves": curves},
             "meta": {**meta, "sites_enoc": len(en), "base_ge": {"fichier": base_file, "sites": len(base)},
                                      "genset_db": gdb_meta, "erreurs": errors},
             "lu_le": timezone.now().isoformat()}
@@ -248,8 +250,10 @@ def _key(t) -> str:
     return re.sub(r"[^A-Z0-9]", "", str(t or "").upper())
 
 
-def parse_genset_db(rows, manufacturers: set | None = None) -> dict:
-    """Clé du « Type de GE » → ensemble des PRP [kVA] de la feuille (une seule valeur attendue)."""
+def parse_genset_db(rows, manufacturers: set | None = None, curves: dict | None = None) -> dict:
+    """Clé du « Type de GE » → ensemble des PRP [kVA] de la feuille (une seule valeur attendue).
+    `curves` (facultatif) reçoit clé → ensemble des coefficients (a, b, c) de la courbe CPH (L/h) = a·x² + b·x + c, x = taux
+    de charge en fraction : colonnes a, b, c de la feuille ; absentes → ajustement des points Conso 50 / 75 / 100 %."""
     out: dict = {}
     head = None
     for row in rows:
@@ -259,6 +263,8 @@ def parse_genset_db(rows, manufacturers: set | None = None) -> dict:
             if "type de ge" in norm and any(h.startswith("prp [kva]") for h in norm):
                 head = (norm.index("type de ge"), next(i for i, h in enumerate(norm) if h.startswith("prp [kva]")),
                         next((i for i, h in enumerate(norm) if h.startswith("manufacturer")), None))
+                cols = {k: (norm.index(k) if k in norm else None) for k in ("a", "b", "c")}
+                cols.update({k: next((i for i, h in enumerate(norm) if h.startswith(f"conso {k}")), None) for k in ("50", "75", "100")})
             continue
         t = vals[head[0]] if head[0] < len(vals) else None
         p = vals[head[1]] if head[1] < len(vals) else None
@@ -266,9 +272,27 @@ def parse_genset_db(rows, manufacturers: set | None = None) -> dict:
         if _clean(t) and isinstance(p, (int, float)) and p > 0:
             if manufacturers is not None and _clean(mf):
                 manufacturers.add(" ".join(str(mf).split()))
+            abc = _curve(vals, cols) if curves is not None else None
             for k in {_key(t), _key(f"{mf or ''}{t}")}:   # « K22 » et « SDMOK22 » (libellé « SDMO - K22 »)
                 out.setdefault(k, set()).add(round(float(p), 2))
+                if abc:
+                    curves.setdefault(k, set()).add(abc)
     return out
+
+
+def _curve(vals, cols) -> tuple | None:
+    """(a, b, c) d'une ligne GENSET DB : colonnes a, b, c ; sinon ajustement exact des points Conso 50 / 75 / 100 % (L/h)."""
+    num = lambda k: (vals[cols[k]] if cols.get(k) is not None and cols[k] < len(vals) and isinstance(vals[cols[k]], (int, float))  # noqa: E731
+                     and not isinstance(vals[cols[k]], bool) else None)
+    a, b, c = num("a"), num("b"), num("c")
+    if None in (a, b, c):
+        y50, y75, y100 = num("50"), num("75"), num("100")
+        if None in (y50, y75, y100):
+            return None
+        a = (y100 - 2 * y75 + y50) * 8
+        b = (y100 - y50) * 2 - a * 1.5
+        c = y100 - a - b
+    return (round(float(a), 6), round(float(b), 6), round(float(c), 6))
 
 
 def fetch_genset_db() -> tuple[dict, dict]:
@@ -290,17 +314,17 @@ def fetch_genset_db() -> tuple[dict, dict]:
         if not Path(b.archive_path).is_file():
             absents.append(b.file_name)   # registre non monté dans ce conteneur, ou copie d'archive supprimée
             continue
-        gdb, mfs = {}, set()
+        gdb, mfs, crv = {}, set(), {}
         try:
             for _n, rows in iter_sheets(Path(b.archive_path).read_bytes(), b.file_name, only={"GENSET DB"}):
-                gdb = parse_genset_db(list(rows), mfs)   # lignes lues pendant que le classeur est ouvert
+                gdb = parse_genset_db(list(rows), mfs, crv)   # lignes lues pendant que le classeur est ouvert
         except Exception as e:  # noqa: BLE001 — archive illisible : fichier précédent
             logger.warning("GENSET DB : archive %s illisible : %s", b.file_name, e)
             illisibles.append(b.file_name)
             continue
         if gdb:
             return gdb, {"fichier": b.file_name, "types": len(gdb), "ambigus": sorted(k for k, v in gdb.items() if len(v) > 1),
-                         "fabricants": sorted(mfs)}
+                         "fabricants": sorted(mfs), "courbes": crv}
     if absents:
         logger.warning("GENSET DB : %d copie(s) d'archive Closing introuvable(s) (ex. %s) — registre %s monté dans ce "
                        "conteneur ?", len(absents), absents[0], getattr(settings, "FUEL_IMPORT_ROOT", "?"))
@@ -308,12 +332,14 @@ def fetch_genset_db() -> tuple[dict, dict]:
                 "archives_illisibles": len(illisibles)}
 
 
-def add_prp(sites: dict, gdb: dict, fichier: str | None) -> None:
+def add_prp(sites: dict, gdb: dict, fichier: str | None, curves: dict | None = None) -> None:
     """Ajoute à chaque site la Puissance PRP (kVA / kW) de chacun de ses types de GE, avec la raison si absente."""
     for v in sites.values():
-        kva, motifs = [], []
+        kva, motifs, abc = [], [], []
         for t in [x for x in (v.get("type_ge") or "").split(" / ") if x]:
             vals = next((gdb[k] for k in _lookup_keys(t) if k in gdb), None)
+            cv = next((curves[k] for k in _lookup_keys(t) if k in curves), None) if curves else None
+            abc.append(next(iter(cv)) if cv and len(cv) == 1 else None)   # plusieurs courbes pour un type : ambigu, aucune
             if not vals:
                 motifs.append(f"type « {t} » absent de GENSET DB" if fichier else "GENSET DB non disponible")
             elif len(vals) > 1:
@@ -324,6 +350,7 @@ def add_prp(sites: dict, gdb: dict, fichier: str | None) -> None:
         v["prp_kw"] = [round(x * KW_PER_KVA, 2) for x in kva] or None
         v["prp_motif"] = " ; ".join(motifs) or None
         v["prp_source"] = f"GENSET DB ({fichier})" if kva and fichier else None
+        v["courbes_cph"] = abc or None   # (a, b, c) par GE, dans l'ordre des types ; None = courbe absente ou ambiguë
 
 
 def _lookup_keys(label: str) -> list[str]:
@@ -351,5 +378,5 @@ def sites_info(site_ids) -> dict:
     gdb_meta = raw.get("gdb_meta") or {}
     brands = known_brands([t for t, _k in base_all.values()], gdb_meta.get("fabricants") or [])
     sites = build(sf, en, base, base_file, brands)
-    add_prp(sites, raw.get("gdb") or {}, gdb_meta.get("fichier"))
+    add_prp(sites, raw.get("gdb") or {}, gdb_meta.get("fichier"), raw.get("gdb_curves"))
     return sites

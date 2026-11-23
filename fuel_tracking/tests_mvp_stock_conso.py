@@ -11,7 +11,7 @@ from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import override_settings
+from django.test import SimpleTestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -1425,6 +1425,27 @@ class PrpGensetDbTests(MvpBase):
         self.assertEqual((sites["C"]["prp_kva"], sites["C"]["prp_motif"]), (None, "type « P33-3U » absent de GENSET DB"))
         self.assertEqual((sites["D"]["prp_kva"], sites["D"]["prp_motif"]), (None, None))
 
+    def test_courbes_cph_genset_db(self):
+        """Coefficients a, b, c de GENSET DB par type de GE ; colonnes absentes → ajustement exact des points 50/75/100 %."""
+        from fuel_tracking.services import ge_info as G
+
+        head = ["", "Manufacturer ", "Type", "Genset List", "Type de GE", "", "Voltage [V]", "No. of phases", "PRP [kVA]", "PRP [kW]",
+                "cosφ", "Conso 100%", "Conso 75%", "Conso 50%", "a", "b", "c"]
+        rows = [head,
+                ["", "SDMO", "", "", "K22", 22, 400, 3, 20, 16, 0.8, 5.0, 4.0, 3.0, 0.5, 3.2, 1.3],
+                ["", "SDMO", "", "", "J66", 66, 400, 3, 60, 48, 0.8, 12.0, 9.5, 7.0, None, None, None]]
+        crv = {}
+        gdb = G.parse_genset_db(rows, None, crv)
+        self.assertEqual(gdb["K22"], {20.0})
+        self.assertEqual(crv["K22"], {(0.5, 3.2, 1.3)})
+        a, b, c = next(iter(crv["J66"]))
+        for x, y in ((0.5, 7.0), (0.75, 9.5), (1.0, 12.0)):
+            self.assertAlmostEqual(a * x * x + b * x + c, y, places=6)
+        sites = {"A": {"type_ge": "SDMO - K22"}, "B": {"type_ge": "X99"}}
+        G.add_prp(sites, gdb, "Closing.xlsb", crv)
+        self.assertEqual((sites["A"]["prp_kw"], sites["A"]["courbes_cph"]), ([16.0], [(0.5, 3.2, 1.3)]))
+        self.assertEqual(sites["B"]["courbes_cph"], [None])
+
     def test_archive_introuvable_signalee_et_derniere_lecture_conservee(self):
         """Worker sans le registre monté (celery-interactive) : archive Closing introuvable → erreur explicite, et la
         dernière GENSET DB lue reste en cache au lieu d'afficher « n.d. » partout."""
@@ -1879,3 +1900,62 @@ class PowerMediansTests(MvpBase):
         # Aucun jour qualifié : médiane des puissances positives de la période
         r = S._batt_power([jour(100, 3, 0.5, vals=[0.4, 0.5, 0.6]), jour(60, 2, 2.0, vals=[1.0, 3.0])], 2)
         self.assertEqual((r["p_batt_kw"], r["p_batt_source"], r["p_batt_median_period_kw"]), (0.6, "BATTERY_CHARGE_MEDIAN_PERIOD", 0.6))
+
+
+class TheoreticalConsoTests(SimpleTestCase):
+    """Bloc ESTIMATION : puissance retenue, taux de charge, CPH = a·x² + b·x + c, conso théorique, conso fuel sensor."""
+
+    def base(self, **kw):
+        e = {"p_ge_kw": None, "p_rect_kw": None, "p_load_dc_kw": None, "p_batt_kw": None, "prp_kw": [16.0],
+             "courbes_cph": [(0.5, 3.2, 1.3)], "tm_retenu_h": 100.0, "type_ge": "K22"}
+        e.update(kw)
+        return e
+
+    def test_max_ge_redresseur(self):
+        from fuel_tracking.services.stock_initial_sources import theoretical_conso
+
+        r = theoretical_conso(self.base(p_ge_kw=6.0, p_rect_kw=8.0))
+        self.assertEqual((r["p_retenue_kw"], r["p_retenue_source"]), (8.0, "PUISSANCE_MEDIANE_REDRESSEUR"))
+        self.assertEqual(r["taux_charge"], 0.5)
+        self.assertAlmostEqual(r["cph_l_h"], 0.5 * 0.25 + 3.2 * 0.5 + 1.3, places=3)   # 3,025 L/h
+        self.assertAlmostEqual(r["conso_theorique_l"], 302.5, places=2)
+        self.assertFalse(r["cph_extrapolation"])
+        r = theoretical_conso(self.base(p_ge_kw=9.0, p_rect_kw=None))
+        self.assertEqual(r["p_retenue_source"], "PUISSANCE_MEDIANE_GE")
+
+    def test_repli_load_dc_batterie(self):
+        from fuel_tracking.services.stock_initial_sources import theoretical_conso
+
+        r = theoretical_conso(self.base(p_load_dc_kw=3.0, p_batt_kw=1.0))
+        self.assertEqual((r["p_retenue_kw"], r["p_retenue_source"], r["p_retenue_reserve"]), (4.0, "LOAD_DC_PLUS_RECHARGE_BATTERIE", False))
+        self.assertTrue(r["cph_extrapolation"])   # 25 % de charge
+        r = theoretical_conso(self.base(p_load_dc_kw=3.0))
+        self.assertEqual((r["p_retenue_kw"], r["p_retenue_source"], r["p_retenue_reserve"]), (3.0, "LOAD_DC_SEUL", True))
+        r = theoretical_conso(self.base())
+        self.assertEqual((r["p_retenue_kw"], r["conso_theorique_l"]), (None, None))
+        self.assertIn("aucune puissance", r["p_retenue_motif"])
+
+    def test_cas_non_calculables(self):
+        from fuel_tracking.services.stock_initial_sources import theoretical_conso
+
+        r = theoretical_conso(self.base(p_ge_kw=20.0))                      # 125 % de la PRP
+        self.assertEqual((r["taux_charge"], r["conso_theorique_l"]), (None, None))
+        r = theoretical_conso(self.base(p_ge_kw=8.0, prp_kw=None, courbes_cph=None))
+        self.assertEqual(r["taux_charge"], None)
+        r = theoretical_conso(self.base(p_ge_kw=8.0, prp_kw=[16.0, 20.0], courbes_cph=[None, None]))
+        self.assertIn("plusieurs GE", r["taux_charge_motif"])
+        r = theoretical_conso(self.base(p_ge_kw=8.0, courbes_cph=[None]))
+        self.assertEqual((r["taux_charge"], r["cph_l_h"], r["conso_theorique_l"]), (0.5, None, None))
+        r = theoretical_conso(self.base(p_ge_kw=8.0, tm_retenu_h=None))
+        self.assertEqual((r["cph_l_h"] is not None, r["conso_theorique_l"]), (True, None))
+
+    def test_conso_fuel_sensor(self):
+        from decimal import Decimal
+
+        from fuel_tracking.services.stock_initial_sources import _fuel_sensor_conso
+
+        r = _fuel_sensor_conso([{"measured_conso_l": Decimal("10.5")}, {"measured_conso_l": Decimal("0")},
+                                {"measured_conso_l": None}], 3)
+        self.assertEqual((r["conso_fuel_sensor_l"], r["conso_fuel_sensor_jours"], r["conso_fuel_sensor_reserve"]), (10.5, 2, True))
+        r = _fuel_sensor_conso([{"measured_conso_l": None}], 1)
+        self.assertEqual((r["conso_fuel_sensor_l"], r["conso_fuel_sensor_jours"]), (None, 0))
