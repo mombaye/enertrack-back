@@ -1167,7 +1167,10 @@ class FmsFromDailyFactsTests(MvpBase):
         # Load DC telco (AVERAGE_LOAD, joint sur ID = DATA_ID) et Ah batterie (BATTERY_REPORT)
         self.assertIn("DB_GFMS_PROD.GOLD.AVERAGE_LOAD", sql)
         self.assertIn("DB_GFMS_ANALYTICS_PROD.GOLD.BATTERY_REPORT", sql)
-        self.assertIn("ld.load_w, b.charge_ah, b.discharge_ah, bd.batt_charge_w", sql)
+        self.assertIn("ld.load_w, b.charge_ah, b.discharge_ah, bd.batt_points, bd.batt_pos", sql)
+        # Recharge batterie (règle équipe data) : SILVER.GFMS_METRICS, I × V ÷ 1000 par mesure avant médiane
+        self.assertIn("DB_GFMS_ANALYTICS_PROD.SILVER.GFMS_METRICS", sql)
+        self.assertIn("IM_CURRENT_BATTERY_CHARGE_VALUE * IM_BATTERY_VOLTAGE_VALUE / 1000.0", sql)
         # Puissance redresseur (règle équipe data) : correction du rendement AVANT la médiane, filtres de qualité
         self.assertIn("P_DC / (RECTIFIER_EFFICIENCY / 100.0) / 1000.0", sql)
         self.assertIn("RECTIFIER_EFFICIENCY BETWEEN 70 AND 100", sql)
@@ -1175,8 +1178,8 @@ class FmsFromDailyFactsTests(MvpBase):
         self.assertNotIn("MEDIAN(P_DC)", sql)
         self.assertIn("IM_CURRENT_BATTERY_CHARGE_VALUE", build_daily_facts_sql([1]))
         sans_5min = build_daily_facts_sql([1], with_battery_5min=False)
-        self.assertNotIn("VW_GFMS_METRICS", sans_5min)
-        self.assertIn("bd.batt_charge_w", sans_5min)   # mêmes colonnes, toujours NULL
+        self.assertNotIn("GFMS_METRICS", sans_5min)
+        self.assertIn("bd.batt_kw_med", sans_5min)   # mêmes colonnes, toujours NULL
         self.assertIn("rect_power_daily AS (", sans_5min)   # la puissance redresseur reste calculée
 
 
@@ -1814,7 +1817,7 @@ class PowerMediansTests(MvpBase):
         self.assertIn("aucune donnée GENSET_REPORT", vide["p_ge_motif"])
         self.assertEqual((vide["p_load_dc_kw"], vide["p_batt_kw"]), (None, None))
         self.assertIn("AVERAGE_LOAD", vide["p_load_dc_motif"])
-        self.assertIn("BATTERY_REPORT", vide["p_batt_motif"])
+        self.assertEqual(vide["p_batt_source"], "BATTERY_CHARGE_TELEMETRY_UNAVAILABLE")
 
     def test_puissance_redresseur_regle_data(self):
         """Règle équipe data : médiane des jours qualifiés (≥ 50 % de 288) → sinon médiane période → sinon indisponible."""
@@ -1835,39 +1838,44 @@ class PowerMediansTests(MvpBase):
         self.assertEqual((r["p_rect_kw"], r["p_rect_source"]), (None, "PUISSANCE_REDRESSEUR_INDISPONIBLE"))
         self.assertIn("aucune mesure redresseur valide", r["p_rect_motif"])
 
-    def test_load_dc_et_recharge_batterie(self):
-        """Load DC = médiane LOAD_W (W → kW, 0 non compté) ; recharge = Ah × 53,5 V ÷ 24 h, valeurs > 0 seules, jour aberrant écarté."""
+    def test_load_dc(self):
+        """Load DC = médiane LOAD_W journaliers (W → kW), 0 non compté."""
         from datetime import date
 
         from fuel_tracking.models import FuelSiteDailyFacts as F
         from fuel_tracking.services import stock_initial_sources as S
 
-        # (jour, LOAD_W, Ah chargés, Ah déchargés)
-        for d, lw, ch, dis in [(1, 2000, 240, 200), (2, 3000, 480, 400), (3, 0, 0, 0), (4, 2500, 19670, 0), (5, None, None, None)]:
-            F.objects.create(country="Senegal", data_id=3, site_id="BAT_1", date=date(2026, 10, d), load_dc_w=lw,
-                             battery_charge_ah=ch, battery_discharge_ah=dis)
-        F.objects.create(country="Senegal", data_id=3, site_id="BAT_1", date=date(2026, 9, 30), load_dc_w=99999,
-                         battery_charge_ah=9999, battery_discharge_ah=9999)   # jour initial exclu
+        for d, lw in [(1, 2000), (2, 3000), (3, 0), (4, 2500), (5, None)]:
+            F.objects.create(country="Senegal", data_id=3, site_id="BAT_1", date=date(2026, 10, d), load_dc_w=lw)
+        F.objects.create(country="Senegal", data_id=3, site_id="BAT_1", date=date(2026, 9, 30), load_dc_w=99999)   # jour initial exclu
         rows = [{"site_id": "BAT_1", "stock": {"date_initial": "2026-09-30", "date_final": "2026-10-05"}}]
         lines = {"BAT_1": {"ini": {"periode": ["2026-09-30", "2026-10-05"]}, "fin": {"periode": ["2026-09-30", "2026-10-05"]}}}
         out = S._power_medians(rows, lines, {}, {})["BAT_1"]
         self.assertEqual((out["p_load_dc_kw"], out["p_load_dc_jours"], out["p_load_dc_motif"]), (2.5, 3, None))
-        # 240 Ah × 53,5 / 24 = 535 W ; 480 Ah → 1 070 W ; 0 Ah non compté ; 19 670 Ah > 3 × 0 + 500 → écarté
-        self.assertEqual((out["p_batt_kw"], out["p_batt_jours"], out["p_batt_ecartes"], out["p_batt_nuls"]), (0.8, 2, 1, 1))
-        self.assertIn("BATTERY_REPORT", out["p_batt_source"])
-        # Télémétrie 5 min présente : prioritaire (médiane des médianes journalières I × V > 0), BATTERY_REPORT ignoré
-        F.objects.filter(site_id="BAT_1", date=date(2026, 10, 1)).update(battery_charge_w=1200)
-        F.objects.filter(site_id="BAT_1", date=date(2026, 10, 2)).update(battery_charge_w=0)
-        F.objects.filter(site_id="BAT_1", date=date(2026, 10, 3)).update(battery_charge_w=1800)
-        cinq = S._power_medians(rows, lines, {}, {})["BAT_1"]
-        self.assertEqual((cinq["p_batt_kw"], cinq["p_batt_jours"], cinq["p_batt_ecartes"], cinq["p_batt_nuls"]), (1.5, 2, 0, 1))
-        self.assertIn("VW_GFMS_METRICS", cinq["p_batt_source"])
-        F.objects.filter(site_id="BAT_1").exclude(battery_charge_w=None).update(battery_charge_w=0)
-        sans_charge = S._power_medians(rows, lines, {}, {})["BAT_1"]
-        self.assertIsNone(sans_charge["p_batt_kw"])
-        self.assertIn("aucune recharge positive", sans_charge["p_batt_motif"])
-        F.objects.filter(site_id="BAT_1").update(battery_charge_w=None)
-        F.objects.filter(site_id="BAT_1", date__lte=date(2026, 10, 3)).delete()
-        seul_aberrant = S._power_medians(rows, lines, {}, {})["BAT_1"]
-        self.assertIsNone(seul_aberrant["p_batt_kw"])
-        self.assertIn("1 jour(s) écarté(s)", seul_aberrant["p_batt_motif"])
+
+    def test_recharge_batterie_regle_data(self):
+        """Règle équipe data : I × V ÷ 1000 par pas 5 min ; jour qualifié ≥ 50 % de 288 pas reçus ; médiane jour → période ;
+        aucune télémétrie / aucune charge → null avec la source, jamais 0 ; réserve si peu de pas en charge."""
+        from fuel_tracking.services import stock_initial_sources as S
+
+        self.assertAlmostEqual(13.00 * 54.01 / 1000, 0.702, places=3)   # exemple BKL_0188 de l'équipe data
+        jour = lambda pts, pos, kw=None, i=None, v=None, vals=None: {
+            "battery_telemetry_points": pts, "battery_charge_slots": pos, "battery_charge_median_kw": kw,
+            "battery_charge_median_current_a": i, "battery_charge_median_voltage_v": v, "battery_charge_values_kw": vals}
+        # 2 jours qualifiés avec charge (+ 1 qualifié sans charge, ignoré pour la médiane)
+        r = S._batt_power([jour(281, 280, 0.702, 13.0, 54.01), jour(280, 200, 0.9, 16.0, 54.2), jour(288, 0)], 3)
+        self.assertEqual((r["p_batt_kw"], r["p_batt_source"], r["p_batt_jours"], r["p_batt_pos"]), (0.801, "BATTERY_CHARGE_MEDIAN_DAY", 2, 480))
+        self.assertEqual((r["p_batt_current_a"], r["p_batt_voltage_v"], r["p_batt_dispo_pct"], r["p_batt_reserve"]), (14.5, 54.105, 98.3, None))
+        # Peu de pas positifs (BKL_0004 : 3 pas) : valeur affichée avec réserve
+        r = S._batt_power([jour(284, 3, 0.483, 9.03, 53.14)], 1)
+        self.assertEqual(r["p_batt_kw"], 0.483)
+        self.assertIn("seulement 3 pas", r["p_batt_reserve"])
+        # Télémétrie présente sans charge (BKL_0088) : null, jamais 0
+        r = S._batt_power([jour(288, 0)], 1)
+        self.assertEqual((r["p_batt_kw"], r["p_batt_source"]), (None, "NO_BATTERY_CHARGING_MEASURED"))
+        # Aucune télémétrie (accès SILVER absent ou site sans mesure)
+        r = S._batt_power([jour(None, None), {}], 2)
+        self.assertEqual((r["p_batt_kw"], r["p_batt_source"]), (None, "BATTERY_CHARGE_TELEMETRY_UNAVAILABLE"))
+        # Aucun jour qualifié : médiane des puissances positives de la période
+        r = S._batt_power([jour(100, 3, 0.5, vals=[0.4, 0.5, 0.6]), jour(60, 2, 2.0, vals=[1.0, 3.0])], 2)
+        self.assertEqual((r["p_batt_kw"], r["p_batt_source"], r["p_batt_median_period_kw"]), (0.6, "BATTERY_CHARGE_MEDIAN_PERIOD", 0.6))

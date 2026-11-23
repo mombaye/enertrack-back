@@ -978,10 +978,18 @@ class FuelSiteDailyFacts(models.Model):
                                             help_text="BATTERY_CHARGE_CURRENT_DAY_AH du jour (Ah), BATTERY_REPORT. Contradictoire → NULL.")
     battery_discharge_ah = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True,
                                                help_text="BATTERY_DISCHARGE_CURRENT_DAY_AH du jour (Ah), BATTERY_REPORT. Contradictoire → NULL.")
-    battery_charge_w = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True,
-                                           help_text="Médiane du jour de courant de charge × tension batterie (W), créneaux 5 min en "
-                                                     "charge, VW_GFMS_METRICS ; 0 si mesuré sans charge ; NULL si non mesuré.")
-    battery_charge_slots = models.IntegerField(null=True, blank=True, help_text="Créneaux 5 min en charge (courant > 0) du jour.")
+    # Recharge batterie (règle équipe data, SILVER.GFMS_METRICS, 5 min) : courant × tension ÷ 1000 par pas, puis médiane
+    battery_telemetry_points = models.IntegerField(null=True, blank=True,
+                                                   help_text="Pas 5 min reçus du jour (tension batterie > 0, même courant nul).")
+    battery_charge_slots = models.IntegerField(null=True, blank=True, help_text="Pas 5 min en charge (puissance > 0) du jour.")
+    battery_charge_median_kw = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True,
+                                                   help_text="Médiane du jour des puissances de recharge > 0 (kW).")
+    battery_charge_median_current_a = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True,
+                                                          help_text="Courant de charge médian du jour sur les pas en charge (A).")
+    battery_charge_median_voltage_v = models.DecimalField(max_digits=10, decimal_places=4, null=True, blank=True,
+                                                          help_text="Tension batterie médiane du jour sur les pas en charge (V).")
+    battery_charge_values_kw = models.JSONField(null=True, blank=True,
+                                                help_text="Puissances de recharge > 0 (kW) des jours NON qualifiés (< 50 % de 288) : repli période.")
     # Puissance redresseur (règle équipe data du 23/11/2026) : P_DC ÷ (rendement/100) ÷ 1000 par mesure, puis médiane
     rect_power_points = models.IntegerField(null=True, blank=True,
                                             help_text="Mesures redresseur valides du jour (Good/Aged/Warning, P_DC > 0, rendement 70-100 %).")
