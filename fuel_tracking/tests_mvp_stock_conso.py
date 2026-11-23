@@ -1404,7 +1404,11 @@ class GeInfoTests(MvpBase):
         with mock.patch.object(S, "_guard_readings", return_value=({}, None)), mock.patch.object(G, "fetch_snowflake", side_effect=AssertionError("Snowflake lu")):
             S.enrich(rows)
         self.assertEqual(rows[0]["estimation_theorique"]["type_ge"], "K22")
-        self.assertTrue(all(v is None for v in rows[1]["estimation_theorique"].values()))   # site inconnu : tout n.d., jamais 0
+        # site inconnu : aucune valeur chiffrée (tout n.d., jamais 0) ; seuls les motifs et indicateurs de réserve sont renseignés
+        e1 = rows[1]["estimation_theorique"]
+        self.assertEqual([k for k, v in e1.items() if v is not None and not isinstance(v, (str, bool))], [])
+        self.assertFalse(any(v for v in e1.values() if isinstance(v, bool)))
+        self.assertIn("aucune puissance", e1["p_retenue_motif"])
         self.assertEqual((rows[0]["estimation_theorique"]["prp_kva"], rows[0]["estimation_theorique"]["prp_kw"]), ([20.0], [16.0]))
 
 
