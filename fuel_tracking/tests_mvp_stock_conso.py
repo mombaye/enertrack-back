@@ -1168,10 +1168,16 @@ class FmsFromDailyFactsTests(MvpBase):
         self.assertIn("DB_GFMS_PROD.GOLD.AVERAGE_LOAD", sql)
         self.assertIn("DB_GFMS_ANALYTICS_PROD.GOLD.BATTERY_REPORT", sql)
         self.assertIn("ld.load_w, b.charge_ah, b.discharge_ah, bd.batt_charge_w", sql)
+        # Puissance redresseur (règle équipe data) : correction du rendement AVANT la médiane, filtres de qualité
+        self.assertIn("P_DC / (RECTIFIER_EFFICIENCY / 100.0) / 1000.0", sql)
+        self.assertIn("RECTIFIER_EFFICIENCY BETWEEN 70 AND 100", sql)
+        self.assertIn("MEDIAN(rect_kw)", sql)
+        self.assertNotIn("MEDIAN(P_DC)", sql)
         self.assertIn("IM_CURRENT_BATTERY_CHARGE_VALUE", build_daily_facts_sql([1]))
         sans_5min = build_daily_facts_sql([1], with_battery_5min=False)
         self.assertNotIn("VW_GFMS_METRICS", sans_5min)
         self.assertIn("bd.batt_charge_w", sans_5min)   # mêmes colonnes, toujours NULL
+        self.assertIn("rect_power_daily AS (", sans_5min)   # la puissance redresseur reste calculée
 
 
 class StockInitialPairCacheTests(MvpBase):
@@ -1793,7 +1799,8 @@ class PowerMediansTests(MvpBase):
         rows = [{"site_id": "OUT_1", "stock": {"date_initial": "2026-09-30", "date_final": "2026-10-04"}}]
         lines = {"OUT_1": {"ini": {"periode": ["2026-09-30", "2026-10-04"]}, "fin": {"periode": ["2026-09-30", "2026-10-04"]}}}
         out = S._power_medians(rows, lines, {}, {"OUT_1": 22.0})["OUT_1"]
-        self.assertEqual((out["p_rect_kw"], out["p_rect_jours"]), (5.0, 3))
+        # Redresseur : plus de faits rect_power_* → indisponible (l'ancienne médiane des P_DC journalières n'est plus utilisée)
+        self.assertEqual((out["p_rect_kw"], out["p_rect_source"]), (None, "PUISSANCE_REDRESSEUR_INDISPONIBLE"))
         self.assertEqual((out["p_grid_kw"], out["p_grid_jours"]), (25.0, 2))   # AC_METER déjà en kW ; 0 non compté
         # GE : kWh ÷ h des jours de marche ; 25 kW > 105 % × 22 kVA × 0,8 écarté ; jour à 0 h ignoré
         self.assertEqual((out["p_ge_kw"], out["p_ge_jours"]), (4.25, 2))
@@ -1808,6 +1815,25 @@ class PowerMediansTests(MvpBase):
         self.assertEqual((vide["p_load_dc_kw"], vide["p_batt_kw"]), (None, None))
         self.assertIn("AVERAGE_LOAD", vide["p_load_dc_motif"])
         self.assertIn("BATTERY_REPORT", vide["p_batt_motif"])
+
+    def test_puissance_redresseur_regle_data(self):
+        """Règle équipe data : médiane des jours qualifiés (≥ 50 % de 288) → sinon médiane période → sinon indisponible."""
+        from fuel_tracking.services import stock_initial_sources as S
+
+        self.assertAlmostEqual(4435.8 / (94.26 / 100) / 1000, 4.706, places=3)   # exemple du calcul validé
+        jour = lambda pts, med, vals=None: {"rect_power_points": pts, "rect_power_median_kw": med, "rect_power_values_kw": vals}
+        # 2 jours qualifiés (204 et 160 pts ≥ 144) + 1 non qualifié (ignoré quand des jours qualifiés existent)
+        r = S._rect_power([jour(204, 4.985), jour(160, 5.2), jour(20, 9.0, [9.0] * 20)], 3)
+        self.assertEqual((r["p_rect_kw"], r["p_rect_jours"], r["p_rect_source"], r["p_rect_motif"]), (5.09, 2, "RECTIFIER_MEDIAN_DAY", None))
+        self.assertEqual((r["p_rect_median_day_kw"], r["p_rect_median_period_kw"], r["p_rect_dispo_pct"]), (5.093, None, 44.4))
+        # Aucun jour qualifié : médiane de toutes les mesures valides de la période
+        r = S._rect_power([jour(100, 3.0, [2.0, 3.0, 4.0]), jour(50, 6.0, [5.0, 6.0])], 2)
+        self.assertEqual((r["p_rect_kw"], r["p_rect_source"], r["p_rect_median_period_kw"]), (4.0, "RECTIFIER_MEDIAN_PERIOD", 4.0))
+        self.assertIn("aucun jour ≥ 50 %", r["p_rect_motif"])
+        # Aucune mesure valide : null, jamais 0
+        r = S._rect_power([jour(None, None), {}], 2)
+        self.assertEqual((r["p_rect_kw"], r["p_rect_source"]), (None, "PUISSANCE_REDRESSEUR_INDISPONIBLE"))
+        self.assertIn("aucune mesure redresseur valide", r["p_rect_motif"])
 
     def test_load_dc_et_recharge_batterie(self):
         """Load DC = médiane LOAD_W (W → kW, 0 non compté) ; recharge = Ah × 53,5 V ÷ 24 h, valeurs > 0 seules, jour aberrant écarté."""

@@ -982,6 +982,13 @@ class FuelSiteDailyFacts(models.Model):
                                            help_text="Médiane du jour de courant de charge × tension batterie (W), créneaux 5 min en "
                                                      "charge, VW_GFMS_METRICS ; 0 si mesuré sans charge ; NULL si non mesuré.")
     battery_charge_slots = models.IntegerField(null=True, blank=True, help_text="Créneaux 5 min en charge (courant > 0) du jour.")
+    # Puissance redresseur (règle équipe data du 23/11/2026) : P_DC ÷ (rendement/100) ÷ 1000 par mesure, puis médiane
+    rect_power_points = models.IntegerField(null=True, blank=True,
+                                            help_text="Mesures redresseur valides du jour (Good/Aged/Warning, P_DC > 0, rendement 70-100 %).")
+    rect_power_median_kw = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True,
+                                               help_text="Médiane du jour de P_DC ÷ (rendement/100) ÷ 1000 (kW), mesures valides.")
+    rect_power_values_kw = models.JSONField(null=True, blank=True,
+                                            help_text="Mesures valides (kW) des jours NON qualifiés (< 50 % de 288) : repli médiane période.")
 
     synced_at = models.DateTimeField(default=timezone.now)
 

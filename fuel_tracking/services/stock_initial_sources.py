@@ -465,7 +465,11 @@ def _fms_runtimes(rows, lines) -> dict:
 def _power_medians(rows, lines, kinds: dict, kva: dict) -> dict:
     """site → puissances médianes mesurées (kW) sur la plage du fichier (lendemain de la date initiale → date finale), depuis les
     faits journaliers Snowflake en base (aucun appel Snowflake) :
-      redresseur : médiane des P_DC journalières (RECTIFIER_EFFICIENCY_STATUS) ;
+      redresseur : règle équipe data (23/11/2026), RECTIFIER_EFFICIENCY_STATUS : par mesure P_DC ÷ (rendement/100) ÷ 1000,
+                   mesures valides (Good/Aged/Warning, P_DC > 0, rendement 70-100 %) ; jour qualifié si ≥ 50 % de 288 pas.
+                   Retenue : 1. médiane des médianes des jours qualifiés (RECTIFIER_MEDIAN_DAY) ; 2. sinon médiane de
+                   toutes les mesures valides de la période (RECTIFIER_MEDIAN_PERIOD) ; 3. sinon null
+                   (PUISSANCE_REDRESSEUR_INDISPONIBLE) avec le motif, jamais 0 ;
       grid       : médiane des puissances AC journalières (AC_METER.ACT_ACTIVE_POWER_AVG, déjà en kW), mesures > 0 ;
       générateur : médiane, sur les jours où le GE a tourné, de DG_PRODUCTION_KWH ÷ DG_RUNTIME_CALCULATED (GENSET_REPORT) ;
                    jour au-delà de 105 % × kVA × 0,8 écarté (kVA = fichier Base GE, sinon PRP GENSET DB) ;
@@ -493,7 +497,8 @@ def _power_medians(rows, lines, kinds: dict, kva: dict) -> dict:
     for f in (F.objects.filter(site_id__in=list(span), date__gt=lo, date__lte=hi)
               .values("site_id", "date", "p_dc_day_kw", "p_dc_ge_tracker_kw", "p_dc_rect_active_kw", "eff_ge_tracker",
                       "eff_rect_active", "ac_active_power_avg_w", "dg_on_runtime_h", "dg_production_kwh", "load_dc_w",
-                      "battery_charge_ah", "battery_discharge_ah", "battery_charge_w")):
+                      "battery_charge_ah", "battery_discharge_ah", "battery_charge_w", "rect_power_points",
+                      "rect_power_median_kw", "rect_power_values_kw")):
         sid = f["site_id"].upper()
         d0, d1 = span.get(sid, (None, None))
         if d0 and d0 < f["date"] <= d1:
@@ -530,7 +535,7 @@ def _power_medians(rows, lines, kinds: dict, kva: dict) -> dict:
                           "(valeur BATTERY_REPORT incohérente)")
         else:
             batt_motif = "aucune donnée BATTERY_REPORT sur la période"
-        rect = [float(f["p_dc_day_kw"]) for f in fx.values() if f["p_dc_day_kw"] is not None and f["p_dc_day_kw"] >= 0]
+        rp = _rect_power(fx.values(), (d1 - d0).days)
         # AC_METER.ACT_ACTIVE_POWER_AVG est déjà en kW (vérifié en prod : BKL_0086 ≈ 24 kW brut) — aucune division
         grid = [float(f["ac_active_power_avg_w"]) for f in fx.values() if f["ac_active_power_avg_w"] is not None and f["ac_active_power_avg_w"] > 0]
         # Générateur : puissance réellement débitée par le GE quand il tourne, jour par jour
@@ -555,7 +560,7 @@ def _power_medians(rows, lines, kinds: dict, kva: dict) -> dict:
                 ge_motif = "GE à l'arrêt sur la période (Day DG On = 0 h)"
             else:
                 ge_motif = "aucune donnée GENSET_REPORT sur la période"
-        out[sid] = {"p_rect_kw": round(median(rect), 2) if rect else None, "p_rect_jours": len(rect),
+        out[sid] = {**rp,
                     "p_grid_kw": round(median(grid), 2) if grid else None, "p_grid_jours": len(grid),
                     "p_ge_kw": ge, "p_ge_jours": len(ge_days), "p_ge_motif": ge_motif,
                     "p_load_dc_kw": round(median(load), 2) if load else None, "p_load_dc_jours": len(load),
@@ -563,6 +568,40 @@ def _power_medians(rows, lines, kinds: dict, kva: dict) -> dict:
                     "p_batt_kw": round(median(batt), 2) if batt else None, "p_batt_jours": len(batt),
                     "p_batt_ecartes": batt_ecart, "p_batt_nuls": batt_nuls, "p_batt_motif": batt_motif, "p_batt_source": batt_src}
     return out
+
+
+RECT_DAY_SLOTS = 288          # pas de 5 min par jour
+RECT_QUALIFIED_RATIO = 0.5    # jour qualifié : mesures valides ≥ 50 % des pas attendus
+RECT_SRC_DAY, RECT_SRC_PERIOD, RECT_SRC_NONE = "RECTIFIER_MEDIAN_DAY", "RECTIFIER_MEDIAN_PERIOD", "PUISSANCE_REDRESSEUR_INDISPONIBLE"
+
+
+def _rect_power(facts, nb_jours: int) -> dict:
+    """Puissance redresseur retenue sur la période (règle équipe data) à partir des faits journaliers."""
+    from statistics import median
+
+    days = [f for f in facts if f.get("rect_power_points")]
+    qualified = [float(f["rect_power_median_kw"]) for f in days
+                 if f["rect_power_median_kw"] is not None and f["rect_power_points"] / RECT_DAY_SLOTS >= RECT_QUALIFIED_RATIO]
+    pts = sum(f["rect_power_points"] for f in days)
+    dispo = round(100 * pts / (RECT_DAY_SLOTS * nb_jours), 1) if nb_jours > 0 else None
+    day_kw = round(median(qualified), 3) if qualified else None
+    # Médiane de la période : toutes les mesures valides, connues seulement quand aucun jour n'est qualifié (repli)
+    values = [x for f in days if not (f["rect_power_points"] / RECT_DAY_SLOTS >= RECT_QUALIFIED_RATIO)
+              for x in (f.get("rect_power_values_kw") or [])]
+    period_kw = round(median(values), 3) if values and not qualified else None
+    if day_kw is not None:
+        kw, src, motif = day_kw, RECT_SRC_DAY, None
+    elif period_kw is not None:
+        kw, src = period_kw, RECT_SRC_PERIOD
+        motif = (f"aucun jour ≥ {RECT_QUALIFIED_RATIO:.0%} de disponibilité : médiane des {len(values)} mesure(s) "
+                 "valide(s) de la période")
+    else:
+        kw, src = None, RECT_SRC_NONE
+        motif = ("aucune mesure redresseur valide sur la période (statut Good/Aged/Warning, P_DC > 0, rendement 70-100 %)"
+                 if not days else "mesures redresseur valides sans détail disponible : resynchronisation nécessaire")
+    return {"p_rect_kw": round(kw, 2) if kw is not None else None, "p_rect_jours": len(qualified),
+            "p_rect_median_day_kw": day_kw, "p_rect_median_period_kw": period_kw, "p_rect_dispo_pct": dispo,
+            "p_rect_source": src, "p_rect_motif": motif}
 
 
 def enrich(rows: list[dict], fetch: bool = True) -> str | None:
@@ -656,6 +695,10 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
         # Puissances médianes mesurées (bloc ESTIMATION) — plage du fichier, faits journaliers Snowflake en base
         pw = powers.get(r["site_id"].upper()) or {}
         r["estimation_theorique"].update(p_rect_kw=pw.get("p_rect_kw"), p_rect_jours=pw.get("p_rect_jours"),
+                                         p_rect_median_day_kw=pw.get("p_rect_median_day_kw"),
+                                         p_rect_median_period_kw=pw.get("p_rect_median_period_kw"),
+                                         p_rect_dispo_pct=pw.get("p_rect_dispo_pct"), p_rect_source=pw.get("p_rect_source"),
+                                         p_rect_motif=pw.get("p_rect_motif"),
                                          p_ge_kw=pw.get("p_ge_kw"), p_ge_jours=pw.get("p_ge_jours"), p_ge_motif=pw.get("p_ge_motif"),
                                          p_grid_kw=pw.get("p_grid_kw"), p_grid_jours=pw.get("p_grid_jours"),
                                          p_load_dc_kw=pw.get("p_load_dc_kw"), p_load_dc_jours=pw.get("p_load_dc_jours"),

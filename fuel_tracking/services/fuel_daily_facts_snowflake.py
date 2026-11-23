@@ -11,7 +11,8 @@ Sources :
   DB_GFMS_ANALYTICS_PROD.GOLD.SITE_ESCO_CURRENT       inventaire (DATA_ID → SITE_ID, réseau, DG_COUNT)
   DB_GFMS_ANALYTICS_PROD.GOLD.GENSET_REPORT           DSE, Day DG On, production GE
   DB_GFMS_PROD.GOLD.GFMS_DATA_TRACKER_NC              compteur horaire (5 min)
-  DB_GFMS_PROD.GOLD.RECTIFIER_EFFICIENCY_STATUS       P_DC, rendement, statut (5 min)
+  DB_GFMS_PROD.GOLD.RECTIFIER_EFFICIENCY_STATUS       P_DC, rendement, statut (5 min) ; puissance redresseur
+                                                      P_DC ÷ (rendement/100) ÷ 1000 (calcul validé équipe data, 23/11/2026)
   DB_GFMS_ANALYTICS_PROD.GOLD.AC_METER                ACT_ACTIVE_POWER_AVG (W), ACT_ENERGY_P
   DB_GFMS_ANALYTICS_DEV.GOLD.VW_FUEL_REPORT           conso MESURÉE du jour (même filtre strict que la conso mensuelle)
   DB_GFMS_PROD.GOLD.AVERAGE_LOAD                      LOAD_W : load DC telco moyen du jour (W)
@@ -36,6 +37,11 @@ FUEL_REPORT = "DB_GFMS_ANALYTICS_DEV.GOLD"  # VW_FUEL_REPORT (cf. fuel_consommat
 METRICS = "DB_GFMS_ANALYTICS_DEV.GOLD"      # VW_GFMS_METRICS (télémétrie 5 min)
 # Puissance de recharge batterie (5 min) : créneau retenu si courant de charge > 0 et tension plausible (système 48 V)
 BATTERY_V_MIN, BATTERY_V_MAX = 40, 60
+# Puissance redresseur (règle équipe data) : mesure valide si statut Good/Aged/Warning, P_DC > 0, rendement 70-100 % ;
+# jour qualifié si mesures valides ≥ 50 % de 288 pas de 5 min. Mesures des jours NON qualifiés conservées (repli période).
+RECT_POWER_EFF_MIN, RECT_POWER_EFF_MAX = 70, 100
+RECT_POWER_DAY_SLOTS = 288
+RECT_POWER_QUALIFIED_RATIO = 0.5
 DATA_ID_CHUNK = 200
 
 # Unités — À CONFIRMER avec `manage.py diagnose_cph_sources` avant la mise en
@@ -54,6 +60,17 @@ def _connect():
 
 def _dec(v):
     return None if v is None else Decimal(str(v))
+
+
+def _values(v) -> list[float] | None:
+    """ARRAY Snowflake (texte JSON côté connecteur) → liste de float ; None si absent."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        import json
+
+        v = json.loads(v)
+    return [float(x) for x in v if x is not None]
 
 
 def fetch_inventory(country: str) -> list[dict]:
@@ -201,6 +218,23 @@ batt_daily AS (
            IFF(COUNT_IF(i_a > 0) > 0, MEDIAN(IFF(i_a > 0, i_a * v_v, NULL)), 0) AS batt_charge_w
     FROM batt_slots GROUP BY data_id, CAST(slot AS DATE)
 ),
+rect_power_valid AS (
+    -- Puissance redresseur par mesure (kW) = P_DC (W) ÷ (RECTIFIER_EFFICIENCY (%) / 100) ÷ 1000, AVANT toute médiane
+    SELECT ID AS data_id, CAST("TIMESTAMP" AS DATE) AS day,
+           P_DC / (RECTIFIER_EFFICIENCY / 100.0) / 1000.0 AS rect_kw
+    FROM {prod}.RECTIFIER_EFFICIENCY_STATUS
+    WHERE "TIMESTAMP" >= %(d_start)s::TIMESTAMP_NTZ
+      AND "TIMESTAMP" < DATEADD('day', 1, %(d_end)s::TIMESTAMP_NTZ)
+      AND ID IN ({ids})
+      AND RECTIFIER_STATUS IN ({active_statuses})
+      AND P_DC > 0
+      AND RECTIFIER_EFFICIENCY BETWEEN {eff_min} AND {eff_max}
+),
+rect_power_daily AS (
+    SELECT data_id, day, COUNT(*) AS rect_power_points, MEDIAN(rect_kw) AS rect_power_median_kw,
+           IFF(COUNT(*) < {day_slots} * {qualified_ratio}, ARRAY_AGG(ROUND(rect_kw, 4)), NULL) AS rect_power_values
+    FROM rect_power_valid GROUP BY data_id, day
+),
 universe AS (
     SELECT data_id, day FROM genset
     UNION SELECT data_id, day FROM tracker_daily
@@ -210,6 +244,7 @@ universe AS (
     UNION SELECT data_id, day FROM load_dc
     UNION SELECT data_id, day FROM battery
     UNION SELECT data_id, day FROM batt_daily
+    UNION SELECT data_id, day FROM rect_power_daily
 )
 SELECT u.data_id, u.day,
        g.dse_h, g.dg_on_h, g.prod_kwh,
@@ -218,7 +253,8 @@ SELECT u.data_id, u.day,
        rd.p_dc_rect_active_kw, rd.eff_rect_active, rd.p_dc_day_kw, rd.eff_day,
        a.ac_w, a.ac_energy, a.ac_points,
        f.measured_l, f.raw_points, g.total_h, f.fms_level,
-       ld.load_w, b.charge_ah, b.discharge_ah, bd.batt_charge_w, bd.batt_charge_slots
+       ld.load_w, b.charge_ah, b.discharge_ah, bd.batt_charge_w, bd.batt_charge_slots,
+       rp.rect_power_points, rp.rect_power_median_kw, rp.rect_power_values
 FROM universe u
 LEFT JOIN genset g ON g.data_id = u.data_id AND g.day = u.day
 LEFT JOIN tracker_daily td ON td.data_id = u.data_id AND td.day = u.day
@@ -228,6 +264,7 @@ LEFT JOIN fuel f ON f.data_id = u.data_id AND f.day = u.day
 LEFT JOIN load_dc ld ON ld.data_id = u.data_id AND ld.day = u.day
 LEFT JOIN battery b ON b.data_id = u.data_id AND b.day = u.day
 LEFT JOIN batt_daily bd ON bd.data_id = u.data_id AND bd.day = u.day
+LEFT JOIN rect_power_daily rp ON rp.data_id = u.data_id AND rp.day = u.day
 """
 
 
@@ -263,10 +300,12 @@ def build_daily_facts_sql(data_ids: list[int], with_tracker: bool = True, with_b
         a, b = sql.index("tracker_iv AS ("), sql.index("rect_slots AS (")
         sql = sql[:a] + NO_TRACKER_CTES + sql[b:]
     if not with_battery_5min:
-        a, b = sql.index("batt_slots AS ("), sql.index("universe AS (")
+        a, b = sql.index("batt_slots AS ("), sql.index("rect_power_valid AS (")
         sql = sql[:a] + NO_BATT_CTES + sql[b:]
     return sql.format(analytics=ANALYTICS, prod=PROD, fuel_report=FUEL_REPORT, metrics=METRICS, ids=ids,
-                      active_statuses=statuses, v_min=BATTERY_V_MIN, v_max=BATTERY_V_MAX)
+                      active_statuses=statuses, v_min=BATTERY_V_MIN, v_max=BATTERY_V_MAX,
+                      eff_min=RECT_POWER_EFF_MIN, eff_max=RECT_POWER_EFF_MAX, day_slots=RECT_POWER_DAY_SLOTS,
+                      qualified_ratio=RECT_POWER_QUALIFIED_RATIO)
 
 
 def view_status(cur, view: str) -> str | None:
@@ -315,7 +354,8 @@ def fetch_daily_facts(data_ids: list[int], d_start: date, d_end: date, country: 
             for (data_id, day, dse_h, dg_on_h, prod_kwh, tracker_h, covered_min, ge_on_slots,
                  slots, active_slots, p_dc_ge, eff_ge, p_dc_act, eff_act, p_dc_day, eff_day,
                  ac_w, ac_energy, ac_points, measured_l, raw_points, total_h, fms_level,
-                 load_w, charge_ah, discharge_ah, batt_w, batt_slots) in cur.fetchall():
+                 load_w, charge_ah, discharge_ah, batt_w, batt_slots,
+                 rect_pts, rect_med, rect_vals) in cur.fetchall():
                 rows.append({
                     "data_id": int(data_id), "date": day,
                     "dse_runtime_h": _dec(dse_h), "dg_on_runtime_h": _dec(dg_on_h), "dg_production_kwh": _dec(prod_kwh),
@@ -336,6 +376,9 @@ def fetch_daily_facts(data_ids: list[int], d_start: date, d_end: date, country: 
                     "battery_discharge_ah": _dec(discharge_ah),
                     "battery_charge_w": _dec(batt_w),
                     "battery_charge_slots": int(batt_slots) if batt_slots is not None else None,
+                    "rect_power_points": int(rect_pts) if rect_pts is not None else None,
+                    "rect_power_median_kw": _dec(rect_med),
+                    "rect_power_values_kw": _values(rect_vals),
                 })
     finally:
         conn.close()
