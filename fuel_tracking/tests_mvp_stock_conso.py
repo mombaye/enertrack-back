@@ -1180,6 +1180,13 @@ class FmsFromDailyFactsTests(MvpBase):
         sans_5min = build_daily_facts_sql([1], with_battery_5min=False)
         self.assertNotIn("GFMS_METRICS", sans_5min)
         self.assertIn("bd.batt_kw_med", sans_5min)   # mêmes colonnes, toujours NULL
+        # Le pilote Snowflake interpole les paramètres avec « % » : aucun « % » littéral hors %(nom)s, même en commentaire
+        import re
+
+        for tr in (True, False):
+            for bt in (True, False):
+                q = build_daily_facts_sql([1], with_tracker=tr, with_battery_5min=bt)
+                self.assertEqual(re.findall(r"%(?!\(\w+\)s|%)", q), [], f"« % » littéral (tracker={tr}, batterie={bt})")
         self.assertIn("rect_power_daily AS (", sans_5min)   # la puissance redresseur reste calculée
 
 

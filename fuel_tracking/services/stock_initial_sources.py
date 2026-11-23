@@ -663,7 +663,7 @@ def _batt_power(facts, nb_jours: int) -> dict:
         kw, src, motif = day_kw, BATT_SRC_DAY, None
     elif period_kw is not None:
         kw, src = period_kw, BATT_SRC_PERIOD
-        motif = (f"aucun jour ≥ {RECT_QUALIFIED_RATIO:.0%} de disponibilité : médiane des {len(values)} pas en charge "
+        motif = (f"aucun jour ≥ {RECT_QUALIFIED_RATIO * 100:.0f} % de disponibilité : médiane des {len(values)} pas en charge "
                  "de la période")
     else:
         kw, src, motif = None, BATT_SRC_NONE, "pas en charge sans détail disponible : resynchronisation nécessaire"
@@ -699,7 +699,7 @@ def _rect_power(facts, nb_jours: int) -> dict:
         kw, src, motif = day_kw, RECT_SRC_DAY, None
     elif period_kw is not None:
         kw, src = period_kw, RECT_SRC_PERIOD
-        motif = (f"aucun jour ≥ {RECT_QUALIFIED_RATIO:.0%} de disponibilité : médiane des {len(values)} mesure(s) "
+        motif = (f"aucun jour ≥ {RECT_QUALIFIED_RATIO * 100:.0f} % de disponibilité : médiane des {len(values)} mesure(s) "
                  "valide(s) de la période")
     else:
         kw, src = None, RECT_SRC_NONE

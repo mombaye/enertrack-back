@@ -225,7 +225,7 @@ batt_daily AS (
     FROM batt_slots GROUP BY data_id, CAST(slot AS DATE)
 ),
 rect_power_valid AS (
-    -- Puissance redresseur par mesure (kW) = P_DC (W) ÷ (RECTIFIER_EFFICIENCY (%) / 100) ÷ 1000, AVANT toute médiane
+    -- Puissance redresseur par mesure (kW) = P_DC (W) ÷ (RECTIFIER_EFFICIENCY en pourcentage / 100) ÷ 1000, AVANT toute médiane
     SELECT ID AS data_id, CAST("TIMESTAMP" AS DATE) AS day,
            P_DC / (RECTIFIER_EFFICIENCY / 100.0) / 1000.0 AS rect_kw
     FROM {prod}.RECTIFIER_EFFICIENCY_STATUS
