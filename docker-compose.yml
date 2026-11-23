@@ -93,6 +93,9 @@ services:
     volumes:
       - ./data_imports:/code/data_imports
       - media_data:/code/media
+      # Registre stock carburant (copies d'archive des fichiers Closing) : refresh_ge_info (file interactive) y lit la
+      # feuille « GENSET DB » pour la Puissance PRP du Suivi Conso. Sans ce montage : PRP « n.d. » sur tous les sites.
+      - "${FUEL_IMPORT_HOST_PATH:-/mnt/suivi_carburant_prod}:/mnt/Suivi_carburant_prod"
     depends_on:
       db:
         condition: service_healthy

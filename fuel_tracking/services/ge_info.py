@@ -187,6 +187,15 @@ def refresh() -> dict:
         logger.warning("GENSET DB illisible : %s", e)
         gdb, gdb_meta = {}, {"fichier": None}
         errors.append("GENSET DB (fichier de clôture) non lue.")
+    if not gdb:
+        if gdb_meta.get("archives_introuvables"):
+            errors.append(f"GENSET DB : {gdb_meta['archives_introuvables']} copie(s) d'archive Closing introuvable(s) "
+                          "(registre non monté dans ce conteneur ?).")
+        elif gdb_meta.get("lots_closing"):
+            errors.append("GENSET DB : aucune feuille « GENSET DB » exploitable dans les fichiers de clôture.")
+        prev = (cached() or {}).get("raw") or {}
+        if prev.get("gdb"):   # dernière lecture réussie conservée : une archive momentanément inaccessible n'efface pas la PRP
+            gdb, gdb_meta = prev["gdb"], {**(prev.get("gdb_meta") or {}), "conservee": True}
     from fuel_tracking.services.base_ge import known_brands
 
     brands = known_brands([t for t, _k in base.values()], gdb_meta.get("fabricants") or [])
@@ -276,19 +285,27 @@ def fetch_genset_db() -> tuple[dict, dict]:
     ref = [x for x in reference_batches(getattr(settings, "FUEL_GENSET_DB_MONTH", "2026-09"))]
     qs = list(FuelImportBatch.objects.filter(source_type="CLOSING").exclude(status__in=("REJECTED", "FAILED"))
               .exclude(archive_path=None).order_by("-received_at"))
+    absents, illisibles = [], []
     for b in sorted(qs, key=lambda x: (x.pk not in ref, ref.index(x.pk) if x.pk in ref else 0)):   # Closing de référence d'abord
         if not Path(b.archive_path).is_file():
+            absents.append(b.file_name)   # registre non monté dans ce conteneur, ou copie d'archive supprimée
             continue
         gdb, mfs = {}, set()
         try:
             for _n, rows in iter_sheets(Path(b.archive_path).read_bytes(), b.file_name, only={"GENSET DB"}):
                 gdb = parse_genset_db(list(rows), mfs)   # lignes lues pendant que le classeur est ouvert
-        except Exception:  # noqa: BLE001 — archive illisible : fichier précédent
+        except Exception as e:  # noqa: BLE001 — archive illisible : fichier précédent
+            logger.warning("GENSET DB : archive %s illisible : %s", b.file_name, e)
+            illisibles.append(b.file_name)
             continue
         if gdb:
             return gdb, {"fichier": b.file_name, "types": len(gdb), "ambigus": sorted(k for k, v in gdb.items() if len(v) > 1),
                          "fabricants": sorted(mfs)}
-    return {}, {"fichier": None, "types": 0}
+    if absents:
+        logger.warning("GENSET DB : %d copie(s) d'archive Closing introuvable(s) (ex. %s) — registre %s monté dans ce "
+                       "conteneur ?", len(absents), absents[0], getattr(settings, "FUEL_IMPORT_ROOT", "?"))
+    return {}, {"fichier": None, "types": 0, "lots_closing": len(qs), "archives_introuvables": len(absents),
+                "archives_illisibles": len(illisibles)}
 
 
 def add_prp(sites: dict, gdb: dict, fichier: str | None) -> None:

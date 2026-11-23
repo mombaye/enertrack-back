@@ -1408,6 +1408,33 @@ class PrpGensetDbTests(MvpBase):
         self.assertEqual((sites["C"]["prp_kva"], sites["C"]["prp_motif"]), (None, "type « P33-3U » absent de GENSET DB"))
         self.assertEqual((sites["D"]["prp_kva"], sites["D"]["prp_motif"]), (None, None))
 
+    def test_archive_introuvable_signalee_et_derniere_lecture_conservee(self):
+        """Worker sans le registre monté (celery-interactive) : archive Closing introuvable → erreur explicite, et la
+        dernière GENSET DB lue reste en cache au lieu d'afficher « n.d. » partout."""
+        from unittest import mock
+
+        from django.core.cache import cache
+
+        from fuel_tracking.services import ge_info as G
+
+        FuelImportBatch.objects.create(source_type="CLOSING", file_name="Closing_sept.xlsb", file_hash="h" * 64,
+                                       archive_path="/inexistant/registre/archive/Closing_sept.xlsb")
+        gdb, meta = G.fetch_genset_db()
+        self.assertEqual((gdb, meta["fichier"], meta["archives_introuvables"]), ({}, None, 1))
+
+        cache.set(G.CACHE_KEY, {"raw": {"gdb": {"K22": {22.0}}, "gdb_meta": {"fichier": "Closing_sept.xlsb"}},
+                                "lu_le": timezone.now().isoformat()})
+        try:
+            with mock.patch.object(G, "fetch_snowflake", return_value=({}, {})), mock.patch.object(G, "fetch_enoc", return_value={}), \
+                    mock.patch("fuel_tracking.services.base_ge.latest_types", return_value=({"A": ("K22", None)}, "base.xlsx")):
+                out = G.refresh()
+            self.assertTrue(any("introuvable" in e for e in out["erreurs"]))
+            data = G.cached()
+            self.assertEqual((data["sites"]["A"]["prp_kva"], data["sites"]["A"]["prp_source"]), ([22.0], "GENSET DB (Closing_sept.xlsb)"))
+            self.assertTrue(data["meta"]["genset_db"]["conservee"])
+        finally:
+            cache.delete(G.CACHE_KEY)
+
 
 class AuditSuiviConsoTests(OutputAppFuelImportTests):
     """Audit global (lecture seule) : chaque valeur affichée comparée à la source ; sources externes simulées."""
