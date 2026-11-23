@@ -36,6 +36,10 @@ PROD = "DB_GFMS_PROD.GOLD"
 ANALYTICS = "DB_GFMS_ANALYTICS_PROD.GOLD"
 FUEL_REPORT = "DB_GFMS_ANALYTICS_DEV.GOLD"  # VW_FUEL_REPORT (cf. fuel_consommation_snowflake.py)
 BATTERY_METRICS = "DB_GFMS_ANALYTICS_PROD.SILVER.GFMS_METRICS"   # télémétrie batterie 5 min (règle équipe data)
+# Repli : vue GOLD sur la même télémétrie 5 min (SELECT m.* FROM DB_GFMS_ANALYTICS_DEV.SILVER.GFMS_METRICS), sur laquelle le rôle
+# a déjà le droit SELECT. Elle échoue tant que l'équipe data ne l'a pas recompilée (002057 : 99 colonnes déclarées, 265 produites).
+BATTERY_METRICS_FALLBACK = "DB_GFMS_ANALYTICS_DEV.GOLD.VW_GFMS_METRICS"
+BATTERY_METRICS_SOURCES = (BATTERY_METRICS, BATTERY_METRICS_FALLBACK)   # première source lisible retenue
 # Recharge batterie (règle équipe data) : pas reçu si tension batterie > 0 ; puissance = courant × tension ÷ 1000 si
 # courant de charge > 0 ; jour qualifié si pas reçus ≥ 50 % de 288. Puissances des jours NON qualifiés conservées (repli).
 # Puissance redresseur (règle équipe data) : mesure valide si statut Good/Aged/Warning, P_DC > 0, rendement 70-100 % ;
@@ -298,7 +302,8 @@ NO_BATT_CTES = """batt_daily AS (
 """
 
 
-def build_daily_facts_sql(data_ids: list[int], with_tracker: bool = True, with_battery_5min: bool = True) -> str:
+def build_daily_facts_sql(data_ids: list[int], with_tracker: bool = True, with_battery_5min: bool = True,
+                          battery_source: str = BATTERY_METRICS) -> str:
     # DATA_ID sont des entiers issus de Snowflake (jamais une saisie utilisateur).
     ids = ",".join(str(int(d)) for d in data_ids)
     statuses = ",".join(f"'{s}'" for s in RECTIFIER_ACTIVE_STATUSES)
@@ -309,7 +314,7 @@ def build_daily_facts_sql(data_ids: list[int], with_tracker: bool = True, with_b
     if not with_battery_5min:
         a, b = sql.index("batt_raw AS ("), sql.index("rect_power_valid AS (")
         sql = sql[:a] + NO_BATT_CTES + sql[b:]
-    return sql.format(analytics=ANALYTICS, prod=PROD, fuel_report=FUEL_REPORT, battery_metrics=BATTERY_METRICS, ids=ids,
+    return sql.format(analytics=ANALYTICS, prod=PROD, fuel_report=FUEL_REPORT, battery_metrics=battery_source, ids=ids,
                       active_statuses=statuses,
                       eff_min=RECT_POWER_EFF_MIN, eff_max=RECT_POWER_EFF_MAX, day_slots=RECT_POWER_DAY_SLOTS,
                       qualified_ratio=RECT_POWER_QUALIFIED_RATIO)
@@ -345,16 +350,26 @@ def fetch_daily_facts(data_ids: list[int], d_start: date, d_end: date, country: 
             logger.warning("[fuel_daily_facts] %s", msg)
             if warnings is not None and msg not in warnings:
                 warnings.append(msg)
-        batt_err = view_status(cur, BATTERY_METRICS)
+        batt_src, batt_errs = None, []
+        for src in BATTERY_METRICS_SOURCES:   # première source de télémétrie batterie 5 min lisible
+            e = view_status(cur, src)
+            if e is None:
+                batt_src = src
+                break
+            batt_errs.append(f"{src} illisible : {e}")
+        batt_err = None if batt_src else " | ".join(batt_errs)
+        if batt_src and batt_errs:
+            logger.info("[fuel_daily_facts] Télémétrie batterie 5 min lue dans %s (%s)", batt_src, batt_errs[0])
         if batt_err:
             msg = (f"Télémétrie batterie 5 min {BATTERY_METRICS} illisible, Puissance Médiane Recharge batterie "
-                   f"indisponible : {batt_err}")
+                   f"indisponible (aucune source lisible) : {batt_err}")
             logger.warning("[fuel_daily_facts] %s", msg)
             if warnings is not None and msg not in warnings:
                 warnings.append(msg)
         for i in range(0, len(data_ids), DATA_ID_CHUNK):
             chunk = data_ids[i:i + DATA_ID_CHUNK]
-            cur.execute(build_daily_facts_sql(chunk, with_tracker=tracker_err is None, with_battery_5min=batt_err is None), {
+            cur.execute(build_daily_facts_sql(chunk, with_tracker=tracker_err is None, with_battery_5min=batt_err is None,
+                                              battery_source=batt_src or BATTERY_METRICS), {
                 "d_start": d_start, "d_end": d_end, "country": country,
                 "p_dc_div": float(P_DC_TO_KW_DIVISOR), "eff_div": float(EFFICIENCY_TO_RATIO_DIVISOR),
             })
