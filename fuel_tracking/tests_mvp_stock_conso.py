@@ -1810,7 +1810,7 @@ class PowerMediansTests(MvpBase):
         self.assertIn("BATTERY_REPORT", vide["p_batt_motif"])
 
     def test_load_dc_et_recharge_batterie(self):
-        """Load DC = médiane LOAD_W (W → kW, 0 non compté) ; recharge = Ah × 53,5 V ÷ 24 h, jour aberrant écarté."""
+        """Load DC = médiane LOAD_W (W → kW, 0 non compté) ; recharge = Ah × 53,5 V ÷ 24 h, valeurs > 0 seules, jour aberrant écarté."""
         from datetime import date
 
         from fuel_tracking.models import FuelSiteDailyFacts as F
@@ -1826,16 +1826,20 @@ class PowerMediansTests(MvpBase):
         lines = {"BAT_1": {"ini": {"periode": ["2026-09-30", "2026-10-05"]}, "fin": {"periode": ["2026-09-30", "2026-10-05"]}}}
         out = S._power_medians(rows, lines, {}, {})["BAT_1"]
         self.assertEqual((out["p_load_dc_kw"], out["p_load_dc_jours"], out["p_load_dc_motif"]), (2.5, 3, None))
-        # 240 Ah × 53,5 / 24 = 535 W ; 480 Ah → 1 070 W ; 0 Ah → 0 W (compté) ; 19 670 Ah > 3 × 0 + 500 → écarté
-        self.assertEqual((out["p_batt_kw"], out["p_batt_jours"], out["p_batt_ecartes"]), (0.54, 3, 1))
+        # 240 Ah × 53,5 / 24 = 535 W ; 480 Ah → 1 070 W ; 0 Ah non compté ; 19 670 Ah > 3 × 0 + 500 → écarté
+        self.assertEqual((out["p_batt_kw"], out["p_batt_jours"], out["p_batt_ecartes"], out["p_batt_nuls"]), (0.8, 2, 1, 1))
         self.assertIn("BATTERY_REPORT", out["p_batt_source"])
-        # Télémétrie 5 min présente : prioritaire (médiane des médianes journalières I × V), BATTERY_REPORT ignoré
+        # Télémétrie 5 min présente : prioritaire (médiane des médianes journalières I × V > 0), BATTERY_REPORT ignoré
         F.objects.filter(site_id="BAT_1", date=date(2026, 10, 1)).update(battery_charge_w=1200)
         F.objects.filter(site_id="BAT_1", date=date(2026, 10, 2)).update(battery_charge_w=0)
         F.objects.filter(site_id="BAT_1", date=date(2026, 10, 3)).update(battery_charge_w=1800)
         cinq = S._power_medians(rows, lines, {}, {})["BAT_1"]
-        self.assertEqual((cinq["p_batt_kw"], cinq["p_batt_jours"], cinq["p_batt_ecartes"]), (1.2, 3, 0))
+        self.assertEqual((cinq["p_batt_kw"], cinq["p_batt_jours"], cinq["p_batt_ecartes"], cinq["p_batt_nuls"]), (1.5, 2, 0, 1))
         self.assertIn("VW_GFMS_METRICS", cinq["p_batt_source"])
+        F.objects.filter(site_id="BAT_1").exclude(battery_charge_w=None).update(battery_charge_w=0)
+        sans_charge = S._power_medians(rows, lines, {}, {})["BAT_1"]
+        self.assertIsNone(sans_charge["p_batt_kw"])
+        self.assertIn("aucune recharge positive", sans_charge["p_batt_motif"])
         F.objects.filter(site_id="BAT_1").update(battery_charge_w=None)
         F.objects.filter(site_id="BAT_1", date__lte=date(2026, 10, 3)).delete()
         seul_aberrant = S._power_medians(rows, lines, {}, {})["BAT_1"]

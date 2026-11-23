@@ -471,9 +471,10 @@ def _power_medians(rows, lines, kinds: dict, kva: dict) -> dict:
                    jour au-delà de 105 % × kVA × 0,8 écarté (kVA = fichier Base GE, sinon PRP GENSET DB) ;
       load DC telco : médiane des LOAD_W journaliers (AVERAGE_LOAD, W → kW), mesures > 0 ;
       recharge batterie : 1. télémétrie 5 min (VW_GFMS_METRICS) : médiane des médianes journalières de courant de charge
-                   × tension batterie (créneaux en charge), 0 W = jour mesuré sans charge ;
+                   × tension batterie (créneaux en charge) ;
                    2. repli si aucun jour de télémétrie : médiane de Ah chargés × tension ÷ 24 h (BATTERY_REPORT), jour écarté
-                   si Ah chargés > facteur × Ah déchargés + marge (FUEL_BATTERY_CHARGE_*) ; 0 = batterie non rechargée (compté).
+                   si Ah chargés > facteur × Ah déchargés + marge (FUEL_BATTERY_CHARGE_*).
+                   Médiane des seules valeurs POSITIVES (décision du 23/11/2026) : jour à 0 ou négatif non compté.
     Aucune mesure : n.d. (jamais 0) avec la raison."""
     from statistics import median
 
@@ -504,20 +505,26 @@ def _power_medians(rows, lines, kinds: dict, kva: dict) -> dict:
     for sid, (d0, d1) in span.items():
         fx = facts.get(sid) or {}
         load = [float(f["load_dc_w"]) / 1000 for f in fx.values() if f["load_dc_w"] is not None and f["load_dc_w"] > 0]
-        batt5 = [float(f["battery_charge_w"]) / 1000 for f in fx.values() if f["battery_charge_w"] is not None and f["battery_charge_w"] >= 0]
-        batt, batt_ecart = [], 0
-        for f in ([] if batt5 else fx.values()):   # repli BATTERY_REPORT seulement sans télémétrie 5 min
+        w5 = [float(f["battery_charge_w"]) for f in fx.values() if f["battery_charge_w"] is not None]
+        batt5 = [w / 1000 for w in w5 if w > 0]   # médiane des seules valeurs positives
+        batt, batt_ecart, batt_nuls = [], 0, len(w5) - len(batt5)
+        for f in ([] if w5 else fx.values()):   # repli BATTERY_REPORT seulement sans télémétrie 5 min
             ch, dis = f["battery_charge_ah"], f["battery_discharge_ah"]
-            if ch is None or ch < 0:
+            if ch is None:
+                continue
+            if ch <= 0:
+                batt_nuls += 1   # pas de recharge ce jour : non compté dans la médiane
                 continue
             if float(ch) > b_fact * float(dis or 0) + b_marge:
                 batt_ecart += 1   # valeur BATTERY_REPORT aberrante (recharge sans décharge correspondante) : écartée
                 continue
             batt.append(float(ch) * volt / 24 / 1000)
-        batt_src = "VW_GFMS_METRICS (courant de charge × tension, 5 min)" if batt5 else ("BATTERY_REPORT (Ah × tension ÷ 24 h)" if batt else None)
-        batt = batt5 or batt
+        batt_src = "VW_GFMS_METRICS (courant de charge × tension, 5 min)" if w5 else ("BATTERY_REPORT (Ah × tension ÷ 24 h)" if batt else None)
+        batt = batt5 if w5 else batt
         if batt:
             batt_motif = None
+        elif batt_nuls and not batt_ecart:
+            batt_motif = f"aucune recharge positive sur la période ({batt_nuls} jour(s) à 0 ou négatif, non comptés)"
         elif batt_ecart:
             batt_motif = (f"{batt_ecart} jour(s) écarté(s) : Ah chargés > {b_fact:g} × Ah déchargés + {b_marge:g} Ah "
                           "(valeur BATTERY_REPORT incohérente)")
@@ -554,7 +561,7 @@ def _power_medians(rows, lines, kinds: dict, kva: dict) -> dict:
                     "p_load_dc_kw": round(median(load), 2) if load else None, "p_load_dc_jours": len(load),
                     "p_load_dc_motif": None if load else "aucune donnée AVERAGE_LOAD (load DC) sur la période",
                     "p_batt_kw": round(median(batt), 2) if batt else None, "p_batt_jours": len(batt),
-                    "p_batt_ecartes": batt_ecart, "p_batt_motif": batt_motif, "p_batt_source": batt_src}
+                    "p_batt_ecartes": batt_ecart, "p_batt_nuls": batt_nuls, "p_batt_motif": batt_motif, "p_batt_source": batt_src}
     return out
 
 
@@ -654,7 +661,8 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
                                          p_load_dc_kw=pw.get("p_load_dc_kw"), p_load_dc_jours=pw.get("p_load_dc_jours"),
                                          p_load_dc_motif=pw.get("p_load_dc_motif"), p_batt_kw=pw.get("p_batt_kw"),
                                          p_batt_jours=pw.get("p_batt_jours"), p_batt_ecartes=pw.get("p_batt_ecartes"),
-                                         p_batt_motif=pw.get("p_batt_motif"), p_batt_source=pw.get("p_batt_source"))
+                                         p_batt_motif=pw.get("p_batt_motif"), p_batt_source=pw.get("p_batt_source"),
+                                         p_batt_nuls=pw.get("p_batt_nuls"))
         # Bloc « DONNÉES DE STOCK FINAL », à la Date de Relevé Finale de la ligne du fichier (seule date retenue ; absente → n.d.)
         line = (lines.get(r["site_id"]) or {}).get("fin") or {}
         df = _day((line.get("periode") or [None, None])[1])   # Date de Relevé Finale du fichier (absente → n.d.)
