@@ -9,6 +9,7 @@ Usage :
     python manage.py sync_fuel_daily_facts --days 3            # J-3 → aujourd'hui
     python manage.py sync_fuel_daily_facts --start 2026-09-01 --end 2026-09-30 --sites DKR_0001,THS_0002 --dry-run
 """
+import time
 from datetime import date, timedelta
 
 from django.conf import settings
@@ -31,8 +32,14 @@ class Command(BaseCommand):
         parser.add_argument("--sites", default=None, help="site_id séparés par des virgules.")
         parser.add_argument("--dry-run", action="store_true")
 
+    def say(self, msg: str, style=None) -> None:
+        """Affiche tout de suite (y compris derrière un « | tail » ou dans un conteneur sans TTY) : avancement visible."""
+        self.stdout.write(style(msg) if style else msg)
+        self.stdout.flush()
+
     def handle(self, *args, **opts):
         today = timezone.localdate()
+        t0 = time.monotonic()
         if opts["days"] is not None:
             d_start, d_end = today - timedelta(days=opts["days"]), today
         else:
@@ -48,8 +55,9 @@ class Command(BaseCommand):
         warnings: list[str] = []
         try:
             for country in countries:
+                self.say(f"{country} : lecture de l'inventaire Snowflake (SITE_ESCO_CURRENT)…")
                 inventory = SF.fetch_inventory(country)
-                self.stdout.write(f"{country} : {len(inventory)} DATA_ID dans SITE_ESCO_CURRENT")
+                self.say(f"{country} : {len(inventory)} DATA_ID dans SITE_ESCO_CURRENT")
                 if not dry:
                     FuelSiteInventory.objects.bulk_create(
                         [FuelSiteInventory(**row, synced_at=timezone.now()) for row in inventory],
@@ -59,11 +67,16 @@ class Command(BaseCommand):
                 ge_rows = [r for r in inventory if (r["dg_count"] or 0) > 0
                            and (site_filter is None or r["site_id"] in site_filter)]
                 site_by_data_id = {r["data_id"]: r["site_id"] for r in ge_rows}
-                self.stdout.write(f"  {len(ge_rows)} DATA_ID avec GE retenus")
+                windows = list(SF.date_windows(d_start, d_end))
+                self.say(f"  {len(ge_rows)} DATA_ID avec GE retenus — {len(windows)} fenêtre(s) de dates à lire "
+                         "(plusieurs minutes possibles, avancement ci-dessous)")
 
-                for w_start, w_end in SF.date_windows(d_start, d_end):
+                for n, (w_start, w_end) in enumerate(windows, 1):
+                    t = time.monotonic()
+                    self.say(f"  [{n}/{len(windows)}] {w_start} → {w_end} : lecture Snowflake en cours…")
                     facts = SF.fetch_daily_facts(list(site_by_data_id), w_start, w_end, country, warnings=warnings)
-                    self.stdout.write(f"  {w_start} → {w_end} : {len(facts)} ligne(s) site/jour")
+                    self.say(f"  [{n}/{len(windows)}] {w_start} → {w_end} : {len(facts)} ligne(s) site/jour "
+                             f"({time.monotonic() - t:.0f} s)")
                     if dry:
                         continue
                     objs = [FuelSiteDailyFacts(country=country, site_id=site_by_data_id[f["data_id"]],
@@ -83,7 +96,7 @@ class Command(BaseCommand):
                 run.save()
             raise
         for w in warnings:
-            self.stdout.write(self.style.WARNING(f"AVERTISSEMENT : {w}"))
+            self.say(f"AVERTISSEMENT : {w}", self.style.WARNING)
         if run:
             run.status = FuelDailyFactsSyncRun.Status.SUCCESS
             run.rows_written = written
@@ -91,4 +104,5 @@ class Command(BaseCommand):
             # Succès partiel visible dans le journal des synchros (une source manquante n'est jamais silencieuse).
             run.error_message = ("AVERTISSEMENT : " + " | ".join(warnings)) if warnings else None
             run.save()
-        self.stdout.write(self.style.SUCCESS(f"Terminé — {written} ligne(s) écrite(s)." if not dry else "DRY RUN — rien écrit."))
+        self.say(f"Terminé — {written} ligne(s) écrite(s) en {time.monotonic() - t0:.0f} s." if not dry else "DRY RUN — rien écrit.",
+                 self.style.SUCCESS)
