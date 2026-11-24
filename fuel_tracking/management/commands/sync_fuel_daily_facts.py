@@ -2,7 +2,9 @@
 """
 Synchronise les faits bruts Suivi Carburant / CPH (Snowflake, lecture seule)
 au grain (country, data_id, date) : inventaire SITE_ESCO_CURRENT puis faits
-journaliers des sites avec GE (DG_COUNT > 0).
+journaliers des sites du périmètre carburant (même périmètre que le tableau Suivi Conso, décision du 24/11/2026) :
+sites avec GE selon l'inventaire (DG_COUNT > 0) + sites qui ont un stock de carburant dans les fichiers de clôture
+(DG_COUNT à 0 ou faux dans SITE_ESCO_CURRENT), hors « sans GE et sans cuve » déclarés par Ops.
 
 Usage :
     python manage.py sync_fuel_daily_facts --start 2026-10-01 --end 2026-10-12
@@ -19,6 +21,18 @@ from django.utils import timezone
 
 from fuel_tracking.models import FuelDailyFactsSyncRun, FuelSiteDailyFacts, FuelSiteInventory
 from fuel_tracking.services import fuel_daily_facts_snowflake as SF
+
+
+def fuel_stock_sites_between(d_start: date, d_end: date) -> set[str]:
+    """Sites (majuscules) qui ont un stock de carburant dans les fichiers de clôture, pour chaque mois de la plage
+    (sans ceux déclarés « sans GE et sans cuve » ce mois-là) — mêmes sites que le tableau Suivi Conso."""
+    from fuel_tracking.services.conso_comparison import fuel_stock_sites
+
+    out, d = set(), date(d_start.year, d_start.month, 1)
+    while d <= d_end:
+        out |= fuel_stock_sites(d.strftime("%Y-%m"))
+        d = date(d.year + (d.month == 12), d.month % 12 + 1, 1)
+    return out
 
 
 class Command(BaseCommand):
@@ -64,11 +78,14 @@ class Command(BaseCommand):
                         batch_size=1000, update_conflicts=True, unique_fields=["country", "data_id"],
                         update_fields=["site_id", "site_name", "grid_supply", "dg_count", "synced_at"],
                     )
-                ge_rows = [r for r in inventory if (r["dg_count"] or 0) > 0
+                stock_sites = fuel_stock_sites_between(d_start, d_end)
+                ge_rows = [r for r in inventory if ((r["dg_count"] or 0) > 0 or (r["site_id"] or "").upper() in stock_sites)
                            and (site_filter is None or r["site_id"] in site_filter)]
+                n_dg = sum(1 for r in ge_rows if (r["dg_count"] or 0) > 0)
                 site_by_data_id = {r["data_id"]: r["site_id"] for r in ge_rows}
                 windows = list(SF.date_windows(d_start, d_end))
-                self.say(f"  {len(ge_rows)} DATA_ID avec GE retenus — {len(windows)} fenêtre(s) de dates à lire "
+                self.say(f"  {len(ge_rows)} DATA_ID retenus ({n_dg} avec GE dans l'inventaire + {len(ge_rows) - n_dg} avec stock "
+                         f"dans les fichiers de clôture) — {len(windows)} fenêtre(s) de dates à lire "
                          "(plusieurs minutes possibles, avancement ci-dessous)")
 
                 for n, (w_start, w_end) in enumerate(windows, 1):

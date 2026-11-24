@@ -11,7 +11,7 @@ from decimal import Decimal
 
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.test import SimpleTestCase, override_settings
+from django.test import SimpleTestCase, TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -2005,3 +2005,28 @@ class TheoreticalConsoTests(SimpleTestCase):
         self.assertEqual((r["conso_fuel_sensor_l"], r["conso_fuel_sensor_jours"], r["conso_fuel_sensor_reserve"]), (10.5, 2, True))
         r = _fuel_sensor_conso([{"measured_conso_l": None}], 1)
         self.assertEqual((r["conso_fuel_sensor_l"], r["conso_fuel_sensor_jours"]), (None, 0))
+
+
+class SyncDailyFactsPerimeterTests(TestCase):
+    """Synchro des faits journaliers : même périmètre que le tableau Suivi Conso (décision du 24/11/2026) — sites avec GE
+    dans l'inventaire + sites avec stock dans les fichiers de clôture (DG_COUNT à 0 dans SITE_ESCO_CURRENT)."""
+
+    def test_sites_avec_stock_fichier_synchronises_meme_sans_dg_count(self):
+        from io import StringIO
+        from unittest import mock
+
+        from django.core.management import call_command
+
+        inv = [{"data_id": 1, "site_id": "GE_1", "site_name": None, "grid_supply": None, "dg_count": 1},
+               {"data_id": 2, "site_id": "Stock_2", "site_name": None, "grid_supply": None, "dg_count": 0},
+               {"data_id": 3, "site_id": "RIEN_3", "site_name": None, "grid_supply": None, "dg_count": 0}]
+        seen = []
+        with mock.patch("fuel_tracking.services.fuel_daily_facts_snowflake.fetch_inventory", return_value=inv), \
+                mock.patch("fuel_tracking.services.fuel_daily_facts_snowflake.fetch_daily_facts",
+                           side_effect=lambda ids, *a, **k: seen.append(sorted(ids)) or []), \
+                mock.patch("fuel_tracking.services.conso_comparison.fuel_stock_sites", return_value={"STOCK_2"}) as fs:
+            out = StringIO()
+            call_command("sync_fuel_daily_facts", start=date(2026, 9, 28), end=date(2026, 10, 2), country="Senegal", stdout=out)
+        self.assertEqual(seen[0], [1, 2])   # GE_1 (DG_COUNT > 0) + Stock_2 (stock dans les fichiers) ; RIEN_3 exclu
+        self.assertEqual(sorted(c.args[0] for c in fs.call_args_list), ["2026-09", "2026-10"])
+        self.assertIn("1 avec GE dans l'inventaire + 1 avec stock", out.getvalue())
