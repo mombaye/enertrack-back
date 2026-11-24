@@ -2099,3 +2099,23 @@ class BackfillBatteryChargeTests(MvpBase):
         r = S._batt_power(list(F.objects.filter(data_id=7).values(*["battery_telemetry_points", "battery_charge_slots",
                           "battery_charge_median_kw", "battery_charge_median_current_a", "battery_charge_median_voltage_v"])), 3)
         self.assertEqual((r["p_batt_kw"], r["p_batt_source"]), (0.702, "BATTERY_CHARGE_MEDIAN_DAY"))
+
+
+class GensetAliasTests(SimpleTestCase):
+    """Correspondance explicite des types absents de GENSET DB (liste A validée le 24/11/2026) : PRP et courbe du type cible,
+    correspondance affichée dans la source ; jamais de rapprochement hors table (P33-3U reste n.d.)."""
+
+    def test_liste_a_et_tracabilite(self):
+        from fuel_tracking.services import ge_info as G
+
+        gdb = {"J66K": {60.0}, "SDMOJ66K": {60.0}, "J88": {88.0}, "P333": {30.0}, "FGWILSONP333": {30.0}}
+        crv = {"J66K": {(0.1, 2.0, 1.0)}}
+        sites = {"A": {"type_ge": "SDMO - J66"}, "B": {"type_ge": "SDMO--J88K"}, "C": {"type_ge": "FG Wilson P33-3U"},
+                 "D": {"type_ge": "J66K"}}
+        G.add_prp(sites, gdb, "Closing.xlsb", crv)
+        self.assertEqual((sites["A"]["prp_kva"], sites["A"]["prp_kw"], sites["A"]["courbes_cph"]), ([60.0], [48.0], [(0.1, 2.0, 1.0)]))
+        self.assertIn("correspondance de type validée : J66 → J66K", sites["A"]["prp_source"])
+        self.assertEqual(sites["B"]["prp_kva"], [88.0])
+        self.assertIsNone(sites["C"]["prp_kva"])                               # liste B en attente : n.d.
+        self.assertIn("absent de GENSET DB", sites["C"]["prp_motif"])
+        self.assertEqual(sites["D"]["prp_source"], "GENSET DB (Closing.xlsb)")  # trouvé tel quel : aucune correspondance

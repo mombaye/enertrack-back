@@ -332,13 +332,46 @@ def fetch_genset_db() -> tuple[dict, dict]:
                 "archives_illisibles": len(illisibles)}
 
 
+# Correspondance EXPLICITE type du site → type GENSET DB, utilisée seulement si le type n'est pas trouvé tel quel. Clés et
+# valeurs = modèle normalisé (_key, sans la marque). Validée le 24/11/2026 (liste A : même modèle, seul un suffixe ou une
+# faute de frappe diffère, PRP cohérente avec le nom). Jamais de rapprochement approché ni de révision différente sans
+# validation de l'Energy Desk (ex. P33-3U, GEP22-4 : en attente). Affichée dans la source de la PRP.
+GENSET_ALIASES = {
+    "J66": "J66K",          # SDMO J66 → J66K (60 kVA)
+    "J165K": "J165",        # SDMO J165K → J165 (165 kVA)
+    "J88K": "J88",          # SDMO J88K → J88 (88 kVA)
+    "J110": "J110K",        # SDMO J110 → J110K (100 kVA)
+    "V410K": "V410",        # SDMO V410K → V410 (410 kVA)
+    "V275C2": "V275",       # SDMO V275C2 → V275 (275 kVA)
+    "GBW15P": "GBW15",      # PRAMAC GBW15P → GBW15 (15,3 kVA)
+    "DE200DE0": "DE200E0",  # CATERPILLAR DE200DE0 → DE200E0 (180 kVA), faute de frappe
+    "TJ22PE": "TJ22PE5L",   # TEKSAN TJ22PE → TJ22PE5L (20 kVA)
+}
+
+
+def _resolve(label: str, table: dict) -> tuple[object, str | None]:
+    """(valeur de la table pour ce type, correspondance appliquée « X → Y » ou None). Type tel quel d'abord, puis la
+    correspondance explicite GENSET_ALIASES du modèle."""
+    keys = _lookup_keys(label)
+    hit = next((table[k] for k in keys if k in table), None)
+    if hit is not None:
+        return hit, None
+    for k in keys:
+        alias = GENSET_ALIASES.get(k)
+        if alias and alias in table:
+            return table[alias], f"{k} → {alias}"
+    return None, None
+
+
 def add_prp(sites: dict, gdb: dict, fichier: str | None, curves: dict | None = None) -> None:
     """Ajoute à chaque site la Puissance PRP (kVA / kW) de chacun de ses types de GE, avec la raison si absente."""
     for v in sites.values():
-        kva, motifs, abc = [], [], []
+        kva, motifs, abc, via = [], [], [], []
         for t in [x for x in (v.get("type_ge") or "").split(" / ") if x]:
-            vals = next((gdb[k] for k in _lookup_keys(t) if k in gdb), None)
-            cv = next((curves[k] for k in _lookup_keys(t) if k in curves), None) if curves else None
+            vals, corr = _resolve(t, gdb)
+            cv = _resolve(t, curves)[0] if curves else None
+            if corr and vals:
+                via.append(corr)
             abc.append(next(iter(cv)) if cv and len(cv) == 1 else None)   # plusieurs courbes pour un type : ambigu, aucune
             if not vals:
                 motifs.append(f"type « {t} » absent de GENSET DB" if fichier else "GENSET DB non disponible")
@@ -349,7 +382,8 @@ def add_prp(sites: dict, gdb: dict, fichier: str | None, curves: dict | None = N
         v["prp_kva"] = [round(x, 2) for x in kva] or None
         v["prp_kw"] = [round(x * KW_PER_KVA, 2) for x in kva] or None
         v["prp_motif"] = " ; ".join(motifs) or None
-        v["prp_source"] = f"GENSET DB ({fichier})" if kva and fichier else None
+        v["prp_source"] = ((f"GENSET DB ({fichier})" + (f" — correspondance de type validée : {', '.join(via)}" if via else ""))
+                           if kva and fichier else None)
         v["courbes_cph"] = abc or None   # (a, b, c) par GE, dans l'ordre des types ; None = courbe absente ou ambiguë
 
 
