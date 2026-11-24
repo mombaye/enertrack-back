@@ -11,6 +11,10 @@ cache et base EnerTrack seulement, aucune tâche de fond lancée) et compte, sit
   4. Courbe CPH a, b, c  GENSET DB selon le type de GE
   5. Temps de marche     Index FMS → relevé de terrain → day_dg_on → day_rectifier_on (hors réseau)
 
+Comparaison avec Ops : « Estimation Conso Fuel Théorique retenue » de la MÊME ligne du fichier Output App Fuel (déjà importée,
+contexte des relevés de clôture). L'écart total est décomposé en litres par cause : site n.d. chez nous (par maillon
+bloquant), 0 L chez nous, valeur plus basse / plus haute, site sans valeur Ops. Aucune valeur n'est modifiée.
+
   python manage.py diagnose_conso_theorique --mois 2026-09 --mois 2026-10 [--csv /tmp/conso_theorique.csv]
 """
 from __future__ import annotations
@@ -70,7 +74,8 @@ class Command(BaseCommand):
                 d_from, d_to = date(y, mo, 1), date(y + (mo == 12), mo % 12 + 1, 1) - timedelta(days=1)
                 rows = C.build(d_from, d_to, {}, with_cph_quality=False)["rows"]
                 S.enrich(rows, fetch=False)
-                self._report(w, m, rows, detail)
+                ops = ops_values(rows)
+                self._report(w, m, rows, detail, ops)
         if csv:
             with open(csv, "w", newline="", encoding="utf-8") as fh:
                 wr = __import__("csv").DictWriter(fh, fieldnames=list(detail[0]) if detail else ["mois"], delimiter=";")
@@ -78,7 +83,7 @@ class Command(BaseCommand):
                 wr.writerows(detail)
             w(f"\nDétail par site : {csv} ({len(detail)} lignes)")
 
-    def _report(self, w, m, rows, detail):  # noqa: C901
+    def _report(self, w, m, rows, detail, ops):  # noqa: C901
         n = len(rows)
         es = [(r, r.get("estimation_theorique") or {}) for r in rows]
         ok = [e for _, e in es if e.get("conso_theorique_l") is not None]
@@ -136,11 +141,65 @@ class Command(BaseCommand):
                 for k, v in c.most_common(6):
                     w(f"    {v:>5}  {k[:140]}")
 
+        self._compare_ops(w, es, ops)
+
         for r, e in es:
-            detail.append({"mois": m, "site_id": r["site_id"], "type_ge": e.get("type_ge"), "prp_kw": e.get("prp_kw"),
+            o = ops.get(r["site_id"]) or {}
+            detail.append({"ops_conso_theorique_l": o.get("l"), "ops_source": o.get("source"), **{"mois": m, "site_id": r["site_id"], "type_ge": e.get("type_ge"), "prp_kw": e.get("prp_kw"),
                            "p_ge_kw": e.get("p_ge_kw"), "p_rect_kw": e.get("p_rect_kw"), "p_load_dc_kw": e.get("p_load_dc_kw"),
                            "p_batt_kw": e.get("p_batt_kw"), "p_retenue_kw": e.get("p_retenue_kw"),
                            "p_retenue_source": e.get("p_retenue_source"), "taux_charge": e.get("taux_charge"),
                            "cph_l_h": e.get("cph_l_h"), "tm_retenu_h": e.get("tm_retenu_h"), "tm_source": e.get("tm_source"),
                            "conso_theorique_l": e.get("conso_theorique_l"), "maillon_bloquant": blocking_step(e),
-                           "motif": e.get("conso_theorique_motif") or e.get("p_retenue_motif")})
+                           "motif": e.get("conso_theorique_motif") or e.get("p_retenue_motif")}})
+
+    def _compare_ops(self, w, es, ops):
+        """Écart en litres entre notre conso théorique et celle d'Ops (même ligne de fichier), décomposé par cause."""
+        if not ops:
+            w("\n-- Comparaison avec Ops : aucune valeur Ops importée pour ce mois --")
+            return
+        ours_tot = sum(e.get("conso_theorique_l") or 0 for _, e in es)
+        both = [(r, e, ops[r["site_id"]]["l"]) for r, e in es if (ops.get(r["site_id"]) or {}).get("l") is not None]
+        ops_tot = sum(o for _, _, o in both)
+        w(f"\n-- Comparaison avec Ops (Estimation Conso Fuel Théorique retenue, même ligne du fichier) --")
+        w(f"  Total EnerTrack : {ours_tot:>10,.0f} L ({sum(1 for _, e in es if e.get('conso_theorique_l') is not None)} sites)")
+        w(f"  Total Ops       : {ops_tot:>10,.0f} L ({len(both)} sites avec une valeur Ops, {sum(1 for *_, o in both if o > 0)} > 0)")
+        causes = Counter()
+        n = Counter()
+        for r, e, o in both:
+            v = e.get("conso_theorique_l")
+            if v is None:
+                k = f"n.d. chez nous — {blocking_step(e)}"
+            elif v == 0 and o > 0:
+                k = "0 L chez nous (temps de marche 0), Ops > 0"
+            elif v < o:
+                k = "valeur plus basse que Ops"
+            elif v > o:
+                k = "valeur plus haute que Ops"
+            else:
+                continue
+            causes[k] += o - (v or 0)
+            n[k] += 1
+        extra = sum(e.get("conso_theorique_l") or 0 for r, e in es if (ops.get(r["site_id"]) or {}).get("l") is None)
+        w("  Écart Ops − EnerTrack par cause (L, sites) :")
+        for k, v in sorted(causes.items(), key=lambda x: -abs(x[1])):
+            w(f"    {v:>10,.0f} L  {n[k]:>4} site(s)  {k}")
+        if extra:
+            w(f"    {-extra:>10,.0f} L        sites calculés chez nous sans valeur Ops")
+        lower = [(r, e, o) for r, e, o in both if e.get("conso_theorique_l") not in (None, 0) and e["conso_theorique_l"] < o]
+        if lower:
+            ratio = sorted(e["conso_theorique_l"] / o for _, e, o in lower if o > 0)
+            w(f"  Sites plus bas que Ops : ratio médian EnerTrack ÷ Ops = {ratio[len(ratio) // 2]:.2f} ; "
+              f"dont charge < 50 % (extrapolation) : {sum(1 for _, e, _ in lower if e.get('cph_extrapolation'))}")
+
+
+def ops_values(rows) -> dict:
+    """site → {"l", "source"} : Estimation Conso Fuel Théorique retenue d'Ops sur la ligne du fichier du site (celle du tableau)."""
+    from fuel_tracking.services import stock_initial_sources as S
+
+    out = {}
+    for sid, line in S._file_line_values(rows).items():
+        c = line.get("fin") or {}
+        if c.get("conso_theorique_ops_l") is not None:
+            out[sid] = {"l": float(c["conso_theorique_ops_l"]), "source": c.get("source_conso_theorique_ops")}
+    return out

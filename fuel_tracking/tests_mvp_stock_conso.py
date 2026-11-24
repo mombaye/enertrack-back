@@ -2119,3 +2119,26 @@ class GensetAliasTests(SimpleTestCase):
         self.assertIsNone(sites["C"]["prp_kva"])                               # liste B en attente : n.d.
         self.assertIn("absent de GENSET DB", sites["C"]["prp_motif"])
         self.assertEqual(sites["D"]["prp_source"], "GENSET DB (Closing.xlsb)")  # trouvé tel quel : aucune correspondance
+
+
+class DiagnosticOpsComparisonTests(SimpleTestCase):
+    """diagnose_conso_theorique : écart avec Ops décomposé en litres par cause (lecture seule)."""
+
+    def test_decomposition_ecart(self):
+        from fuel_tracking.management.commands.diagnose_conso_theorique import STEPS, Command
+
+        es = [({"site_id": "A"}, {"conso_theorique_l": 100.0, "cph_extrapolation": True}),     # plus bas : 300 − 100
+              ({"site_id": "B"}, {"conso_theorique_l": None, "p_retenue_kw": 5.0, "taux_charge": None, "taux_charge_motif": "Puissance PRP (kW) n.d."}),
+              ({"site_id": "C"}, {"conso_theorique_l": 0.0}),                                    # 0 L chez nous
+              ({"site_id": "D"}, {"conso_theorique_l": 50.0})]                                   # pas de valeur Ops
+        ops = {"A": {"l": 300.0}, "B": {"l": 200.0}, "C": {"l": 80.0}}
+        out = []
+        Command()._compare_ops(out.append, es, ops)
+        txt = "\n".join(out)
+        self.assertIn("Total EnerTrack :        150 L", txt)
+        self.assertIn("Total Ops       :        580 L", txt)
+        self.assertIn(f"200 L     1 site(s)  n.d. chez nous — {STEPS[1]}", txt)
+        self.assertIn("200 L     1 site(s)  valeur plus basse que Ops", txt)
+        self.assertIn("80 L     1 site(s)  0 L chez nous", txt)
+        self.assertIn("-50 L        sites calculés chez nous sans valeur Ops", txt)
+        self.assertIn("ratio médian EnerTrack ÷ Ops = 0.33", txt)
