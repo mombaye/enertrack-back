@@ -1168,26 +1168,21 @@ class FmsFromDailyFactsTests(MvpBase):
         self.assertIn("DB_GFMS_PROD.GOLD.AVERAGE_LOAD", sql)
         self.assertIn("DB_GFMS_ANALYTICS_PROD.GOLD.BATTERY_REPORT", sql)
         self.assertIn("ld.load_w, b.charge_ah, b.discharge_ah, bd.batt_points, bd.batt_pos", sql)
-        # Recharge batterie (règle équipe data) : SILVER.GFMS_METRICS, I × V ÷ 1000 par mesure avant médiane
-        self.assertIn("DB_GFMS_ANALYTICS_PROD.SILVER.GFMS_METRICS", sql)
-        self.assertIn("IM_CURRENT_BATTERY_CHARGE_VALUE * IM_BATTERY_VOLTAGE_VALUE / 1000.0", sql)
+        # Recharge batterie (équipe data) : médiane du jour lue dans GOLD.BATTERY_REPORT, plus de télémétrie 5 min
+        self.assertIn("MAX(BATTERY_CHARGE_POWER_MEDIAN_KW)", sql)
+        self.assertNotIn("GFMS_METRICS", sql)
         # Puissance redresseur (règle équipe data) : correction du rendement AVANT la médiane, filtres de qualité
         self.assertIn("P_DC / (RECTIFIER_EFFICIENCY / 100.0) / 1000.0", sql)
         self.assertIn("RECTIFIER_EFFICIENCY BETWEEN 70 AND 100", sql)
         self.assertIn("MEDIAN(rect_kw)", sql)
         self.assertNotIn("MEDIAN(P_DC)", sql)
-        self.assertIn("IM_CURRENT_BATTERY_CHARGE_VALUE", build_daily_facts_sql([1]))
-        sans_5min = build_daily_facts_sql([1], with_battery_5min=False)
-        self.assertNotIn("GFMS_METRICS", sans_5min)
-        self.assertIn("bd.batt_kw_med", sans_5min)   # mêmes colonnes, toujours NULL
         # Le pilote Snowflake interpole les paramètres avec « % » : aucun « % » littéral hors %(nom)s, même en commentaire
         import re
 
         for tr in (True, False):
-            for bt in (True, False):
-                q = build_daily_facts_sql([1], with_tracker=tr, with_battery_5min=bt)
-                self.assertEqual(re.findall(r"%(?!\(\w+\)s|%)", q), [], f"« % » littéral (tracker={tr}, batterie={bt})")
-        self.assertIn("rect_power_daily AS (", sans_5min)   # la puissance redresseur reste calculée
+            q = build_daily_facts_sql([1], with_tracker=tr)
+            self.assertEqual(re.findall(r"%(?!\(\w+\)s|%)", q), [], f"« % » littéral (tracker={tr})")
+        self.assertIn("rect_power_daily AS (", sql)   # la puissance redresseur reste calculée
 
 
 class StockInitialPairCacheTests(MvpBase):
@@ -1905,12 +1900,16 @@ class PowerMediansTests(MvpBase):
         # Télémétrie présente sans charge (BKL_0088) : null, jamais 0
         r = S._batt_power([jour(288, 0)], 1)
         self.assertEqual((r["p_batt_kw"], r["p_batt_source"]), (None, "NO_BATTERY_CHARGING_MEASURED"))
-        # Aucune télémétrie (accès SILVER absent ou site sans mesure)
+        # Aucune télémétrie (site sans mesure dans BATTERY_REPORT)
         r = S._batt_power([jour(None, None), {}], 2)
         self.assertEqual((r["p_batt_kw"], r["p_batt_source"]), (None, "BATTERY_CHARGE_TELEMETRY_UNAVAILABLE"))
-        # Aucun jour qualifié : médiane des puissances positives de la période
-        r = S._batt_power([jour(100, 3, 0.5, vals=[0.4, 0.5, 0.6]), jour(60, 2, 2.0, vals=[1.0, 3.0])], 2)
-        self.assertEqual((r["p_batt_kw"], r["p_batt_source"], r["p_batt_median_period_kw"]), (0.6, "BATTERY_CHARGE_MEDIAN_PERIOD", 0.6))
+        # Aucun jour qualifié avec charge : n.d. (règle prudente du 24/11/2026), jamais une médiane de jours peu couverts
+        r = S._batt_power([jour(100, 3, 0.5), jour(60, 2, 2.0)], 2)
+        self.assertEqual((r["p_batt_kw"], r["p_batt_source"], r["p_batt_median_period_kw"]), (None, "BATTERY_CHARGE_POWER_UNAVAILABLE", None))
+        self.assertIn("2 jour(s) en charge sous ce seuil", r["p_batt_motif"])
+        # Jour qualifié en charge mais puissance NULL dans BATTERY_REPORT (597 cas en octobre) : n.d., jamais 0
+        r = S._batt_power([jour(288, 40, None)], 1)
+        self.assertEqual((r["p_batt_kw"], r["p_batt_source"]), (None, "BATTERY_CHARGE_POWER_UNAVAILABLE"))
 
 
 class TheoreticalConsoTests(SimpleTestCase):
@@ -1977,6 +1976,24 @@ class TheoreticalConsoTests(SimpleTestCase):
         e = self.base(p_ge_kw=8.0, tm_retenu_h=0.0)                               # GE à l'arrêt : 0 L, pas n.d.
         e.update(theoretical_conso(e))
         self.assertEqual(retained_estimation(e)["conso_retenue_l"], 0.0)
+
+    def test_diagnostic_maillon_bloquant(self):
+        """diagnose_conso_theorique : premier maillon bloquant, dans l'ordre du calcul."""
+        from fuel_tracking.management.commands.diagnose_conso_theorique import STEPS, blocking_step
+        from fuel_tracking.services.stock_initial_sources import theoretical_conso
+
+        def step(**kw):
+            e = self.base(**kw)
+            e.update(theoretical_conso(e))
+            return blocking_step(e)
+
+        self.assertIsNone(step(p_ge_kw=8.0))
+        self.assertEqual(step(), STEPS[0])
+        self.assertEqual(step(p_ge_kw=8.0, prp_kw=None, courbes_cph=None), STEPS[1])
+        self.assertEqual(step(p_ge_kw=8.0, prp_kw=[16.0, 20.0], courbes_cph=[None, None]), STEPS[2])
+        self.assertEqual(step(p_ge_kw=20.0), STEPS[3])
+        self.assertEqual(step(p_ge_kw=8.0, courbes_cph=[None]), STEPS[4])
+        self.assertEqual(step(p_ge_kw=8.0, tm_retenu_h=None), STEPS[6])
 
     def test_conso_fuel_sensor(self):
         from decimal import Decimal

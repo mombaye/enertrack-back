@@ -474,7 +474,7 @@ def _power_medians(rows, lines, kinds: dict, kva: dict) -> dict:
       générateur : médiane, sur les jours où le GE a tourné, de DG_PRODUCTION_KWH ÷ DG_RUNTIME_CALCULATED (GENSET_REPORT) ;
                    jour au-delà de 105 % × kVA × 0,8 écarté (kVA = fichier Base GE, sinon PRP GENSET DB) ;
       load DC telco : médiane des LOAD_W journaliers (AVERAGE_LOAD, W → kW), mesures > 0 ;
-      recharge batterie : règle équipe data (SILVER.GFMS_METRICS, 5 min) — voir _batt_power ;
+      recharge batterie : médiane du jour de l'équipe data (GOLD.BATTERY_REPORT) — voir _batt_power ;
     Aucune mesure : n.d. (jamais 0) avec la raison."""
     from statistics import median
 
@@ -645,10 +645,11 @@ BATT_LOW_POSITIVE_INTERVALS = 12   # moins d'1 h de charge mesurée sur la péri
 
 
 def _batt_power(facts, nb_jours: int) -> dict:
-    """Puissance Médiane Recharge batterie sur la période (règle équipe data) à partir des faits journaliers :
-    par pas de 5 min, courant de charge × tension ÷ 1000 (kW) si courant > 0 ; jour qualifié si pas reçus ≥ 50 % de 288.
+    """Puissance Médiane Recharge batterie sur la période, à partir des faits journaliers (GOLD.BATTERY_REPORT : médiane du
+    jour de courant × tension ÷ 1000 sur les mesures en charge, calculée par l'équipe data) ; jour qualifié si pas de 5 min
+    reçus ≥ 50 % de 288.
     1. médiane des médianes des jours qualifiés ayant de la charge (BATTERY_CHARGE_MEDIAN_DAY) ;
-    2. sinon médiane des puissances positives de la période (BATTERY_CHARGE_MEDIAN_PERIOD) ;
+    2. aucun jour qualifié avec charge → null (BATTERY_CHARGE_POWER_UNAVAILABLE), règle prudente validée le 24/11/2026 ;
     aucune télémétrie → null (BATTERY_CHARGE_TELEMETRY_UNAVAILABLE) ; télémétrie sans charge → null
     (NO_BATTERY_CHARGING_MEASURED). Jamais 0, jamais ajoutée à P_DC."""
     from statistics import median
@@ -658,34 +659,28 @@ def _batt_power(facts, nb_jours: int) -> dict:
     pos = sum(f.get("battery_charge_slots") or 0 for f in days)
     qual = lambda f: f["battery_telemetry_points"] / RECT_DAY_SLOTS >= RECT_QUALIFIED_RATIO
     q = [f for f in days if qual(f) and (f.get("battery_charge_slots") or 0) > 0 and f.get("battery_charge_median_kw") is not None]
-    nq = [f for f in days if not qual(f) and (f.get("battery_charge_slots") or 0) > 0]
     med = lambda xs: round(median(xs), 3) if xs else None
     day_kw = med([float(f["battery_charge_median_kw"]) for f in q])
-    values = [x for f in nq for x in (f.get("battery_charge_values_kw") or []) if x and x > 0]
-    period_kw = med(values) if not q else None
-    src_days = q or nq
-    cur = med([float(f["battery_charge_median_current_a"]) for f in src_days if f.get("battery_charge_median_current_a") is not None])
-    volt = med([float(f["battery_charge_median_voltage_v"]) for f in src_days if f.get("battery_charge_median_voltage_v") is not None])
+    cur = med([float(f["battery_charge_median_current_a"]) for f in q if f.get("battery_charge_median_current_a") is not None])
+    volt = med([float(f["battery_charge_median_voltage_v"]) for f in q if f.get("battery_charge_median_voltage_v") is not None])
     reserve = None
     if not obs:
-        kw, src, motif = None, BATT_SRC_NO_TELEMETRY, "aucune télémétrie batterie (SILVER.GFMS_METRICS) sur la période"
-        cur = volt = None
+        kw, src, motif = None, BATT_SRC_NO_TELEMETRY, "aucune télémétrie batterie (BATTERY_REPORT) sur la période"
     elif not pos:
         kw, src = None, BATT_SRC_NO_CHARGE
         motif = f"télémétrie présente ({obs} pas de 5 min) mais aucun courant de charge positif sur la période"
-        cur = volt = None
     elif day_kw is not None:
         kw, src, motif = day_kw, BATT_SRC_DAY, None
-    elif period_kw is not None:
-        kw, src = period_kw, BATT_SRC_PERIOD
-        motif = (f"aucun jour ≥ {RECT_QUALIFIED_RATIO * 100:.0f} % de disponibilité : médiane des {len(values)} pas en charge "
-                 "de la période")
     else:
-        kw, src, motif = None, BATT_SRC_NONE, "pas en charge sans détail disponible : resynchronisation nécessaire"
+        kw, src = None, BATT_SRC_NONE
+        nq = sum(1 for f in days if not qual(f) and (f.get("battery_charge_slots") or 0) > 0)
+        motif = (f"aucun jour ≥ {RECT_QUALIFIED_RATIO * 100:.0f} % de télémétrie avec une puissance de charge"
+                 + (f" ({nq} jour(s) en charge sous ce seuil, non retenus)" if nq else
+                    " (jours en charge sans puissance fournie par BATTERY_REPORT)"))
     if kw is not None and pos < BATT_LOW_POSITIVE_INTERVALS:
         reserve = f"seulement {pos} pas de 5 min en charge sur la période : médiane peu représentative"
     return {"p_batt_kw": round(kw, 3) if kw is not None else None, "p_batt_jours": len(q),
-            "p_batt_median_day_kw": day_kw, "p_batt_median_period_kw": period_kw,
+            "p_batt_median_day_kw": day_kw, "p_batt_median_period_kw": None,
             "p_batt_current_a": cur, "p_batt_voltage_v": volt,
             "p_batt_dispo_pct": round(100 * obs / (RECT_DAY_SLOTS * nb_jours), 1) if nb_jours > 0 else None,
             "p_batt_pos": pos, "p_batt_source": src, "p_batt_motif": motif, "p_batt_reserve": reserve}

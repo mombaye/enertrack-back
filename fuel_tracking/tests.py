@@ -620,35 +620,20 @@ class DailyFactsSqlTests(SimpleTestCase):
         with mock.patch.object(SF, "_connect", return_value=conn):
             rows = SF.fetch_daily_facts([1], date(2026, 11, 10), date(2026, 11, 11), "Senegal", warnings=warnings)
         self.assertEqual(rows, [])
-        self.assertEqual(len(warnings), 2)   # compteur horaire + télémétrie batterie 5 min, synchro poursuivie sans elles
+        self.assertEqual(len(warnings), 1)   # compteur horaire, synchro poursuivie sans lui
         self.assertIn("GFMS_DATA_TRACKER_NC illisible", warnings[0])
-        self.assertIn("SILVER.GFMS_METRICS illisible", warnings[1])
-        self.assertNotIn("GFMS_METRICS", executed[-1])
         self.assertIn("002057", warnings[0])
         self.assertNotIn("GFMS_DATA_TRACKER_NC", executed[-1])
         conn.close.assert_called_once()
 
-    def test_battery_fallback_source_used_when_silver_unreadable(self):
-        """SILVER.GFMS_METRICS sans droit : la vue GOLD VW_GFMS_METRICS (même télémétrie 5 min) est lue si elle compile."""
-        from unittest import mock
-        from fuel_tracking.services import fuel_daily_facts_snowflake as SF
-        cur = mock.MagicMock()
-        executed = []
-
-        def execute(sql, params=None):
-            executed.append(sql)
-            if "LIMIT 0" in sql and ("SILVER.GFMS_METRICS" in sql or "GFMS_DATA_TRACKER_NC" in sql):
-                raise Exception("002003 (02000): SQL compilation error:\nSchema does not exist or not authorized")
-        cur.execute.side_effect = execute
-        cur.fetchall.return_value = []
-        conn = mock.MagicMock()
-        conn.cursor.return_value = cur
-        warnings = []
-        with mock.patch.object(SF, "_connect", return_value=conn):
-            SF.fetch_daily_facts([1], date(2026, 11, 10), date(2026, 11, 11), "Senegal", warnings=warnings)
-        self.assertEqual(len(warnings), 1)   # compteur horaire seulement : la recharge batterie a une source
-        self.assertIn("FROM DB_GFMS_ANALYTICS_DEV.GOLD.VW_GFMS_METRICS", executed[-1])
-        self.assertNotIn("SILVER.GFMS_METRICS", executed[-1])
+    def test_battery_charge_read_from_gold_battery_report(self):
+        """Recharge batterie : médiane du jour de l'équipe data (GOLD.BATTERY_REPORT), plus aucune télémétrie 5 min."""
+        from fuel_tracking.services.fuel_daily_facts_snowflake import build_daily_facts_sql
+        sql = build_daily_facts_sql([1])
+        self.assertNotIn("GFMS_METRICS", sql)
+        for col in ("BATTERY_CHARGE_POWER_MEDIAN_KW", "TELEMETRY_RECEIVED_COUNT", "BATTERY_CHARGE_POSITIVE_TIMESTAMP_COUNT"):
+            self.assertIn(col, sql)
+        self.assertIn("bd.batt_points, bd.batt_pos, bd.batt_i_med, bd.batt_v_med", sql)
 
 
 class BlocageNoCphTests(SimpleTestCase):

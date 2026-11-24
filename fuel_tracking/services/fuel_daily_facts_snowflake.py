@@ -16,10 +16,9 @@ Sources :
   DB_GFMS_ANALYTICS_PROD.GOLD.AC_METER                ACT_ACTIVE_POWER_AVG (W), ACT_ENERGY_P
   DB_GFMS_ANALYTICS_DEV.GOLD.VW_FUEL_REPORT           conso MESURÉE du jour (même filtre strict que la conso mensuelle)
   DB_GFMS_PROD.GOLD.AVERAGE_LOAD                      LOAD_W : load DC telco moyen du jour (W)
-  DB_GFMS_ANALYTICS_PROD.GOLD.BATTERY_REPORT          Ah chargés / déchargés du jour (batterie) — repli
-  DB_GFMS_ANALYTICS_PROD.SILVER.GFMS_METRICS          courant de charge × tension batterie (5 min), source confirmée
-                                                      par l'équipe data ; illisible (droit manquant) : détecté,
-                                                      synchro sans elle, recharge batterie indisponible
+  DB_GFMS_ANALYTICS_PROD.GOLD.BATTERY_REPORT          Ah chargés / déchargés du jour ; recharge batterie calculée par
+                                                      l'équipe data (24/11/2026) : médiane du jour de courant × tension
+                                                      ÷ 1000 sur les mesures en charge, pas reçus, pas en charge
 VW_INVOICE_DATA_REPORT n'est volontairement PAS utilisé (instruction §0).
 """
 from __future__ import annotations
@@ -35,13 +34,8 @@ logger = logging.getLogger(__name__)
 PROD = "DB_GFMS_PROD.GOLD"
 ANALYTICS = "DB_GFMS_ANALYTICS_PROD.GOLD"
 FUEL_REPORT = "DB_GFMS_ANALYTICS_DEV.GOLD"  # VW_FUEL_REPORT (cf. fuel_consommation_snowflake.py)
-BATTERY_METRICS = "DB_GFMS_ANALYTICS_PROD.SILVER.GFMS_METRICS"   # télémétrie batterie 5 min (règle équipe data)
-# Repli : vue GOLD sur la même télémétrie 5 min (SELECT m.* FROM DB_GFMS_ANALYTICS_DEV.SILVER.GFMS_METRICS), sur laquelle le rôle
-# a déjà le droit SELECT. Elle échoue tant que l'équipe data ne l'a pas recompilée (002057 : 99 colonnes déclarées, 265 produites).
-BATTERY_METRICS_FALLBACK = "DB_GFMS_ANALYTICS_DEV.GOLD.VW_GFMS_METRICS"
-BATTERY_METRICS_SOURCES = (BATTERY_METRICS, BATTERY_METRICS_FALLBACK)   # première source lisible retenue
-# Recharge batterie (règle équipe data) : pas reçu si tension batterie > 0 ; puissance = courant × tension ÷ 1000 si
-# courant de charge > 0 ; jour qualifié si pas reçus ≥ 50 % de 288. Puissances des jours NON qualifiés conservées (repli).
+# Recharge batterie (équipe data, GOLD.BATTERY_REPORT) : médiane du jour fournie par la table ; jour qualifié si pas de
+# 5 min reçus (TELEMETRY_RECEIVED_COUNT) ≥ 50 % de 288.
 # Puissance redresseur (règle équipe data) : mesure valide si statut Good/Aged/Warning, P_DC > 0, rendement 70-100 % ;
 # jour qualifié si mesures valides ≥ 50 % de 288 pas de 5 min. Mesures des jours NON qualifiés conservées (repli période).
 RECT_POWER_EFF_MIN, RECT_POWER_EFF_MAX = 70, 100
@@ -206,27 +200,20 @@ battery AS (
     WHERE DATE >= %(d_start)s AND DATE <= %(d_end)s AND DATA_ID IN ({ids})
     GROUP BY DATA_ID, DATE
 ),
-batt_raw AS (
-    -- Recharge batterie (règle équipe data) : puissance par mesure = courant de charge (A) × tension (V) ÷ 1000, AVANT médiane
-    SELECT ID AS data_id, TIME_SLICE("TIMESTAMP", 5, 'MINUTE') AS slot,
-           IM_CURRENT_BATTERY_CHARGE_VALUE AS i_a, IM_BATTERY_VOLTAGE_VALUE AS v_v,
-           IFF(IM_CURRENT_BATTERY_CHARGE_VALUE > 0 AND IM_BATTERY_VOLTAGE_VALUE > 0,
-               IM_CURRENT_BATTERY_CHARGE_VALUE * IM_BATTERY_VOLTAGE_VALUE / 1000.0, NULL) AS kw
-    FROM {battery_metrics}
-    WHERE "TIMESTAMP" >= %(d_start)s::TIMESTAMP_NTZ
-      AND "TIMESTAMP" < DATEADD('day', 1, %(d_end)s::TIMESTAMP_NTZ)
-      AND ID IN ({ids}) AND IM_BATTERY_VOLTAGE_VALUE > 0
-),
-batt_slots AS (
-    SELECT data_id, slot, MEDIAN(i_a) AS i_a, MEDIAN(v_v) AS v_v, MEDIAN(kw) AS kw FROM batt_raw GROUP BY data_id, slot
-),
 batt_daily AS (
-    -- Pas reçus (tension renseignée, même courant nul) ≠ pas en charge (puissance > 0) : deux notions distinctes
-    SELECT data_id, CAST(slot AS DATE) AS day, COUNT(*) AS batt_points, COUNT_IF(kw > 0) AS batt_pos,
-           MEDIAN(IFF(kw > 0, i_a, NULL)) AS batt_i_med, MEDIAN(IFF(kw > 0, v_v, NULL)) AS batt_v_med,
-           MEDIAN(kw) AS batt_kw_med,
-           IFF(COUNT(*) < {day_slots} * {qualified_ratio}, ARRAY_AGG(ROUND(kw, 4)), NULL) AS batt_values
-    FROM batt_slots GROUP BY data_id, CAST(slot AS DATE)
+    -- Recharge batterie (équipe data) : BATTERY_CHARGE_POWER_MEDIAN_KW = médiane du jour de courant × tension ÷ 1000 sur les
+    -- mesures en charge (NULL si aucune charge, jamais 0). Pas reçus ≠ pas en charge. Doublon contradictoire → NULL.
+    -- Courant / tension médians : non fournis par la table (NULL).
+    SELECT DATA_ID AS data_id, DATE AS day,
+           IFF(MIN(TELEMETRY_RECEIVED_COUNT) = MAX(TELEMETRY_RECEIVED_COUNT), MAX(TELEMETRY_RECEIVED_COUNT), NULL) AS batt_points,
+           IFF(MIN(BATTERY_CHARGE_POSITIVE_TIMESTAMP_COUNT) = MAX(BATTERY_CHARGE_POSITIVE_TIMESTAMP_COUNT),
+               MAX(BATTERY_CHARGE_POSITIVE_TIMESTAMP_COUNT), NULL) AS batt_pos,
+           NULL::FLOAT AS batt_i_med, NULL::FLOAT AS batt_v_med,
+           IFF(MIN(BATTERY_CHARGE_POWER_MEDIAN_KW) = MAX(BATTERY_CHARGE_POWER_MEDIAN_KW), MAX(BATTERY_CHARGE_POWER_MEDIAN_KW), NULL) AS batt_kw_med,
+           NULL::ARRAY AS batt_values
+    FROM {analytics}.BATTERY_REPORT
+    WHERE DATE >= %(d_start)s AND DATE <= %(d_end)s AND DATA_ID IN ({ids})
+    GROUP BY DATA_ID, DATE
 ),
 rect_power_valid AS (
     -- Puissance redresseur par mesure (kW) = P_DC (W) ÷ (RECTIFIER_EFFICIENCY en pourcentage / 100) ÷ 1000, AVANT toute médiane
@@ -292,18 +279,7 @@ tracker_on_slots AS (
 """
 
 
-# Télémétrie batterie 5 min illisible (droit manquant sur SILVER) : mêmes colonnes, aucune ligne → recharge batterie
-# indisponible (BATTERY_CHARGE_TELEMETRY_UNAVAILABLE), jamais 0 ni estimée.
-NO_BATT_CTES = """batt_daily AS (
-    SELECT NULL::NUMBER AS data_id, NULL::DATE AS day, NULL::NUMBER AS batt_points, NULL::NUMBER AS batt_pos,
-           NULL::FLOAT AS batt_i_med, NULL::FLOAT AS batt_v_med, NULL::FLOAT AS batt_kw_med, NULL::ARRAY AS batt_values
-    WHERE FALSE
-),
-"""
-
-
-def build_daily_facts_sql(data_ids: list[int], with_tracker: bool = True, with_battery_5min: bool = True,
-                          battery_source: str = BATTERY_METRICS) -> str:
+def build_daily_facts_sql(data_ids: list[int], with_tracker: bool = True) -> str:
     # DATA_ID sont des entiers issus de Snowflake (jamais une saisie utilisateur).
     ids = ",".join(str(int(d)) for d in data_ids)
     statuses = ",".join(f"'{s}'" for s in RECTIFIER_ACTIVE_STATUSES)
@@ -311,10 +287,7 @@ def build_daily_facts_sql(data_ids: list[int], with_tracker: bool = True, with_b
     if not with_tracker:
         a, b = sql.index("tracker_iv AS ("), sql.index("rect_slots AS (")
         sql = sql[:a] + NO_TRACKER_CTES + sql[b:]
-    if not with_battery_5min:
-        a, b = sql.index("batt_raw AS ("), sql.index("rect_power_valid AS (")
-        sql = sql[:a] + NO_BATT_CTES + sql[b:]
-    return sql.format(analytics=ANALYTICS, prod=PROD, fuel_report=FUEL_REPORT, battery_metrics=battery_source, ids=ids,
+    return sql.format(analytics=ANALYTICS, prod=PROD, fuel_report=FUEL_REPORT, ids=ids,
                       active_statuses=statuses,
                       eff_min=RECT_POWER_EFF_MIN, eff_max=RECT_POWER_EFF_MAX, day_slots=RECT_POWER_DAY_SLOTS,
                       qualified_ratio=RECT_POWER_QUALIFIED_RATIO)
@@ -350,26 +323,9 @@ def fetch_daily_facts(data_ids: list[int], d_start: date, d_end: date, country: 
             logger.warning("[fuel_daily_facts] %s", msg)
             if warnings is not None and msg not in warnings:
                 warnings.append(msg)
-        batt_src, batt_errs = None, []
-        for src in BATTERY_METRICS_SOURCES:   # première source de télémétrie batterie 5 min lisible
-            e = view_status(cur, src)
-            if e is None:
-                batt_src = src
-                break
-            batt_errs.append(f"{src} illisible : {e}")
-        batt_err = None if batt_src else " | ".join(batt_errs)
-        if batt_src and batt_errs:
-            logger.info("[fuel_daily_facts] Télémétrie batterie 5 min lue dans %s (%s)", batt_src, batt_errs[0])
-        if batt_err:
-            msg = (f"Télémétrie batterie 5 min {BATTERY_METRICS} illisible, Puissance Médiane Recharge batterie "
-                   f"indisponible (aucune source lisible) : {batt_err}")
-            logger.warning("[fuel_daily_facts] %s", msg)
-            if warnings is not None and msg not in warnings:
-                warnings.append(msg)
         for i in range(0, len(data_ids), DATA_ID_CHUNK):
             chunk = data_ids[i:i + DATA_ID_CHUNK]
-            cur.execute(build_daily_facts_sql(chunk, with_tracker=tracker_err is None, with_battery_5min=batt_err is None,
-                                              battery_source=batt_src or BATTERY_METRICS), {
+            cur.execute(build_daily_facts_sql(chunk, with_tracker=tracker_err is None), {
                 "d_start": d_start, "d_end": d_end, "country": country,
                 "p_dc_div": float(P_DC_TO_KW_DIVISOR), "eff_div": float(EFFICIENCY_TO_RATIO_DIVISOR),
             })

@@ -978,7 +978,7 @@ class FuelSiteDailyFacts(models.Model):
                                             help_text="BATTERY_CHARGE_CURRENT_DAY_AH du jour (Ah), BATTERY_REPORT. Contradictoire → NULL.")
     battery_discharge_ah = models.DecimalField(max_digits=14, decimal_places=3, null=True, blank=True,
                                                help_text="BATTERY_DISCHARGE_CURRENT_DAY_AH du jour (Ah), BATTERY_REPORT. Contradictoire → NULL.")
-    # Recharge batterie (règle équipe data, SILVER.GFMS_METRICS, 5 min) : courant × tension ÷ 1000 par pas, puis médiane
+    # Recharge batterie (équipe data, GOLD.BATTERY_REPORT depuis le 24/11/2026) : médiane du jour courant × tension ÷ 1000 en charge
     battery_telemetry_points = models.IntegerField(null=True, blank=True,
                                                    help_text="Pas 5 min reçus du jour (tension batterie > 0, même courant nul).")
     battery_charge_slots = models.IntegerField(null=True, blank=True, help_text="Pas 5 min en charge (puissance > 0) du jour.")
