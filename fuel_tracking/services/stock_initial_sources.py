@@ -412,12 +412,14 @@ def _file_line_values(rows) -> dict:
 def closing_genset_types(lines: dict) -> dict:
     """site → (fabricant, type de GE, source affichée) lus sur la ligne du fichier de clôture de la période du tableau
     (jamais celle d'un autre mois). Ligne sans type : site absent (le type vient alors d'ENOC / Snowflake)."""
+    from fuel_tracking.services.stock_file_analysis import ge_label
+
     out = {}
     for sid, line in lines.items():
         c = line.get("fin") or {}
-        if c.get("type_ge"):
+        if ge_label(c.get("type_ge")):
             per = [str(x or "?")[:10] for x in (list(c.get("periode") or []) + [None, None])[:2]]
-            out[sid.upper()] = (c.get("fabricant_ge"), c["type_ge"],
+            out[sid.upper()] = (c.get("fabricant_ge"), ge_label(c["type_ge"]),
                                 f"Fichier de clôture ({c.get('fichier') or 'Closing'}, {per[0]} → {per[1]})")
     return out
 

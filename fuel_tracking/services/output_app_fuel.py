@@ -237,7 +237,7 @@ def process_output_file(batch, rows, file_name: str, resolver, tanks_of) -> dict
 def backfill_terrain_counters() -> int:
     """Fichiers de clôture importés avant l'ajout du compteur : relit la copie d'archive (Closing ou Output App Fuel) et complète
     le contexte des relevés de clôture avec les valeurs de terrain du fichier : compteur à la date initiale, quantité et compteur
-    à la date finale, fabricant et type de GE de la ligne (v4, 24/11/2026).
+    à la date finale, fabricant et type de GE de la ligne (v4 puis v5, 24/11/2026).
     Idempotent (lot marqué). Lecture seule de l'archive ; aucune valeur inventée (case vide du fichier → rien)."""
     from pathlib import Path
 
@@ -249,7 +249,7 @@ def backfill_terrain_counters() -> int:
     done = 0
     for b in FuelImportBatch.objects.filter(source_type="CLOSING").exclude(status__in=("REJECTED", "FAILED")):
         st = (b.summary or {}).get("stocks_closing") or {}
-        if "terrain_repris_v4" in st or not b.archive_path or not Path(b.archive_path).is_file():
+        if "terrain_repris_v5" in st or not b.archive_path or not Path(b.archive_path).is_file():
             continue
         oaf = st.get("format") == FILE_LABEL
         recs = []
@@ -261,7 +261,8 @@ def backfill_terrain_counters() -> int:
         by_key = {}
         for r in recs:
             sid = resolver.resolve(r["site"])
-            vals = {k: r.get(k) for k in keys if r.get(k) is not None}
+            # fabricant / type de GE : toujours repris (une mention « sans GE » lue à tort en v4 est ainsi effacée)
+            vals = {k: r.get(k) for k in keys if r.get(k) is not None or k in ("fabricant_ge", "type_ge")}
             if sid and r.get("date_initiale") and vals:
                 by_key[(sid.upper(), r["date_initiale"].isoformat()[:10])] = vals
         upd = []
@@ -273,7 +274,7 @@ def backfill_terrain_counters() -> int:
                 o.source_context = {**ctx, **v}
                 upd.append(o)
         Obs.objects.bulk_update(upd, ["source_context"], batch_size=1000)
-        b.summary = {**(b.summary or {}), "stocks_closing": {**st, "terrain_repris_v4": len(upd)}}
+        b.summary = {**(b.summary or {}), "stocks_closing": {**st, "terrain_repris_v5": len(upd)}}
         b.save(update_fields=["summary"])
         done += 1
     return done

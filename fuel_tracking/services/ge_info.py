@@ -422,6 +422,29 @@ def sites_info(site_ids, closing: dict | None = None) -> dict:
     base = {k: v for k, v in base_all.items() if k in ids}
     gdb_meta = raw.get("gdb_meta") or {}
     brands = known_brands([t for t, _k in base_all.values()], gdb_meta.get("fabricants") or [])
-    sites = build(sf, en, base, base_file, brands, {k.upper(): v for k, v in (closing or {}).items() if k.upper() in ids})
-    add_prp(sites, raw.get("gdb") or {}, gdb_meta.get("fichier"), raw.get("gdb_curves"))
+    closing = {k.upper(): v for k, v in (closing or {}).items() if k.upper() in ids}
+    sites = build(sf, en, base, base_file, brands, closing)
+    gdb, fichier, curves = raw.get("gdb") or {}, gdb_meta.get("fichier"), raw.get("gdb_curves")
+    add_prp(sites, gdb, fichier, curves)
+    closing_if_base_unknown(sites, base, closing, gdb, fichier, curves)
     return sites
+
+
+def closing_if_base_unknown(sites: dict, base: dict, closing: dict, gdb: dict, fichier, curves) -> int:
+    """Décision du 24/11/2026 : type du fichier Base GE sans aucune PRP dans GENSET DB (absent ou ambigu) → type de la ligne du
+    fichier de clôture du mois, s'il en donne une. La source garde la trace du type Base GE écarté et de la raison."""
+    n = 0
+    for sid, v in sites.items():
+        c_fab, c_typ, c_src = (list(closing.get(sid) or ()) + [None, None, None])[:3]
+        if sid not in base or v.get("prp_kva") or not _clean(c_typ) or _clean(c_typ) == v.get("type_ge"):
+            continue
+        alt = {"type_ge": _clean(c_typ)}
+        add_prp({sid: alt}, gdb, fichier, curves)
+        if not alt.get("prp_kva"):
+            continue   # le fichier de clôture ne fait pas mieux : type Base GE conservé (avec son motif)
+        note = f"type Base GE « {v.get('type_ge')} » : {v.get('prp_motif') or 'PRP n.d.'}"
+        alt.update(fabricant_ge=_clean(c_fab) or v.get("fabricant_ge"),
+                   source_ge=f"{c_src or SRC_CLOSING} — {note}", type_ge_base=v.get("type_ge"))
+        v.update(alt)
+        n += 1
+    return n

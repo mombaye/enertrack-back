@@ -2212,3 +2212,26 @@ class ClosingGensetTypeTests(OutputAppFuelImportTests):
         self.assertEqual(out["D"]["prp_kw"], [17.6])
         got = G.sites_info(["dkr_0009"], {"DKR_0009": ("SDMO", "K22", "Fichier de clôture (Closing, 2026-08-31 → 2026-09-30)")})
         self.assertEqual(got["DKR_0009"]["type_ge"], "K22")                  # transmis jusqu'à l'affichage
+
+
+class ClosingFallbackUnknownBaseTypeTests(SimpleTestCase):
+    """Décision du 24/11/2026 : type Base GE inconnu de GENSET DB → type du fichier de clôture du mois s'il donne une PRP."""
+
+    def test_repli_et_tracabilite(self):
+        from fuel_tracking.services import ge_info as G
+        from fuel_tracking.services.stock_file_analysis import ge_label
+
+        self.assertIsNone(ge_label("Site avec cuve et sans GE"))             # mention, pas un type de GE
+        gdb = {"P333": {30.0}, "K22": {22.0}, "J66K": {60.0}}
+        base = {"A": ("FG Wilson P33-3U", 30), "B": ("J66K", 60), "C": ("SDMO - K33", 33), "D": ("SDMO - K33", 33)}
+        src = "Fichier de clôture (Output App Fuel, 2026-09-30 → 2026-10-31)"
+        closing = {"A": ("FG Wilson", "P33-3", src), "B": ("SDMO", "K22", src), "C": ("SDMO", "K44", src)}
+        sites = G.build({}, {}, base, "Base GE.xlsx", ["SDMO", "FG Wilson"], closing)
+        G.add_prp(sites, gdb, "Closing.xlsb")
+        self.assertEqual(G.closing_if_base_unknown(sites, base, closing, gdb, "Closing.xlsb", None), 1)
+        a = sites["A"]
+        self.assertEqual((a["type_ge"], a["fabricant_ge"], a["prp_kw"], a["type_ge_base"]), ("P33-3", "FG Wilson", [24.0], "FG Wilson P33-3U"))
+        self.assertEqual(a["source_ge"], src + " — type Base GE « FG Wilson P33-3U » : type « FG Wilson P33-3U » absent de GENSET DB")
+        self.assertEqual((sites["B"]["type_ge"], sites["B"]["prp_kva"]), ("J66K", [60.0]))   # Base GE reconnu : conservé
+        self.assertEqual((sites["C"]["type_ge"], sites["C"]["prp_kva"]), ("SDMO - K33", None))  # clôture pas mieux : Base GE
+        self.assertEqual(sites["D"]["type_ge"], "SDMO - K33")                # pas de ligne de clôture : Base GE

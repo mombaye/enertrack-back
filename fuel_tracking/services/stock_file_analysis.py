@@ -71,9 +71,12 @@ def _first_idx(header: list[str], prefix: str, lo: int = 0, hi: int | None = Non
 
 
 def ge_label(v) -> str | None:
-    """Libellé de GE d'un fichier de clôture nettoyé ; case vide / « 0 » / « N/A » → None (jamais un type inventé)."""
+    """Libellé de GE d'un fichier de clôture nettoyé ; case vide / « 0 » / « N/A » → None (jamais un type inventé).
+    Mention « Site avec cuve et sans GE » (colonne Type de GE des fichiers Ops) : pas un type de GE → None."""
     s = " ".join(str(v).split()) if v is not None and not isinstance(v, bool) else ""
-    return None if s.upper() in {"", "0", "NONE", "NULL", "N/A", "NA", "-", "NAN", "#N/A"} else s
+    if s.upper() in {"", "0", "NONE", "NULL", "N/A", "NA", "-", "NAN", "#N/A"} or "SANS GE" in s.upper():
+        return None
+    return s
 
 
 def _ge_labels(pairs) -> dict:
