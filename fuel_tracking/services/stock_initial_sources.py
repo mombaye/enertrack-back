@@ -623,6 +623,21 @@ def theoretical_conso(e: dict) -> dict:
     return out
 
 
+RETENUE_SRC_CPH = "calcul cph et temps de marche GE"
+
+
+def retained_estimation(e: dict) -> dict:
+    """Estimation Conso Fuel Théorique retenue (L) et sa source, règle d'Ops (fichier Output App Fuel, vérifiée sur
+    3 409 lignes) : la conso théorique CPH × Temps de marche GE retenu, et elle seule. La conso fuel sensor n'est jamais
+    retenue à sa place, même quand le CPH n'est pas calculable (deux sources distinctes, jamais mélangées).
+    Conso théorique n.d. → null + la même raison, source null ; 0 reste 0."""
+    v = e.get("conso_theorique_l")
+    if v is None:
+        return {"conso_retenue_l": None, "conso_retenue_source": None,
+                "conso_retenue_motif": e.get("conso_theorique_motif") or "Consommation théorique n.d."}
+    return {"conso_retenue_l": v, "conso_retenue_source": RETENUE_SRC_CPH, "conso_retenue_motif": None}
+
+
 BATT_SRC_DAY, BATT_SRC_PERIOD = "BATTERY_CHARGE_MEDIAN_DAY", "BATTERY_CHARGE_MEDIAN_PERIOD"
 BATT_SRC_NO_TELEMETRY, BATT_SRC_NO_CHARGE = "BATTERY_CHARGE_TELEMETRY_UNAVAILABLE", "NO_BATTERY_CHARGING_MEASURED"
 BATT_SRC_NONE = "BATTERY_CHARGE_POWER_UNAVAILABLE"
@@ -849,6 +864,7 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
                                                     (e.get("tm_rectifier_h") if e.get("tm_rectifier_off_grid") is True else None,
                                                      "Alarme day_rectifier_on FMS"))
         e.update(theoretical_conso(e))
+        e.update(retained_estimation(e))
     return err
 
 
@@ -865,7 +881,7 @@ TOTAL_FIELDS = {
     "stock_final_sources": ("terrain_l", "gardiennage_l", "fms_l", "retenue_l", "compteur_terrain_h", "compteur_gardiennage_h",
                             "compteur_fms_h", "compteur_retenu_h"),
     "estimation_theorique": ("prp_kva", "prp_kw", "tm_dg_on_h", "tm_rectifier_h", "tm_terrain_h", "tm_index_fms_h", "tm_retenu_h",
-                             "conso_theorique_l", "conso_fuel_sensor_l"),
+                             "conso_theorique_l", "conso_fuel_sensor_l", "conso_retenue_l"),
 }
 
 

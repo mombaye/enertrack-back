@@ -1960,6 +1960,24 @@ class TheoreticalConsoTests(SimpleTestCase):
         r = theoretical_conso(self.base(p_ge_kw=8.0, tm_retenu_h=None))
         self.assertEqual((r["cph_l_h"] is not None, r["conso_theorique_l"]), (True, None))
 
+    def test_estimation_retenue_cph_seule(self):
+        """Règle Ops : conso retenue = conso théorique CPH, jamais la conso fuel sensor à sa place ; 0 reste 0."""
+        from fuel_tracking.services.stock_initial_sources import RETENUE_SRC_CPH, retained_estimation, theoretical_conso
+
+        e = self.base(p_ge_kw=8.0, p_rect_kw=None, conso_fuel_sensor_l=250.0)
+        e.update(theoretical_conso(e))
+        r = retained_estimation(e)
+        self.assertEqual((r["conso_retenue_l"], r["conso_retenue_source"], r["conso_retenue_motif"]),
+                         (e["conso_theorique_l"], RETENUE_SRC_CPH, None))
+        e = self.base(p_ge_kw=8.0, tm_retenu_h=None, conso_fuel_sensor_l=250.0)   # CPH n.d., capteur présent
+        e.update(theoretical_conso(e))
+        r = retained_estimation(e)
+        self.assertEqual((r["conso_retenue_l"], r["conso_retenue_source"]), (None, None))
+        self.assertEqual(r["conso_retenue_motif"], "Temps de marche GE retenu n.d.")
+        e = self.base(p_ge_kw=8.0, tm_retenu_h=0.0)                               # GE à l'arrêt : 0 L, pas n.d.
+        e.update(theoretical_conso(e))
+        self.assertEqual(retained_estimation(e)["conso_retenue_l"], 0.0)
+
     def test_conso_fuel_sensor(self):
         from decimal import Decimal
 
