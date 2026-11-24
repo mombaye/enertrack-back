@@ -732,7 +732,8 @@ def _process_closing_stocks(batch, file_bytes: bytes, file_name: str, resolver) 
                        "conso_closing_l": _ref, "formule_coherente": coherent,
                        "compteur_terrain_initial_h": r.get("compteur_terrain_initial_h"),
                        "stock_terrain_final_l": r.get("stock_terrain_final_l"), "compteur_terrain_final_h": r.get("compteur_terrain_final_h"),
-                       "stock_initial_l": r["stock_initial_l"], "stock_final_l": r["stock_final_l"], "ligne": r["ligne"]}
+                       "stock_initial_l": r["stock_initial_l"], "stock_final_l": r["stock_final_l"], "ligne": r["ligne"],
+                       "fabricant_ge": r.get("fabricant_ge"), "type_ge": r.get("type_ge")}
             if event_id in existing:
                 Obs.objects.filter(pk=existing[event_id]).update(source_context=context)  # complète le contexte d'un stock déjà importé
                 stats["doublons"] += 1

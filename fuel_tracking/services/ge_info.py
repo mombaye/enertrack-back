@@ -6,7 +6,9 @@ Ordre, CHAMP PAR CHAMP (fabricant et type choisis indépendamment), jamais de d�
   Fabricant GE : 1. fichier « Base GE » : marque lue dans le libellé « Type de GE » (« SDMO - K22 » → SDMO ;
                  « FG Wilson P33-3U » → FG Wilson, marque connue) ; 2. Snowflake SITE_DG (VENDOR) puis historique ; 3. ENOC (brand).
   Type de GE   : 1. fichier « Base GE » importé dans Configuration (type BASE_GE, dernier fichier) — décision métier ;
-                 2. à défaut (site absent du fichier) : ENOC (model), puis Snowflake SITE_DG / historique ; source affichée.
+                 2. à défaut (décision du 24/11/2026) : fichier de clôture DU MOIS AFFICHÉ, sur la ligne du site (Closing :
+                    « Type de GE #1 / #2 » ; Output App Fuel : « Type de GE ») — le fabricant de la même ligne l'accompagne ;
+                 3. à défaut : ENOC (model), puis Snowflake SITE_DG / historique ; source affichée.
   ENOC : registre des GE (ge_assets), GE au statut INSTALLED uniquement.
 « Source de donnée GE » indique la source exacte (une seule si les deux champs viennent du même endroit).
 Rattachement Snowflake : S_ID = identifiant interne du site → SITE_ESCO_CURRENT.ID → SITE_ID (jointure dans Snowflake ;
@@ -37,6 +39,7 @@ REFRESH_AFTER_S = 6 * 3600
 MIN_MATCH = 0.5
 SRC_BASE = "Fichier Base GE"
 SRC_SF, SRC_SF_HIST, SRC_ENOC = "Snowflake (SITE_DG)", "Snowflake (historique SITE_DG)", "ENOC (registre des GE)"
+SRC_CLOSING = "Fichier de clôture"
 EMPTY = {"", "NONE", "NULL", "N/A", "NA", "0", "-", "UNDEFINED", "NAN"}
 
 
@@ -137,16 +140,24 @@ def _pick(snowflake_values: list, enoc_values: list) -> tuple[str | None, str | 
     return (en, SRC_ENOC) if en else (None, None)
 
 
-def build(sf: dict, enoc: dict, base: dict | None = None, base_file: str | None = None, brands=()) -> dict:
-    """site → {"fabricant_ge", "type_ge", "source_ge"}. `base` : site → (type, kVA) du fichier Base GE (type prioritaire)."""
-    base = base or {}
+def build(sf: dict, enoc: dict, base: dict | None = None, base_file: str | None = None, brands=(),
+          closing: dict | None = None) -> dict:
+    """site → {"fabricant_ge", "type_ge", "source_ge"}.
+    `base` : site → (type, kVA) du fichier Base GE (1ʳᵉ source) ; `closing` : site → (fabricant, type, source affichée) lus sur
+    la ligne du fichier de clôture du mois affiché (2ᵉ source) ; puis ENOC / Snowflake."""
+    base, closing = base or {}, closing or {}
     out = {}
-    for sid in set(sf) | set(enoc) | set(base):
+    for sid in set(sf) | set(enoc) | set(base) | set(closing):
         ges = sorted(sf.get(sid, []), key=lambda g: g[0])
         en = enoc.get(sid, [])
         fab, fab_src = _pick([g[1] for g in ges], [_clean(e[0]) for e in en])
-        typ, typ_src = _pick_enoc_first([g[2] for g in ges], [_clean(e[1]) for e in en])   # à défaut : ENOC puis Snowflake
-        if _clean((base.get(sid) or (None,))[0]):   # type : fichier Base GE d'abord (décision métier)
+        typ, typ_src = _pick_enoc_first([g[2] for g in ges], [_clean(e[1]) for e in en])   # 3. ENOC puis Snowflake
+        c_fab, c_typ, c_src = (list(closing.get(sid) or ()) + [None, None, None])[:3]
+        if _clean(c_typ):   # 2. fichier de clôture du mois
+            typ, typ_src = _clean(c_typ), c_src or SRC_CLOSING
+            if _clean(c_fab):
+                fab, fab_src = _clean(c_fab), c_src or SRC_CLOSING
+        if _clean((base.get(sid) or (None,))[0]):   # 1. type : fichier Base GE d'abord (décision métier)
             typ, typ_src = _clean(base[sid][0]), f"{SRC_BASE} ({base_file})" if base_file else SRC_BASE
             from fuel_tracking.services.base_ge import split_label
 
@@ -397,7 +408,7 @@ def _lookup_keys(label: str) -> list[str]:
     return keys
 
 
-def sites_info(site_ids) -> dict:
+def sites_info(site_ids, closing: dict | None = None) -> dict:
     """site → fabricant / type / source / PRP, calculés À L'AFFICHAGE pour ces sites : fichier Base GE lu en base (toujours le
     dernier importé, sans attendre de relecture), Snowflake / ENOC / GENSET DB repris du cache (relus en tâche de fond)."""
     from fuel_tracking.services.base_ge import known_brands, latest_types
@@ -411,6 +422,6 @@ def sites_info(site_ids) -> dict:
     base = {k: v for k, v in base_all.items() if k in ids}
     gdb_meta = raw.get("gdb_meta") or {}
     brands = known_brands([t for t, _k in base_all.values()], gdb_meta.get("fabricants") or [])
-    sites = build(sf, en, base, base_file, brands)
+    sites = build(sf, en, base, base_file, brands, {k.upper(): v for k, v in (closing or {}).items() if k.upper() in ids})
     add_prp(sites, raw.get("gdb") or {}, gdb_meta.get("fichier"), raw.get("gdb_curves"))
     return sites

@@ -62,6 +62,8 @@ def find_header(rows) -> tuple[int, dict] | tuple[None, None]:
             "vol": _col(h, "total qte volée"), "vidange": _col(h, "total qte vidangée"),
             "variation": _col(h, "variation de stock fuel considér"), "cph_l": _col(h, "estimation conso fuel théorique retenue"),
             "cph_source": _col(h, "source de donnée estimation conso fuel théorique"),
+            "fabricant_ge": next((i for i, x in enumerate(h) if x in ("fabriquant ge", "fabricant ge")), None),
+            "type_ge": h.index("type de ge") if "type de ge" in h else None,
         }
         if None in (idx["stock_initial"], idx["stock_final"], idx["source_finale"]):
             continue
@@ -71,6 +73,7 @@ def find_header(rows) -> tuple[int, dict] | tuple[None, None]:
 
 def parse_rows(rows) -> list[dict]:
     from fuel_tracking.services import stock_import_files as F
+    from fuel_tracking.services.stock_file_analysis import _ge_labels
 
     n, idx = find_header(rows)
     if n is None:
@@ -95,6 +98,7 @@ def parse_rows(rows) -> list[dict]:
             "compteur_terrain_initial_h": num("compteur_initial") if idx.get("compteur_initial") is not None and idx["compteur_initial"] < idx["date_finale"] else None,
             "stock_terrain_final_l": num("stock_final_terrain"), "compteur_terrain_final_h": num("compteur_final"),
             "temps_marche_terrain_h": num("tm_terrain"),
+            **_ge_labels([(get("fabricant_ge"), get("type_ge"))]),
         })
     return out
 
@@ -180,7 +184,8 @@ def process_output_file(batch, rows, file_name: str, resolver, tanks_of) -> dict
                    "source_conso_theorique_ops": r["source_conso_theorique_ops"],
                    "compteur_terrain_initial_h": r.get("compteur_terrain_initial_h"),
                    "stock_terrain_final_l": r.get("stock_terrain_final_l"), "compteur_terrain_final_h": r.get("compteur_terrain_final_h"),
-                   "temps_marche_terrain_h": r.get("temps_marche_terrain_h")}
+                   "temps_marche_terrain_h": r.get("temps_marche_terrain_h"),
+                   "fabricant_ge": r.get("fabricant_ge"), "type_ge": r.get("type_ge")}
         for kind, value, d in (("initial", r["stock_initial_l"], r["date_initiale"]), ("final", r["stock_final_l"], r["date_finale"])):
             if value is None or d is None:
                 stats["stocks_absents"] += 1
@@ -232,7 +237,7 @@ def process_output_file(batch, rows, file_name: str, resolver, tanks_of) -> dict
 def backfill_terrain_counters() -> int:
     """Fichiers de clôture importés avant l'ajout du compteur : relit la copie d'archive (Closing ou Output App Fuel) et complète
     le contexte des relevés de clôture avec les valeurs de terrain du fichier : compteur à la date initiale, quantité et compteur
-    à la date finale.
+    à la date finale, fabricant et type de GE de la ligne (v4, 24/11/2026).
     Idempotent (lot marqué). Lecture seule de l'archive ; aucune valeur inventée (case vide du fichier → rien)."""
     from pathlib import Path
 
@@ -244,14 +249,15 @@ def backfill_terrain_counters() -> int:
     done = 0
     for b in FuelImportBatch.objects.filter(source_type="CLOSING").exclude(status__in=("REJECTED", "FAILED")):
         st = (b.summary or {}).get("stocks_closing") or {}
-        if "terrain_repris_v3" in st or not b.archive_path or not Path(b.archive_path).is_file():
+        if "terrain_repris_v4" in st or not b.archive_path or not Path(b.archive_path).is_file():
             continue
         oaf = st.get("format") == FILE_LABEL
         recs = []
         for _n, rows in iter_sheets(Path(b.archive_path).read_bytes(), b.file_name, only={SHEET if oaf else CLOSING_SHEET}):
             recs = parse_rows(list(rows)) if oaf else closing_stock_rows(list(rows))[0]
         resolver = SiteResolver()
-        keys = ("compteur_terrain_initial_h", "stock_terrain_final_l", "compteur_terrain_final_h", "temps_marche_terrain_h")
+        keys = ("compteur_terrain_initial_h", "stock_terrain_final_l", "compteur_terrain_final_h", "temps_marche_terrain_h",
+                "fabricant_ge", "type_ge")
         by_key = {}
         for r in recs:
             sid = resolver.resolve(r["site"])
@@ -267,7 +273,7 @@ def backfill_terrain_counters() -> int:
                 o.source_context = {**ctx, **v}
                 upd.append(o)
         Obs.objects.bulk_update(upd, ["source_context"], batch_size=1000)
-        b.summary = {**(b.summary or {}), "stocks_closing": {**st, "terrain_repris_v3": len(upd)}}
+        b.summary = {**(b.summary or {}), "stocks_closing": {**st, "terrain_repris_v4": len(upd)}}
         b.save(update_fields=["summary"])
         done += 1
     return done

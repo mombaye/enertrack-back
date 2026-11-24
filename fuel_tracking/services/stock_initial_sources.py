@@ -409,6 +409,19 @@ def _file_line_values(rows) -> dict:
     return out
 
 
+def closing_genset_types(lines: dict) -> dict:
+    """site → (fabricant, type de GE, source affichée) lus sur la ligne du fichier de clôture de la période du tableau
+    (jamais celle d'un autre mois). Ligne sans type : site absent (le type vient alors d'ENOC / Snowflake)."""
+    out = {}
+    for sid, line in lines.items():
+        c = line.get("fin") or {}
+        if c.get("type_ge"):
+            per = [str(x or "?")[:10] for x in (list(c.get("periode") or []) + [None, None])[:2]]
+            out[sid.upper()] = (c.get("fabricant_ge"), c["type_ge"],
+                                f"Fichier de clôture ({c.get('fichier') or 'Closing'}, {per[0]} → {per[1]})")
+    return out
+
+
 def file_dates(r: dict, lines: dict) -> tuple[date | None, date | None]:
     """(Date de Relevé Initiale, Date de Relevé Finale) de la ligne du fichier du site ; à défaut, dates du bilan."""
     per = (((lines.get(r["site_id"]) or {}).get("fin") or {}).get("periode") or [None, None]) + [None, None]
@@ -735,7 +748,8 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
     pairs = row_pairs(rows, lines)
     ravitaillement(rows)
     runtimes = _fms_runtimes(rows, lines)
-    _ge_now = __import__("fuel_tracking.services.ge_info", fromlist=["x"]).sites_info(r["site_id"] for r in rows)
+    _closing_ge = closing_genset_types(lines)   # type de GE lu sur la ligne du fichier de clôture du mois (2ᵉ source)
+    _ge_now = __import__("fuel_tracking.services.ge_info", fromlist=["x"]).sites_info((r["site_id"] for r in rows), _closing_ge)
     from fuel_tracking.services.base_ge import latest_types as _latest_types
 
     _base_kva = {k: v[1] for k, v in _latest_types()[0].items() if v[1]}
@@ -750,7 +764,7 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
     powers = _power_medians(rows, lines, _kinds, _kva)
     from fuel_tracking.services import ge_info as G
 
-    ge = G.sites_info(r["site_id"] for r in rows)   # Base GE en direct (dernier fichier importé) + sources en cache
+    ge = G.sites_info((r["site_id"] for r in rows), _closing_ge)   # Base GE en direct (dernier fichier importé) + sources en cache
     guards, gerr = _guard_readings(pairs, fetch)
     sf, err = _snowflake_points(pairs, fetch)
     err = " ".join(m for m in (err, gerr) if m) or None

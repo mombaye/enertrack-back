@@ -70,6 +70,19 @@ def _first_idx(header: list[str], prefix: str, lo: int = 0, hi: int | None = Non
     return None
 
 
+def ge_label(v) -> str | None:
+    """Libellé de GE d'un fichier de clôture nettoyé ; case vide / « 0 » / « N/A » → None (jamais un type inventé)."""
+    s = " ".join(str(v).split()) if v is not None and not isinstance(v, bool) else ""
+    return None if s.upper() in {"", "0", "NONE", "NULL", "N/A", "NA", "-", "NAN", "#N/A"} else s
+
+
+def _ge_labels(pairs) -> dict:
+    """{"fabricant_ge", "type_ge"} des GE d'une ligne de fichier, dans l'ordre (#1, #2), joints par « / » ; None si aucun type."""
+    ges = [(ge_label(m), ge_label(t)) for m, t in pairs if ge_label(t)]
+    fabs = list(dict.fromkeys(m for m, _t in ges if m))
+    return {"fabricant_ge": " / ".join(fabs) or None, "type_ge": " / ".join(t for _m, t in ges) or None}
+
+
 def closing_stock_rows(rows) -> tuple[list[dict], dict]:
     """
     Lit la feuille de synthèse du Closing en tenant compte des en-têtes répétés :
@@ -102,6 +115,8 @@ def closing_stock_rows(rows) -> tuple[list[dict], dict]:
                     "compteur_final": _first_idx(header, "relevé visuel compteur genset", i1 + 1, i_end),
                     "conso_closing": _first_idx(header, "qtité cons considéréé", i1 + 1, i_end),
                     "conso_niveau": _first_idx(header, "qtité consommée sur la période de relevé niveau fuel", i1 + 1, i_end),
+                    "marque_ge_1": _first_idx(header, "marque ge installé #1"), "type_ge_1": _first_idx(header, "type de ge #1"),
+                    "marque_ge_2": _first_idx(header, "marque ge installé #2"), "type_ge_2": _first_idx(header, "type de ge #2"),
                 }
             continue
         if not row:
@@ -121,6 +136,8 @@ def closing_stock_rows(rows) -> tuple[list[dict], dict]:
             "compteur_terrain_initial_h": F.parse_number(get("compteur_initial")),
             # bloc « Date de Relevé Finale » du Closing : quantité laissée et compteur relevés à cette date
             "stock_terrain_final_l": F.parse_number(get("stock_final")), "compteur_terrain_final_h": F.parse_number(get("compteur_final")),
+            # GE #1 puis #2 (« / » si deux GE), comme le registre : type de GE du site lu dans le fichier de clôture du mois
+            **_ge_labels([(get("marque_ge_1"), get("type_ge_1")), (get("marque_ge_2"), get("type_ge_2"))]),
         })
     diag = {k: (None if v is None else (header[v] if header and v < len(header) else None)) for k, v in (h_idx or {}).items()} if header else None
     return out, {"colonnes_utilisees": diag, "en_tete_trouve": header is not None}

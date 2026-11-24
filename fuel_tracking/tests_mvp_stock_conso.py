@@ -199,6 +199,19 @@ class ClosingFormat2026Tests(BalanceBase):
         self.assertEqual(diag["colonnes_utilisees"]["livre"], "total livraison")
         self.assertEqual(data[0]["livre_l"], 1200.0)
 
+    def test_type_de_ge_1_et_2(self):
+        """Closing de septembre : « Marque GE installé #1/#2 » et « Type de GE #1/#2 » → type de GE de la ligne (24/11/2026)."""
+        head = ["Id du site", "Marque GE installé #1", "New GE/Reused #1", "Type de GE #1", "Puissance PRP (KVA) #1",
+                "Marque GE installé #2", "New GE/Reused #2", "Type de GE #2", "Date de relevé initiale",
+                "Qtité laissée à la date du relevé", "Date de relevé finale", "Qtité laissée à la date du relevé", "Test date"]
+        d0, d1 = datetime(2026, 8, 31), datetime(2026, 9, 30)
+        rows = [["Synthèse"], head, ["DKR_0001", "SDMO", "New", "K22", 22, "FG Wilson", "New", "P33-3", d0, 500, d1, 300, None],
+                ["DKR_0002", "SDMO", "New", "J66K", 60, 0, None, 0, d0, 500, d1, 300, None],
+                ["DKR_0003", None, None, None, None, None, None, None, d0, 500, d1, 300, None]]
+        data, _diag = closing_stock_rows(rows)
+        self.assertEqual([(r["fabricant_ge"], r["type_ge"]) for r in data],
+                         [("SDMO / FG Wilson", "K22 / P33-3"), ("SDMO", "J66K"), (None, None)])
+
 
 @override_settings(CELERY_TASK_ALWAYS_EAGER=True, CELERY_TASK_EAGER_PROPAGATES=True)
 class ConfigurationClosingUploadTests(TmpRootMixin, MvpBase):
@@ -2142,3 +2155,60 @@ class DiagnosticOpsComparisonTests(SimpleTestCase):
         self.assertIn("80 L     1 site(s)  0 L chez nous", txt)
         self.assertIn("-50 L        sites calculés chez nous sans valeur Ops", txt)
         self.assertIn("ratio médian EnerTrack ÷ Ops = 0.33", txt)
+
+
+
+class ClosingGensetTypeTests(OutputAppFuelImportTests):
+    """Décision du 24/11/2026 : type de GE = 1. Base GE ; 2. fichier de clôture du mois (ligne du site) ; 3. ENOC / Snowflake."""
+
+    def output_bytes(self):
+        from openpyxl import load_workbook
+        import io
+
+        wb = load_workbook(io.BytesIO(super().output_bytes()))
+        ws = wb["Output"]
+        ws.cell(row=2, column=ws.max_column + 1, value="Fabriquant GE")
+        ws.cell(row=2, column=ws.max_column + 1, value="Type de GE")
+        n = ws.max_column
+        for r, (fab, typ) in zip(range(3, 7), (("SDMO", " K22 "), ("FG Wilson", "0"), ("SDMO", "J66K"), ("SDMO", "K33"))):
+            ws.cell(row=r, column=n - 1, value=fab)
+            ws.cell(row=r, column=n, value=typ)
+        out = io.BytesIO()
+        wb.save(out)
+        return out.getvalue()
+
+    def test_type_lu_sur_la_ligne_du_mois(self):
+        from fuel_tracking.models import FuelStockObservation as Obs
+        from fuel_tracking.services import stock_import_pipeline as P
+        from fuel_tracking.services import stock_initial_sources as S
+
+        P.process_bytes(self.output_bytes(), "Output App Fuel.xlsx", "CLOSING", origin="UPLOAD")
+        ctx = {o.site_id: o.source_context for o in Obs.objects.filter(source_type="CLOSING")}
+        self.assertEqual((ctx["DKR_0001"]["fabricant_ge"], ctx["DKR_0001"]["type_ge"]), ("SDMO", "K22"))
+        self.assertIsNone(ctx["DKR_0002"]["type_ge"])                        # « 0 » n'est pas un type
+        self.assertIsNone(ctx["DKR_0002"]["fabricant_ge"])                   # fabricant sans type : ignoré
+        rows = [{"site_id": "DKR_0001", "stock": {"date_initial": "2026-09-30", "date_final": "2026-10-31"}},
+                {"site_id": "DKR_0002", "stock": {"date_initial": "2026-10-02", "date_final": "2026-11-05"}}]
+        got = S.closing_genset_types(S._file_line_values(rows))
+        self.assertEqual(got, {"DKR_0001": ("SDMO", "K22", "Fichier de clôture (Output App Fuel, 2026-09-30 → 2026-10-31)")})
+        other = [{"site_id": "DKR_0001", "stock": {"date_initial": "2026-08-31", "date_final": "2026-09-30"}}]
+        self.assertEqual(S.closing_genset_types(S._file_line_values(other)), {})   # jamais la ligne d'un autre mois
+
+    def test_ordre_des_sources(self):
+        from fuel_tracking.services import ge_info as G
+        from fuel_tracking.services.stock_file_analysis import _ge_labels
+
+        self.assertEqual(_ge_labels([("SDMO", "J66K"), ("SDMO", "K22")]), {"fabricant_ge": "SDMO", "type_ge": "J66K / K22"})
+        self.assertEqual(_ge_labels([("SDMO", "N/A"), (None, None)]), {"fabricant_ge": None, "type_ge": None})
+        cl = {k: ("SDMO", "K22", "Fichier de clôture (Closing, 2026-08-31 → 2026-09-30)") for k in "ABCD"}
+        out = G.build({"C": [(1, ("FG Wilson", G.SRC_SF), ("P33-3", G.SRC_SF))], "E": [(1, ("FG Wilson", G.SRC_SF), ("P33-3", G.SRC_SF))]},
+                      {"B": [("PRAMAC", "GBW15")]}, {"A": ("SDMO - J66K", 60)}, "Base GE.xlsx", ["SDMO"], cl)
+        self.assertEqual(out["A"]["type_ge"], "SDMO - J66K")                 # 1. Base GE
+        self.assertEqual((out["B"]["type_ge"], out["C"]["type_ge"], out["D"]["type_ge"]), ("K22", "K22", "K22"))   # 2. clôture
+        self.assertEqual(out["C"], {"fabricant_ge": "SDMO", "type_ge": "K22",
+                                    "source_ge": "Fichier de clôture (Closing, 2026-08-31 → 2026-09-30)"})
+        self.assertEqual(out["E"]["type_ge"], "P33-3")                       # 3. Snowflake si aucun fichier
+        G.add_prp(out, {"K22": {22.0}}, "Closing.xlsb")
+        self.assertEqual(out["D"]["prp_kw"], [17.6])
+        got = G.sites_info(["dkr_0009"], {"DKR_0009": ("SDMO", "K22", "Fichier de clôture (Closing, 2026-08-31 → 2026-09-30)")})
+        self.assertEqual(got["DKR_0009"]["type_ge"], "K22")                  # transmis jusqu'à l'affichage
