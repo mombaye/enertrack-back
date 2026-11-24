@@ -2030,3 +2030,72 @@ class SyncDailyFactsPerimeterTests(TestCase):
         self.assertEqual(seen[0], [1, 2])   # GE_1 (DG_COUNT > 0) + Stock_2 (stock dans les fichiers) ; RIEN_3 exclu
         self.assertEqual(sorted(c.args[0] for c in fs.call_args_list), ["2026-09", "2026-10"])
         self.assertIn("1 avec GE dans l'inventaire + 1 avec stock", out.getvalue())
+
+
+class DailyRateTests(SimpleTestCase):
+    """Conso journalière des bilans : jamais une division par presque 0 qui fait échouer le recalcul de TOUS les bilans
+    (« numeric field overflow » au déploiement du 24/11/2026)."""
+
+    def test_releves_trop_proches_ou_valeur_hors_colonne(self):
+        from fuel_tracking.services.stock_period_balance import daily_rate
+
+        from datetime import timezone as dt_tz
+
+        t0 = datetime(2026, 10, 1, 8, 0, tzinfo=dt_tz.utc)
+        self.assertEqual(daily_rate(Decimal("300"), t0, t0 + timedelta(days=30)), Decimal("10.000"))
+        self.assertIsNone(daily_rate(Decimal("300"), t0, t0 + timedelta(microseconds=5)))   # ancien calcul : ≈ 5,2 × 10^12 L/jour
+        self.assertIsNone(daily_rate(Decimal("300"), t0, t0 + timedelta(minutes=59)))
+        self.assertIsNone(daily_rate(Decimal("300"), t0, t0))
+        self.assertIsNone(daily_rate(Decimal("300"), t0 + timedelta(days=1), t0))           # relevé final avant l'initial
+        self.assertIsNone(daily_rate(None, t0, t0 + timedelta(days=30)))
+        self.assertEqual(daily_rate(Decimal("0"), t0, t0 + timedelta(days=2)), Decimal("0.000"))   # 0 reste 0
+        self.assertIsNone(daily_rate(Decimal("1E13"), t0, t0 + timedelta(hours=2)))          # hors colonne : n.d.
+
+
+class BackfillBatteryChargeTests(MvpBase):
+    """Reprise de la recharge batterie (GOLD.BATTERY_REPORT, instructions équipe data) : lignes existantes seulement,
+    NULL jamais transformé en 0, doublon contradictoire → NULL, Snowflake en lecture seule."""
+
+    def test_complete_les_faits_existants(self):
+        from io import StringIO
+        from unittest import mock
+
+        from django.core.management import call_command
+
+        from fuel_tracking.models import FuelSiteDailyFacts as F, FuelSiteInventory as INV
+
+        INV.objects.create(country="Senegal", data_id=7, site_id="DKR_0001", dg_count=1)
+        for d in (1, 2, 3):
+            F.objects.create(country="Senegal", data_id=7, site_id="DKR_0001", date=date(2026, 10, d), dse_runtime_h=Decimal("5"))
+        sqls = []
+
+        class Cur:
+            def execute(self, sql, params):
+                sqls.append(sql)
+
+            def fetchall(self):
+                return [(7, date(2026, 10, 1), 288, 288, 120, 120, 0.702, 0.702),      # en charge
+                        (7, date(2026, 10, 2), 288, 288, 0, 0, None, None),            # télémétrie sans charge : NULL
+                        (7, date(2026, 10, 3), 288, 288, 50, 50, 0.4, 0.9),            # doublon contradictoire : NULL
+                        (7, date(2026, 10, 4), 280, 280, 90, 90, 0.5, 0.5)]            # pas de ligne de faits : signalé
+
+        conn = mock.Mock()
+        conn.cursor.return_value = Cur()
+        out = StringIO()
+        with mock.patch("fuel_tracking.services.fuel_daily_facts_snowflake._connect", return_value=conn):
+            call_command("backfill_battery_charge", start=date(2026, 10, 1), end=date(2026, 10, 4), stdout=out)
+        rows = {f.date.day: f for f in F.objects.filter(data_id=7)}
+        self.assertEqual((rows[1].battery_telemetry_points, rows[1].battery_charge_slots, float(rows[1].battery_charge_median_kw)), (288, 120, 0.702))
+        self.assertEqual((rows[2].battery_telemetry_points, rows[2].battery_charge_slots, rows[2].battery_charge_median_kw), (288, 0, None))
+        self.assertIsNone(rows[3].battery_charge_median_kw)
+        self.assertEqual(float(rows[1].dse_runtime_h), 5.0)   # aucune autre colonne touchée
+        self.assertFalse(F.objects.filter(date=date(2026, 10, 4)).exists())
+        self.assertIn("sync_fuel_daily_facts --start 2026-10-04", out.getvalue())
+        self.assertTrue(all(s.lstrip().upper().startswith("SELECT") and "BATTERY_REPORT" in s for s in sqls))
+        self.assertFalse(any("GFMS_METRICS" in s for s in sqls))
+        # La période retient la médiane des jours qualifiés en charge
+        from fuel_tracking.services import stock_initial_sources as S
+
+        r = S._batt_power(list(F.objects.filter(data_id=7).values(*["battery_telemetry_points", "battery_charge_slots",
+                          "battery_charge_median_kw", "battery_charge_median_current_a", "battery_charge_median_voltage_v"])), 3)
+        self.assertEqual((r["p_batt_kw"], r["p_batt_source"]), (0.702, "BATTERY_CHARGE_MEDIAN_DAY"))

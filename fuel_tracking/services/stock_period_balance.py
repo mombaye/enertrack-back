@@ -37,6 +37,23 @@ RULE_VERSION = "bilan-v2"
 MVP_RULE_VERSION = "bilan-v6-mvp"  # 18/11/2026 : stocks = ligne du fichier du mois aux dates exactes ; v5 = stock final tardif retenu ; v4 = fichiers = stocks seulement, mouvements ENOC  # règles du cahier des charges 16/11/2026 (FUEL_MVP_IGNORE_VALIDATION / FUEL_APP_STOCK_START / …)
 
 
+MIN_RATE_HOURS = 1                       # conso journalière non significative sous 1 h entre les deux relevés
+MAX_RATE_L = Decimal("99999999999.999")  # plus grande valeur d'une colonne de litres (14 chiffres dont 3 décimales)
+
+
+def daily_rate(conso, t0, t1):
+    """Consommation journalière (L/jour) = conso ÷ jours entre les deux relevés. n.d. (None) si la conso est n.d., si les
+    relevés sont à moins d'1 h d'écart (division par presque 0 : un débit journalier n'y a aucun sens) ou si le résultat
+    sort de la colonne — jamais une valeur qui bloque l'enregistrement de tous les bilans."""
+    if conso is None or t0 is None or t1 is None:
+        return None
+    seconds = (t1 - t0).total_seconds()
+    if seconds < MIN_RATE_HOURS * 3600:
+        return None
+    rate = (conso / Decimal(str(seconds / 86400))).quantize(Decimal("0.001"))
+    return rate if abs(rate) <= MAX_RATE_L else None
+
+
 def current_rule_version() -> str:
     """Version de règle effectivement appliquée (enregistrée sur chaque bilan) : permet de repérer les bilans à recalculer."""
     return MVP_RULE_VERSION if bool(getattr(settings, "FUEL_MVP_IGNORE_VALIDATION", False)) or getattr(settings, "FUEL_APP_STOCK_START", None) \
@@ -818,8 +835,7 @@ def _reference_balance(site_id, start, end, c, obs, tanks, site, profile, month:
             conso, statut, cause = variation, "PRET_A_CERTIFIER", REFERENCE_CAUSE
     t0 = o_ini["observation_datetime"] if o_ini else start
     t1 = o_fin["observation_datetime"] if o_fin else end
-    days = (t1 - t0).total_seconds() / 86400 if (o_ini and o_fin) else None
-    conso_j = (conso / Decimal(str(days))).quantize(Decimal("0.001")) if conso is not None and days and days > 0 else None
+    conso_j = daily_rate(conso, t0, t1) if (o_ini and o_fin) else None
     entrees_ext = comps["livraisons_externes_l"]
     ref = {**(ctx or {}), "decision": REFERENCE_CAUSE}
     if ini:
@@ -980,8 +996,7 @@ def _site_balance(site_id, start, end, c, obs, enoc, movements, tanks, site, pro
     else:
         statut = "ESTIMATION_AVEC_RESERVE"
         cause = "ESTIMATION" if any(x and x["estimation"] for x in (ini, fin)) else "RESERVES"
-    days = (t1 - t0).total_seconds() / 86400 if (ini and fin) else None
-    conso_j = (conso / Decimal(str(days))).quantize(Decimal("0.001")) if conso is not None and days and days > 0 else None
+    conso_j = daily_rate(conso, t0, t1) if (ini and fin) else None
 
     entrees_ext = comps["livraisons_externes_l"] + comps["carte_total_l"]
     volume_transfere = comps["transferts_sortants_l"]
