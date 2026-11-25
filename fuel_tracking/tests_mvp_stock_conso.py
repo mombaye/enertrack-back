@@ -2317,3 +2317,32 @@ class GeFiltersTests(SimpleTestCase):
         self.assertEqual(len(f(fabricant_ge="AUCUN")), 2)
         self.assertEqual(f(type_ge="gep 22-6"), [rows[1]])
         self.assertEqual(f(source_ge="Fichier Base GE"), [rows[0]])
+
+
+class ColumnFiltersTests(SimpleTestCase):
+    """Filtres de colonnes « comme Excel » : valeur affichée → clé ; vides distincts de 0 ; valeurs selon les autres filtres."""
+
+    def test_cles_filtres_et_valeurs(self):
+        from fuel_tracking.services import conso_column_filters as CF
+
+        self.assertEqual((CF.vkey(None), CF.vkey(0), CF.vkey(Decimal("1234.500")), CF.vkey([22.0, 30.0]), CF.vkey("  SDMO  K22 ")),
+                         ("", "0", "1234.5", "22 / 30", "SDMO K22"))
+        rows = [{"site_id": "A", "site_name": "a", "estimation_theorique": {"type_ge": "K22", "conso_theorique_l": 10.0}},
+                {"site_id": "B", "site_name": "b", "estimation_theorique": {"type_ge": "K22", "conso_theorique_l": None}},
+                {"site_id": "C", "site_name": "c", "estimation_theorique": {"type_ge": None, "conso_theorique_l": 0.0}}]
+        idx = CF.index(rows)
+        f = CF.parse('{"estimation_theorique.type_ge": ["K22"], "inconnue.x": ["1"]}')
+        self.assertEqual(list(f), ["estimation_theorique.type_ge"])                      # colonne inconnue ignorée
+        self.assertEqual([s for s in "ABC" if CF.keep(idx, f, s)], ["A", "B"])
+        vals = CF.distinct(idx, f, "ABC", "estimation_theorique.conso_theorique_l")      # parmi les sites K22 seulement
+        self.assertEqual(vals, [{"valeur": "10", "nb": 1}, {"valeur": "", "nb": 1}])     # (Vides) en dernier, 0 ≠ vide
+        self.assertEqual(CF.distinct(idx, f, "ABC", "estimation_theorique.type_ge"),     # sa propre colonne : tous les choix
+                         [{"valeur": "K22", "nb": 2}, {"valeur": "", "nb": 1}])
+        self.assertEqual(CF.parse("pas du json"), {})
+
+    def test_avec_ou_sans_ge(self):
+        from fuel_tracking.services import conso_comparison as C
+
+        rows = [{"ge": {"type": "K22"}}, {"ge": {"type": None}}]
+        self.assertEqual(C._filter(rows, {"avec_ge": "oui"}), [rows[0]])
+        self.assertEqual(C._filter(rows, {"avec_ge": "non"}), [rows[1]])

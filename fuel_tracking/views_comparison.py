@@ -15,6 +15,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from fuel_tracking.services import conso_column_filters as CF
 from fuel_tracking.services import conso_comparison as C
 from fuel_tracking.services.period_utils import available_periods, default_period, to_day
 
@@ -44,6 +45,10 @@ class ConsommationsView(APIView):
             return Response({"detail": "Aucun bilan de stock calculé : lancez le calcul des bilans.", "rows": [], "total": 0, "periode": None}, status=200)
         data = _cached_build(d_from, d_to, p)
         rows = data.pop("rows")
+        cf = CF.parse(p.get(CF.PARAM))
+        if cf:   # filtres de colonnes « comme Excel » : sur les valeurs affichées, avant pagination
+            idx = _cached_index(d_from, d_to, p, rows)
+            rows = [r for r in rows if CF.keep(idx, cf, r["site_id"])]
         try:
             size = max(1, min(int(p.get("page_size", 50)), 1000))   # « Tous les sites » côté interface
             page = max(1, int(p.get("page", 1)))
@@ -204,6 +209,57 @@ def _cached_totals(d_from, d_to, p, rows):
     return out
 
 
+def _cached_index(d_from, d_to, p, rows):
+    """site → {colonne: valeur affichée} pour les filtres de colonnes, en cache 10 min (clé = période + filtres hors filtres de
+    colonnes + version des données + dernier Base GE + dernière relecture GE)."""
+    import hashlib
+    import json
+
+    from django.core.cache import cache
+
+    from fuel_tracking.models import FuelImportBatch
+    from fuel_tracking.services import ge_info as G
+    from fuel_tracking.services import stock_initial_sources as S
+
+    params = {k: v for k, v in (p.dict() if hasattr(p, "dict") else dict(p)).items() if k not in ("page", "page_size", CF.PARAM, "colonne")}
+    base = FuelImportBatch.objects.filter(source_type="BASE_GE").order_by("-received_at").values_list("pk", flat=True).first()
+    raw = json.dumps([str(d_from), str(d_to), sorted(params.items()), _data_version(), base, (G.cached() or {}).get("lu_le")], default=str)
+    key = "fuel-conso-colonnes:" + hashlib.sha1(raw.encode()).hexdigest()
+    try:
+        hit = cache.get(key)
+    except Exception:  # noqa: BLE001
+        hit = None
+    if hit is not None:
+        return hit
+    idx = CF.index(S.enriched_copy(rows))
+    try:
+        cache.set(key, idx, 600)
+    except Exception:  # noqa: BLE001
+        pass
+    return idx
+
+
+class ConsommationsValeursView(APIView):
+    """GET /api/fuel-tracking/consommations/valeurs/?colonne=bloc.champ&<filtres> — valeurs d'une colonne (bouton ▼ de l'en-tête),
+    avec le nombre de sites, parmi les sites retenus par les autres filtres (comme Excel)."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        p = request.query_params
+        col = p.get("colonne") or ""
+        if col not in CF.FILTER_KEYS:
+            return Response({"detail": "Colonne non filtrable."}, status=400)
+        try:
+            d_from, d_to, _dflt = _period(p)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=400)
+        if d_from is None:
+            return Response({"colonne": col, "valeurs": []})
+        rows = _cached_build(d_from, d_to, p)["rows"]
+        idx = _cached_index(d_from, d_to, p, rows)
+        return Response({"colonne": col, "valeurs": CF.distinct(idx, CF.parse(p.get(CF.PARAM)), [r["site_id"] for r in rows], col)})
+
+
 def _cached_build(d_from, d_to, p):
     """Résultat du calcul de l'écran mis en cache (6 h, clé = période + filtres + version des données) : changer de page ou
     revenir sur l'écran ne recalcule plus tout. Jamais servi périmé : tout nouveau calcul ou import change la version."""
@@ -213,7 +269,7 @@ def _cached_build(d_from, d_to, p):
 
     from django.core.cache import cache
 
-    params = {k: v for k, v in (p.dict() if hasattr(p, "dict") else dict(p)).items() if k not in ("page", "page_size")}
+    params = {k: v for k, v in (p.dict() if hasattr(p, "dict") else dict(p)).items() if k not in ("page", "page_size", CF.PARAM, "colonne")}
     raw = json.dumps([str(d_from), str(d_to), sorted(params.items()), _data_version()], default=str)
     key = "fuel-conso-build:" + hashlib.sha1(raw.encode()).hexdigest()
     data = cache.get(key)

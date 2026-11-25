@@ -38,7 +38,7 @@ from fuel_tracking.views_stock import (
     TankDetailView,
     TankListView,
 )
-from fuel_tracking.views_comparison import ConsommationsExportView, ConsommationsPeriodesView, ConsommationsSanteView, ConsommationsEvolutionView, ConsommationsView
+from fuel_tracking.views_comparison import ConsommationsExportView, ConsommationsPeriodesView, ConsommationsSanteView, ConsommationsEvolutionView, ConsommationsValeursView, ConsommationsView
 from fuel_tracking.views_cph import (
     CphAbaqueImportView,
     CphCurveApproveView,
@@ -112,6 +112,7 @@ urlpatterns = [
     path("consommations/evolution/", ConsommationsEvolutionView.as_view(), name="fuel-consommations-evolution"),
     path("consommations/sante/", ConsommationsSanteView.as_view(), name="fuel-consommations-sante"),
     path("consommations/periodes/", ConsommationsPeriodesView.as_view(), name="fuel-consommations-periodes"),
+    path("consommations/valeurs/", ConsommationsValeursView.as_view(), name="fuel-consommations-valeurs"),
     path("consommations/export/<str:kind>/", ConsommationsExportView.as_view(), name="fuel-consommations-export"),
     path("cph/", CphPeriodView.as_view(), name="fuel-cph"),
     path("cph/health/", CphHealthView.as_view(), name="fuel-cph-health"),

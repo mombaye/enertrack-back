@@ -369,6 +369,9 @@ def _filter(rows: list[dict], p) -> list[dict]:
     eq(p.get("fabricant_ge"), lambda r: (r.get("ge") or {}).get("fabricant") or "AUCUN")
     eq(p.get("type_ge"), lambda r: (r.get("ge") or {}).get("type") or "AUCUN")
     eq(p.get("source_ge"), lambda r: (r.get("ge") or {}).get("source") or "AUCUN")
+    ge = (p.get("avec_ge") or "").strip().lower()   # avec GE = le Type de GE s'affiche (décision du 25/11/2026)
+    if ge in ("oui", "non"):
+        rows = [r for r in rows if bool((r.get("ge") or {}).get("type")) == (ge == "oui")]
     site = (p.get("site") or "").strip().lower()
     if site:
         rows = [r for r in rows if site in r["site_id"].lower() or site in (r["site_name"] or "").lower()]
@@ -494,7 +497,7 @@ def _kpis(rows: list[dict]) -> dict:
 
 def _has_filter(params) -> bool:
     keys = ("pays", "zone", "typologie", "typologie_energie", "statut_bilan", "statut_certification", "source_stock", "source_runtime",
-            "source_puissance", "source_target", "correspondance", "qualite", "site", "fabricant_ge", "type_ge", "source_ge")
+            "source_puissance", "source_target", "correspondance", "qualite", "site", "fabricant_ge", "type_ge", "source_ge", "avec_ge")
     return any((params or {}).get(k) for k in keys)
 
 

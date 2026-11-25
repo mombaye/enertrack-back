@@ -939,6 +939,26 @@ class ConsoComparisonTests(BalanceBase):
             self.assertIn("Variation de stock (L)", full)
             self.assertIn("Consommation réelle certifiée (L)", full)
 
+    def test_api_column_filters_and_values(self):
+        """Filtres de colonnes « comme Excel » : liste des valeurs d'une colonne, puis filtrage sur une valeur."""
+        import json
+
+        self.stocks(1000, 400)
+        SB.compute_balances(self.start, self.end, site_ids=["DKR_0001"])
+        c = APIClient()
+        c.force_authenticate(get_user_model().objects.create_user("cf", "cf@x.sn", "p", role="analyst"))
+        q = {"date_debut": self.start.strftime("%Y-%m-%d"), "date_fin": self.end.strftime("%Y-%m-%d")}
+        with mock.patch("fuel_tracking.services.cph_service.compute_period_summary", return_value=[self.cph_row(theo="610")]):
+            v = c.get("/api/fuel-tracking/consommations/valeurs/", {**q, "colonne": "site_id"}).json()
+            self.assertEqual(v["valeurs"], [{"valeur": "DKR_0001", "nb": 1}])
+            self.assertEqual(c.get("/api/fuel-tracking/consommations/valeurs/", {**q, "colonne": "x.y"}).status_code, 400)
+            j = c.get("/api/fuel-tracking/consommations/", {**q, "filtres_colonnes": json.dumps({"site_id": ["DKR_0001"]})}).json()
+            self.assertEqual(j["total"], 1)
+            j = c.get("/api/fuel-tracking/consommations/", {**q, "filtres_colonnes": json.dumps({"site_id": ["AUTRE"]})}).json()
+            self.assertEqual((j["total"], j["rows"]), (0, []))
+            j = c.get("/api/fuel-tracking/consommations/", {**q, "avec_ge": "oui"}).json()
+            self.assertIn("total", j)
+
     def test_recette_command_runs_and_prints_counts(self):
         self.stocks(1000, 400)
         SB.compute_balances(self.start, self.end, site_ids=["DKR_0001"])
