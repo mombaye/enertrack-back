@@ -366,6 +366,9 @@ def _filter(rows: list[dict], p) -> list[dict]:
     eq(p.get("source_runtime"), lambda r: r["cph"]["runtime_source"] or "AUCUNE")
     eq(p.get("source_puissance"), lambda r: r["cph"]["power_source"] or "AUCUNE")
     eq(p.get("source_target"), lambda r: r["target"]["source"] or "AUCUNE")
+    eq(p.get("fabricant_ge"), lambda r: (r.get("ge") or {}).get("fabricant") or "AUCUN")
+    eq(p.get("type_ge"), lambda r: (r.get("ge") or {}).get("type") or "AUCUN")
+    eq(p.get("source_ge"), lambda r: (r.get("ge") or {}).get("source") or "AUCUN")
     site = (p.get("site") or "").strip().lower()
     if site:
         rows = [r for r in rows if site in r["site_id"].lower() or site in (r["site_name"] or "").lower()]
@@ -491,7 +494,7 @@ def _kpis(rows: list[dict]) -> dict:
 
 def _has_filter(params) -> bool:
     keys = ("pays", "zone", "typologie", "typologie_energie", "statut_bilan", "statut_certification", "source_stock", "source_runtime",
-            "source_puissance", "source_target", "correspondance", "qualite", "site")
+            "source_puissance", "source_target", "correspondance", "qualite", "site", "fabricant_ge", "type_ge", "source_ge")
     return any((params or {}).get(k) for k in keys)
 
 
@@ -537,6 +540,26 @@ def closing_base_sites() -> set[str]:
     return {s.upper() for s in Obs.objects.filter(source_type="CLOSING").values_list("site_id", flat=True).distinct() if s}
 
 
+def _attach_ge(rows: list[dict]) -> None:
+    """r["ge"] = fabricant, type et famille de source du type de GE, mêmes valeurs que les colonnes du tableau (Base GE →
+    fichier de clôture du mois → ENOC / Snowflake). Jamais bloquant : en cas d'erreur, valeurs absentes (« n.d. »)."""
+    info = {}
+    try:
+        from fuel_tracking.services import ge_info as G
+        from fuel_tracking.services import stock_initial_sources as S
+
+        info = G.sites_info([r["site_id"] for r in rows], S.closing_genset_types(S._file_line_values(rows)))
+    except Exception:  # noqa: BLE001
+        import logging
+
+        logging.getLogger(__name__).exception("Fabricant / type de GE non calculés pour les filtres")
+        G = None
+    for r in rows:
+        g = info.get(r["site_id"].upper()) or {}
+        r["ge"] = {"fabricant": g.get("fabricant_ge"), "type": g.get("type_ge"),
+                   "source": G.source_family(g.get("source_ge")) if G else None}
+
+
 def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) -> dict:
     """Calcule le tableau de comparaison unique pour la période EXACTE [d_from 00:00:00 ; d_to 23:59:59]."""
     from fuel_tracking.services.cph_health import freshness
@@ -571,6 +594,7 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
                                  "exclu des totaux et des indicateurs." if sf is not None
                                  else "Site absent du fichier Closing (base de référence) : affiché pour information, exclu des totaux et des indicateurs.")
         r["correspondance"] = {"base_closing": ok, "utilise": ok, "motif": motif}
+    _attach_ge(rows)   # fabricant / type / source de GE, comme dans le tableau : filtrables
     # nombre de sites par statut avec les AUTRES filtres (le filtre de statut lui-même ne doit pas vider les compteurs)
     # liste des sites de la période (pour les suggestions de la barre de recherche), avant tout filtre
     site_options = [{"id": sid, "nom": nom} for sid, nom in sorted({(r["site_id"], r["site_name"] or "") for r in rows})]
@@ -617,6 +641,8 @@ def build(d_from: date, d_to: date, params=None, with_cph_quality: bool = True) 
             "typologies_energie": uniq(lambda r: r["typologie_energie"]), "statuts_bilan": list(STATUTS_BILAN), "statuts_compte": statut_counts, "sites": site_options,
             "sources_stock": uniq(lambda r: r["stock"]["source_initial"]), "sources_runtime": uniq(lambda r: r["cph"]["runtime_source"]),
             "sources_puissance": uniq(lambda r: r["cph"]["power_source"]), "sources_target": uniq(lambda r: r["target"]["source"]),
+            "fabricants_ge": uniq(lambda r: r["ge"]["fabricant"] or "AUCUN"), "types_ge": uniq(lambda r: r["ge"]["type"] or "AUCUN"),
+            "sources_ge": uniq(lambda r: r["ge"]["source"] or "AUCUN"),
         },
         "seuils": {"couverture_instrumentee_min_pct": float(_cfg("FUEL_COMPARE_INSTR_MIN_COVERAGE_PCT", 80)), "tolerance_target_pct": TG.tolerance_pct(),
                    "reference_minimale_l": float(_cfg("FUEL_COMPARE_MIN_REFERENCE_L", 20))},

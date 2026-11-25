@@ -172,6 +172,24 @@ def build(sf: dict, enoc: dict, base: dict | None = None, base_file: str | None 
     return out
 
 
+def source_family(source: str | None) -> str | None:
+    """Famille de la source du TYPE de GE (filtre de l'écran) : le libellé complet porte le nom du fichier et la période."""
+    s = str(source or "")
+    if s.startswith("Fabricant :") and "Type :" in s:
+        s = s.split("Type :", 1)[1].strip()
+    if not s or s.startswith("n.d."):
+        return None
+    if s.startswith(SRC_BASE):
+        return SRC_BASE
+    if s.startswith(SRC_CLOSING):
+        return f"{SRC_CLOSING} (type Base GE non reconnu)" if "type Base GE" in s else SRC_CLOSING
+    if "ENOC" in s:
+        return SRC_ENOC
+    if "Snowflake" in s:
+        return "Snowflake (SITE_DG)"
+    return s
+
+
 def refresh() -> dict:
     """Relit Snowflake puis ENOC (lecture seule) et met le résultat en cache. Une source en échec n'empêche pas l'autre."""
     meta, errors = {}, []

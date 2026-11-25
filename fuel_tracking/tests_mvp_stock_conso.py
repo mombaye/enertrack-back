@@ -2293,3 +2293,27 @@ class TableKpisTests(SimpleTestCase):
         self.assertEqual(val["check_l"], 650.0)                                             # 1700+600+100−550−1150−50 : sites incomplets
         self.assertIsNone(val["commande_mois_suivant_l"])                                   # aucune source : n.d., jamais 0
         self.assertIn("Tableau Suivi Conso", k["stock_initial_l"]["detail"]["source"])
+
+
+class GeFiltersTests(SimpleTestCase):
+    """Filtres de l'écran Suivi Conso : Fabriquant GE, Type de GE, Source de donnée GE (n.d. = « AUCUN »)."""
+
+    def test_famille_de_source_et_filtres(self):
+        from fuel_tracking.services import conso_comparison as C
+        from fuel_tracking.services import ge_info as G
+
+        self.assertEqual(G.source_family("Fichier Base GE (Base GE.xlsx)"), "Fichier Base GE")
+        self.assertEqual(G.source_family("Fichier de clôture (Output App Fuel, 2026-09-30 → 2026-10-31)"), "Fichier de clôture")
+        self.assertEqual(G.source_family("Fichier de clôture (Closing, a → b) — type Base GE « X » : absent"),
+                         "Fichier de clôture (type Base GE non reconnu)")
+        self.assertEqual(G.source_family("Fabricant : Snowflake (SITE_DG) · Type : ENOC (registre des GE)"), "ENOC (registre des GE)")
+        self.assertIsNone(G.source_family(None))
+        rows = [{"ge": {"fabricant": "SDMO", "type": "K22", "source": "Fichier Base GE"}},
+                {"ge": {"fabricant": None, "type": "GEP 22-6", "source": "Fichier de clôture"}},
+                {"ge": {"fabricant": None, "type": None, "source": None}}]
+        f = lambda **p: C._filter(rows, {**{k: None for k in ("pays", "zone", "typologie", "typologie_energie", "statut_bilan",  # noqa: E731
+                                                              "source_runtime", "source_puissance", "source_target", "site",
+                                                              "correspondance", "statut_certification", "qualite")}, **p})
+        self.assertEqual(len(f(fabricant_ge="AUCUN")), 2)
+        self.assertEqual(f(type_ge="gep 22-6"), [rows[1]])
+        self.assertEqual(f(source_ge="Fichier Base GE"), [rows[0]])
