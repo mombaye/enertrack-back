@@ -3,7 +3,8 @@
 Fabricant et type de GE par site — bloc « ESTIMATION CONSOMMATION FUEL THÉORIQUE » du Suivi Conso.
 
 Ordre, CHAMP PAR CHAMP (fabricant et type choisis indépendamment), jamais de déduction :
-  Fabricant GE : 1. fichier « Base GE » : marque lue dans le libellé « Type de GE » (« SDMO - K22 » → SDMO ;
+  Fabricant GE : 1. fichier « Base GE » : colonne « Fabricant GE » si le fichier l'a (Base GE VF5), sinon marque lue dans
+                 le libellé « Type de GE » (« SDMO - K22 » → SDMO ;
                  « FG Wilson P33-3U » → FG Wilson, marque connue) ; 2. Snowflake SITE_DG (VENDOR) puis historique ; 3. ENOC (brand).
   Type de GE   : 1. fichier « Base GE » importé dans Configuration (type BASE_GE, dernier fichier) — décision métier ;
                  2. à défaut (décision du 24/11/2026) : fichier de clôture DU MOIS AFFICHÉ, sur la ligne du site (Closing :
@@ -141,11 +142,11 @@ def _pick(snowflake_values: list, enoc_values: list) -> tuple[str | None, str | 
 
 
 def build(sf: dict, enoc: dict, base: dict | None = None, base_file: str | None = None, brands=(),
-          closing: dict | None = None) -> dict:
+          closing: dict | None = None, base_fab: dict | None = None) -> dict:
     """site → {"fabricant_ge", "type_ge", "source_ge"}.
     `base` : site → (type, kVA) du fichier Base GE (1ʳᵉ source) ; `closing` : site → (fabricant, type, source affichée) lus sur
     la ligne du fichier de clôture du mois affiché (2ᵉ source) ; puis ENOC / Snowflake."""
-    base, closing = base or {}, closing or {}
+    base, closing, base_fab = base or {}, closing or {}, base_fab or {}
     out = {}
     for sid in set(sf) | set(enoc) | set(base) | set(closing):
         ges = sorted(sf.get(sid, []), key=lambda g: g[0])
@@ -162,6 +163,8 @@ def build(sf: dict, enoc: dict, base: dict | None = None, base_file: str | None 
             from fuel_tracking.services.base_ge import split_label
 
             marque, _modele = split_label(typ, brands)
+            if _clean(base_fab.get(sid)):   # colonne « Fabricant GE » du fichier Base GE (VF5) d'abord
+                marque = base_fab[sid]
             if _clean(marque):   # fabricant : marque écrite dans le libellé du fichier Base GE d'abord
                 fab, fab_src = _clean(marque), typ_src
         if not fab and not typ:
@@ -230,7 +233,9 @@ def refresh() -> dict:
     from fuel_tracking.services.base_ge import known_brands
 
     brands = known_brands([t for t, _k in base.values()], gdb_meta.get("fabricants") or [])
-    sites = build(sf, en, base, base_file, brands)
+    from fuel_tracking.services.base_ge import latest_fabricants
+
+    sites = build(sf, en, base, base_file, brands, base_fab=latest_fabricants())
     add_prp(sites, gdb, gdb_meta.get("fichier"), curves)
     data = {"sites": sites, "raw": {"sf": sf, "enoc": en, "gdb": gdb, "gdb_meta": gdb_meta, "gdb_curves": curves},
             "meta": {**meta, "sites_enoc": len(en), "base_ge": {"fichier": base_file, "sites": len(base)},
@@ -464,7 +469,9 @@ def sites_info(site_ids, closing: dict | None = None) -> dict:
     gdb_meta = raw.get("gdb_meta") or {}
     brands = known_brands([t for t, _k in base_all.values()], gdb_meta.get("fabricants") or [])
     closing = {k.upper(): v for k, v in (closing or {}).items() if k.upper() in ids}
-    sites = build(sf, en, base, base_file, brands, closing)
+    from fuel_tracking.services.base_ge import latest_fabricants
+
+    sites = build(sf, en, base, base_file, brands, closing, latest_fabricants())
     gdb, fichier, curves = raw.get("gdb") or {}, gdb_meta.get("fichier"), raw.get("gdb_curves")
     add_prp(sites, gdb, fichier, curves)
     closing_if_base_unknown(sites, base, closing, gdb, fichier, curves)

@@ -1564,6 +1564,28 @@ class BaseGeImportTests(MvpBase):
         self.assertEqual(out["DKR_0001"]["type_ge"], "SDMO - K22")                       # fichier Base GE prioritaire
         self.assertIn("Fichier Base GE (Base GE.xlsx)", out["DKR_0001"]["source_ge"])
 
+    def test_vf5_fabricant_column(self):
+        """Base GE VF5 : onglet « Liste », « Fabricant GE » en colonne à part et « Type de GE » sans marque (« K22 »)."""
+        from fuel_tracking.services import base_ge as BG
+        from fuel_tracking.services import ge_info as G
+        from fuel_tracking.services import stock_import_pipeline as P
+
+        data = self._xlsx([[], [None, None, ";"], [None, None, 1],
+                           [None, "Site ID", "NOM", "On-Grid / Off-Grid ", "Fabricant GE", "Type de GE", "Puissance\nGE\n(KVA)"],
+                           [None, "DKR_0001", "SITE 1", "Off grid", "SDMO", "K22", 22],
+                           [None, "DKR_0002", "SITE 2", "Off grid", None, "P33-3U", 33]])    # fabricant vide : jamais inventé
+        b = P.process_bytes(data, "Base_GE_VF5.xlsx", "BASE_GE", origin="UPLOAD")
+        self.assertNotIn(b.status, ("REJECTED", "FAILED"))
+        base, f = BG.latest_types()
+        self.assertEqual((base["DKR_0001"], base["DKR_0002"]), (("K22", 22), ("P33-3U", 33)))
+        fab = BG.latest_fabricants()
+        self.assertEqual(fab, {"DKR_0001": "SDMO"})
+        sf = {"DKR_0001": [(1, ("Kohler", G.SRC_SF), ("J88K", G.SRC_SF))], "DKR_0002": [(1, ("CATERPILLAR", G.SRC_SF), (None, None))]}
+        out = G.build(sf, {}, base, f, [], base_fab=fab)
+        self.assertEqual((out["DKR_0001"]["fabricant_ge"], out["DKR_0001"]["type_ge"], out["DKR_0001"]["source_ge"]),
+                         ("SDMO", "K22", "Fichier Base GE (Base_GE_VF5.xlsx)"))
+        self.assertEqual((out["DKR_0002"]["fabricant_ge"], out["DKR_0002"]["type_ge"]), ("CATERPILLAR", "P33-3U"))   # source suivante
+
     def test_genset_db_lookup_by_type_or_brand_and_type(self):
         from fuel_tracking.services import ge_info as G
 

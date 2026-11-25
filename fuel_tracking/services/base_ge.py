@@ -4,7 +4,8 @@ Fichier « Base GE » (rubrique Configuration, type BASE_GE) : type de GE par si
 Suivi Conso (bloc ESTIMATION CONSOMMATION FUEL THÉORIQUE) — décision métier.
 
 Feuille lue : la première dont une ligne d'en-tête contient « Site ID » et « Type de GE » (ex. « Feuil32 »).
-Colonnes : Site ID, Type de GE (libellé « MARQUE - MODÈLE », ex. « SDMO - K22 »), Puissance GE (KVA) (information).
+Colonnes : Site ID, Type de GE (libellé « MARQUE - MODÈLE », ex. « SDMO - K22 », ou modèle seul « K22 » dans Base GE VF5),
+Fabricant GE (facultatif, Base GE VF5 : quand la colonne existe, c'est elle qui donne le fabricant), Puissance GE (KVA).
 Chaque ligne devient une ligne d'import (FuelImportRow) : ACCEPTED ; WARNING si site inconnu de Gestion des sites, doublon
 (première occurrence conservée) ou type vide ; jamais de type inventé. Le dernier fichier importé fait foi (relu par ge_info).
 """
@@ -29,7 +30,8 @@ def find_header(rows) -> tuple[int, dict] | None:
         if "site id" in h and "type de ge" in h:
             kva = next((i for i, x in enumerate(h) if x.startswith("puissance ge")), None)
             nom = h.index("nom") if "nom" in h else None
-            return n, {"site": h.index("site id"), "type": h.index("type de ge"), "kva": kva, "nom": nom}
+            fab = h.index("fabricant ge") if "fabricant ge" in h else None   # Base GE VF5 : colonne fabricant à part
+            return n, {"site": h.index("site id"), "type": h.index("type de ge"), "kva": kva, "nom": nom, "fab": fab}
     return None
 
 
@@ -61,7 +63,10 @@ def process_base_ge_file(batch, file_bytes: bytes, file_name: str) -> dict:
         key = (resolved or site_raw).upper()
         typ = " ".join(str(get(row, "type") or "").split()) or None
         kva = F.parse_number(get(row, "kva"))
+        fab = " ".join(str(get(row, "fab") or "").split()) or None
         raw = {"site_id": site_raw, "nom": F._jsonable(get(row, "nom")), "type_ge": typ, "puissance_ge_kva": kva}
+        if cols.get("fab") is not None:
+            raw["fabricant_ge"] = fab
         msgs, status = [], Row.ValidationStatus.ACCEPTED
         if key in seen:
             msgs.append({"code": "DUPLICATE_ALREADY_IMPORTED", "message": "Site déjà présent plus haut : première occurrence conservée."})
@@ -87,22 +92,35 @@ def process_base_ge_file(batch, file_bytes: bytes, file_name: str) -> dict:
     return stats
 
 
-def latest_types() -> tuple[dict, str | None]:
-    """site → (type de GE, puissance GE kVA du fichier) du dernier fichier Base GE importé ; (valeurs, nom du fichier)."""
+def _latest_rows() -> tuple[dict, str | None]:
+    """site → ligne brute (type renseigné, première occurrence) du dernier fichier Base GE importé ; (lignes, nom du fichier)."""
     from fuel_tracking.models import FuelImportBatch as B, FuelImportRow as Row
 
     b = B.objects.filter(source_type="BASE_GE").exclude(status__in=("REJECTED", "FAILED")).order_by("-received_at").first()
     if b is None:
         return {}, None
     out = {}
-    for sid_res, sid_raw, raw, st in (Row.objects.filter(batch=b).exclude(validation_status="REJECTED").order_by("row_number")
-                                      .values_list("site_id_resolved", "site_id_raw", "raw_payload", "validation_status")):
+    for sid_res, sid_raw, raw in (Row.objects.filter(batch=b).exclude(validation_status="REJECTED").order_by("row_number")
+                                  .values_list("site_id_resolved", "site_id_raw", "raw_payload")):
         if not (raw or {}).get("type_ge"):
             continue
         key = (sid_res or sid_raw or "").upper()
         if key and key not in out:
-            out[key] = (raw["type_ge"], raw.get("puissance_ge_kva"))
+            out[key] = raw
     return out, b.file_name
+
+
+def latest_types() -> tuple[dict, str | None]:
+    """site → (type de GE, puissance GE kVA du fichier) du dernier fichier Base GE importé ; (valeurs, nom du fichier)."""
+    rows, name = _latest_rows()
+    return {k: (r["type_ge"], r.get("puissance_ge_kva")) for k, r in rows.items()}, name
+
+
+def latest_fabricants() -> dict:
+    """site → fabricant de la colonne « Fabricant GE » du dernier fichier Base GE (Base GE VF5) ; vide pour un ancien fichier
+    sans cette colonne (le fabricant est alors lu dans le libellé du type)."""
+    rows, _name = _latest_rows()
+    return {k: " ".join(str(r["fabricant_ge"]).split()) for k, r in rows.items() if str(r.get("fabricant_ge") or "").strip()}
 
 
 def looks_like_base_ge(file_bytes: bytes, file_name: str) -> bool:
