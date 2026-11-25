@@ -2204,6 +2204,40 @@ class GensetAliasTests(SimpleTestCase):
 class DiagnosticOpsComparisonTests(SimpleTestCase):
     """diagnose_conso_theorique : écart avec Ops décomposé en litres par cause (lecture seule)."""
 
+    def test_xlsx_tabs(self):
+        """--xlsx : deux onglets, « Plus bas qu'Ops » trié par écart et « Sans puissance » (puissance retenue n.d.) ; n.d. reste vide."""
+        import os
+        import tempfile
+        from decimal import Decimal
+
+        import openpyxl
+
+        from fuel_tracking.management.commands.diagnose_conso_theorique import STEPS, ops_cause, write_xlsx
+
+        base = {"mois": "2026-10", "site_name": "S", "type_ge": "K22", "prp_kw": [16.0], "p_ge_kw": None}
+        rows = [{**base, "site_id": "A", "conso_theorique_l": Decimal("100"), "ops_conso_theorique_l": 300.0},
+                {**base, "site_id": "B", "conso_theorique_l": 50.0, "ops_conso_theorique_l": 500.0},
+                {**base, "site_id": "C", "conso_theorique_l": None, "ops_conso_theorique_l": 80.0, "p_retenue_kw": None},
+                {**base, "site_id": "D", "conso_theorique_l": 90.0, "ops_conso_theorique_l": None}]
+        for d in rows:
+            e = {"conso_theorique_l": d["conso_theorique_l"], "p_retenue_kw": d.get("p_retenue_kw")}
+            o = d["ops_conso_theorique_l"]
+            d.update(ecart_ops_l=(o - float(d["conso_theorique_l"] or 0)) if o is not None else None, cause_ecart_ops=ops_cause(e, o))
+        self.assertEqual(rows[2]["cause_ecart_ops"], f"n.d. chez nous — {STEPS[0]}")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "diag.xlsx")
+            self.assertEqual(write_xlsx(path, rows), (2, 1))
+            wb = openpyxl.load_workbook(path)
+            self.assertEqual(wb.sheetnames, ["Plus bas qu'Ops", "Sans puissance"])
+            bas = list(wb["Plus bas qu'Ops"].iter_rows(values_only=True))
+            h = bas[0]
+            self.assertEqual([r[h.index("Site ID")] for r in bas[1:3]], ["B", "A"])          # écart 450 puis 200
+            self.assertEqual(bas[3][h.index("Écart Ops − EnerTrack (L)")], 650)               # ligne Total
+            self.assertEqual(bas[1][h.index("PRP (kW)")], "16")
+            pw = list(wb["Sans puissance"].iter_rows(values_only=True))
+            self.assertEqual(pw[1][pw[0].index("Site ID")], "C")
+            self.assertIsNone(pw[1][pw[0].index("Puissance médiane GE (kW)")])                # n.d. : cellule vide, jamais 0
+
     def test_decomposition_ecart(self):
         from fuel_tracking.management.commands.diagnose_conso_theorique import STEPS, Command
 

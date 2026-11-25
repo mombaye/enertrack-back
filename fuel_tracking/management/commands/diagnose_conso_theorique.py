@@ -16,6 +16,10 @@ contexte des relevés de clôture). L'écart total est décomposé en litres par
 bloquant), 0 L chez nous, valeur plus basse / plus haute, site sans valeur Ops. Aucune valeur n'est modifiée.
 
   python manage.py diagnose_conso_theorique --mois 2026-09 --mois 2026-10 [--csv /tmp/conso_theorique.csv]
+                                            [--xlsx /tmp/conso_theorique.xlsx]
+
+--xlsx : classeur Excel — onglets « Plus bas qu'Ops » (valeur calculée inférieure à Ops, trié par écart), « Sans puissance »
+(conso n.d. car puissance retenue n.d., avec une valeur Ops) — ces deux onglets seulement.
 """
 from __future__ import annotations
 
@@ -47,6 +51,22 @@ def blocking_step(e: dict) -> str | None:
     return STEPS[6]
 
 
+def ops_cause(e: dict, o: float | None) -> str | None:
+    """Cause de l'écart avec Ops pour un site (None : pas de valeur Ops, ou valeurs égales)."""
+    if o is None:
+        return None
+    v = e.get("conso_theorique_l")
+    if v is None:
+        return f"n.d. chez nous — {blocking_step(e)}"
+    if v == 0 and o > 0:
+        return "0 L chez nous (temps de marche 0), Ops > 0"
+    if v < o:
+        return "valeur plus basse que Ops"
+    if v > o:
+        return "valeur plus haute que Ops"
+    return None
+
+
 def _norm(m: str | None) -> str:
     """Motif sans les nombres ni les noms propres, pour regrouper les raisons identiques."""
     m = re.sub(r"« [^»]* »", "« … »", m or "(aucun motif)")
@@ -59,8 +79,9 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument("--mois", action="append", default=None, help="AAAA-MM, répétable (défaut : 2026-09 et 2026-10).")
         parser.add_argument("--csv", default=None, help="Détail par site (une ligne par site et par mois).")
+        parser.add_argument("--xlsx", default=None, help="Classeur Excel : sites plus bas qu'Ops et sites sans puissance.")
 
-    def handle(self, *args, mois, csv: str | None, **opts):
+    def handle(self, *args, mois, csv: str | None, xlsx: str | None = None, **opts):
         from fuel_tracking.services import conso_comparison as C
         from fuel_tracking.services import stock_initial_sources as S
 
@@ -82,6 +103,9 @@ class Command(BaseCommand):
                 wr.writeheader()
                 wr.writerows(detail)
             w(f"\nDétail par site : {csv} ({len(detail)} lignes)")
+        if xlsx:
+            n_bas, n_pw = write_xlsx(xlsx, detail)
+            w(f"\nClasseur Excel : {xlsx} — {n_bas} site(s) plus bas qu'Ops, {n_pw} site(s) sans puissance")
 
     def _report(self, w, m, rows, detail, ops):  # noqa: C901
         n = len(rows)
@@ -145,7 +169,14 @@ class Command(BaseCommand):
 
         for r, e in es:
             o = ops.get(r["site_id"]) or {}
-            detail.append({"ops_conso_theorique_l": o.get("l"), "ops_source": o.get("source"), **{"mois": m, "site_id": r["site_id"], "type_ge": e.get("type_ge"), "prp_kw": e.get("prp_kw"),
+            v, ol = e.get("conso_theorique_l"), o.get("l")
+            detail.append({"ops_conso_theorique_l": ol, "ops_source": o.get("source"),
+                           "ecart_ops_l": round(ol - (v or 0), 2) if ol is not None else None, "cause_ecart_ops": ops_cause(e, ol),
+                           "site_name": r.get("site_name"), "fabricant_ge": e.get("fabricant_ge"),
+                           "prp_source": e.get("prp_source"), "cph_extrapolation": e.get("cph_extrapolation"),
+                           "p_ge_motif": e.get("p_ge_motif"), "p_rect_motif": e.get("p_rect_motif"),
+                           "p_load_dc_motif": e.get("p_load_dc_motif"), "p_retenue_motif": e.get("p_retenue_motif"),
+                           **{"mois": m, "site_id": r["site_id"], "type_ge": e.get("type_ge"), "prp_kw": e.get("prp_kw"),
                            "p_ge_kw": e.get("p_ge_kw"), "p_rect_kw": e.get("p_rect_kw"), "p_load_dc_kw": e.get("p_load_dc_kw"),
                            "p_batt_kw": e.get("p_batt_kw"), "p_retenue_kw": e.get("p_retenue_kw"),
                            "p_retenue_source": e.get("p_retenue_source"), "taux_charge": e.get("taux_charge"),
@@ -168,15 +199,8 @@ class Command(BaseCommand):
         n = Counter()
         for r, e, o in both:
             v = e.get("conso_theorique_l")
-            if v is None:
-                k = f"n.d. chez nous — {blocking_step(e)}"
-            elif v == 0 and o > 0:
-                k = "0 L chez nous (temps de marche 0), Ops > 0"
-            elif v < o:
-                k = "valeur plus basse que Ops"
-            elif v > o:
-                k = "valeur plus haute que Ops"
-            else:
+            k = ops_cause(e, o)
+            if k is None:
                 continue
             causes[k] += o - (v or 0)
             n[k] += 1
@@ -203,3 +227,73 @@ def ops_values(rows) -> dict:
         if c.get("conso_theorique_ops_l") is not None:
             out[sid] = {"l": float(c["conso_theorique_ops_l"]), "source": c.get("source_conso_theorique_ops")}
     return out
+
+
+# ── Classeur Excel (--xlsx) ──
+XLSX_BAS = (("Mois", "mois"), ("Site ID", "site_id"), ("Nom du site", "site_name"), ("Fabricant GE", "fabricant_ge"),
+            ("Type de GE", "type_ge"), ("PRP (kW)", "prp_kw"), ("Source PRP", "prp_source"), ("Puissance retenue (kW)", "p_retenue_kw"),
+            ("Source puissance", "p_retenue_source"), ("Taux de charge", "taux_charge"), ("Charge < 50 % (extrapolation)", "cph_extrapolation"),
+            ("CPH (L/h)", "cph_l_h"), ("Temps de marche (h)", "tm_retenu_h"), ("Source temps de marche", "tm_source"),
+            ("Conso théorique EnerTrack (L)", "conso_theorique_l"), ("Conso théorique Ops (L)", "ops_conso_theorique_l"),
+            ("Écart Ops − EnerTrack (L)", "ecart_ops_l"), ("Ratio EnerTrack ÷ Ops", "_ratio"))
+XLSX_PW = (("Mois", "mois"), ("Site ID", "site_id"), ("Nom du site", "site_name"), ("Type de GE", "type_ge"),
+           ("Conso théorique Ops (L)", "ops_conso_theorique_l"), ("Puissance médiane GE (kW)", "p_ge_kw"), ("Motif GE", "p_ge_motif"),
+           ("Puissance médiane redresseur (kW)", "p_rect_kw"), ("Motif redresseur", "p_rect_motif"),
+           ("Load DC telco (kW)", "p_load_dc_kw"), ("Motif Load DC", "p_load_dc_motif"), ("Recharge batterie (kW)", "p_batt_kw"),
+           ("Motif puissance retenue", "p_retenue_motif"), ("Temps de marche (h)", "tm_retenu_h"))
+
+
+def _cell(v):
+    """Valeur Excel : nombre conservé comme nombre ; liste (plusieurs GE) jointe par « / » ; vide = n.d. (jamais 0)."""
+    if isinstance(v, (list, tuple)):
+        return " / ".join(f"{x:g}" if isinstance(x, (int, float)) else str(x) for x in v) if v else None
+    if isinstance(v, bool):
+        return "oui" if v else "non"
+    try:
+        from decimal import Decimal
+
+        if isinstance(v, Decimal):
+            return float(v)
+    except Exception:  # noqa: BLE001
+        pass
+    return v
+
+
+def write_xlsx(path: str, detail: list[dict]) -> tuple[int, int]:
+    """Classeur : « Plus bas qu'Ops » (trié par écart décroissant) et « Sans puissance ». → (nb plus bas, nb sans puissance)."""
+    import openpyxl
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    bas = sorted((d for d in detail if d.get("cause_ecart_ops") == "valeur plus basse que Ops"),
+                 key=lambda d: -(d.get("ecart_ops_l") or 0))
+    for d in bas:
+        o, v = d.get("ops_conso_theorique_l"), d.get("conso_theorique_l")
+        d["_ratio"] = round(float(v) / o, 3) if o and v is not None else None
+    pw = sorted((d for d in detail if d.get("cause_ecart_ops") == f"n.d. chez nous — {STEPS[0]}"),
+                key=lambda d: -(d.get("ops_conso_theorique_l") or 0))
+    wb = openpyxl.Workbook()
+    head_fill, head_font = PatternFill("solid", fgColor="1F3864"), Font(bold=True, color="FFFFFF")
+
+    def sheet(ws, cols, items, total_keys=()):
+        ws.append([h for h, _ in cols])
+        for d in items:
+            ws.append([_cell(d.get(k)) for _, k in cols])
+        if items and total_keys:
+            ws.append([("Total" if i == 0 else (round(sum(float(_cell(d.get(k)) or 0) for d in items), 2) if k in total_keys else None))
+                       for i, (_, k) in enumerate(cols)])
+            for c in ws[ws.max_row]:
+                c.font = Font(bold=True)
+        for i, c in enumerate(ws[1], start=1):
+            c.fill, c.font = head_fill, head_font
+            c.alignment = Alignment(wrap_text=True, vertical="center")
+            ws.column_dimensions[get_column_letter(i)].width = 14 if i > 3 else 16
+        ws.freeze_panes = "C2"
+        ws.auto_filter.ref = ws.dimensions
+
+    ws = wb.active
+    ws.title = "Plus bas qu'Ops"
+    sheet(ws, XLSX_BAS, bas, {"conso_theorique_l", "ops_conso_theorique_l", "ecart_ops_l"})
+    sheet(wb.create_sheet("Sans puissance"), XLSX_PW, pw, {"ops_conso_theorique_l"})
+    wb.save(path)
+    return len(bas), len(pw)
