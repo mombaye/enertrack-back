@@ -1441,7 +1441,7 @@ class PrpGensetDbTests(MvpBase):
         self.assertEqual((sites["A"]["prp_kva"], sites["A"]["prp_kw"], sites["A"]["prp_source"]), ([100.0], [80.0], "GENSET DB (Closing.xlsb)"))
         self.assertEqual((sites["B"]["prp_kva"], sites["B"]["prp_kw"]), ([250.0], [200.0]))
         self.assertIn("ambigu", sites["B"]["prp_motif"])
-        self.assertEqual((sites["C"]["prp_kva"], sites["C"]["prp_motif"]), (None, "type « P33-3U » absent de GENSET DB"))
+        self.assertEqual((sites["C"]["prp_kva"], sites["C"]["prp_motif"]), ([30.0], None))   # fiche constructeur FC-07 (25/11)
         self.assertEqual((sites["D"]["prp_kva"], sites["D"]["prp_motif"]), (None, None))
 
     def test_courbes_cph_genset_db(self):
@@ -1573,7 +1573,7 @@ class BaseGeImportTests(MvpBase):
         sites = {"A": {"type_ge": "SDMO - K22"}, "B": {"type_ge": "SDMO--K22"}, "C": {"type_ge": "FG Wilson P33-3"},
                  "D": {"type_ge": "FG Wilson P33-3U"}, "E": {"type_ge": "K22"}}
         G.add_prp(sites, gdb, "Closing.xlsb")
-        self.assertEqual([sites[k]["prp_kva"] for k in "ABCDE"], [[20.0], [20.0], [30.0], None, [20.0]])   # P33-3U ≠ P33-3 : jamais approché
+        self.assertEqual([sites[k]["prp_kva"] for k in "ABCDE"], [[20.0], [20.0], [30.0], [30.0], [20.0]])   # P33-3U ≠ P33-3 : jamais approché ; PRP de la fiche constructeur FC-07 (25/11)
 
 
 class BaseGeUploadApiTests(BaseGeImportTests):
@@ -2129,8 +2129,8 @@ class GensetAliasTests(SimpleTestCase):
         self.assertEqual((sites["A"]["prp_kva"], sites["A"]["prp_kw"], sites["A"]["courbes_cph"]), ([60.0], [48.0], [(0.1, 2.0, 1.0)]))
         self.assertIn("correspondance de type validée : J66 → J66K", sites["A"]["prp_source"])
         self.assertEqual(sites["B"]["prp_kva"], [88.0])
-        self.assertIsNone(sites["C"]["prp_kva"])                               # liste B en attente : n.d.
-        self.assertIn("absent de GENSET DB", sites["C"]["prp_motif"])
+        self.assertEqual(sites["C"]["prp_kva"], [30.0])                       # P33-3U : fiche constructeur FC-07 (25/11)
+        self.assertNotIn("GENSET DB", sites["C"]["prp_source"])
         self.assertEqual(sites["D"]["prp_source"], "GENSET DB (Closing.xlsb)")  # trouvé tel quel : aucune correspondance
 
 
@@ -2223,15 +2223,41 @@ class ClosingFallbackUnknownBaseTypeTests(SimpleTestCase):
 
         self.assertIsNone(ge_label("Site avec cuve et sans GE"))             # mention, pas un type de GE
         gdb = {"P333": {30.0}, "K22": {22.0}, "J66K": {60.0}}
-        base = {"A": ("FG Wilson P33-3U", 30), "B": ("J66K", 60), "C": ("SDMO - K33", 33), "D": ("SDMO - K33", 33)}
+        base = {"A": ("FG Wilson P33-3X", 30), "B": ("J66K", 60), "C": ("SDMO - K33", 33), "D": ("SDMO - K33", 33)}
         src = "Fichier de clôture (Output App Fuel, 2026-09-30 → 2026-10-31)"
         closing = {"A": ("FG Wilson", "P33-3", src), "B": ("SDMO", "K22", src), "C": ("SDMO", "K44", src)}
         sites = G.build({}, {}, base, "Base GE.xlsx", ["SDMO", "FG Wilson"], closing)
         G.add_prp(sites, gdb, "Closing.xlsb")
         self.assertEqual(G.closing_if_base_unknown(sites, base, closing, gdb, "Closing.xlsb", None), 1)
         a = sites["A"]
-        self.assertEqual((a["type_ge"], a["fabricant_ge"], a["prp_kw"], a["type_ge_base"]), ("P33-3", "FG Wilson", [24.0], "FG Wilson P33-3U"))
-        self.assertEqual(a["source_ge"], src + " — type Base GE « FG Wilson P33-3U » : type « FG Wilson P33-3U » absent de GENSET DB")
+        self.assertEqual((a["type_ge"], a["fabricant_ge"], a["prp_kw"], a["type_ge_base"]), ("P33-3", "FG Wilson", [24.0], "FG Wilson P33-3X"))
+        self.assertEqual(a["source_ge"], src + " — type Base GE « FG Wilson P33-3X » : type « FG Wilson P33-3X » absent de GENSET DB")
         self.assertEqual((sites["B"]["type_ge"], sites["B"]["prp_kva"]), ("J66K", [60.0]))   # Base GE reconnu : conservé
         self.assertEqual((sites["C"]["type_ge"], sites["C"]["prp_kva"]), ("SDMO - K33", None))  # clôture pas mieux : Base GE
         self.assertEqual(sites["D"]["type_ge"], "SDMO - K33")                # pas de ligne de clôture : Base GE
+
+
+class FichesConstructeurTests(SimpleTestCase):
+    """Décision du 25/11/2026 : fiches constructeur validées = PRP et courbe des types absents de GENSET DB (jamais le T66K)."""
+
+    def test_fiche_apres_genset_db(self):
+        from fuel_tracking.services import ge_info as G
+
+        gdb, crv = {"P333": {30.0}, "K22": {22.0}}, {"K22": {(1.0, 2.0, 3.0)}}
+        sites = {"A": {"type_ge": "FG Wilson P33-3U"}, "B": {"type_ge": "OLYMPIAN - GEP18-4"}, "C": {"type_ge": "SDMO - T66K"},
+                 "D": {"type_ge": "K22 / P33-3U"}, "E": {"type_ge": "SDMO - K33"}}
+        G.add_prp(sites, gdb, "Closing.xlsb", crv)
+        a = sites["A"]
+        self.assertEqual((a["prp_kva"], a["prp_kw"], a["courbes_cph"]), ([30.0], [24.0], [(2.4, 2.6, 1.9)]))
+        self.assertEqual(a["prp_source"], "fiche constructeur FC-07 (FG Wilson P33-3U, fiche FG Wilson du P33-3U)")
+        self.assertEqual((sites["B"]["prp_kva"], sites["B"]["courbes_cph"]), ([16.5], [(1.6, 1.2, 1.6)]))
+        self.assertIsNone(sites["C"]["prp_kva"])                             # T66K : équivalence provisoire, non reprise
+        d = sites["D"]                                                       # deux GE : GENSET DB + fiche, les deux sources
+        self.assertEqual(d["prp_kva"], [22.0, 30.0])
+        self.assertEqual(d["prp_source"], "GENSET DB (Closing.xlsb) ; fiche constructeur FC-07 (FG Wilson P33-3U, fiche FG Wilson du P33-3U)")
+        self.assertIsNone(sites["E"]["prp_kva"])
+        self.assertIn("absent de GENSET DB", sites["E"]["prp_motif"])
+        g = {"P333U": {33.0}}                                               # type présent dans GENSET DB : GENSET DB prime
+        s2 = {"X": {"type_ge": "P33-3U"}}
+        G.add_prp(s2, g, "Closing.xlsb")
+        self.assertEqual((s2["X"]["prp_kva"], s2["X"]["prp_source"]), ([33.0], "GENSET DB (Closing.xlsb)"))

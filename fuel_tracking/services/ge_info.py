@@ -360,6 +360,22 @@ GENSET_ALIASES = {
 }
 
 
+# Fiches constructeur (fichier « Correspondance complète NEWTABLE_SITE_DG_FIXED / Abaque CPH Sénégal », onglet « Fiches
+# constructeur », vérifiées le 24/11/2026) : PRP et courbe CPH des types ABSENTS de GENSET DB, utilisées seulement quand GENSET
+# DB ne donne rien pour le type. Coefficients a, b, c du fichier (points 100 / 75 / 50 % du PRP). Le T66K (FC-01, équivalence
+# provisoire J66K à confirmer sur plaque) n'est PAS repris. Décision du 25/11/2026.
+FICHES_CONSTRUCTEUR = (
+    # (id, fabricant, modèle, PRP kVA, (a, b, c), validation)
+    ("FC-02", "Grupel", "G0014PKSTCA5T4000A", 12.5, (0.8, 2.2, 0.7), "fiche du moteur Perkins 403A-15G1"),
+    ("FC-03", "Green Power", "GP16 SH/PW-A", 13.1, (0.8, 2.2, 0.7), "fiche du moteur Perkins 403A-15G1"),
+    ("FC-04", "GreenPole", "LG16P", 15.0, (2.4, 0.6, 1.3), "fiche du moteur Perkins 403A-15G2"),
+    ("FC-05", "Olympian", "GEP18-4", 16.5, (1.6, 1.2, 1.6), "fiche du groupe (18 kVA = secours)"),
+    ("FC-06", "Jet Generators", "JP20", 20.0, (1.6, 2.4, 1.3), "fiche du moteur"),
+    ("FC-07", "FG Wilson", "P33-3U", 30.0, (2.4, 2.6, 1.9), "fiche FG Wilson du P33-3U"),
+)
+FICHE_BY_KEY = {k: f for f in FICHES_CONSTRUCTEUR for k in {_key(f[2]), _key(f[1] + f[2])}}
+
+
 def _resolve(label: str, table: dict) -> tuple[object, str | None]:
     """(valeur de la table pour ce type, correspondance appliquée « X → Y » ou None). Type tel quel d'abord, puis la
     correspondance explicite GENSET_ALIASES du modèle."""
@@ -375,12 +391,18 @@ def _resolve(label: str, table: dict) -> tuple[object, str | None]:
 
 
 def add_prp(sites: dict, gdb: dict, fichier: str | None, curves: dict | None = None) -> None:
-    """Ajoute à chaque site la Puissance PRP (kVA / kW) de chacun de ses types de GE, avec la raison si absente."""
+    """Ajoute à chaque site la Puissance PRP (kVA / kW) de chacun de ses types de GE, avec la raison si absente.
+    GENSET DB d'abord ; type absent de GENSET DB → fiche constructeur validée (FICHES_CONSTRUCTEUR) si elle existe."""
     for v in sites.values():
-        kva, motifs, abc, via = [], [], [], []
+        kva, motifs, abc, via, fiches = [], [], [], [], []
         for t in [x for x in (v.get("type_ge") or "").split(" / ") if x]:
             vals, corr = _resolve(t, gdb)
             cv = _resolve(t, curves)[0] if curves else None
+            if not vals:
+                f = next((FICHE_BY_KEY[k] for k in _lookup_keys(t) if k in FICHE_BY_KEY), None)
+                if f:
+                    vals, cv, corr = {f[3]}, {f[4]}, None
+                    fiches.append(f"fiche constructeur {f[0]} ({f[1]} {f[2]}, {f[5]})")
             if corr and vals:
                 via.append(corr)
             abc.append(next(iter(cv)) if cv and len(cv) == 1 else None)   # plusieurs courbes pour un type : ambigu, aucune
@@ -393,8 +415,9 @@ def add_prp(sites: dict, gdb: dict, fichier: str | None, curves: dict | None = N
         v["prp_kva"] = [round(x, 2) for x in kva] or None
         v["prp_kw"] = [round(x * KW_PER_KVA, 2) for x in kva] or None
         v["prp_motif"] = " ; ".join(motifs) or None
-        v["prp_source"] = ((f"GENSET DB ({fichier})" + (f" — correspondance de type validée : {', '.join(via)}" if via else ""))
-                           if kva and fichier else None)
+        parts = ([f"GENSET DB ({fichier})" + (f" — correspondance de type validée : {', '.join(via)}" if via else "")]
+                 if fichier and len(fiches) < len(kva) else []) + fiches
+        v["prp_source"] = " ; ".join(parts) if kva and parts else None
         v["courbes_cph"] = abc or None   # (a, b, c) par GE, dans l'ordre des types ; None = courbe absente ou ambiguë
 
 
