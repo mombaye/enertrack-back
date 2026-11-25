@@ -1765,7 +1765,8 @@ class TotalsRowTests(MvpBase):
             vals = [(100.0, [20.0, 30.0], 5.5), (None, None, None), (250.5, [30.0], 2.0)]
             for r, (t, kva, h) in zip(rows, vals):
                 r["stock_initial_sources"] = {"terrain_l": t}
-                r["estimation_theorique"] = {"prp_kva": kva, "tm_terrain_h": h, "type_ge": "K22" if t else None}
+                r["estimation_theorique"] = {"prp_kva": kva, "tm_terrain_h": h, "type_ge": "K22" if t else None,
+                                             "p_ge_kw": Decimal("2.5") if t else None, "tm_source": "FMS" if h else None}
             return None
 
         rows = [{"site_id": f"S_{i}", "stock": {}} for i in range(3)]
@@ -1778,6 +1779,9 @@ class TotalsRowTests(MvpBase):
         self.assertEqual(t["estimation_theorique"]["tm_terrain_h"], {"total": 7.5, "sites": 2})
         self.assertEqual(t["ravitaillement"]["eydon_l"], {"total": None, "sites": 0})
         self.assertEqual(t["estimation_theorique"]["type_ge"], {"total": 2, "sites": 2, "comptage": True})   # sites avec un type
+        self.assertEqual(t["estimation_theorique"]["p_ge_kw"], {"total": 5.0, "sites": 2})          # médianes Decimal comptées
+        self.assertEqual(t["estimation_theorique"]["tm_source"], {"total": 2, "sites": 2, "comptage": True})
+        self.assertEqual(t["estimation_theorique"]["fabricant_ge"], {"total": 0, "sites": 0, "comptage": True})
         self.assertNotIn("stock_initial_sources", rows[0])                      # lignes affichées non modifiées
 
 

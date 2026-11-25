@@ -39,6 +39,8 @@ Mouvement rejeté, non intégré, ponction déséquilibrée : non compté. Aucun
 """
 from __future__ import annotations
 
+from decimal import Decimal
+
 import logging
 from datetime import date, datetime, timedelta
 
@@ -892,10 +894,11 @@ TOTAL_FIELDS = {
     "stock_final_sources": ("terrain_l", "gardiennage_l", "fms_l", "retenue_l", "compteur_terrain_h", "compteur_gardiennage_h",
                             "compteur_fms_h", "compteur_retenu_h"),
     "estimation_theorique": ("prp_kva", "prp_kw", "tm_dg_on_h", "tm_rectifier_h", "tm_terrain_h", "tm_index_fms_h", "tm_retenu_h",
+                             "p_rect_kw", "p_ge_kw", "p_grid_kw", "p_load_dc_kw", "p_batt_kw", "p_retenue_kw",
                              "conso_theorique_l", "conso_fuel_sensor_l", "conso_retenue_l"),
 }
 # Colonnes texte : « total » = nombre de sites renseignés (case vide / « n.d. » non comptée)
-TOTAL_COUNTS = {"estimation_theorique": ("type_ge",)}
+TOTAL_COUNTS = {"estimation_theorique": ("fabricant_ge", "type_ge", "source_ge", "tm_source", "p_retenue_source")}
 
 
 def totals(rows: list[dict]) -> dict:
@@ -914,7 +917,7 @@ def totals(rows: list[dict]) -> dict:
                 v = (r.get(bloc) or {}).get(champ)
                 if isinstance(v, list):
                     v = sum(x for x in v if x is not None) if any(x is not None for x in v) else None
-                if isinstance(v, (int, float)):
+                if isinstance(v, (int, float, Decimal)) and not isinstance(v, bool):   # médianes en Decimal
                     vals.append(float(v))
             out.setdefault(bloc, {})[champ] = {"total": round(sum(vals), 2) if vals else None, "sites": len(vals)}
     for bloc, champs in TOTAL_COUNTS.items():
