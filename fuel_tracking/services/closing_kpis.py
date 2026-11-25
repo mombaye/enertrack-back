@@ -354,6 +354,109 @@ def kpis_for_period(d_from: date, d_to: date, sites: set[str] | None = None) -> 
     return {"mois": month, "debut": d_from.isoformat(), "fin": d_to.isoformat(), "source": "CALCUL_ENERTRACK", "fichier": None, "kpis": calc}
 
 
+TABLE_KEYS = ("nb_sites_ge", "stock_initial_l", "appoint_initial_l", "commande_mois_suivant_l", "commande_non_livree_l", "livree_l",
+              "autre_l", "conso_moyenne_jour_l", "stock_final_l", "appoint_final_l", "conso_releves_l", "perdue_l", "check_l", "nb_sites")
+
+
+def table_kpis(rows: list[dict], d_from: date, d_to: date) -> dict:
+    """Synthèse du mois calculée à partir des lignes du tableau Suivi Conso (décision du 25/11/2026) : rien n'est lu dans
+    l'en-tête d'un fichier. `rows` = lignes ENRICHIES (stock_initial_sources, ravitaillement, stock_final_sources,
+    estimation_theorique), tous les sites du filtre. Chaque somme = total de la colonne correspondante du tableau.
+      stock début / fin = Σ « Qtité laissée retenue » ; livré = Σ EYDON + Σ CARTE TOTAL ; autre = Σ Ajout − Σ Retrait ;
+      perdu = Σ volé + Σ vidangé / fuite ; consommé = Σ, sur les sites complets (stocks début et fin + mouvements ENOC lus),
+      de stock début + livré + ajout − retrait − volé − vidangé − stock fin ; CHECK = stock début + livré + autre − stock fin
+      − consommé − perdu (≠ 0 : litres des sites incomplets) ; conso moyenne / jour = moyenne des L/jour des sites complets."""
+    f = lambda v: None if v is None else float(v)  # noqa: E731
+    ini = lambda r: f((r.get("stock_initial_sources") or {}).get("retenue_l"))  # noqa: E731
+    fin = lambda r: f((r.get("stock_final_sources") or {}).get("retenue_l"))  # noqa: E731
+    rav = lambda r, k: f((r.get("ravitaillement") or {}).get(k))  # noqa: E731
+
+    def col(get):
+        vals = [x for x in (get(r) for r in rows) if x is not None]
+        return (round(sum(vals), 1) if vals else None), len(vals)
+
+    (s_ini, n_ini), (s_fin, n_fin) = col(ini), col(fin)
+    (eydon, _), (carte, _) = col(lambda r: rav(r, "eydon_l")), col(lambda r: rav(r, "carte_total_l"))
+    (ajout, _), (retrait, _) = col(lambda r: rav(r, "ajout_l")), col(lambda r: rav(r, "retrait_l"))
+    (vole, _), (fuite, _) = col(lambda r: rav(r, "vole_l")), col(lambda r: rav(r, "fuite_l"))
+    add = lambda *xs: None if all(x is None for x in xs) else round(sum(x or 0 for x in xs), 1)  # noqa: E731
+    livree, perdue = add(eydon, carte), add(vole, fuite)
+    autre = None if ajout is None and retrait is None else round((ajout or 0) - (retrait or 0), 1)
+    conso, rates, n_neg = [], [], 0
+    for r in rows:
+        a, b, rv = ini(r), fin(r), r.get("ravitaillement") or {}
+        if a is None or b is None or rv.get("source") != "ENOC":
+            continue
+        c = a + sum(rav(r, k) or 0 for k in ("eydon_l", "carte_total_l", "ajout_l")) \
+            - sum(rav(r, k) or 0 for k in ("retrait_l", "vole_l", "fuite_l")) - b
+        conso.append(c)
+        n_neg += c < 0
+        d0 = (r.get("stock_initial_sources") or {}).get("date")
+        d1 = (r.get("stock_final_sources") or {}).get("date")
+        days = (date.fromisoformat(d1[:10]) - date.fromisoformat(d0[:10])).days if d0 and d1 else 0
+        if days > 0:
+            rates.append(c / days)
+    s_conso = round(sum(conso), 1) if conso else None
+    check = None if None in (s_ini, s_fin, s_conso) else round(s_ini + (livree or 0) + (autre or 0) - s_fin - s_conso - (perdue or 0), 1)
+    n_ge = sum(1 for r in rows if str((r.get("estimation_theorique") or {}).get("type_ge") or "").strip())
+    M, N = _label(d_from, d_to), f"{MOIS[_month_bounds(_next_month(d_to))[0].month - 1]} {_month_bounds(_next_month(d_to))[0].year}"
+    P = _label(*_previous_period(d_from, d_to))
+    v = lambda label, val: {"libelle": label, "valeur": None if val is None else round(val, 3)}  # noqa: E731
+    out = {
+        "nb_sites_ge": v("Nbre de site avec GE", n_ge),
+        "stock_initial_l": v(f"Quantité laissée dans les cuves aux dates de relevés de début ({P})", s_ini),
+        "appoint_initial_l": v("Quantité laissée stock d'appoint (début)", None),
+        "commande_mois_suivant_l": v(f"Qtité Commandée pour Conso {N} chez Fournisseur Aktivco", None),
+        "commande_non_livree_l": v(f"Qtité Commandée pour Conso {N} mais non-livrée chez Fournisseur Aktivco", None),
+        "livree_l": v("Quantité commandée et livrée entre les dates de relevés", livree),
+        "autre_l": v("Autre Quantité livrée / rajoutée ou retirée entre les dates de relevés", autre),
+        "conso_moyenne_jour_l": v(f"Conso moyenne / jour {M}", sum(rates) / len(rates) if rates else None),
+        "stock_final_l": v(f"Quantité laissée dans les cuves aux dates de relevés de {M}", s_fin),
+        "appoint_final_l": v(f"Quantité laissée stock d'appoint {M}", None),
+        "conso_releves_l": v("Quantité consommée entre les dates de relevés", s_conso),
+        "perdue_l": v("Quantité perdue", perdue),
+        "check_l": v("CHECK", check),
+        "nb_sites": v("Nbre de site", len(rows)),
+    }
+    tab = "Tableau Suivi Conso (valeurs calculées par EnerTrack, telles qu'affichées)"
+    nd = "Donnée non disponible : aucune source du programme ne la donne. Jamais remplacée par 0."
+    n_c = len(conso)
+    D = {
+        "nb_sites_ge": (f"{tab} — colonne « Type de GE ».", "Nombre de sites du tableau qui ont un type de GE.",
+                        [("Sites du tableau", len(rows)), ("dont avec un type de GE", n_ge)]),
+        "stock_initial_l": (f"{tab} — colonne « Qtité laissée retenue » du stock initial (Fuel Sensor FMS, sinon relevé de terrain).",
+                            "Somme de la colonne sur les sites renseignés (= total en tête de colonne).",
+                            [("Sites renseignés", n_ini), ("Σ stock initial (L)", s_ini)]),
+        "stock_final_l": (f"{tab} — colonne « Qtité laissée retenue » du stock final (Fuel Sensor FMS, sinon société de gardiennage, "
+                          "sinon relevé de terrain).", "Somme de la colonne sur les sites renseignés (= total en tête de colonne).",
+                          [("Sites renseignés", n_fin), ("Σ stock final (L)", s_fin)]),
+        "appoint_initial_l": ("Aucune", nd, []), "appoint_final_l": ("Aucune", nd, []),
+        "commande_mois_suivant_l": ("Aucune (commandes Aktivco)", nd, []), "commande_non_livree_l": ("Aucune (commandes Aktivco)", nd, []),
+        "livree_l": (f"{tab} — colonnes « Total Livraison Fuel EYDON » et « CARTE TOTAL » (ENOC).", "Σ EYDON + Σ CARTE TOTAL.",
+                     [("EYDON (L)", eydon), ("CARTE TOTAL (L)", carte), ("Total (L)", livree)]),
+        "autre_l": (f"{tab} — colonnes « Total Ajout » et « Total Retrait » (ENOC).", "Σ Ajout − Σ Retrait.",
+                    [("Ajout (L)", ajout), ("Retrait (L)", retrait), ("Total (L)", autre)]),
+        "perdue_l": (f"{tab} — colonnes « Total QTE volée déclarée » et « QTE vidangée / Fuite » (ENOC).", "Σ volé + Σ vidangé / fuite.",
+                     [("Volé (L)", vole), ("Vidangé / fuite (L)", fuite), ("Total (L)", perdue)]),
+        "conso_releves_l": (tab + ".", "Pour chaque site complet (stock initial et final retenus + mouvements ENOC lus) : stock initial + "
+                            "EYDON + CARTE TOTAL + Ajout − Retrait − volé − vidangé − stock final ; puis somme.",
+                            [("Sites complets", n_c), ("Sites du tableau", len(rows)), ("dont consommation négative", n_neg), ("Total (L)", s_conso)]),
+        "conso_moyenne_jour_l": (tab + ".", "Pour chaque site complet : consommation ÷ jours entre la date du stock initial et celle du stock "
+                                 "final ; puis moyenne de ces L/jour.", [("Sites pris en compte", len(rates))]),
+        "check_l": ("Contrôle de cohérence des valeurs ci-dessus.",
+                    "Stock initial + livré + autre − stock final − consommé − perdu. Différent de 0 : litres des sites qui ont un stock ou "
+                    "des mouvements mais pas de consommation calculable (stock initial ou final absent).",
+                    [("Stock initial (L)", s_ini), ("+ Livré (L)", livree), ("+ Autre quantité (L)", autre), ("− Stock final (L)", s_fin),
+                     ("− Consommé (L)", s_conso), ("− Perdu (L)", perdue), ("= CHECK (L)", check)]),
+        "nb_sites": (f"{tab}.", "Nombre de sites du tableau (filtres de l'écran appliqués).", [("Sites", len(rows))]),
+    }
+    perim = "Sites du tableau Suivi Conso (filtres de l'écran appliqués)."
+    for key, (src, op, comps) in D.items():
+        out[key]["detail"] = {"source": src, "operation": op, "perimetre": perim, "periode": [d_from.isoformat(), d_to.isoformat()],
+                              "composantes": [{"libelle": l_, "valeur": v_} for l_, v_ in comps]}
+    return out
+
+
 def backfill_file_kpis() -> int:
     """Closing importés avant le 17/11/2026 : relit la copie d'archive pour enregistrer le bloc de KPI de l'en-tête."""
     from pathlib import Path

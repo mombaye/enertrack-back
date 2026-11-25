@@ -2266,3 +2266,30 @@ class FichesConstructeurTests(SimpleTestCase):
         s2 = {"X": {"type_ge": "P33-3U"}}
         G.add_prp(s2, g, "Closing.xlsb")
         self.assertEqual((s2["X"]["prp_kva"], s2["X"]["prp_source"]), ([33.0], "GENSET DB (Closing.xlsb)"))
+
+
+class TableKpisTests(SimpleTestCase):
+    """Décision du 25/11/2026 : synthèse du mois = totaux du tableau Suivi Conso (aucune valeur lue dans un fichier)."""
+
+    def test_synthese_depuis_le_tableau(self):
+        from fuel_tracking.services.closing_kpis import table_kpis
+
+        rav = lambda **k: {"source": "ENOC", **dict.fromkeys(("eydon_l", "carte_total_l", "ajout_l", "retrait_l", "vole_l", "fuite_l"), 0.0), **k}  # noqa: E731
+        rows = [
+            {"stock_initial_sources": {"retenue_l": 1000.0, "date": "2026-09-30"}, "stock_final_sources": {"retenue_l": 400.0, "date": "2026-10-30"},
+             "ravitaillement": rav(eydon_l=600.0, vole_l=50.0), "estimation_theorique": {"type_ge": "K22"}},          # conso 1 150 L / 30 j
+            {"stock_initial_sources": {"retenue_l": 500.0, "date": "2026-10-01"}, "stock_final_sources": {"retenue_l": None},
+             "ravitaillement": rav(ajout_l=100.0), "estimation_theorique": {"type_ge": None}},                         # incomplet
+            {"stock_initial_sources": {"retenue_l": 200.0, "date": "2026-10-01"}, "stock_final_sources": {"retenue_l": 150.0, "date": "2026-10-11"},
+             "ravitaillement": {"source": None}, "estimation_theorique": {"type_ge": "J66K"}},                      # ENOC non lu : incomplet
+        ]
+        k = table_kpis(rows, date(2026, 10, 1), date(2026, 10, 31))
+        val = {x: k[x]["valeur"] for x in k}
+        self.assertEqual((val["nb_sites"], val["nb_sites_ge"]), (3, 2))
+        self.assertEqual((val["stock_initial_l"], val["stock_final_l"]), (1700.0, 550.0))   # = totaux des colonnes « retenue »
+        self.assertEqual((val["livree_l"], val["autre_l"], val["perdue_l"]), (600.0, 100.0, 50.0))
+        self.assertEqual(val["conso_releves_l"], 1150.0)                                    # seul le site complet
+        self.assertAlmostEqual(val["conso_moyenne_jour_l"], 1150 / 30, places=3)
+        self.assertEqual(val["check_l"], 650.0)                                             # 1700+600+100−550−1150−50 : sites incomplets
+        self.assertIsNone(val["commande_mois_suivant_l"])                                   # aucune source : n.d., jamais 0
+        self.assertIn("Tableau Suivi Conso", k["stock_initial_l"]["detail"]["source"])

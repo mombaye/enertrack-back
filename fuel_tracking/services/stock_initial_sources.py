@@ -901,14 +901,21 @@ TOTAL_FIELDS = {
 TOTAL_COUNTS = {"estimation_theorique": ("fabricant_ge", "type_ge", "source_ge", "tm_source", "p_retenue_source")}
 
 
-def totals(rows: list[dict]) -> dict:
-    """Totaux de chaque colonne chiffrée sur TOUS les sites du filtre (et non la seule page) : {bloc: {champ: {total, sites}}}.
-    Valeurs lues comme à l'affichage, sans aucun appel à Snowflake / ENOC (cache uniquement). Case « n.d. » : non comptée
-    (jamais 0) ; `sites` = nombre de sites ayant une valeur. Plusieurs GE sur un site : leurs puissances sont additionnées."""
+def enriched_copy(rows: list[dict]) -> list[dict]:
+    """Copie des lignes enrichie comme à l'affichage (cache uniquement, aucun appel Snowflake / ENOC) ; lignes d'origine intactes."""
     import copy
 
     rows = copy.deepcopy(rows)
     enrich(rows, fetch=False)
+    return rows
+
+
+def totals(rows: list[dict], enriched: bool = False) -> dict:
+    """Totaux de chaque colonne chiffrée sur TOUS les sites du filtre (et non la seule page) : {bloc: {champ: {total, sites}}}.
+    Valeurs lues comme à l'affichage, sans aucun appel à Snowflake / ENOC (cache uniquement). Case « n.d. » : non comptée
+    (jamais 0) ; `sites` = nombre de sites ayant une valeur. Plusieurs GE sur un site : leurs puissances sont additionnées."""
+    if not enriched:
+        rows = enriched_copy(rows)
     out: dict = {}
     for bloc, champs in TOTAL_FIELDS.items():
         for champ in champs:
