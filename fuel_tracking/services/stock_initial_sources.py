@@ -894,6 +894,8 @@ TOTAL_FIELDS = {
     "estimation_theorique": ("prp_kva", "prp_kw", "tm_dg_on_h", "tm_rectifier_h", "tm_terrain_h", "tm_index_fms_h", "tm_retenu_h",
                              "conso_theorique_l", "conso_fuel_sensor_l", "conso_retenue_l"),
 }
+# Colonnes texte : « total » = nombre de sites renseignés (case vide / « n.d. » non comptée)
+TOTAL_COUNTS = {"estimation_theorique": ("type_ge",)}
 
 
 def totals(rows: list[dict]) -> dict:
@@ -915,4 +917,8 @@ def totals(rows: list[dict]) -> dict:
                 if isinstance(v, (int, float)):
                     vals.append(float(v))
             out.setdefault(bloc, {})[champ] = {"total": round(sum(vals), 2) if vals else None, "sites": len(vals)}
+    for bloc, champs in TOTAL_COUNTS.items():
+        for champ in champs:
+            n = sum(1 for r in rows if str((r.get(bloc) or {}).get(champ) or "").strip())
+            out.setdefault(bloc, {})[champ] = {"total": n, "sites": n, "comptage": True}
     return out

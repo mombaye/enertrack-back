@@ -1765,7 +1765,7 @@ class TotalsRowTests(MvpBase):
             vals = [(100.0, [20.0, 30.0], 5.5), (None, None, None), (250.5, [30.0], 2.0)]
             for r, (t, kva, h) in zip(rows, vals):
                 r["stock_initial_sources"] = {"terrain_l": t}
-                r["estimation_theorique"] = {"prp_kva": kva, "tm_terrain_h": h}
+                r["estimation_theorique"] = {"prp_kva": kva, "tm_terrain_h": h, "type_ge": "K22" if t else None}
             return None
 
         rows = [{"site_id": f"S_{i}", "stock": {}} for i in range(3)]
@@ -1777,6 +1777,7 @@ class TotalsRowTests(MvpBase):
         self.assertEqual(t["estimation_theorique"]["prp_kva"], {"total": 80.0, "sites": 2})
         self.assertEqual(t["estimation_theorique"]["tm_terrain_h"], {"total": 7.5, "sites": 2})
         self.assertEqual(t["ravitaillement"]["eydon_l"], {"total": None, "sites": 0})
+        self.assertEqual(t["estimation_theorique"]["type_ge"], {"total": 2, "sites": 2, "comptage": True})   # sites avec un type
         self.assertNotIn("stock_initial_sources", rows[0])                      # lignes affichées non modifiées
 
 
