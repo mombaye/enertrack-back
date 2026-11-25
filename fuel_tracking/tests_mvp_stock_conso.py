@@ -1586,6 +1586,46 @@ class BaseGeImportTests(MvpBase):
                          ("SDMO", "K22", "Fichier Base GE (Base_GE_VF5.xlsx)"))
         self.assertEqual((out["DKR_0002"]["fabricant_ge"], out["DKR_0002"]["type_ge"]), ("CATERPILLAR", "P33-3U"))   # source suivante
 
+    def test_vf5_genset_db_tab_first(self):
+        """Base GE VF5 : PRP et courbe du type lues dans l'onglet GENSET DB du fichier Base GE, avant la GENSET DB du Closing."""
+        import io
+
+        import openpyxl
+
+        from fuel_tracking.services import base_ge as BG
+        from fuel_tracking.services import ge_info as G
+        from fuel_tracking.services import stock_import_pipeline as P
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Liste"
+        for r in ([None, "Site ID", "NOM", "Fabricant GE", "Type de GE", "Puissance GE (KVA)"],
+                  [None, "DKR_0001", "S1", "CATERPILLAR", "DE33E0", 33], [None, "DKR_0002", "S2", "SDMO", "K22", 22]):
+            ws.append(r)
+        g = wb.create_sheet("GENSET DB")
+        for r in ([None, None, None, None, 1, 2, 3],
+                  [None, "Manufacturer ", "Type", "Genset List", "Type de GE", None, "Voltage [V]", "No. of phases", "PRP [kVA]",
+                   "PRP [kW]", "cosφ", "Conso 100%", "Conso 75%", "Conso 50%", "a", "b", "c"],
+                  [None, None, None, None, None, None, None, None, None, None, None, 1, 0.75, 0.5],
+                  [None, "Caterpillar", None, None, "DE33E0", 33, 400, 3, 30, 24, 0.8, 7.0, 5.2, 3.8, 0.8, 4.0, 2.2]):
+            g.append(r)
+        buf = io.BytesIO()
+        wb.save(buf)
+        b = P.process_bytes(buf.getvalue(), "Base_GE_VF5.xlsx", "BASE_GE", origin="UPLOAD")
+        self.assertNotIn(b.status, ("REJECTED", "FAILED"))
+        bg, bc, bf, f = BG.latest_genset_db()
+        self.assertEqual((bg["DE33E0"], bc["DE33E0"], f), ({30.0}, {(0.8, 4.0, 2.2)}, "Base_GE_VF5.xlsx"))
+        closing_gdb = {"DE33E0": {33.0}, "K22": {20.0}}                       # GENSET DB du Closing de référence
+        closing_crv = {"DE33E0": {(1.0, 4.0, 2.7)}, "K22": {(1.0, 2.0, 1.0)}}
+        gdb, crv, src = G.with_base_genset_db(closing_gdb, closing_crv)
+        sites = {"DKR_0001": {"type_ge": "DE33E0"}, "DKR_0002": {"type_ge": "K22"}}
+        G.add_prp(sites, gdb, "Closing.xlsb", crv, src)
+        s1, s2 = sites["DKR_0001"], sites["DKR_0002"]
+        self.assertEqual((s1["prp_kva"], s1["courbes_cph"], s1["prp_source"]),
+                         ([30.0], [(0.8, 4.0, 2.2)], "GENSET DB (Base_GE_VF5.xlsx)"))   # onglet du fichier Base GE prioritaire
+        self.assertEqual((s2["prp_kva"], s2["courbes_cph"], s2["prp_source"]),
+                         ([20.0], [(1.0, 2.0, 1.0)], "GENSET DB (Closing.xlsb)"))       # type absent de l'onglet : Closing
+
     def test_genset_db_lookup_by_type_or_brand_and_type(self):
         from fuel_tracking.services import ge_info as G
 

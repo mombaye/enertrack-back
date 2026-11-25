@@ -6,6 +6,9 @@ Suivi Conso (bloc ESTIMATION CONSOMMATION FUEL THÉORIQUE) — décision métier
 Feuille lue : la première dont une ligne d'en-tête contient « Site ID » et « Type de GE » (ex. « Feuil32 »).
 Colonnes : Site ID, Type de GE (libellé « MARQUE - MODÈLE », ex. « SDMO - K22 », ou modèle seul « K22 » dans Base GE VF5),
 Fabricant GE (facultatif, Base GE VF5 : quand la colonne existe, c'est elle qui donne le fabricant), Puissance GE (KVA).
+Onglet « GENSET DB » du même fichier (Base GE VF5, décision du 25/11/2026) : PRP [kVA] et courbe CPH (a, b, c) par type de GE,
+lus à l'import et gardés dans le résumé du lot ; source PRIORITAIRE de la PRP et des courbes du Suivi Conso (GENSET DB du
+Closing de référence et fiches constructeur seulement pour un type absent de cet onglet).
 Chaque ligne devient une ligne d'import (FuelImportRow) : ACCEPTED ; WARNING si site inconnu de Gestion des sites, doublon
 (première occurrence conservée) ou type vide ; jamais de type inventé. Le dernier fichier importé fait foi (relu par ge_info).
 """
@@ -87,6 +90,7 @@ def process_base_ge_file(batch, file_bytes: bytes, file_name: str) -> dict:
         out.append(Row(batch=batch, sheet_name=name, row_number=k, raw_payload=raw, site_id_raw=site_raw, site_id_resolved=resolved,
                        validation_status=status, messages=msgs, row_fingerprint=F.fingerprint("BASE_GE", key, typ)))
     Row.objects.bulk_create(out, batch_size=1000)
+    stats["genset_db"] = genset_db_from_file(file_bytes, file_name)   # onglet « GENSET DB » du même fichier (Base GE VF5)
     # Pas de vidage de cache : le Suivi Conso lit le dernier fichier Base GE en base à chaque affichage (ge_info.sites_info) ;
     # les puissances GENSET DB et les données Snowflake / ENOC en cache restent disponibles.
     return stats
@@ -114,6 +118,52 @@ def latest_types() -> tuple[dict, str | None]:
     """site → (type de GE, puissance GE kVA du fichier) du dernier fichier Base GE importé ; (valeurs, nom du fichier)."""
     rows, name = _latest_rows()
     return {k: (r["type_ge"], r.get("puissance_ge_kva")) for k, r in rows.items()}, name
+
+
+def genset_db_from_file(file_bytes: bytes, file_name: str) -> dict | None:
+    """Onglet « GENSET DB » du classeur → {"types": clé → [PRP kVA], "courbes": clé → [[a, b, c]], "fabricants", "lignes"} ;
+    None si le fichier n'a pas cet onglet (ancien fichier Base GE : la GENSET DB du Closing reste la source)."""
+    from fuel_tracking.services.ge_info import parse_genset_db
+
+    for _n, rows in F.iter_sheets(file_bytes, file_name, only={"GENSET DB"}):
+        mfs, crv = set(), {}
+        gdb = parse_genset_db(list(rows), mfs, crv)
+        if gdb:
+            return {"types": {k: sorted(v) for k, v in gdb.items()}, "courbes": {k: sorted(list(x) for x in v) for k, v in crv.items()},
+                    "fabricants": sorted(mfs), "lignes": len(gdb)}
+    return None
+
+
+def latest_genset_db() -> tuple[dict, dict, list, str | None]:
+    """(clé type → {PRP kVA}, clé type → {(a, b, c)}, fabricants, nom du fichier) de l'onglet GENSET DB du dernier fichier Base GE ;
+    ({}, {}, [], None) s'il n'en a pas. Lu dans le résumé du lot ; lot importé avant cette lecture : copie d'archive relue une
+    fois (mise en cache par lot)."""
+    from pathlib import Path
+
+    from django.core.cache import cache
+
+    from fuel_tracking.models import FuelImportBatch as B
+
+    b = B.objects.filter(source_type="BASE_GE").exclude(status__in=("REJECTED", "FAILED")).order_by("-received_at").first()
+    if b is None:
+        return {}, {}, [], None
+    summary = b.summary or {}
+    g = summary.get("genset_db")
+    if "genset_db" not in summary:   # lot importé avant la lecture de l'onglet
+        key = f"fuel-base-ge-gdb:{b.pk}"
+        g = cache.get(key, "absent")
+        if g == "absent":
+            g = None
+            try:
+                if b.archive_path and Path(b.archive_path).is_file():
+                    g = genset_db_from_file(Path(b.archive_path).read_bytes(), b.file_name)
+            except Exception:  # noqa: BLE001 — archive illisible : GENSET DB du Closing
+                g = None
+            cache.set(key, g, 24 * 3600)
+    if not g:
+        return {}, {}, [], None
+    return ({k: set(v) for k, v in g["types"].items()}, {k: {tuple(x) for x in v} for k, v in g["courbes"].items()},
+            g.get("fabricants") or [], b.file_name)
 
 
 def latest_fabricants() -> dict:

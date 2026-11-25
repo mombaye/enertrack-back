@@ -15,7 +15,8 @@ Ordre, CHAMP PAR CHAMP (fabricant et type choisis indépendamment), jamais de d�
 Rattachement Snowflake : S_ID = identifiant interne du site → SITE_ESCO_CURRENT.ID → SITE_ID (jointure dans Snowflake ;
 S_ID n'est PAS le DATA_ID). Plusieurs GE sur un site : valeurs distinctes jointes par « / » dans l'ordre des GE.
 
-Puissance PRP (kVA) : feuille « GENSET DB » du Closing de référence (FUEL_GENSET_DB_MONTH, défaut 2026-09 = Closing de
+Puissance PRP (kVA) et courbe CPH : D'ABORD l'onglet « GENSET DB » du dernier fichier Base GE (VF5, décision du 25/11/2026) pour
+les types qu'il contient ; sinon feuille « GENSET DB » du Closing de référence (FUEL_GENSET_DB_MONTH, défaut 2026-09 = Closing de
 septembre ; à défaut le dernier fichier de clôture qui la contient), copie d'archive, colonne « PRP [kVA] » de
 la ligne dont le « Type de GE » correspond EXACTEMENT au type du site (casse, espaces et ponctuation ignorés ; « P33-3U » ≠
 « P33-3 »). Type présent plusieurs fois avec des PRP différentes : ambigu, aucune valeur. Puissance PRP (kW) = kVA × 0,8.
@@ -232,11 +233,13 @@ def refresh() -> dict:
     gdb_meta["courbes_cph"] = len(curves)
     from fuel_tracking.services.base_ge import known_brands
 
-    brands = known_brands([t for t, _k in base.values()], gdb_meta.get("fabricants") or [])
+    m = {"fabricants": gdb_meta.get("fabricants") or []}
+    gdb_all, curves_all, bsrc = with_base_genset_db(gdb, curves, m)   # onglet GENSET DB du fichier Base GE d'abord
+    brands = known_brands([t for t, _k in base.values()], m["fabricants"])
     from fuel_tracking.services.base_ge import latest_fabricants
 
     sites = build(sf, en, base, base_file, brands, base_fab=latest_fabricants())
-    add_prp(sites, gdb, gdb_meta.get("fichier"), curves)
+    add_prp(sites, gdb_all, gdb_meta.get("fichier"), curves_all, bsrc)
     data = {"sites": sites, "raw": {"sf": sf, "enoc": en, "gdb": gdb, "gdb_meta": gdb_meta, "gdb_curves": curves},
             "meta": {**meta, "sites_enoc": len(en), "base_ge": {"fichier": base_file, "sites": len(base)},
                                      "genset_db": gdb_meta, "erreurs": errors},
@@ -399,28 +402,58 @@ FICHES_CONSTRUCTEUR = (
 FICHE_BY_KEY = {k: f for f in FICHES_CONSTRUCTEUR for k in {_key(f[2]), _key(f[1] + f[2])}}
 
 
-def _resolve(label: str, table: dict) -> tuple[object, str | None]:
-    """(valeur de la table pour ce type, correspondance appliquée « X → Y » ou None). Type tel quel d'abord, puis la
+def _hit(label: str, table: dict) -> tuple[str | None, str | None]:
+    """(clé de la table retenue pour ce type, correspondance appliquée « X → Y » ou None). Type tel quel d'abord, puis la
     correspondance explicite GENSET_ALIASES du modèle."""
     keys = _lookup_keys(label)
-    hit = next((table[k] for k in keys if k in table), None)
-    if hit is not None:
-        return hit, None
+    k = next((k for k in keys if k in table), None)
+    if k is not None:
+        return k, None
     for k in keys:
         alias = GENSET_ALIASES.get(k)
         if alias and alias in table:
-            return table[alias], f"{k} → {alias}"
+            return alias, f"{k} → {alias}"
     return None, None
 
 
-def add_prp(sites: dict, gdb: dict, fichier: str | None, curves: dict | None = None) -> None:
+def _resolve(label: str, table: dict) -> tuple[object, str | None]:
+    """(valeur de la table pour ce type, correspondance appliquée « X → Y » ou None)."""
+    k, corr = _hit(label, table)
+    return (table[k], corr) if k is not None else (None, None)
+
+
+def with_base_genset_db(gdb: dict, curves: dict | None, meta: dict | None = None) -> tuple[dict, dict, tuple | None]:
+    """Décision du 25/11/2026 : PRP et courbe CPH lues D'ABORD dans l'onglet « GENSET DB » du dernier fichier Base GE (VF5).
+    Un type présent dans cet onglet y prend PRP ET courbe (jamais une PRP d'un fichier avec la courbe d'un autre) ; les autres
+    types gardent la GENSET DB du Closing de référence, puis les fiches constructeur. → (gdb, courbes, (clés, fichier) ou None)."""
+    from fuel_tracking.services.base_ge import latest_genset_db
+
+    bg, bc, bf, bfile = latest_genset_db()
+    if not bg:
+        return gdb or {}, curves or {}, None
+    g = {k: v for k, v in (gdb or {}).items() if k not in bg}
+    g.update(bg)
+    c = {k: v for k, v in (curves or {}).items() if k not in bg}
+    c.update(bc)
+    if meta is not None:
+        meta["fabricants"] = sorted(set(meta.get("fabricants") or []) | set(bf))
+    return g, c, (set(bg), bfile)
+
+
+def add_prp(sites: dict, gdb: dict, fichier: str | None, curves: dict | None = None, base: tuple | None = None) -> None:
     """Ajoute à chaque site la Puissance PRP (kVA / kW) de chacun de ses types de GE, avec la raison si absente.
-    GENSET DB d'abord ; type absent de GENSET DB → fiche constructeur validée (FICHES_CONSTRUCTEUR) si elle existe."""
+    GENSET DB d'abord (onglet du fichier Base GE `base` = (clés, fichier) prioritaire, sinon Closing) ; type absent →
+    fiche constructeur validée (FICHES_CONSTRUCTEUR) si elle existe."""
+    base_keys, base_file = base or (set(), None)
+    any_db = fichier or base_file
     for v in sites.values():
-        kva, motifs, abc, via, fiches = [], [], [], [], []
+        kva, motifs, abc, via, fiches, files = [], [], [], [], [], []
         for t in [x for x in (v.get("type_ge") or "").split(" / ") if x]:
-            vals, corr = _resolve(t, gdb)
+            key, corr = _hit(t, gdb)
+            vals = gdb[key] if key is not None else None
             cv = _resolve(t, curves)[0] if curves else None
+            if vals and len(vals) == 1:
+                files.append(base_file if key in base_keys else fichier)
             if not vals:
                 f = next((FICHE_BY_KEY[k] for k in _lookup_keys(t) if k in FICHE_BY_KEY), None)
                 if f:
@@ -430,7 +463,7 @@ def add_prp(sites: dict, gdb: dict, fichier: str | None, curves: dict | None = N
                 via.append(corr)
             abc.append(next(iter(cv)) if cv and len(cv) == 1 else None)   # plusieurs courbes pour un type : ambigu, aucune
             if not vals:
-                motifs.append(f"type « {t} » absent de GENSET DB" if fichier else "GENSET DB non disponible")
+                motifs.append(f"type « {t} » absent de GENSET DB" if any_db else "GENSET DB non disponible")
             elif len(vals) > 1:
                 motifs.append(f"type « {t} » ambigu dans GENSET DB ({' / '.join(f'{x:g}' for x in sorted(vals))} kVA)")
             else:
@@ -438,8 +471,10 @@ def add_prp(sites: dict, gdb: dict, fichier: str | None, curves: dict | None = N
         v["prp_kva"] = [round(x, 2) for x in kva] or None
         v["prp_kw"] = [round(x * KW_PER_KVA, 2) for x in kva] or None
         v["prp_motif"] = " ; ".join(motifs) or None
-        parts = ([f"GENSET DB ({fichier})" + (f" — correspondance de type validée : {', '.join(via)}" if via else "")]
-                 if fichier and len(fiches) < len(kva) else []) + fiches
+        uniq = list(dict.fromkeys(f for f in files if f))
+        parts = [f"GENSET DB ({f})" for f in uniq] + fiches
+        if parts and via and uniq:
+            parts[len(uniq) - 1] += f" — correspondance de type validée : {', '.join(via)}"
         v["prp_source"] = " ; ".join(parts) if kva and parts else None
         v["courbes_cph"] = abc or None   # (a, b, c) par GE, dans l'ordre des types ; None = courbe absente ou ambiguë
 
@@ -467,18 +502,21 @@ def sites_info(site_ids, closing: dict | None = None) -> dict:
     base_all, base_file = latest_types()
     base = {k: v for k, v in base_all.items() if k in ids}
     gdb_meta = raw.get("gdb_meta") or {}
-    brands = known_brands([t for t, _k in base_all.values()], gdb_meta.get("fabricants") or [])
+    m = {"fabricants": gdb_meta.get("fabricants") or []}
+    # PRP / courbes : onglet GENSET DB du dernier fichier Base GE (lu en direct, comme les types), puis GENSET DB du Closing
+    gdb, curves, bsrc = with_base_genset_db(raw.get("gdb") or {}, raw.get("gdb_curves"), m)
+    fichier = gdb_meta.get("fichier")
+    brands = known_brands([t for t, _k in base_all.values()], m["fabricants"])
     closing = {k.upper(): v for k, v in (closing or {}).items() if k.upper() in ids}
     from fuel_tracking.services.base_ge import latest_fabricants
 
     sites = build(sf, en, base, base_file, brands, closing, latest_fabricants())
-    gdb, fichier, curves = raw.get("gdb") or {}, gdb_meta.get("fichier"), raw.get("gdb_curves")
-    add_prp(sites, gdb, fichier, curves)
-    closing_if_base_unknown(sites, base, closing, gdb, fichier, curves)
+    add_prp(sites, gdb, fichier, curves, bsrc)
+    closing_if_base_unknown(sites, base, closing, gdb, fichier, curves, bsrc)
     return sites
 
 
-def closing_if_base_unknown(sites: dict, base: dict, closing: dict, gdb: dict, fichier, curves) -> int:
+def closing_if_base_unknown(sites: dict, base: dict, closing: dict, gdb: dict, fichier, curves, bsrc: tuple | None = None) -> int:
     """Décision du 24/11/2026 : type du fichier Base GE sans aucune PRP dans GENSET DB (absent ou ambigu) → type de la ligne du
     fichier de clôture du mois, s'il en donne une. La source garde la trace du type Base GE écarté et de la raison."""
     n = 0
@@ -487,7 +525,7 @@ def closing_if_base_unknown(sites: dict, base: dict, closing: dict, gdb: dict, f
         if sid not in base or v.get("prp_kva") or not _clean(c_typ) or _clean(c_typ) == v.get("type_ge"):
             continue
         alt = {"type_ge": _clean(c_typ)}
-        add_prp({sid: alt}, gdb, fichier, curves)
+        add_prp({sid: alt}, gdb, fichier, curves, bsrc)
         if not alt.get("prp_kva"):
             continue   # le fichier de clôture ne fait pas mieux : type Base GE conservé (avec son motif)
         note = f"type Base GE « {v.get('type_ge')} » : {v.get('prp_motif') or 'PRP n.d.'}"
