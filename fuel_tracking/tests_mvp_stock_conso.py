@@ -2034,6 +2034,20 @@ class TheoreticalConsoTests(SimpleTestCase):
         self.assertEqual((r["p_retenue_kw"], r["conso_theorique_l"]), (None, None))
         self.assertIn("aucune puissance", r["p_retenue_motif"])
 
+    def test_repli_grid_en_dernier(self):
+        from fuel_tracking.services.stock_initial_sources import theoretical_conso
+
+        r = theoretical_conso(self.base(p_grid_kw=5.48))                    # GE, redresseur, load DC n.d.
+        self.assertEqual((r["p_retenue_kw"], r["p_retenue_source"]), (5.48, "PUISSANCE_GRID_MEDIANE"))
+        self.assertIn("Grid", r["p_retenue_motif"])
+        self.assertIsNotNone(r["taux_charge"])
+        r = theoretical_conso(self.base(p_load_dc_kw=3.0, p_grid_kw=5.48))  # load DC présent : Grid ignoré
+        self.assertEqual(r["p_retenue_source"], "LOAD_DC_SEUL")
+        r = theoretical_conso(self.base(p_ge_kw=9.0, p_grid_kw=20.0))       # GE présent : Grid ignoré même plus grand
+        self.assertEqual(r["p_retenue_source"], "PUISSANCE_MEDIANE_GE")
+        r = theoretical_conso(self.base(p_grid_kw=0.0))                      # 0 kW n'est pas une puissance mesurée
+        self.assertIsNone(r["p_retenue_kw"])
+
     def test_cas_non_calculables(self):
         from fuel_tracking.services.stock_initial_sources import theoretical_conso
 

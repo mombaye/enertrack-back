@@ -577,6 +577,7 @@ def _fuel_sensor_conso(facts, nb_jours: int) -> dict:
 # Sélection de la puissance retenue et consommation théorique (bloc ESTIMATION)
 SEL_SRC_GE, SEL_SRC_RECT = "PUISSANCE_MEDIANE_GE", "PUISSANCE_MEDIANE_REDRESSEUR"
 SEL_SRC_LOAD_BATT, SEL_SRC_LOAD = "LOAD_DC_PLUS_RECHARGE_BATTERIE", "LOAD_DC_SEUL"
+SEL_SRC_GRID = "PUISSANCE_GRID_MEDIANE"   # dernier recours (décision du 26/11/2026) : toutes les autres puissances n.d.
 TAUX_CHARGE_MAX = 1.05            # au-delà de 105 % de la PRP : puissance incohérente avec le GE, aucune conso calculée
 TAUX_CHARGE_EXTRAPOLATION = 0.5   # en dessous de 50 % : extrapolation de la parabole (points 50 / 75 / 100 %)
 
@@ -585,7 +586,8 @@ def theoretical_conso(e: dict) -> dict:
     """Bloc ESTIMATION, à partir des champs déjà calculés de la ligne :
     1. puissance retenue = max(Puissance médiane GE, Puissance médiane redresseur) — la médiane redresseur est déjà
        P_DC ÷ rendement mesuré (règle équipe data), elle n'est pas redivisée ; si aucune des deux : Load DC telco +
-       Recharge batterie (Load DC seul, avec réserve, tant que la recharge batterie est n.d.) ;
+       Recharge batterie (Load DC seul, avec réserve, tant que la recharge batterie est n.d.) ; si toutes ces puissances
+       manquent : Puissance Grid médiane mesurée (compteur AC : charge du site que le GE alimente quand il tourne) ;
     2. taux de charge = puissance retenue ÷ Puissance PRP (kW) du GE ;
     3. CPH (L/h) = a·x² + b·x + c (x = taux de charge en fraction, a, b, c de GENSET DB selon le type de GE) ;
        conso théorique (L) = CPH × Temps de marche GE retenu.
@@ -604,8 +606,11 @@ def theoretical_conso(e: dict) -> dict:
         if batt is None:
             out["p_retenue_reserve"] = True
             out["p_retenue_motif"] = "recharge batterie n.d. : Load DC telco seul (puissance probablement sous-estimée)"
+    elif e.get("p_grid_kw") is not None and e["p_grid_kw"] > 0:
+        out["p_retenue_kw"], out["p_retenue_source"] = e["p_grid_kw"], SEL_SRC_GRID
+        out["p_retenue_motif"] = "puissances GE, redresseur et load DC n.d. : Puissance Grid médiane mesurée retenue"
     else:
-        out["p_retenue_motif"] = "aucune puissance médiane (GE, redresseur, load DC) sur la période"
+        out["p_retenue_motif"] = "aucune puissance médiane (GE, redresseur, load DC, Grid) sur la période"
         out["taux_charge_motif"] = out["conso_theorique_motif"] = "puissance retenue n.d."
         return out
     p = out["p_retenue_kw"]
