@@ -2573,3 +2573,47 @@ class AlerteAppFuelTests(MvpBase):
         with mock.patch.object(S, "enrich", side_effect=fake_enrich):
             t = S.totals(rows)
         self.assertEqual(t["analyse_variation"]["alerte"], {"total": 2, "sites": 3, "oui": True, "valeur": "En écart"})
+
+
+class RuntimeVisibilityTests(MvpBase):
+    """Temps de marche GE : visibilité (%) de chaque source ; seules les sources vues sur plus de 50 % de la période sont retenues."""
+
+    @staticmethod
+    def e(**kw):
+        base = {"tm_jours_periode": 30, "tm_index_fms_h": None, "tm_terrain_h": None, "tm_dg_on_h": None, "tm_dg_on_jours": 0,
+                "tm_rectifier_h": None, "tm_rectifier_dispo_pct": None, "tm_rectifier_off_grid": True}
+        return {**base, **kw}
+
+    def test_visibility_per_source(self):
+        from fuel_tracking.services.stock_initial_sources import retained_runtime as R
+
+        o = R(self.e(tm_index_fms_h=7.3, tm_terrain_h=7.0, tm_dg_on_h=0.0, tm_dg_on_jours=12, tm_rectifier_h=480.3, tm_rectifier_dispo_pct=83.4))
+        self.assertEqual((o["tm_index_fms_visibilite_pct"], o["tm_terrain_visibilite_pct"], o["tm_dg_on_visibilite_pct"],
+                          o["tm_rectifier_visibilite_pct"]), (100.0, 100.0, 40.0, 83.4))
+        self.assertEqual((o["tm_retenu_h"], o["tm_source"]), (7.3, "FMS"))
+        self.assertIn("40 % ≤ 50 %", o["tm_dg_on_ecart_motif"])
+
+    def test_dg_on_below_50_pct_no_longer_retained(self):
+        from fuel_tracking.services.stock_initial_sources import retained_runtime as R
+
+        # avant : 0,00 h day_dg_on retenu ; 15 jours sur 30 = 50 % → pas « plus de 50 % » → écarté, redresseur hors réseau retenu
+        o = R(self.e(tm_dg_on_h=0.0, tm_dg_on_jours=15, tm_rectifier_h=412.83, tm_rectifier_dispo_pct=90.0))
+        self.assertEqual((o["tm_retenu_h"], o["tm_source"]), (412.83, "Alarme day_rectifier_on FMS"))
+        self.assertEqual(o["tm_sources_ecartees"], ["Alarme day_dg_on FMS (50 %)"])
+        o = R(self.e(tm_dg_on_h=6.08, tm_dg_on_jours=16))                               # 53,3 % → retenu
+        self.assertEqual((o["tm_retenu_h"], o["tm_source"], o["tm_dg_on_visibilite_pct"]), (6.08, "Alarme day_dg_on FMS", 53.3))
+
+    def test_nothing_visible_enough_is_nd(self):
+        from fuel_tracking.services.stock_initial_sources import retained_runtime as R
+
+        o = R(self.e(tm_dg_on_h=0.0, tm_dg_on_jours=3, tm_rectifier_h=10.0, tm_rectifier_dispo_pct=20.0))
+        self.assertEqual((o["tm_retenu_h"], o["tm_source"]), (None, None))            # jamais 0 par défaut
+        self.assertEqual(len(o["tm_sources_ecartees"]), 2)
+        o = R(self.e())
+        self.assertEqual((o["tm_retenu_h"], o["tm_dg_on_visibilite_pct"], o["tm_sources_ecartees"]), (None, None, None))
+
+    def test_rectifier_on_grid_still_excluded(self):
+        from fuel_tracking.services.stock_initial_sources import retained_runtime as R
+
+        o = R(self.e(tm_rectifier_h=400.0, tm_rectifier_dispo_pct=95.0, tm_rectifier_off_grid=False))
+        self.assertEqual((o["tm_retenu_h"], o["tm_rectifier_visibilite_pct"]), (None, 95.0))

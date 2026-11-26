@@ -930,15 +930,53 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
         # Source de donnée Temps de marche GE : ordre appliqué par Ops dans le fichier Output App Fuel d'octobre (vérifié sur
         # 400 sites) : Index Compteur FMS → relevé de terrain → Alarme day_dg_on FMS → Alarme day_rectifier_on FMS.
         e = r["estimation_theorique"]
-        e["tm_retenu_h"], e["tm_source"] = _first_of((e.get("tm_index_fms_h"), "FMS"), (e.get("tm_terrain_h"), "relevé de terrain"),
-                                                    (e.get("tm_dg_on_h"), "Alarme day_dg_on FMS"),
-                                                    # redresseur retenu seulement hors réseau (sinon heures réseau + GE)
-                                                    (e.get("tm_rectifier_h") if e.get("tm_rectifier_off_grid") is True else None,
-                                                     "Alarme day_rectifier_on FMS"))
+        e.update(retained_runtime(e))
         e.update(theoretical_conso(e))
         e.update(retained_estimation(e))
         r["analyse_variation"] = stock_vs_theoretical(r)
     return err
+
+
+# Visibilité de chaque source de temps de marche GE sur la période d'observation (décision du 26/11/2026) : seule une
+# source vue sur PLUS de 50 % de la période entre dans le choix du temps de marche retenu.
+TM_VISIBILITE_MIN_PCT = 50.0
+
+
+def retained_runtime(e: dict) -> dict:
+    """Visibilité (%) de chaque source de temps de marche GE et temps de marche retenu.
+      - Alarme day_dg_on FMS : jours renseignés (GENSET_REPORT) ÷ jours de la période ;
+      - Alarme day_rectifier_on FMS : créneaux 5 min reçus ÷ (288 × jours de la période) ;
+      - Index Compteur FMS et relevé de terrain : compteur cumulatif lu aux deux dates du fichier → 100 % quand les deux
+        relevés existent et sont cohérents (l'écart couvre toute la période), sinon n.d.
+    Ordre inchangé (Index Compteur FMS → relevé de terrain → day_dg_on → day_rectifier_on, ce dernier seulement hors
+    réseau), mais une source à 50 % de visibilité ou moins est écartée (valeur toujours affichée, raison au survol)."""
+    jours = e.get("tm_jours_periode") or 0
+    pct = lambda n: round(100 * n / jours, 1) if jours > 0 and n is not None else None  # noqa: E731
+    vis = {
+        "tm_index_fms": 100.0 if e.get("tm_index_fms_h") is not None else None,
+        "tm_terrain": 100.0 if e.get("tm_terrain_h") is not None else None,
+        "tm_dg_on": pct(e.get("tm_dg_on_jours")) if e.get("tm_dg_on_h") is not None else None,
+        "tm_rectifier": (e.get("tm_rectifier_dispo_pct") if e.get("tm_rectifier_h") is not None else None),
+    }
+    vis = {k: (min(float(v), 100.0) if v is not None else None) for k, v in vis.items()}
+    ok = lambda k: vis[k] is not None and vis[k] > TM_VISIBILITE_MIN_PCT  # noqa: E731
+    out = {f"{k}_visibilite_pct": v for k, v in vis.items()}
+    ecartees = []
+    for k, label in (("tm_index_fms", "Index Compteur FMS"), ("tm_terrain", "relevé de terrain"), ("tm_dg_on", "Alarme day_dg_on FMS"),
+                     ("tm_rectifier", "Alarme day_rectifier_on FMS")):
+        if e.get(f"{k}_h") is not None and not ok(k):
+            ecartees.append(f"{label} ({vis[k]:g} %)" if vis[k] is not None else label)
+            out[f"{k}_ecart_motif"] = f"visibilité {vis[k]:g} % ≤ {TM_VISIBILITE_MIN_PCT:g} % : non retenue" if vis[k] is not None else "visibilité n.d. : non retenue"
+        else:
+            out[f"{k}_ecart_motif"] = None
+    g = lambda k: e.get(f"{k}_h") if ok(k) else None  # noqa: E731
+    out["tm_retenu_h"], out["tm_source"] = _first_of((g("tm_index_fms"), "FMS"), (g("tm_terrain"), "relevé de terrain"),
+                                                     (g("tm_dg_on"), "Alarme day_dg_on FMS"),
+                                                     # redresseur retenu seulement hors réseau (sinon heures réseau + GE)
+                                                     (g("tm_rectifier") if e.get("tm_rectifier_off_grid") is True else None,
+                                                      "Alarme day_rectifier_on FMS"))
+    out["tm_sources_ecartees"] = ecartees or None
+    return out
 
 
 def _first_of(*candidates):
