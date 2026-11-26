@@ -22,7 +22,8 @@ FILTER_KEYS = TOP + tuple(f"inventaire.{k}" for k in ("region", "indoor_outdoor"
     + tuple(f"ravitaillement.{k}" for k in ("date_finale_fichier", "eydon_l", "carte_total_l", "ajout_l", "retrait_l", "vole_l", "fuite_l")) \
     + tuple(f"estimation_theorique.{k}" for k in (
         "fabricant_ge", "type_ge", "source_ge", "prp_kva", "prp_kw", "tm_dg_on_h", "tm_rectifier_h", "tm_terrain_h", "tm_index_fms_h",
-        "tm_retenu_h", "tm_source", "p_rect_kw", "p_ge_kw", "p_grid_kw", "p_load_dc_kw", "p_batt_kw", "p_retenue_kw", "p_retenue_source",
+        "tm_retenu_h", "tm_source", "p_rect_kw", "p_ge_kw", "p_grid_kw", "p_rect_min_kw", "p_rect_max_kw", "p_ge_min_kw",
+        "p_ge_max_kw", "p_grid_min_kw", "p_grid_max_kw", "p_load_dc_kw", "p_batt_kw", "p_retenue_kw", "p_retenue_source",
         "taux_charge", "cph_l_h", "conso_theorique_l", "conso_fuel_sensor_l", "conso_retenue_source")) \
     + tuple(f"analyse_variation.{k}" for k in ("conso_theorique_retenue_l", "variation_l", "grande_difference", "delta_l"))
 PARAM = "filtres_colonnes"

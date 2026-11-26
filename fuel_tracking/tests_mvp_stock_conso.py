@@ -1914,11 +1914,17 @@ class PowerMediansTests(MvpBase):
         self.assertEqual((out["p_grid_kw"], out["p_grid_jours"]), (25.0, 2))   # AC_METER déjà en kW ; 0 non compté
         # GE : kWh ÷ h des jours de marche ; 25 kW > 105 % × 22 kVA × 0,8 écarté ; jour à 0 h ignoré
         self.assertEqual((out["p_ge_kw"], out["p_ge_jours"]), (4.25, 2))
+        # min / max : mêmes valeurs que la médiane (jour écarté au-delà du plafond non compté)
+        self.assertEqual((out["p_ge_min_kw"], out["p_ge_max_kw"]), (3.75, 4.75))
+        self.assertEqual((out["p_grid_min_kw"], out["p_grid_max_kw"]), (24.0, 26.0))
+        self.assertEqual((out["p_rect_min_kw"], out["p_rect_max_kw"]), (None, None))
         sans_kva = S._power_medians(rows, lines, {}, {})["OUT_1"]
         self.assertEqual((sans_kva["p_ge_kw"], sans_kva["p_ge_jours"]), (4.75, 3))
+        self.assertEqual((sans_kva["p_ge_min_kw"], sans_kva["p_ge_max_kw"]), (3.75, 25.0))
         F.objects.create(country="Senegal", data_id=2, site_id="ARR_1", date=date(2026, 10, 2), dg_on_runtime_h=0, dg_production_kwh=0)
         arr = S._power_medians([{**rows[0], "site_id": "ARR_1"}], {"ARR_1": lines["OUT_1"]}, {}, {})["ARR_1"]
         self.assertIsNone(arr["p_ge_kw"])
+        self.assertEqual((arr["p_ge_min_kw"], arr["p_ge_max_kw"], arr["p_grid_min_kw"]), (None, None, None))   # jamais 0
         self.assertIn("arrêt", arr["p_ge_motif"])
         vide = S._power_medians([{**rows[0], "site_id": "VID_1"}], {"VID_1": lines["OUT_1"]}, {}, {})["VID_1"]
         self.assertIn("aucune donnée GENSET_REPORT", vide["p_ge_motif"])
@@ -1936,13 +1942,16 @@ class PowerMediansTests(MvpBase):
         r = S._rect_power([jour(204, 4.985), jour(160, 5.2), jour(20, 9.0, [9.0] * 20)], 3)
         self.assertEqual((r["p_rect_kw"], r["p_rect_jours"], r["p_rect_source"], r["p_rect_motif"]), (5.09, 2, "RECTIFIER_MEDIAN_DAY", None))
         self.assertEqual((r["p_rect_median_day_kw"], r["p_rect_median_period_kw"], r["p_rect_dispo_pct"]), (5.093, None, 44.4))
+        self.assertEqual((r["p_rect_min_kw"], r["p_rect_max_kw"]), (round(4.985, 2), 5.2))   # jour non qualifié (9 kW) exclu
         # Aucun jour qualifié : médiane de toutes les mesures valides de la période
         r = S._rect_power([jour(100, 3.0, [2.0, 3.0, 4.0]), jour(50, 6.0, [5.0, 6.0])], 2)
         self.assertEqual((r["p_rect_kw"], r["p_rect_source"], r["p_rect_median_period_kw"]), (4.0, "RECTIFIER_MEDIAN_PERIOD", 4.0))
         self.assertIn("aucun jour ≥ 50 %", r["p_rect_motif"])
+        self.assertEqual((r["p_rect_min_kw"], r["p_rect_max_kw"]), (2.0, 6.0))   # toutes les mesures valides de la période
         # Aucune mesure valide : null, jamais 0
         r = S._rect_power([jour(None, None), {}], 2)
         self.assertEqual((r["p_rect_kw"], r["p_rect_source"]), (None, "PUISSANCE_REDRESSEUR_INDISPONIBLE"))
+        self.assertEqual((r["p_rect_min_kw"], r["p_rect_max_kw"]), (None, None))
         self.assertIn("aucune mesure redresseur valide", r["p_rect_motif"])
 
     def test_load_dc(self):

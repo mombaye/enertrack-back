@@ -490,6 +490,7 @@ def _power_medians(rows, lines, kinds: dict, kva: dict) -> dict:
       grid       : médiane des puissances AC journalières (AC_METER.ACT_ACTIVE_POWER_AVG, déjà en kW), mesures > 0 ;
       générateur : médiane, sur les jours où le GE a tourné, de DG_PRODUCTION_KWH ÷ DG_RUNTIME_CALCULATED (GENSET_REPORT) ;
                    jour au-delà de 105 % × kVA × 0,8 écarté (kVA = fichier Base GE, sinon PRP GENSET DB) ;
+      min / max (redresseur, générateur, grid) : plus petite et plus grande des valeurs qui servent à la médiane ;
       load DC telco : médiane des LOAD_W journaliers (AVERAGE_LOAD, W → kW), mesures > 0 ;
       recharge batterie : médiane du jour de l'équipe data (GOLD.BATTERY_REPORT) — voir _batt_power ;
     Aucune mesure : n.d. (jamais 0) avec la raison."""
@@ -548,7 +549,9 @@ def _power_medians(rows, lines, kinds: dict, kva: dict) -> dict:
                 ge_motif = "aucune donnée GENSET_REPORT sur la période"
         out[sid] = {**rp,
                     "p_grid_kw": round(median(grid), 2) if grid else None, "p_grid_jours": len(grid),
+                    "p_grid_min_kw": round(min(grid), 2) if grid else None, "p_grid_max_kw": round(max(grid), 2) if grid else None,
                     "p_ge_kw": ge, "p_ge_jours": len(ge_days), "p_ge_motif": ge_motif,
+                    "p_ge_min_kw": round(min(ge_days), 2) if ge_days else None, "p_ge_max_kw": round(max(ge_days), 2) if ge_days else None,
                     "p_load_dc_kw": round(median(load), 2) if load else None, "p_load_dc_jours": len(load),
                     "p_load_dc_motif": None if load else "aucune donnée AVERAGE_LOAD (load DC) sur la période",
                     **bp, **_fuel_sensor_conso(fx.values(), (d1 - d0).days)}
@@ -771,7 +774,9 @@ def _rect_power(facts, nb_jours: int) -> dict:
         kw, src = None, RECT_SRC_NONE
         motif = ("aucune mesure redresseur valide sur la période (statut Good/Aged/Warning, P_DC > 0, rendement 70-100 %)"
                  if not days else "mesures redresseur valides sans détail disponible : resynchronisation nécessaire")
+    used = qualified if day_kw is not None else (values if period_kw is not None else [])   # valeurs de la médiane retenue
     return {"p_rect_kw": round(kw, 2) if kw is not None else None, "p_rect_jours": len(qualified),
+            "p_rect_min_kw": round(min(used), 2) if used else None, "p_rect_max_kw": round(max(used), 2) if used else None,
             "p_rect_median_day_kw": day_kw, "p_rect_median_period_kw": period_kw, "p_rect_dispo_pct": dispo,
             "p_rect_source": src, "p_rect_motif": motif}
 
@@ -874,6 +879,9 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
                                          p_rect_motif=pw.get("p_rect_motif"),
                                          p_ge_kw=pw.get("p_ge_kw"), p_ge_jours=pw.get("p_ge_jours"), p_ge_motif=pw.get("p_ge_motif"),
                                          p_grid_kw=pw.get("p_grid_kw"), p_grid_jours=pw.get("p_grid_jours"),
+                                         # min / max : mêmes valeurs journalières que la médiane (même filtre, même période)
+                                         **{k: pw.get(k) for k in ("p_rect_min_kw", "p_rect_max_kw", "p_ge_min_kw", "p_ge_max_kw",
+                                                                   "p_grid_min_kw", "p_grid_max_kw")},
                                          p_load_dc_kw=pw.get("p_load_dc_kw"), p_load_dc_jours=pw.get("p_load_dc_jours"),
                                          p_load_dc_motif=pw.get("p_load_dc_motif"),
                                          **{k: pw.get(k) for k in ("p_batt_kw", "p_batt_jours", "p_batt_median_day_kw",
