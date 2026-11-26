@@ -2099,15 +2099,42 @@ class TheoreticalConsoTests(SimpleTestCase):
         self.assertEqual(step(p_ge_kw=8.0, tm_retenu_h=None), STEPS[6])
 
     def test_conso_fuel_sensor(self):
+        """Par le niveau de cuve : niveau initial − niveau final + remplissages (hausse ≥ 50 L) ; cas réels d'octobre 2026."""
+        from datetime import date, timedelta
         from decimal import Decimal
 
         from fuel_tracking.services.stock_initial_sources import _fuel_sensor_conso
 
-        r = _fuel_sensor_conso([{"measured_conso_l": Decimal("10.5")}, {"measured_conso_l": Decimal("0")},
-                                {"measured_conso_l": None}], 3)
-        self.assertEqual((r["conso_fuel_sensor_l"], r["conso_fuel_sensor_jours"], r["conso_fuel_sensor_reserve"]), (10.5, 2, True))
-        r = _fuel_sensor_conso([{"measured_conso_l": None}], 1)
-        self.assertEqual((r["conso_fuel_sensor_l"], r["conso_fuel_sensor_jours"]), (None, 0))
+        def serie(d0, vals):
+            return {d0 + timedelta(days=i): (Decimal(str(v)) if v is not None else None) for i, v in enumerate(vals)}
+
+        # BKL_0675 (01/10 → 29/10) : baisse régulière, remontée de 3 L = bruit, aucun drapeau Snowflake
+        d0 = date(2026, 10, 1)
+        bkl = [579.8348, 579.8348, 579.8348, 547.2746, 547.2746, 515.3513, 515.3513, 504.8556, 504.8556, 487.5278, 450.4887,
+               450.4887, 427.7459, 430.9693, 427.7459, 427.7459, 402.2722, 402.2722, 380.4495, 380.4495, 350.0567, 350.0567,
+               350.0567, 326.4293, 326.4293, 300.1512, 300.1512, 291.5471, 291.5471]
+        r = _fuel_sensor_conso(serie(d0, bkl), d0, date(2026, 10, 29))
+        self.assertEqual((r["conso_fuel_sensor_l"], r["conso_fuel_sensor_remplissages"], r["conso_fuel_sensor_reserve"]),
+                         (288.29, 0, False))
+        # DBL_1166 (24/10 → 28/10) : +4 L = bruit
+        d0 = date(2026, 10, 24)
+        r = _fuel_sensor_conso(serie(d0, [1144.6696, 1046.361, 1046.361, 1050.5852, 1054.8143]), d0, date(2026, 10, 28))
+        self.assertEqual(r["conso_fuel_sensor_l"], 89.86)
+        # DBL_2463 : remplissage de +980 L vu par le capteur — compté
+        d0 = date(2026, 10, 12)
+        r = _fuel_sensor_conso(serie(d0, [131.5, 126.4377, 126.4377, 1106.5809, 1123.6732, 1119.3936]), d0, date(2026, 10, 17))
+        self.assertEqual((r["conso_fuel_sensor_remplissages"], r["conso_fuel_sensor_remplissages_l"]), (1, 980.14))
+        self.assertEqual(r["conso_fuel_sensor_l"], round(131.5 - 1119.3936 + 980.1432, 2))
+        # jour sans niveau entre les deux : valeur gardée, réserve
+        d0 = date(2026, 10, 1)
+        r = _fuel_sensor_conso(serie(d0, [500, None, 480, 470]), d0, date(2026, 10, 4))
+        self.assertEqual((r["conso_fuel_sensor_l"], r["conso_fuel_sensor_reserve"]), (30.0, True))
+        self.assertIn("1 jour(s) sur 3 sans niveau FMS", r["conso_fuel_sensor_motif"])
+        # niveau absent au relevé final : n.d., jamais 0
+        r = _fuel_sensor_conso(serie(d0, [500, 490, 480, None]), d0, date(2026, 10, 4))
+        self.assertIsNone(r["conso_fuel_sensor_l"])
+        self.assertIn("au relevé final", r["conso_fuel_sensor_motif"])
+        self.assertIsNone(_fuel_sensor_conso({}, d0, date(2026, 10, 4))["conso_fuel_sensor_l"])
 
 
 class SyncDailyFactsPerimeterTests(TestCase):

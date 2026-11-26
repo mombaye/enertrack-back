@@ -517,6 +517,14 @@ def _power_medians(rows, lines, kinds: dict, kva: dict) -> dict:
         d0, d1 = span.get(sid, (None, None))
         if d0 and d0 < f["date"] <= d1:
             facts.setdefault(sid, {})[f["date"]] = f   # plusieurs DATA_ID pour un site : dernier lu (rare)
+    # Niveau de cuve FMS de fin de journée, relevé initial INCLUS (conso fuel sensor par le niveau)
+    levels: dict = {}
+    for sid, d, lvl in (F.objects.filter(site_id__in=list(span), date__gte=lo, date__lte=hi, fms_level_l__isnull=False)
+                        .values_list("site_id", "date", "fms_level_l")):
+        s_ = sid.upper()
+        d0, d1 = span.get(s_, (None, None))
+        if d0 and d0 <= d <= d1:
+            levels.setdefault(s_, {})[d] = lvl
     out = {}
     for sid, (d0, d1) in span.items():
         fx = facts.get(sid) or {}
@@ -554,24 +562,46 @@ def _power_medians(rows, lines, kinds: dict, kva: dict) -> dict:
                     "p_ge_min_kw": round(min(ge_days), 2) if ge_days else None, "p_ge_max_kw": round(max(ge_days), 2) if ge_days else None,
                     "p_load_dc_kw": round(median(load), 2) if load else None, "p_load_dc_jours": len(load),
                     "p_load_dc_motif": None if load else "aucune donnée AVERAGE_LOAD (load DC) sur la période",
-                    **bp, **_fuel_sensor_conso(fx.values(), (d1 - d0).days)}
+                    **bp, **_fuel_sensor_conso(levels.get(sid) or {}, d0, d1)}
     return out
 
 
-def _fuel_sensor_conso(facts, nb_jours: int) -> dict:
-    """Conso Snowflake (fuel sensor) sur la période : somme des consommations mesurées du jour (VW_FUEL_REPORT, filtre strict
-    QUALITY_STATUS = 'OK', VALID_POINT_COUNT ≥ 2 ; jour sans baisse = 0 L mesuré, jour non mesurable = NULL, non compté).
-    Aucun jour mesurable → null avec la raison (jamais 0). Jours manquants → réserve (somme partielle)."""
-    vals = [float(f["measured_conso_l"]) for f in facts if f.get("measured_conso_l") is not None]
-    if not vals:
-        return {"conso_fuel_sensor_l": None, "conso_fuel_sensor_jours": 0, "conso_fuel_sensor_jours_periode": nb_jours,
-                "conso_fuel_sensor_motif": "aucun jour mesurable par le fuel sensor (VW_FUEL_REPORT) sur la période",
-                "conso_fuel_sensor_reserve": False}
-    manque = max(nb_jours - len(vals), 0)
-    return {"conso_fuel_sensor_l": round(sum(vals), 2), "conso_fuel_sensor_jours": len(vals),
-            "conso_fuel_sensor_jours_periode": nb_jours,
-            "conso_fuel_sensor_motif": f"{manque} jour(s) sur {nb_jours} sans mesure fuel sensor : somme partielle" if manque else None,
-            "conso_fuel_sensor_reserve": bool(manque)}
+# Conso fuel sensor par le niveau de cuve (validée par le Fuel Manager le 26/11/2026) : les drapeaux DROP_DETECTED /
+# REFILL_DETECTED de VW_FUEL_REPORT ne se déclenchent presque jamais (vérifié en lecture seule sur octobre 2026 : BKL_0675,
+# niveau 580 → 292 L sans aucune baisse détectée). Hausse d'au moins 50 L d'un jour à l'autre = remplissage ; en dessous = bruit.
+SEUIL_REMPLISSAGE_CAPTEUR_L = 50.0
+
+
+def _fuel_sensor_conso(levels: dict, d0, d1) -> dict:
+    """Consommation Snowflake fuel sensor sur la période, à partir du niveau de cuve de fin de journée (LAST_VALID_LEVEL,
+    faits journaliers en base) : niveau au relevé initial − niveau au relevé final + remplissages vus par le capteur
+    (hausse ≥ 50 L entre deux jours relevés consécutifs). Niveau absent à l'une des deux dates → null avec la raison
+    (jamais 0) ; jours sans niveau entre les deux → réserve (un remplissage peut ne pas avoir été vu)."""
+    nb_jours = (d1 - d0).days if d0 and d1 else 0
+    base = {"conso_fuel_sensor_jours_periode": nb_jours, "conso_fuel_sensor_niveau_debut_l": None, "conso_fuel_sensor_niveau_fin_l": None,
+            "conso_fuel_sensor_remplissages": 0, "conso_fuel_sensor_remplissages_l": None}
+    serie = sorted((d, float(v)) for d, v in (levels or {}).items() if v is not None and d0 <= d <= d1) if d0 and d1 else []
+    l0 = next((v for d, v in serie if d == d0), None)
+    l1 = next((v for d, v in serie if d == d1), None)
+    jours = sum(1 for d, _ in serie if d > d0)
+    if l0 is None or l1 is None:
+        manque = " et ".join(x for x, v in (("au relevé initial", l0), ("au relevé final", l1)) if v is None)
+        return {**base, "conso_fuel_sensor_l": None, "conso_fuel_sensor_jours": jours, "conso_fuel_sensor_reserve": False,
+                "conso_fuel_sensor_niveau_debut_l": l0, "conso_fuel_sensor_niveau_fin_l": l1,
+                "conso_fuel_sensor_motif": f"niveau de cuve FMS absent {manque} (VW_FUEL_REPORT)"}
+    sauts = [b - a for (_, a), (_, b) in zip(serie, serie[1:]) if b - a >= SEUIL_REMPLISSAGE_CAPTEUR_L]
+    rempli = sum(sauts)
+    conso = round(l0 - l1 + rempli, 2)
+    manque = max(nb_jours - jours, 0)
+    motifs = []
+    if manque:
+        motifs.append(f"{manque} jour(s) sur {nb_jours} sans niveau FMS : un remplissage a pu ne pas être vu")
+    if conso < 0:
+        motifs.append("niveau final au-dessus du niveau initial sans remplissage ≥ 50 L vu par le capteur : à vérifier")
+    return {**base, "conso_fuel_sensor_l": conso, "conso_fuel_sensor_jours": jours, "conso_fuel_sensor_reserve": bool(motifs),
+            "conso_fuel_sensor_motif": " ; ".join(motifs) or None, "conso_fuel_sensor_niveau_debut_l": round(l0, 2),
+            "conso_fuel_sensor_niveau_fin_l": round(l1, 2), "conso_fuel_sensor_remplissages": len(sauts),
+            "conso_fuel_sensor_remplissages_l": round(rempli, 2) if sauts else 0.0}
 
 
 # Sélection de la puissance retenue et consommation théorique (bloc ESTIMATION)
@@ -935,7 +965,9 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
                                                                    "p_batt_motif", "p_batt_reserve",
                                                                    "conso_fuel_sensor_l", "conso_fuel_sensor_jours",
                                                                    "conso_fuel_sensor_jours_periode", "conso_fuel_sensor_motif",
-                                                                   "conso_fuel_sensor_reserve")})
+                                                                   "conso_fuel_sensor_reserve", "conso_fuel_sensor_niveau_debut_l",
+                                                                   "conso_fuel_sensor_niveau_fin_l", "conso_fuel_sensor_remplissages",
+                                                                   "conso_fuel_sensor_remplissages_l")})
         # Bloc « DONNÉES DE STOCK FINAL », à la Date de Relevé Finale de la ligne du fichier (seule date retenue ; absente → n.d.)
         line = (lines.get(r["site_id"]) or {}).get("fin") or {}
         df = _day((line.get("periode") or [None, None])[1])   # Date de Relevé Finale du fichier (absente → n.d.)
