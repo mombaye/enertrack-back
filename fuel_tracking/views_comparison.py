@@ -185,7 +185,7 @@ def _cached_totals(d_from, d_to, p, rows):
     params = {k: v for k, v in (p.dict() if hasattr(p, "dict") else dict(p)).items() if k not in ("page", "page_size")}
     base = FuelImportBatch.objects.filter(source_type="BASE_GE").order_by("-received_at").values_list("pk", flat=True).first()
     raw = json.dumps([str(d_from), str(d_to), sorted(params.items()), _data_version(), base, (G.cached() or {}).get("lu_le")], default=str)
-    key = "fuel-conso-totaux-v3:" + hashlib.sha1(raw.encode()).hexdigest()
+    key = "fuel-conso-totaux-v4:" + hashlib.sha1(raw.encode()).hexdigest()
     try:
         hit = cache.get(key)
     except Exception:  # noqa: BLE001
@@ -224,7 +224,7 @@ def _cached_index(d_from, d_to, p, rows):
     params = {k: v for k, v in (p.dict() if hasattr(p, "dict") else dict(p)).items() if k not in ("page", "page_size", CF.PARAM, "colonne")}
     base = FuelImportBatch.objects.filter(source_type="BASE_GE").order_by("-received_at").values_list("pk", flat=True).first()
     raw = json.dumps([str(d_from), str(d_to), sorted(params.items()), _data_version(), base, (G.cached() or {}).get("lu_le")], default=str)
-    key = "fuel-conso-colonnes-v2:" + hashlib.sha1(raw.encode()).hexdigest()
+    key = "fuel-conso-colonnes-v3:" + hashlib.sha1(raw.encode()).hexdigest()
     try:
         hit = cache.get(key)
     except Exception:  # noqa: BLE001
@@ -271,7 +271,7 @@ def _cached_build(d_from, d_to, p):
 
     params = {k: v for k, v in (p.dict() if hasattr(p, "dict") else dict(p)).items() if k not in ("page", "page_size", CF.PARAM, "colonne")}
     raw = json.dumps([str(d_from), str(d_to), sorted(params.items()), _data_version()], default=str)
-    key = "fuel-conso-build-v2:" + hashlib.sha1(raw.encode()).hexdigest()
+    key = "fuel-conso-build-v3:" + hashlib.sha1(raw.encode()).hexdigest()
     data = cache.get(key)
     if data is None:
         data = C.build(d_from, d_to, params)

@@ -655,6 +655,45 @@ def retained_estimation(e: dict) -> dict:
     return {"conso_retenue_l": v, "conso_retenue_source": RETENUE_SRC_CPH, "conso_retenue_motif": None}
 
 
+# Bloc « ANALYSE VARIATION DE STOCK Vs ESTIMATION THÉORIQUE » (décision du 26/11/2026, règles retrouvées sur les 3 408 lignes
+# du fichier Output App Fuel d'Ops d'octobre 2026) ; seuil « Grande différence » : |DELTA| > 100 L (Ops : 51 « Oui » ≥ 102 L,
+# 350 « Non » ≤ 99 L, aucune ligne à 100 L).
+SEUIL_GRANDE_DIFFERENCE_L = 100.0
+
+
+def stock_vs_theoretical(r: dict) -> dict:
+    """Ligne enrichie → bloc « analyse_variation » :
+      - conso_theorique_retenue_l : Estimation Conso Fuel Théorique retenue (bloc ESTIMATION) ;
+      - variation_l : stock initial retenu + EYDON + CARTE TOTAL + Ajout − Retrait − Volé − Vidangé / Fuite − stock final retenu,
+        seulement si les deux stocks retenus existent et que les mouvements ENOC ont été lus (même règle que la synthèse) ;
+        négative conservée ;
+      - delta_l = conso théorique retenue − variation de stock ;
+      - grande_difference : « Oui » si |DELTA| > 100 L, « Non » sinon.
+    Une valeur absente reste null (jamais 0), avec sa raison."""
+    f = lambda v: None if v is None else float(v)  # noqa: E731
+    e = r.get("estimation_theorique") or {}
+    rv = r.get("ravitaillement") or {}
+    ini, fin = f((r.get("stock_initial_sources") or {}).get("retenue_l")), f((r.get("stock_final_sources") or {}).get("retenue_l"))
+    theo = f(e.get("conso_retenue_l"))
+    theo_motif = None if theo is not None else (e.get("conso_retenue_motif") or "Consommation théorique n.d.")
+    if ini is None or fin is None:
+        var, var_motif = None, " et ".join(m for m, v in (("stock initial retenu n.d.", ini), ("stock final retenu n.d.", fin)) if v is None)
+    elif rv.get("source") != "ENOC":
+        var, var_motif = None, "mouvements ENOC non lus (dates de relevé absentes du fichier)"
+    else:
+        var = ini + sum(f(rv.get(k)) or 0 for k in ("eydon_l", "carte_total_l", "ajout_l")) \
+            - sum(f(rv.get(k)) or 0 for k in ("retrait_l", "vole_l", "fuite_l")) - fin
+        var, var_motif = round(var, 3), None
+    if theo is None or var is None:
+        delta, grand = None, None
+        motif = " ; ".join(m for m in (theo_motif and f"Conso théorique : {theo_motif}", var_motif and f"Variation de stock : {var_motif}") if m)
+    else:
+        delta = round(theo - var, 3)
+        grand, motif = ("Oui" if abs(delta) > SEUIL_GRANDE_DIFFERENCE_L else "Non"), None
+    return {"conso_theorique_retenue_l": theo, "conso_theorique_motif": theo_motif, "variation_l": var, "variation_motif": var_motif,
+            "delta_l": delta, "grande_difference": grand, "motif": motif, "seuil_l": SEUIL_GRANDE_DIFFERENCE_L}
+
+
 BATT_SRC_DAY, BATT_SRC_PERIOD = "BATTERY_CHARGE_MEDIAN_DAY", "BATTERY_CHARGE_MEDIAN_PERIOD"
 BATT_SRC_NO_TELEMETRY, BATT_SRC_NO_CHARGE = "BATTERY_CHARGE_TELEMETRY_UNAVAILABLE", "NO_BATTERY_CHARGING_MEASURED"
 BATT_SRC_NONE = "BATTERY_CHARGE_POWER_UNAVAILABLE"
@@ -878,6 +917,7 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
                                                      "Alarme day_rectifier_on FMS"))
         e.update(theoretical_conso(e))
         e.update(retained_estimation(e))
+        r["analyse_variation"] = stock_vs_theoretical(r)
     return err
 
 
@@ -896,9 +936,12 @@ TOTAL_FIELDS = {
     "estimation_theorique": ("prp_kva", "prp_kw", "tm_dg_on_h", "tm_rectifier_h", "tm_terrain_h", "tm_index_fms_h", "tm_retenu_h",
                              "p_rect_kw", "p_ge_kw", "p_grid_kw", "p_load_dc_kw", "p_batt_kw", "p_retenue_kw",
                              "conso_theorique_l", "conso_fuel_sensor_l", "conso_retenue_l"),
+    "analyse_variation": ("conso_theorique_retenue_l", "variation_l", "delta_l"),
 }
 # Colonnes texte : « total » = nombre de sites renseignés (case vide / « n.d. » non comptée)
 TOTAL_COUNTS = {"estimation_theorique": ("fabricant_ge", "type_ge", "source_ge", "tm_source", "p_retenue_source")}
+# Colonnes Oui / Non : « total » = nombre de « Oui », `sites` = nombre de sites avec Oui ou Non
+TOTAL_OUI = {"analyse_variation": ("grande_difference",)}
 
 
 def enriched_copy(rows: list[dict]) -> list[dict]:
@@ -931,4 +974,9 @@ def totals(rows: list[dict], enriched: bool = False) -> dict:
         for champ in champs:
             n = sum(1 for r in rows if str((r.get(bloc) or {}).get(champ) or "").strip())
             out.setdefault(bloc, {})[champ] = {"total": n, "sites": n, "comptage": True}
+    for bloc, champs in TOTAL_OUI.items():
+        for champ in champs:
+            vals = [(r.get(bloc) or {}).get(champ) for r in rows]
+            out.setdefault(bloc, {})[champ] = {"total": sum(1 for v in vals if v == "Oui"), "sites": sum(1 for v in vals if v in ("Oui", "Non")),
+                                               "oui": True}
     return out

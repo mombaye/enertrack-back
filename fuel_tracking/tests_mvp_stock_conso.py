@@ -2442,3 +2442,77 @@ class ColumnFiltersTests(SimpleTestCase):
         rows = [{"ge": {"type": "K22"}}, {"ge": {"type": None}}]
         self.assertEqual(C._filter(rows, {"avec_ge": "oui"}), [rows[0]])
         self.assertEqual(C._filter(rows, {"avec_ge": "non"}), [rows[1]])
+
+
+class StockVsTheoreticalTests(MvpBase):
+    """Bloc « ANALYSE VARIATION DE STOCK Vs ESTIMATION THÉORIQUE » : règles du fichier Output App Fuel d'Ops (octobre 2026)."""
+
+    @staticmethod
+    def row(theo=1848.47, ini=1000.0, fin=400.0, src="ENOC", **rav):
+        rv = {"source": src, **dict.fromkeys(("eydon_l", "carte_total_l", "ajout_l", "retrait_l", "vole_l", "fuite_l"), 0.0), **rav}
+        return {"site_id": "S_1", "stock_initial_sources": {"retenue_l": ini}, "stock_final_sources": {"retenue_l": fin},
+                "ravitaillement": rv, "estimation_theorique": {"conso_retenue_l": theo, "conso_retenue_motif": None if theo is not None else "Puissance retenue n.d."}}
+
+    def test_variation_delta_and_flag(self):
+        from fuel_tracking.services.stock_initial_sources import stock_vs_theoretical as A
+
+        a = A(self.row(theo=1000.0, eydon_l=600.0, carte_total_l=100.0, ajout_l=50.0, retrait_l=20.0, vole_l=10.0, fuite_l=5.0))
+        self.assertEqual(a["variation_l"], 1000 + 600 + 100 + 50 - 20 - 10 - 5 - 400)   # 1 315 L
+        self.assertEqual(a["delta_l"], 1000 - 1315)
+        self.assertEqual(a["grande_difference"], "Oui")                                    # |−315| > 100
+
+    def test_threshold_strictly_above_100(self):
+        from fuel_tracking.services.stock_initial_sources import stock_vs_theoretical as A
+
+        self.assertEqual(A(self.row(theo=700.0))["delta_l"], 100.0)                 # variation 600 L → DELTA 100 L
+        self.assertEqual(A(self.row(theo=700.0))["grande_difference"], "Non")      # 100 L pile : pas au-dessus du seuil
+        self.assertEqual(A(self.row(theo=700.5))["grande_difference"], "Oui")
+        self.assertEqual(A(self.row(theo=499.0))["grande_difference"], "Oui")      # DELTA −101 : écart dans l'autre sens
+        self.assertEqual(A(self.row(theo=550.0))["grande_difference"], "Non")
+
+    def test_missing_values_stay_null(self):
+        from fuel_tracking.services.stock_initial_sources import stock_vs_theoretical as A
+
+        a = A(self.row(theo=None))
+        self.assertEqual((a["conso_theorique_retenue_l"], a["delta_l"], a["grande_difference"]), (None, None, None))
+        self.assertEqual(a["variation_l"], 600.0)                                          # la variation reste calculée
+        self.assertIn("Puissance retenue n.d.", a["motif"])
+        a = A(self.row(fin=None))
+        self.assertEqual((a["variation_l"], a["delta_l"], a["grande_difference"]), (None, None, None))
+        self.assertIn("stock final retenu n.d.", a["variation_motif"])
+        a = A(self.row(src=None))
+        self.assertIsNone(a["variation_l"])
+        self.assertIn("ENOC", a["variation_motif"])
+        a = A(self.row(theo=0.0, ini=0.0, fin=0.0))                                        # 0 reste 0
+        self.assertEqual((a["variation_l"], a["delta_l"], a["grande_difference"]), (0.0, 0.0, "Non"))
+
+    def test_negative_variation_kept(self):
+        from fuel_tracking.services.stock_initial_sources import stock_vs_theoretical as A
+
+        a = A(self.row(theo=50.0, ini=100.0, fin=300.0))
+        self.assertEqual((a["variation_l"], a["delta_l"], a["grande_difference"]), (-200.0, 250.0, "Oui"))
+
+    def test_totals_count_oui(self):
+        from unittest import mock
+
+        from fuel_tracking.services import stock_initial_sources as S
+
+        def fake_enrich(rows, fetch=True):
+            for r, (v, d, g) in zip(rows, [(600.0, 150.0, "Oui"), (300.0, -20.0, "Non"), (None, None, None)]):
+                r["analyse_variation"] = {"variation_l": v, "delta_l": d, "grande_difference": g, "conso_theorique_retenue_l": None}
+
+        rows = [{"site_id": f"S_{i}", "stock": {}} for i in range(3)]
+        with mock.patch.object(S, "enrich", side_effect=fake_enrich):
+            t = S.totals(rows)
+        self.assertEqual(t["analyse_variation"]["variation_l"], {"total": 900.0, "sites": 2})
+        self.assertEqual(t["analyse_variation"]["delta_l"], {"total": 130.0, "sites": 2})
+        self.assertEqual(t["analyse_variation"]["conso_theorique_retenue_l"], {"total": None, "sites": 0})
+        self.assertEqual(t["analyse_variation"]["grande_difference"], {"total": 1, "sites": 2, "oui": True})
+
+    def test_filter_keys(self):
+        from fuel_tracking.services import conso_column_filters as CF
+
+        r = {"site_id": "S_1", "analyse_variation": {"grande_difference": "Oui", "delta_l": 150.25, "variation_l": None}}
+        idx = CF.index([r])["S_1"]
+        self.assertEqual((idx["analyse_variation.grande_difference"], idx["analyse_variation.delta_l"], idx["analyse_variation.variation_l"]),
+                         ("Oui", "150.25", ""))
