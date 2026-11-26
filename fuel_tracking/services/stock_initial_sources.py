@@ -698,7 +698,7 @@ def stock_vs_theoretical(r: dict) -> dict:
             - sum(f(rv.get(k)) or 0 for k in ("retrait_l", "vole_l", "fuite_l")) - fin
         var, var_motif = round(var, 3), None
     tol = round(max(ALERTE_TOLERANCE_MIN_L, ALERTE_TOLERANCE_PCT * abs(theo)), 3) if theo is not None else None
-    alerte = alerte_motif = None
+    alerte = alerte_motif = alerte_detail = None
     if theo is None or var is None:
         delta, grand = None, None
         motif = " ; ".join(m for m in (theo_motif and f"Conso théorique : {theo_motif}", var_motif and f"Variation de stock : {var_motif}") if m)
@@ -709,9 +709,18 @@ def stock_vs_theoretical(r: dict) -> dict:
         alerte = ALERTE_CONFORME if ok else ALERTE_ECART
         alerte_motif = (f"écart {abs(delta):.0f} L {'≤' if ok else '>'} tolérance {tol:.0f} L (max(50 L ; 5 % × {theo:.0f} L))"
                         + ("" if ok else " : à instruire (vol, stock terrain incorrect ou mouvement mal tracé)"))
+        fr = lambda x: f"{x:,.2f}".replace(",", " ").replace(".", ",")  # noqa: E731
+        sens = ("variation de stock égale à la conso théorique" if delta == 0 else
+                f"variation de stock {'supérieure' if delta < 0 else 'inférieure'} de {fr(abs(delta))} L à la conso théorique")
+        alerte_detail = (f"{'Conforme' if ok else 'En écart'} : variation de stock {fr(var)} L, conso théorique {fr(theo)} L — {sens} ; "
+                         f"écart {fr(abs(delta))} L {'≤' if ok else '>'} seuil {fr(tol)} L "
+                         f"({'50 L minimum' if tol == ALERTE_TOLERANCE_MIN_L else '5 % de la conso théorique'})"
+                         + ("." if ok else ". À instruire auprès des équipes opérationnelles : vol avéré, stock terrain incorrect "
+                                          "ou mouvement (livraison, ajout, retrait) mal tracé ; puis recalculer avec la donnée corrigée."))
     return {"conso_theorique_retenue_l": theo, "conso_theorique_motif": theo_motif, "variation_l": var, "variation_motif": var_motif,
             "delta_l": delta, "grande_difference": grand, "motif": motif, "seuil_l": SEUIL_GRANDE_DIFFERENCE_L,
-            "tolerance_l": tol, "alerte": alerte, "alerte_motif": alerte_motif or (motif if alerte is None else None)}
+            "tolerance_l": tol, "alerte": alerte, "alerte_motif": alerte_motif or (motif if alerte is None else None),
+            "alerte_detail": alerte_detail or (f"Non calculable : {motif}" if motif else None)}
 
 
 BATT_SRC_DAY, BATT_SRC_PERIOD = "BATTERY_CHARGE_MEDIAN_DAY", "BATTERY_CHARGE_MEDIAN_PERIOD"
