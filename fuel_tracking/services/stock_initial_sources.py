@@ -662,6 +662,10 @@ def retained_estimation(e: dict) -> dict:
 # du fichier Output App Fuel d'Ops d'octobre 2026) ; seuil « Grande différence » : |DELTA| > 100 L (Ops : 51 « Oui » ≥ 102 L,
 # 350 « Non » ≤ 99 L, aucune ligne à 100 L).
 SEUIL_GRANDE_DIFFERENCE_L = 100.0
+# Alerte App Fuel (process de validation conso fuel, novembre 2026) : site conforme si
+# |Variation de stock − Consommation théorique| ≤ max(50 L ; 5 % de la consommation théorique).
+ALERTE_TOLERANCE_MIN_L, ALERTE_TOLERANCE_PCT = 50.0, 0.05
+ALERTE_CONFORME, ALERTE_ECART = "Conforme", "En écart"
 
 
 def stock_vs_theoretical(r: dict) -> dict:
@@ -671,7 +675,8 @@ def stock_vs_theoretical(r: dict) -> dict:
         seulement si les deux stocks retenus existent et que les mouvements ENOC ont été lus (même règle que la synthèse) ;
         négative conservée ;
       - delta_l = conso théorique retenue − variation de stock ;
-      - grande_difference : « Oui » si |DELTA| > 100 L, « Non » sinon.
+      - grande_difference : « Oui » si |DELTA| > 100 L, « Non » sinon ;
+      - alerte : « Conforme » si |DELTA| ≤ max(50 L ; 5 % × conso théorique), « En écart » sinon (à instruire).
     Une valeur absente reste null (jamais 0), avec sa raison."""
     f = lambda v: None if v is None else float(v)  # noqa: E731
     e = r.get("estimation_theorique") or {}
@@ -687,14 +692,21 @@ def stock_vs_theoretical(r: dict) -> dict:
         var = ini + sum(f(rv.get(k)) or 0 for k in ("eydon_l", "carte_total_l", "ajout_l")) \
             - sum(f(rv.get(k)) or 0 for k in ("retrait_l", "vole_l", "fuite_l")) - fin
         var, var_motif = round(var, 3), None
+    tol = round(max(ALERTE_TOLERANCE_MIN_L, ALERTE_TOLERANCE_PCT * abs(theo)), 3) if theo is not None else None
+    alerte = alerte_motif = None
     if theo is None or var is None:
         delta, grand = None, None
         motif = " ; ".join(m for m in (theo_motif and f"Conso théorique : {theo_motif}", var_motif and f"Variation de stock : {var_motif}") if m)
     else:
         delta = round(theo - var, 3)
         grand, motif = ("Oui" if abs(delta) > SEUIL_GRANDE_DIFFERENCE_L else "Non"), None
+        ok = abs(delta) <= tol
+        alerte = ALERTE_CONFORME if ok else ALERTE_ECART
+        alerte_motif = (f"écart {abs(delta):.0f} L {'≤' if ok else '>'} tolérance {tol:.0f} L (max(50 L ; 5 % × {theo:.0f} L))"
+                        + ("" if ok else " : à instruire (vol, stock terrain incorrect ou mouvement mal tracé)"))
     return {"conso_theorique_retenue_l": theo, "conso_theorique_motif": theo_motif, "variation_l": var, "variation_motif": var_motif,
-            "delta_l": delta, "grande_difference": grand, "motif": motif, "seuil_l": SEUIL_GRANDE_DIFFERENCE_L}
+            "delta_l": delta, "grande_difference": grand, "motif": motif, "seuil_l": SEUIL_GRANDE_DIFFERENCE_L,
+            "tolerance_l": tol, "alerte": alerte, "alerte_motif": alerte_motif or (motif if alerte is None else None)}
 
 
 BATT_SRC_DAY, BATT_SRC_PERIOD = "BATTERY_CHARGE_MEDIAN_DAY", "BATTERY_CHARGE_MEDIAN_PERIOD"
@@ -948,8 +960,8 @@ TOTAL_FIELDS = {
 }
 # Colonnes texte : « total » = nombre de sites renseignés (case vide / « n.d. » non comptée)
 TOTAL_COUNTS = {"estimation_theorique": ("fabricant_ge", "type_ge", "source_ge", "tm_source", "p_retenue_source")}
-# Colonnes Oui / Non : « total » = nombre de « Oui », `sites` = nombre de sites avec Oui ou Non
-TOTAL_OUI = {"analyse_variation": ("grande_difference",)}
+# Colonnes à deux valeurs : « total » = nombre de sites avec la valeur signalée (1ʳᵉ), `sites` = nombre de sites renseignés
+TOTAL_OUI = {"analyse_variation": {"grande_difference": ("Oui", "Non"), "alerte": (ALERTE_ECART, ALERTE_CONFORME)}}
 
 
 def enriched_copy(rows: list[dict]) -> list[dict]:
@@ -983,8 +995,8 @@ def totals(rows: list[dict], enriched: bool = False) -> dict:
             n = sum(1 for r in rows if str((r.get(bloc) or {}).get(champ) or "").strip())
             out.setdefault(bloc, {})[champ] = {"total": n, "sites": n, "comptage": True}
     for bloc, champs in TOTAL_OUI.items():
-        for champ in champs:
+        for champ, (flag, other) in champs.items():
             vals = [(r.get(bloc) or {}).get(champ) for r in rows]
-            out.setdefault(bloc, {})[champ] = {"total": sum(1 for v in vals if v == "Oui"), "sites": sum(1 for v in vals if v in ("Oui", "Non")),
-                                               "oui": True}
+            out.setdefault(bloc, {})[champ] = {"total": sum(1 for v in vals if v == flag), "sites": sum(1 for v in vals if v in (flag, other)),
+                                               "oui": True, "valeur": flag}
     return out
