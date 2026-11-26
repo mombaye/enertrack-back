@@ -712,26 +712,34 @@ def stock_vs_theoretical(r: dict) -> dict:
         alerte = ALERTE_CONFORME if ok else ALERTE_ECART
         alerte_motif = (f"écart {abs(delta):.0f} L {'≤' if ok else '>'} tolérance {tol:.0f} L (max(50 L ; 5 % × {theo:.0f} L))"
                         + ("" if ok else " : à instruire (vol, stock terrain incorrect ou mouvement mal tracé)"))
-        fr = lambda x: f"{x:,.2f}".replace(",", " ").replace(".", ",")  # noqa: E731
-        sens = ("variation de stock égale à la conso théorique" if delta == 0 else
-                f"variation de stock {'supérieure' if delta < 0 else 'inférieure'} de {fr(abs(delta))} L à la conso théorique")
-        alerte_detail = (f"{'Conforme' if ok else 'En écart'} : variation de stock {fr(var)} L, conso théorique {fr(theo)} L — {sens} ; "
-                         f"écart {fr(abs(delta))} L {'≤' if ok else '>'} seuil {fr(tol)} L "
-                         f"({'50 L minimum' if tol == ALERTE_TOLERANCE_MIN_L else '5 % de la conso théorique'})"
-                         + ("." if ok else ". À instruire auprès des équipes opérationnelles : vol avéré, stock terrain incorrect "
-                                          "ou mouvement (livraison, ajout, retrait) mal tracé ; puis recalculer avec la donnée corrigée."))
+        # Détail en langage clair (décision du 26/11/2026) : ce qui s'est passé, la tolérance, quoi vérifier
+        tol_txt = f"tolérance {_l0(tol)}" + ("" if tol == ALERTE_TOLERANCE_MIN_L else " = 5 % de la conso théorique")
+        if ok:
+            alerte_detail = (f"Écart de {_l0(abs(delta))} entre le stock consommé ({_l0(var)}) et la conso théorique du GE "
+                             f"({_l0(theo)}) : dans la {tol_txt}. Rien à faire.")
+        elif delta < 0:
+            alerte_detail = (f"Le stock a baissé de {_l0(var)} alors que le GE aurait dû consommer {_l0(theo)} : "
+                             f"{_l0(abs(delta))} de trop ({tol_txt}). À vérifier sur site : vol, stock relevé faux "
+                             "ou mouvement mal saisi dans ENOC.")
+        else:
+            alerte_detail = (f"Le stock a baissé de {_l0(var)} alors que le GE aurait dû consommer {_l0(theo)} : "
+                             f"{_l0(abs(delta))} de moins que prévu ({tol_txt}). À vérifier sur site : stock relevé faux, "
+                             "mouvement mal saisi dans ENOC, ou site qui fonctionne anormalement.")
     if var is not None and var < 0:
-        fr = lambda x: f"{x:,.2f}".replace(",", " ").replace(".", ",")  # noqa: E731
         alerte = ALERTE_VAR_NEGATIVE
-        alerte_motif = f"variation de stock négative ({fr(var)} L) : stock ou mouvement à corriger avant comparaison"
-        alerte_detail = (f"Variation négative : variation de stock {fr(var)} L — le stock final et les sorties dépassent le stock "
-                         "initial et les entrées, ce qui est impossible physiquement. À instruire auprès des équipes "
-                         "opérationnelles : livraison ou ajout non tracé dans ENOC, ou relevé de stock (initial / final) erroné ; "
-                         "la comparaison avec la conso théorique n'a pas de sens tant que la donnée n'est pas corrigée.")
+        alerte_motif = f"variation de stock négative ({_l0(var)}) : stock ou mouvement à corriger avant comparaison"
+        alerte_detail = (f"Le stock a augmenté de {_l0(abs(var))} de plus que les livraisons enregistrées : c'est impossible. "
+                         "Une livraison ou un ajout manque dans ENOC, ou un relevé de stock (début ou fin) est faux. "
+                         "À corriger avant de comparer avec la conso théorique.")
     return {"conso_theorique_retenue_l": theo, "conso_theorique_motif": theo_motif, "variation_l": var, "variation_motif": var_motif,
             "delta_l": delta, "grande_difference": grand, "motif": motif, "seuil_l": SEUIL_GRANDE_DIFFERENCE_L,
             "tolerance_l": tol, "alerte": alerte, "alerte_motif": alerte_motif or (motif if alerte is None else None),
-            "alerte_detail": alerte_detail or (f"Non calculable : {motif}" if motif else None)}
+            "alerte_detail": alerte_detail or (f"Calcul impossible : {motif}." if motif else None)}
+
+
+def _l0(v: float) -> str:
+    """Litres arrondis à l'unité, séparateur de milliers français : 1234.6 → « 1 235 L »."""
+    return f"{round(v):,} L".replace(",", " ")
 
 
 BATT_SRC_DAY, BATT_SRC_PERIOD = "BATTERY_CHARGE_MEDIAN_DAY", "BATTERY_CHARGE_MEDIAN_PERIOD"

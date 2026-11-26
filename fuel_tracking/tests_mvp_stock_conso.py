@@ -2515,7 +2515,9 @@ class StockVsTheoreticalTests(MvpBase):
         a = A(self.row(theo=50.0, ini=100.0, fin=300.0))
         self.assertEqual((a["variation_l"], a["delta_l"], a["grande_difference"]), (-200.0, 250.0, "Oui"))
         self.assertEqual(a["alerte"], "Variation négative")                               # alerte à part, prioritaire
-        self.assertIn("impossible physiquement", a["alerte_detail"])
+        self.assertEqual(a["alerte_detail"], "Le stock a augmenté de 200 L de plus que les livraisons enregistrées : c'est impossible. "
+                         "Une livraison ou un ajout manque dans ENOC, ou un relevé de stock (début ou fin) est faux. "
+                         "À corriger avant de comparer avec la conso théorique.")
         self.assertEqual(A(self.row(theo=30.0, ini=100.0, fin=104.0))["alerte"], "Variation négative")   # même petite (−4 L)
         a = A(self.row(theo=None, ini=100.0, fin=270.0))                                  # sans conso théorique : alertée quand même
         self.assertEqual((a["alerte"], a["delta_l"]), ("Variation négative", None))
@@ -2559,17 +2561,19 @@ class AlerteAppFuelTests(MvpBase):
         a = A(self.row(theo=620.0, ini=1300.0, fin=400.0))           # variation 900 L : écart 280 L pour 50 L tolérés
         self.assertEqual(a["alerte"], "En écart")
         self.assertIn("280 L > tolérance 50 L", a["alerte_motif"])
-        self.assertIn("variation de stock supérieure de 280,00 L à la conso théorique", a["alerte_detail"])
-        self.assertIn("seuil 50,00 L (50 L minimum)", a["alerte_detail"])
-        self.assertIn("À instruire", a["alerte_detail"])
+        self.assertEqual(a["alerte_detail"], "Le stock a baissé de 900 L alors que le GE aurait dû consommer 620 L : 280 L de trop "
+                         "(tolérance 50 L). À vérifier sur site : vol, stock relevé faux ou mouvement mal saisi dans ENOC.")
+        a = A(self.row(theo=620.0, ini=1000.0, fin=400.0))
+        self.assertEqual(a["alerte_detail"], "Écart de 20 L entre le stock consommé (600 L) et la conso théorique du GE (620 L) : "
+                         "dans la tolérance 50 L. Rien à faire.")
 
     def test_tolerance_5_pct_and_limits(self):
         from fuel_tracking.services.stock_initial_sources import stock_vs_theoretical as A
 
         a = A(self.row(theo=2000.0, ini=1500.0, fin=400.0))          # variation 1 100 L, écart 900 L, tolérance 100 L
         self.assertEqual((a["tolerance_l"], a["alerte"]), (100.0, "En écart"))
-        self.assertIn("(5 % de la conso théorique)", a["alerte_detail"])
-        self.assertIn("inférieure de 900,00 L", a["alerte_detail"])
+        self.assertIn("900 L de moins que prévu (tolérance 100 L = 5 % de la conso théorique)", a["alerte_detail"])
+        self.assertIn("site qui fonctionne anormalement", a["alerte_detail"])
         self.assertEqual(A(self.row(theo=2000.0, ini=2500.0, fin=400.0))["alerte"], "Conforme")   # écart 100 L = tolérance
         self.assertEqual(A(self.row(theo=2000.0, ini=2501.0, fin=400.0))["alerte"], "En écart")   # écart 101 L
         self.assertEqual(A(self.row(theo=0.0, ini=50.0, fin=0.0))["alerte"], "Conforme")          # 0 L théorique : 50 L tolérés
@@ -2583,7 +2587,7 @@ class AlerteAppFuelTests(MvpBase):
         a = A(self.row(fin=None))
         self.assertIsNone(a["alerte"])
         self.assertIn("stock final retenu n.d.", a["alerte_motif"])
-        self.assertTrue(a["alerte_detail"].startswith("Non calculable : "))
+        self.assertTrue(a["alerte_detail"].startswith("Calcul impossible : "))
 
     def test_totals_count_ecart(self):
         from unittest import mock
