@@ -671,6 +671,9 @@ SEUIL_GRANDE_DIFFERENCE_L = 100.0
 # |Variation de stock − Consommation théorique| ≤ max(50 L ; 5 % de la consommation théorique).
 ALERTE_TOLERANCE_MIN_L, ALERTE_TOLERANCE_PCT = 50.0, 0.05
 ALERTE_CONFORME, ALERTE_ECART = "Conforme", "En écart"
+# Variation de stock négative (décision du 26/11/2026) : alerte à part, prioritaire, même sans conso théorique — physiquement
+# impossible (plus de carburant à la fin que début + entrées) : donnée de stock ou mouvement à corriger avant toute comparaison.
+ALERTE_VAR_NEGATIVE = "Variation négative"
 
 
 def stock_vs_theoretical(r: dict) -> dict:
@@ -717,6 +720,14 @@ def stock_vs_theoretical(r: dict) -> dict:
                          f"({'50 L minimum' if tol == ALERTE_TOLERANCE_MIN_L else '5 % de la conso théorique'})"
                          + ("." if ok else ". À instruire auprès des équipes opérationnelles : vol avéré, stock terrain incorrect "
                                           "ou mouvement (livraison, ajout, retrait) mal tracé ; puis recalculer avec la donnée corrigée."))
+    if var is not None and var < 0:
+        fr = lambda x: f"{x:,.2f}".replace(",", " ").replace(".", ",")  # noqa: E731
+        alerte = ALERTE_VAR_NEGATIVE
+        alerte_motif = f"variation de stock négative ({fr(var)} L) : stock ou mouvement à corriger avant comparaison"
+        alerte_detail = (f"Variation négative : variation de stock {fr(var)} L — le stock final et les sorties dépassent le stock "
+                         "initial et les entrées, ce qui est impossible physiquement. À instruire auprès des équipes "
+                         "opérationnelles : livraison ou ajout non tracé dans ENOC, ou relevé de stock (initial / final) erroné ; "
+                         "la comparaison avec la conso théorique n'a pas de sens tant que la donnée n'est pas corrigée.")
     return {"conso_theorique_retenue_l": theo, "conso_theorique_motif": theo_motif, "variation_l": var, "variation_motif": var_motif,
             "delta_l": delta, "grande_difference": grand, "motif": motif, "seuil_l": SEUIL_GRANDE_DIFFERENCE_L,
             "tolerance_l": tol, "alerte": alerte, "alerte_motif": alerte_motif or (motif if alerte is None else None),
@@ -1013,7 +1024,8 @@ TOTAL_FIELDS = {
 # Colonnes texte : « total » = nombre de sites renseignés (case vide / « n.d. » non comptée)
 TOTAL_COUNTS = {"estimation_theorique": ("fabricant_ge", "type_ge", "source_ge", "tm_source", "p_retenue_source")}
 # Colonnes à deux valeurs : « total » = nombre de sites avec la valeur signalée (1ʳᵉ), `sites` = nombre de sites renseignés
-TOTAL_OUI = {"analyse_variation": {"grande_difference": ("Oui", "Non"), "alerte": (ALERTE_ECART, ALERTE_CONFORME)}}
+TOTAL_OUI = {"analyse_variation": {"grande_difference": ("Oui", "Non"),
+                                   "alerte": (ALERTE_ECART, ALERTE_CONFORME, ALERTE_VAR_NEGATIVE)}}
 
 
 def enriched_copy(rows: list[dict]) -> list[dict]:
@@ -1047,8 +1059,10 @@ def totals(rows: list[dict], enriched: bool = False) -> dict:
             n = sum(1 for r in rows if str((r.get(bloc) or {}).get(champ) or "").strip())
             out.setdefault(bloc, {})[champ] = {"total": n, "sites": n, "comptage": True}
     for bloc, champs in TOTAL_OUI.items():
-        for champ, (flag, other) in champs.items():
+        for champ, (flag, *others) in champs.items():
             vals = [(r.get(bloc) or {}).get(champ) for r in rows]
-            out.setdefault(bloc, {})[champ] = {"total": sum(1 for v in vals if v == flag), "sites": sum(1 for v in vals if v in (flag, other)),
+            out.setdefault(bloc, {})[champ] = {"total": sum(1 for v in vals if v == flag), "sites": sum(1 for v in vals if v in (flag, *others)),
                                                "oui": True, "valeur": flag}
+            if len(others) > 1:   # valeurs signalées en plus (ex. « Variation négative »)
+                out[bloc][champ]["autres"] = {o: sum(1 for v in vals if v == o) for o in others[1:]}
     return out

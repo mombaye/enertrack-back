@@ -2514,6 +2514,11 @@ class StockVsTheoreticalTests(MvpBase):
 
         a = A(self.row(theo=50.0, ini=100.0, fin=300.0))
         self.assertEqual((a["variation_l"], a["delta_l"], a["grande_difference"]), (-200.0, 250.0, "Oui"))
+        self.assertEqual(a["alerte"], "Variation négative")                               # alerte à part, prioritaire
+        self.assertIn("impossible physiquement", a["alerte_detail"])
+        self.assertEqual(A(self.row(theo=30.0, ini=100.0, fin=104.0))["alerte"], "Variation négative")   # même petite (−4 L)
+        a = A(self.row(theo=None, ini=100.0, fin=270.0))                                  # sans conso théorique : alertée quand même
+        self.assertEqual((a["alerte"], a["delta_l"]), ("Variation négative", None))
 
     def test_totals_count_oui(self):
         from unittest import mock
@@ -2586,13 +2591,14 @@ class AlerteAppFuelTests(MvpBase):
         from fuel_tracking.services import stock_initial_sources as S
 
         def fake_enrich(rows, fetch=True):
-            for r, v in zip(rows, ["En écart", "Conforme", None, "En écart"]):
+            for r, v in zip(rows, ["En écart", "Conforme", None, "En écart", "Variation négative"]):
                 r["analyse_variation"] = {"alerte": v}
 
-        rows = [{"site_id": f"S_{i}", "stock": {}} for i in range(4)]
+        rows = [{"site_id": f"S_{i}", "stock": {}} for i in range(5)]
         with mock.patch.object(S, "enrich", side_effect=fake_enrich):
             t = S.totals(rows)
-        self.assertEqual(t["analyse_variation"]["alerte"], {"total": 2, "sites": 3, "oui": True, "valeur": "En écart"})
+        self.assertEqual(t["analyse_variation"]["alerte"], {"total": 2, "sites": 4, "oui": True, "valeur": "En écart",
+                                                            "autres": {"Variation négative": 1}})
 
 
 class RuntimeVisibilityTests(MvpBase):
