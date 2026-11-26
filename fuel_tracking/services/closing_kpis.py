@@ -457,6 +457,53 @@ def table_kpis(rows: list[dict], d_from: date, d_to: date) -> dict:
     return out
 
 
+# Synthèse « ANALYSE VARIATION DE STOCK Vs ESTIMATION THÉORIQUE » (décision du 26/11/2026) : groupes de sites exclusifs, dans
+# cet ordre (un site n'est compté qu'une fois) : certifiés (Alerte App Fuel = Conforme), en alerte (En écart ou Variation
+# négative), sans conso théorique estimée, puis non calculables (conso théorique présente, variation de stock n.d.).
+ANALYSE_GROUPES = (
+    ("certifies", "Sites certifiés (Alerte App Fuel = Conforme)"),
+    ("alerte", "Sites en alerte (En écart ou Variation négative)"),
+    ("sans_theorique", "Sites sans conso théorique estimée"),
+    ("non_calculables", "Sites sans variation de stock calculable"),
+)
+
+
+def analyse_synthese(rows: list[dict]) -> dict:
+    """Lignes ENRICHIES (bloc analyse_variation) → {"groupes": [...], "total": {...}} : pour chaque groupe, nombre de sites et
+    Σ conso théorique, Σ variation de stock, Σ DELTA (seulement les sites qui ont la valeur ; aucune valeur → null, jamais 0)."""
+    def groupe(a: dict) -> str:
+        if a.get("alerte") == "Conforme":
+            return "certifies"
+        if a.get("alerte") in ("En écart", "Variation négative"):
+            return "alerte"
+        if a.get("conso_theorique_retenue_l") is None:
+            return "sans_theorique"
+        return "non_calculables"
+
+    def somme(items, k):
+        vals = [float(a[k]) for a in items if a.get(k) is not None]
+        return (round(sum(vals), 1) if vals else None), len(vals)
+
+    def bloc(items):
+        (t, nt), (v, nv), (d, nd) = somme(items, "conso_theorique_retenue_l"), somme(items, "variation_l"), somme(items, "delta_l")
+        return {"sites": len(items), "conso_theorique_l": t, "sites_theorique": nt, "variation_l": v, "sites_variation": nv,
+                "delta_l": d, "sites_delta": nd}
+
+    parts = {k: [] for k, _ in ANALYSE_GROUPES}
+    for r in rows:
+        a = r.get("analyse_variation") or {}
+        parts[groupe(a)].append(a)
+    out = []
+    for k, lib in ANALYSE_GROUPES:
+        g = {"cle": k, "libelle": lib, **bloc(parts[k])}
+        if k == "alerte":
+            g["dont"] = {"En écart": sum(1 for a in parts[k] if a.get("alerte") == "En écart"),
+                         "Variation négative": sum(1 for a in parts[k] if a.get("alerte") == "Variation négative"),
+                         "sans conso théorique": sum(1 for a in parts[k] if a.get("conso_theorique_retenue_l") is None)}
+        out.append(g)
+    return {"groupes": out, "total": {"libelle": "Tous les sites du tableau", **bloc([r.get("analyse_variation") or {} for r in rows])}}
+
+
 def backfill_file_kpis() -> int:
     """Closing importés avant le 17/11/2026 : relit la copie d'archive pour enregistrer le bloc de KPI de l'en-tête."""
     from pathlib import Path

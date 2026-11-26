@@ -58,8 +58,11 @@ class ConsommationsView(APIView):
         data["page"], data["page_size"] = page, size
         data["totaux"], synth = _cached_totals(d_from, d_to, p, rows)   # ligne de totaux : tous les sites du filtre
         if synth:   # synthèse du mois = totaux du tableau (décision du 25/11/2026)
+            synth = dict(synth)
+            analyse = synth.pop("_analyse", None)   # synthèse de l'analyse variation de stock Vs estimation théorique
             prev = data.get("kpis_closing") or {"mois": d_from.strftime("%Y-%m"), "debut": d_from.isoformat(), "fin": d_to.isoformat()}
-            data["kpis_closing"] = {**prev, "source": "TABLEAU_SUIVI_CONSO", "fichier": None, "kpis": {**(prev.get("kpis") or {}), **synth}}
+            data["kpis_closing"] = {**prev, "source": "TABLEAU_SUIVI_CONSO", "fichier": None, "kpis": {**(prev.get("kpis") or {}), **synth},
+                                    "analyse": analyse}
         data["rows"] = rows[(page - 1) * size: page * size]
         # Blocs « INVENTAIRE », « DONNÉES DE STOCK INITIAL » et « RAVITAILLEMENT » pour la page affichée seulement.
         # Les valeurs Snowflake / ENOC déjà en cache s'affichent tout de suite ; celles qui manquent sont lues EN TÂCHE DE FOND
@@ -185,7 +188,7 @@ def _cached_totals(d_from, d_to, p, rows):
     params = {k: v for k, v in (p.dict() if hasattr(p, "dict") else dict(p)).items() if k not in ("page", "page_size")}
     base = FuelImportBatch.objects.filter(source_type="BASE_GE").order_by("-received_at").values_list("pk", flat=True).first()
     raw = json.dumps([str(d_from), str(d_to), sorted(params.items()), _data_version(), base, (G.cached() or {}).get("lu_le")], default=str)
-    key = "fuel-conso-totaux-v7:" + hashlib.sha1(raw.encode()).hexdigest()
+    key = "fuel-conso-totaux-v8:" + hashlib.sha1(raw.encode()).hexdigest()
     try:
         hit = cache.get(key)
     except Exception:  # noqa: BLE001
@@ -196,7 +199,9 @@ def _cached_totals(d_from, d_to, p, rows):
         from fuel_tracking.services.closing_kpis import table_kpis
 
         full = S.enriched_copy(rows)   # une seule lecture pour la ligne de totaux et la synthèse du mois
-        out = (S.totals(full, enriched=True), table_kpis(full, d_from, d_to))
+        from fuel_tracking.services.closing_kpis import analyse_synthese
+
+        out = (S.totals(full, enriched=True), {**table_kpis(full, d_from, d_to), "_analyse": analyse_synthese(full)})
     except Exception:  # noqa: BLE001 — jamais bloquant : le tableau s'affiche sans la ligne de totaux
         import logging
 

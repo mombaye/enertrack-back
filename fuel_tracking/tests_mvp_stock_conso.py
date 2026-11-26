@@ -2647,3 +2647,29 @@ class RuntimeVisibilityTests(MvpBase):
 
         o = R(self.e(tm_rectifier_h=400.0, tm_rectifier_dispo_pct=95.0, tm_rectifier_off_grid=False))
         self.assertEqual((o["tm_retenu_h"], o["tm_rectifier_visibilite_pct"]), (None, 95.0))
+
+
+class AnalyseSyntheseTests(MvpBase):
+    """Synthèse de l'analyse variation de stock Vs estimation théorique : groupes exclusifs, sommes sans inventer de 0."""
+
+    def test_groupes(self):
+        from fuel_tracking.services.closing_kpis import analyse_synthese
+
+        A = lambda alerte, t, v, d: {"analyse_variation": {"alerte": alerte, "conso_theorique_retenue_l": t, "variation_l": v, "delta_l": d}}  # noqa: E731
+        rows = [A("Conforme", 620.0, 600.0, 20.0), A("Conforme", 100.0, 90.0, 10.0),
+                A("En écart", 620.0, 900.0, -280.0), A("Variation négative", 50.0, -200.0, 250.0),
+                A("Variation négative", None, -170.0, None),        # alerte prioritaire sur « sans conso théorique »
+                A(None, None, 76.84, None), A(None, None, None, None),
+                A(None, 30.0, None, None)]
+        out = analyse_synthese(rows)
+        g = {x["cle"]: x for x in out["groupes"]}
+        self.assertEqual((g["certifies"]["sites"], g["certifies"]["conso_theorique_l"], g["certifies"]["variation_l"], g["certifies"]["delta_l"]),
+                         (2, 720.0, 690.0, 30.0))
+        self.assertEqual((g["alerte"]["sites"], g["alerte"]["conso_theorique_l"], g["alerte"]["sites_theorique"], g["alerte"]["variation_l"],
+                          g["alerte"]["delta_l"]), (3, 670.0, 2, 530.0, -30.0))
+        self.assertEqual(g["alerte"]["dont"], {"En écart": 1, "Variation négative": 2, "sans conso théorique": 1})
+        self.assertEqual((g["sans_theorique"]["sites"], g["sans_theorique"]["conso_theorique_l"], g["sans_theorique"]["variation_l"],
+                          g["sans_theorique"]["delta_l"]), (2, None, 76.8, None))           # jamais 0 inventé
+        self.assertEqual((g["non_calculables"]["sites"], g["non_calculables"]["conso_theorique_l"]), (1, 30.0))
+        self.assertEqual(out["total"]["sites"], len(rows))
+        self.assertEqual(sum(x["sites"] for x in out["groupes"]), len(rows))
