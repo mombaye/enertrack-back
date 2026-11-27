@@ -1848,7 +1848,7 @@ class TotalsRowTests(MvpBase):
 
         from fuel_tracking.services import stock_initial_sources as S
 
-        def fake_enrich(rows, fetch=True):
+        def fake_enrich(rows, fetch=True, seuil=None):
             vals = [(100.0, [20.0, 30.0], 5.5), (None, None, None), (250.5, [30.0], 2.0)]
             for r, (t, kva, h) in zip(rows, vals):
                 r["stock_initial_sources"] = {"terrain_l": t}
@@ -2579,7 +2579,7 @@ class StockVsTheoreticalTests(MvpBase):
 
         from fuel_tracking.services import stock_initial_sources as S
 
-        def fake_enrich(rows, fetch=True):
+        def fake_enrich(rows, fetch=True, seuil=None):
             for r, (v, d, g) in zip(rows, [(600.0, 150.0, "Oui"), (300.0, -20.0, "Non"), (None, None, None)]):
                 r["analyse_variation"] = {"variation_l": v, "delta_l": d, "grande_difference": g, "conso_theorique_retenue_l": None}
 
@@ -2641,12 +2641,32 @@ class AlerteAppFuelTests(MvpBase):
         self.assertIn("stock final retenu n.d.", a["alerte_motif"])
         self.assertTrue(a["alerte_detail"].startswith("Calcul impossible : "))
 
+    def test_seuil_choisi_a_l_ecran(self):
+        from fuel_tracking.services import stock_initial_sources as S
+
+        r = self.row(theo=2000.0, ini=2550.0, fin=400.0)              # variation 2 150 L : écart 150 L
+        defaut = S.stock_vs_theoretical(r)
+        self.assertEqual((defaut["seuil_code"], defaut["tolerance_l"], defaut["alerte"]), ("50_5", 100.0, "En écart"))
+        self.assertEqual(defaut["tolerance_formule"], "max(50 L ; 5 % × 2 000 L) = 100 L")
+        a = S.stock_vs_theoretical(r, "50_10")                       # max(50 ; 200) = 200 L : conforme
+        self.assertEqual((a["tolerance_l"], a["alerte"]), (200.0, "Conforme"))
+        self.assertIn("tolérance 200 L = 10 % de la conso théorique", a["alerte_detail"])
+        a = S.stock_vs_theoretical(r, "100_0")                       # 100 L fixe
+        self.assertEqual((a["tolerance_l"], a["alerte"], a["tolerance_formule"]), (100.0, "En écart", "100 L fixe = 100 L"))
+        self.assertIn("150 L > tolérance 100 L (100 L fixe)", a["alerte_motif"])
+        a = S.stock_vs_theoretical(self.row(theo=0.0, ini=50.0, fin=0.0), "0_5")   # 5 % de 0 L : aucune marge
+        self.assertEqual((a["tolerance_l"], a["alerte"]), (0.0, "En écart"))
+        self.assertEqual(S.stock_vs_theoretical(r, "abc")["seuil_code"], "50_5")   # code inconnu : règle du process
+        opts = S.seuils_alerte_options("100_10")
+        self.assertEqual((opts["code"], opts["defaut"]), ("100_10", "50_5"))
+        self.assertIn({"code": "50_5", "libelle": S.SEUILS_ALERTE["50_5"]}, opts["options"])
+
     def test_totals_count_ecart(self):
         from unittest import mock
 
         from fuel_tracking.services import stock_initial_sources as S
 
-        def fake_enrich(rows, fetch=True):
+        def fake_enrich(rows, fetch=True, seuil=None):
             for r, v in zip(rows, ["En écart", "Conforme", None, "En écart", "Variation négative"]):
                 r["analyse_variation"] = {"alerte": v}
 

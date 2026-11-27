@@ -741,13 +741,45 @@ SEUIL_GRANDE_DIFFERENCE_L = 100.0
 # Alerte App Fuel (process de validation conso fuel, novembre 2026) : site conforme si
 # |Variation de stock − Consommation théorique| ≤ max(50 L ; 5 % de la consommation théorique).
 ALERTE_TOLERANCE_MIN_L, ALERTE_TOLERANCE_PCT = 50.0, 0.05
+# Seuil de tolérance choisi à l'écran (liste déroulante de la colonne « Seuil de tolérance Alerte ») et appliqué à TOUS les
+# sites : code « <minimum L>_<pourcentage> » → max(minimum ; pourcentage × conso théorique). Code inconnu ou absent : règle du
+# process, max(50 L ; 5 %).
+SEUIL_ALERTE_DEFAUT = "50_5"
+SEUILS_ALERTE = {
+    "50_5": "max(50 L ; 5 % de la conso théorique) — règle du process",
+    "50_10": "max(50 L ; 10 % de la conso théorique)",
+    "100_5": "max(100 L ; 5 % de la conso théorique)",
+    "100_10": "max(100 L ; 10 % de la conso théorique)",
+    "50_0": "50 L fixe",
+    "100_0": "100 L fixe",
+    "0_5": "5 % de la conso théorique",
+    "0_10": "10 % de la conso théorique",
+}
+
+
+def seuil_alerte(code: str | None) -> tuple[str, float, float]:
+    """Code de seuil → (code retenu, minimum en L, pourcentage en fraction)."""
+    code = code if code in SEUILS_ALERTE else SEUIL_ALERTE_DEFAUT
+    mini, pct = code.split("_")
+    return code, float(mini), float(pct) / 100
+
+
+def seuils_alerte_options(code: str | None) -> dict:
+    """Liste déroulante de l'écran : seuil appliqué + choix possibles."""
+    return {"code": seuil_alerte(code)[0], "defaut": SEUIL_ALERTE_DEFAUT,
+            "options": [{"code": k, "libelle": v} for k, v in SEUILS_ALERTE.items()]}
+
+
+def _seuil_formule(mini: float, pct: float, theo: float) -> str:
+    p = f"{pct * 100:g} % × {_l0(theo)}"
+    return f"max({mini:g} L ; {p})" if mini and pct else (f"{mini:g} L fixe" if mini else p)
 ALERTE_CONFORME, ALERTE_ECART = "Conforme", "En écart"
 # Variation de stock négative (décision du 26/11/2026) : alerte à part, prioritaire, même sans conso théorique — physiquement
 # impossible (plus de carburant à la fin que début + entrées) : donnée de stock ou mouvement à corriger avant toute comparaison.
 ALERTE_VAR_NEGATIVE = "Variation négative"
 
 
-def stock_vs_theoretical(r: dict) -> dict:
+def stock_vs_theoretical(r: dict, seuil: str | None = None) -> dict:
     """Ligne enrichie → bloc « analyse_variation » :
       - conso_theorique_retenue_l : Estimation Conso Fuel Théorique retenue (bloc ESTIMATION) ;
       - variation_l : stock initial retenu + EYDON + CARTE TOTAL + Ajout − Retrait − Volé − Vidangé / Fuite − stock final retenu,
@@ -756,7 +788,8 @@ def stock_vs_theoretical(r: dict) -> dict:
         négative conservée ;
       - delta_l = conso théorique retenue − variation de stock ;
       - grande_difference : « Oui » si |DELTA| > 100 L, « Non » sinon ;
-      - alerte : « Conforme » si |DELTA| ≤ max(50 L ; 5 % × conso théorique), « En écart » sinon (à instruire).
+      - alerte : « Conforme » si |DELTA| ≤ tolérance, « En écart » sinon (à instruire) ; tolérance = seuil choisi à l'écran
+        (`seuil`, voir SEUILS_ALERTE), par défaut max(50 L ; 5 % × conso théorique).
     Une valeur absente reste null (jamais 0), avec sa raison."""
     f = lambda v: None if v is None else float(v)  # noqa: E731
     e = r.get("estimation_theorique") or {}
@@ -775,7 +808,9 @@ def stock_vs_theoretical(r: dict) -> dict:
         var = ini + sum(f(rv.get(k)) or 0 for k in ("eydon_l", "carte_total_l", "ajout_l")) \
             - sum(f(rv.get(k)) or 0 for k in ("retrait_l", *RAV_PERTES_CALCUL)) - fin
         var, var_motif = round(var, 3), None
-    tol = round(max(ALERTE_TOLERANCE_MIN_L, ALERTE_TOLERANCE_PCT * abs(theo)), 3) if theo is not None else None
+    seuil, mini, pct = seuil_alerte(seuil)
+    tol = round(max(mini, pct * abs(theo)), 3) if theo is not None else None
+    tol_formule = f"{_seuil_formule(mini, pct, theo)} = {_l0(tol)}" if tol is not None else None
     alerte = alerte_motif = alerte_detail = None
     if theo is None or var is None:
         delta, grand = None, None
@@ -785,10 +820,10 @@ def stock_vs_theoretical(r: dict) -> dict:
         grand, motif = ("Oui" if abs(delta) > SEUIL_GRANDE_DIFFERENCE_L else "Non"), None
         ok = abs(delta) <= tol
         alerte = ALERTE_CONFORME if ok else ALERTE_ECART
-        alerte_motif = (f"écart {abs(delta):.0f} L {'≤' if ok else '>'} tolérance {tol:.0f} L (max(50 L ; 5 % × {theo:.0f} L))"
+        alerte_motif = (f"écart {abs(delta):.0f} L {'≤' if ok else '>'} tolérance {tol:.0f} L ({_seuil_formule(mini, pct, theo)})"
                         + ("" if ok else " : à instruire (vol, stock terrain incorrect ou mouvement mal tracé)"))
         # Détail en langage clair (décision du 26/11/2026) : ce qui s'est passé, la tolérance, quoi vérifier
-        tol_txt = f"tolérance {_l0(tol)}" + ("" if tol == ALERTE_TOLERANCE_MIN_L else " = 5 % de la conso théorique")
+        tol_txt = f"tolérance {_l0(tol)}" + ("" if not pct or tol == mini else f" = {pct * 100:g} % de la conso théorique")
         if ok:
             alerte_detail = (f"Écart de {_l0(abs(delta))} entre le stock consommé ({_l0(var)}) et la conso théorique du GE "
                              f"({_l0(theo)}) : dans la {tol_txt}. Rien à faire.")
@@ -808,7 +843,7 @@ def stock_vs_theoretical(r: dict) -> dict:
                          "À corriger avant de comparer avec la conso théorique.")
     return {"conso_theorique_retenue_l": theo, "conso_theorique_motif": theo_motif, "variation_l": var, "variation_motif": var_motif,
             "delta_l": delta, "grande_difference": grand, "motif": motif, "seuil_l": SEUIL_GRANDE_DIFFERENCE_L,
-            "tolerance_l": tol, "alerte": alerte, "alerte_motif": alerte_motif or (motif if alerte is None else None),
+            "tolerance_l": tol, "tolerance_formule": tol_formule, "seuil_code": seuil, "alerte": alerte, "alerte_motif": alerte_motif or (motif if alerte is None else None),
             "alerte_detail": alerte_detail or (f"Calcul impossible : {motif}." if motif else None)}
 
 
@@ -901,8 +936,9 @@ def _rect_power(facts, nb_jours: int) -> dict:
             "p_rect_source": src, "p_rect_motif": motif}
 
 
-def enrich(rows: list[dict], fetch: bool = True) -> str | None:
-    """Ajoute à chaque ligne du tableau les blocs « inventaire » et « stock_initial_sources ». Retourne un message si Snowflake a échoué."""
+def enrich(rows: list[dict], fetch: bool = True, seuil: str | None = None) -> str | None:
+    """Ajoute à chaque ligne du tableau les blocs « inventaire » et « stock_initial_sources ». Retourne un message si Snowflake a échoué.
+    `seuil` : seuil de tolérance de l'Alerte App Fuel choisi à l'écran (SEUILS_ALERTE), appliqué à toutes les lignes."""
     from core.models import Site
 
     from fuel_tracking.models import FuelSiteInventory as INV
@@ -1046,7 +1082,7 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
         e.update(retained_runtime(e))
         e.update(theoretical_conso(e))
         e.update(retained_estimation(e))
-        r["analyse_variation"] = stock_vs_theoretical(r)
+        r["analyse_variation"] = stock_vs_theoretical(r, seuil)
     return err
 
 
@@ -1116,12 +1152,12 @@ TOTAL_OUI = {"analyse_variation": {"grande_difference": ("Oui", "Non"),
                                    "alerte": (ALERTE_ECART, ALERTE_CONFORME, ALERTE_VAR_NEGATIVE)}}
 
 
-def enriched_copy(rows: list[dict]) -> list[dict]:
+def enriched_copy(rows: list[dict], seuil: str | None = None) -> list[dict]:
     """Copie des lignes enrichie comme à l'affichage (cache uniquement, aucun appel Snowflake / ENOC) ; lignes d'origine intactes."""
     import copy
 
     rows = copy.deepcopy(rows)
-    enrich(rows, fetch=False)
+    enrich(rows, fetch=False, seuil=seuil)
     return rows
 
 

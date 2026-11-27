@@ -67,7 +67,10 @@ class ConsommationsView(APIView):
         # Blocs « INVENTAIRE », « DONNÉES DE STOCK INITIAL » et « RAVITAILLEMENT » pour la page affichée seulement.
         # Les valeurs Snowflake / ENOC déjà en cache s'affichent tout de suite ; celles qui manquent sont lues EN TÂCHE DE FOND
         # (au-delà de SYNC_MAX paires) : la page ne reste jamais bloquée sur une source externe lente.
-        data["avertissement_sources"], data["sources_en_attente"] = _enrich_page(data["rows"])
+        data["avertissement_sources"], data["sources_en_attente"] = _enrich_page(data["rows"], p.get("seuil"))
+        from fuel_tracking.services.stock_initial_sources import seuils_alerte_options
+
+        data["seuil_alerte"] = seuils_alerte_options(p.get("seuil"))   # liste déroulante « Seuil de tolérance Alerte »
         data["periode"]["par_defaut"] = is_default
         return Response(data)
 
@@ -115,7 +118,7 @@ SYNC_MAX = 0           # aucune lecture Snowflake / ENOC pendant l'affichage : t
 BUILD_TTL = 6 * 3600   # la clé contient la version des données : un recalcul ou un import la change (jamais servi périmé)
 
 
-def _enrich_page(rows) -> tuple[str | None, int]:
+def _enrich_page(rows, seuil: str | None = None) -> tuple[str | None, int]:
     """(message sources, nombre de sites dont les valeurs Snowflake / ENOC sont en cours de lecture)."""
     from django.core.cache import cache
 
@@ -129,7 +132,7 @@ def _enrich_page(rows) -> tuple[str | None, int]:
         ge_pending = 0 if G.cached() else len(rows)
     miss = S.missing_pairs(S.row_pairs(rows))
     if len(miss) <= SYNC_MAX:
-        return S.enrich(rows), ge_pending
+        return S.enrich(rows, seuil=seuil), ge_pending
     try:
         from fuel_tracking.tasks import warm_stock_initial_sources
 
@@ -137,9 +140,9 @@ def _enrich_page(rows) -> tuple[str | None, int]:
         if cache.add(lock, 1, 120):   # une seule lecture en cours pour les mêmes sites
             warm_stock_initial_sources.delay([[s, d.isoformat()] for s, d in sorted(miss)])
     except Exception:  # noqa: BLE001 — pas de file Celery : lecture directe (comportement d'avant)
-        return S.enrich(rows), 0
+        return S.enrich(rows, seuil=seuil), 0
     # valeurs déjà en cache affichées tout de suite ; le reste arrive au prochain rafraîchissement (l'interface relance seule)
-    return S.enrich(rows, fetch=False), max(ge_pending, len(S.missing_pairs(S.row_pairs(rows))))
+    return S.enrich(rows, fetch=False, seuil=seuil), max(ge_pending, len(S.missing_pairs(S.row_pairs(rows))))
 
 
 def warm_cache(months: int = 2) -> list[dict]:
@@ -198,7 +201,7 @@ def _cached_totals(d_from, d_to, p, rows):
     try:
         from fuel_tracking.services.closing_kpis import table_kpis
 
-        full = S.enriched_copy(rows)   # une seule lecture pour la ligne de totaux et la synthèse du mois
+        full = S.enriched_copy(rows, p.get("seuil"))   # une seule lecture pour la ligne de totaux et la synthèse du mois
         from fuel_tracking.services.closing_kpis import analyse_synthese
 
         out = (S.totals(full, enriched=True), {**table_kpis(full, d_from, d_to), "_analyse": analyse_synthese(full)})
@@ -236,7 +239,7 @@ def _cached_index(d_from, d_to, p, rows):
         hit = None
     if hit is not None:
         return hit
-    idx = CF.index(S.enriched_copy(rows))
+    idx = CF.index(S.enriched_copy(rows, p.get("seuil")))
     try:
         cache.set(key, idx, 600)
     except Exception:  # noqa: BLE001
@@ -274,7 +277,7 @@ def _cached_build(d_from, d_to, p):
 
     from django.core.cache import cache
 
-    params = {k: v for k, v in (p.dict() if hasattr(p, "dict") else dict(p)).items() if k not in ("page", "page_size", CF.PARAM, "colonne")}
+    params = {k: v for k, v in (p.dict() if hasattr(p, "dict") else dict(p)).items() if k not in ("page", "page_size", CF.PARAM, "colonne", "seuil")}
     raw = json.dumps([str(d_from), str(d_to), sorted(params.items()), _data_version()], default=str)
     key = "fuel-conso-build-v3:" + hashlib.sha1(raw.encode()).hexdigest()
     data = cache.get(key)
