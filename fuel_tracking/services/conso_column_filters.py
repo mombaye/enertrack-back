@@ -25,7 +25,7 @@ FILTER_KEYS = TOP + tuple(f"inventaire.{k}" for k in ("region", "indoor_outdoor"
         "tm_dg_on_visibilite_pct", "tm_rectifier_visibilite_pct", "tm_terrain_visibilite_pct", "tm_index_fms_visibilite_pct",
         "tm_retenu_h", "tm_source", "p_rect_kw", "p_ge_kw", "p_grid_kw", "p_rect_min_kw", "p_rect_max_kw", "p_ge_min_kw",
         "p_ge_max_kw", "p_grid_min_kw", "p_grid_max_kw", "p_load_dc_kw", "p_batt_kw", "p_retenue_kw", "p_retenue_source",
-        "taux_charge", "cph_l_h", "conso_theorique_l", "conso_fuel_sensor_l", "conso_retenue_source")) \
+        "taux_charge", "cph_l_h", "conso_theorique_l", "conso_fuel_sensor_l", "conso_fuel_sensor_avant_l", "conso_retenue_source")) \
     + tuple(f"analyse_variation.{k}" for k in ("conso_theorique_retenue_l", "variation_l", "grande_difference", "delta_l", "alerte", "tolerance_l"))
 PARAM = "filtres_colonnes"
 

@@ -562,8 +562,27 @@ def _power_medians(rows, lines, kinds: dict, kva: dict) -> dict:
                     "p_ge_min_kw": round(min(ge_days), 2) if ge_days else None, "p_ge_max_kw": round(max(ge_days), 2) if ge_days else None,
                     "p_load_dc_kw": round(median(load), 2) if load else None, "p_load_dc_jours": len(load),
                     "p_load_dc_motif": None if load else "aucune donnée AVERAGE_LOAD (load DC) sur la période",
-                    **bp, **_fuel_sensor_conso(levels.get(sid) or {}, d0, d1)}
+                    **bp, **_fuel_sensor_conso(levels.get(sid) or {}, d0, d1),
+                    **_fuel_sensor_conso_avant(fx.values(), (d1 - d0).days)}
     return out
+
+
+def _fuel_sensor_conso_avant(facts, nb_jours: int) -> dict:
+    """ANCIEN calcul de la conso fuel sensor, gardé en colonne « Avant » pour comparaison (décision du 27/11/2026) : somme des
+    baisses que Snowflake a lui-même signalées jour par jour (VW_FUEL_REPORT : QUALITY_STATUS = 'OK', VALID_POINT_COUNT ≥ 2,
+    DROP_DETECTED = TRUE → volume de la baisse ; ni baisse ni remplissage signalé → 0 L ; sinon jour non compté).
+    Aucun jour mesurable → null (jamais 0) ; jours manquants → réserve. N'est plus utilisé dans aucun calcul."""
+    vals = [float(f["measured_conso_l"]) for f in facts if f.get("measured_conso_l") is not None]
+    detectes = sum(1 for v in vals if v > 0)
+    if not vals:
+        return {"conso_fuel_sensor_avant_l": None, "conso_fuel_sensor_avant_jours": 0, "conso_fuel_sensor_avant_baisses": 0,
+                "conso_fuel_sensor_avant_motif": "aucun jour mesurable par le fuel sensor (VW_FUEL_REPORT) sur la période",
+                "conso_fuel_sensor_avant_reserve": False}
+    manque = max(nb_jours - len(vals), 0)
+    return {"conso_fuel_sensor_avant_l": round(sum(vals), 2), "conso_fuel_sensor_avant_jours": len(vals),
+            "conso_fuel_sensor_avant_baisses": detectes,
+            "conso_fuel_sensor_avant_motif": f"{manque} jour(s) sur {nb_jours} sans mesure fuel sensor : somme partielle" if manque else None,
+            "conso_fuel_sensor_avant_reserve": bool(manque)}
 
 
 # Conso fuel sensor par le niveau de cuve (validée par le Fuel Manager le 26/11/2026) : les drapeaux DROP_DETECTED /
@@ -967,7 +986,9 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
                                                                    "conso_fuel_sensor_jours_periode", "conso_fuel_sensor_motif",
                                                                    "conso_fuel_sensor_reserve", "conso_fuel_sensor_niveau_debut_l",
                                                                    "conso_fuel_sensor_niveau_fin_l", "conso_fuel_sensor_remplissages",
-                                                                   "conso_fuel_sensor_remplissages_l")})
+                                                                   "conso_fuel_sensor_remplissages_l", "conso_fuel_sensor_avant_l",
+                                                                   "conso_fuel_sensor_avant_jours", "conso_fuel_sensor_avant_baisses",
+                                                                   "conso_fuel_sensor_avant_motif", "conso_fuel_sensor_avant_reserve")})
         # Bloc « DONNÉES DE STOCK FINAL », à la Date de Relevé Finale de la ligne du fichier (seule date retenue ; absente → n.d.)
         line = (lines.get(r["site_id"]) or {}).get("fin") or {}
         df = _day((line.get("periode") or [None, None])[1])   # Date de Relevé Finale du fichier (absente → n.d.)
@@ -1058,7 +1079,7 @@ TOTAL_FIELDS = {
                             "compteur_fms_h", "compteur_retenu_h"),
     "estimation_theorique": ("prp_kva", "prp_kw", "tm_dg_on_h", "tm_rectifier_h", "tm_terrain_h", "tm_index_fms_h", "tm_retenu_h",
                              "p_rect_kw", "p_ge_kw", "p_grid_kw", "p_load_dc_kw", "p_batt_kw", "p_retenue_kw",
-                             "conso_theorique_l", "conso_fuel_sensor_l", "conso_retenue_l"),
+                             "conso_theorique_l", "conso_fuel_sensor_l", "conso_fuel_sensor_avant_l", "conso_retenue_l"),
     "analyse_variation": ("conso_theorique_retenue_l", "variation_l", "delta_l"),
 }
 # Colonnes texte : « total » = nombre de sites renseignés (case vide / « n.d. » non comptée)

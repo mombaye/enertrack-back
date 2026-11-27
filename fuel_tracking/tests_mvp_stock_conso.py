@@ -2700,3 +2700,19 @@ class AnalyseSyntheseTests(MvpBase):
         self.assertEqual((g["non_calculables"]["sites"], g["non_calculables"]["conso_theorique_l"]), (1, 30.0))
         self.assertEqual(out["total"]["sites"], len(rows))
         self.assertEqual(sum(x["sites"] for x in out["groupes"]), len(rows))
+
+
+class FuelSensorAvantTests(MvpBase):
+    """Colonne « Avant » : ancien calcul (baisses signalées par Snowflake), affichée à côté du nouveau pour comparaison."""
+
+    def test_ancien_calcul(self):
+        from fuel_tracking.services.stock_initial_sources import _fuel_sensor_conso_avant as A
+
+        r = A([{"measured_conso_l": 0}] * 28, 28)                   # BKL_0675 : aucune baisse signalée → 0 L
+        self.assertEqual((r["conso_fuel_sensor_avant_l"], r["conso_fuel_sensor_avant_baisses"], r["conso_fuel_sensor_avant_reserve"]),
+                         (0.0, 0, False))
+        r = A([{"measured_conso_l": 0}, {"measured_conso_l": 40.5}, {"measured_conso_l": None}], 4)
+        self.assertEqual((r["conso_fuel_sensor_avant_l"], r["conso_fuel_sensor_avant_baisses"], r["conso_fuel_sensor_avant_reserve"]),
+                         (40.5, 1, True))
+        r = A([], 10)
+        self.assertIsNone(r["conso_fuel_sensor_avant_l"])                   # jamais 0 sans mesure
