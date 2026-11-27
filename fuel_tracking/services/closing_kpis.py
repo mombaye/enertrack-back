@@ -363,7 +363,8 @@ def table_kpis(rows: list[dict], d_from: date, d_to: date) -> dict:
     l'en-tête d'un fichier. `rows` = lignes ENRICHIES (stock_initial_sources, ravitaillement, stock_final_sources,
     estimation_theorique), tous les sites du filtre. Chaque somme = total de la colonne correspondante du tableau.
       stock début / fin = Σ « Qtité laissée retenue » ; livré = Σ EYDON + Σ CARTE TOTAL ; autre = Σ Ajout − Σ Retrait ;
-      perdu = Σ volé + Σ vidangé / fuite ; consommé = Σ, sur les sites complets (stocks début et fin + mouvements ENOC lus),
+      perdu = Σ volé + Σ vidangé / fuite (fichier de clôture, RAV_PERTES_CALCUL) ; consommé = Σ, sur les sites complets (stocks
+      début et fin + mouvements ENOC lus + volé / vidangé du fichier renseignés),
       de stock début + livré + ajout − retrait − volé − vidangé − stock fin ; CHECK = stock début + livré + autre − stock fin
       − consommé − perdu (≠ 0 : litres des sites incomplets) ; conso moyenne / jour = moyenne des L/jour des sites complets."""
     f = lambda v: None if v is None else float(v)  # noqa: E731
@@ -378,17 +379,19 @@ def table_kpis(rows: list[dict], d_from: date, d_to: date) -> dict:
     (s_ini, n_ini), (s_fin, n_fin) = col(ini), col(fin)
     (eydon, _), (carte, _) = col(lambda r: rav(r, "eydon_l")), col(lambda r: rav(r, "carte_total_l"))
     (ajout, _), (retrait, _) = col(lambda r: rav(r, "ajout_l")), col(lambda r: rav(r, "retrait_l"))
-    (vole, _), (fuite, _) = col(lambda r: rav(r, "vole_l")), col(lambda r: rav(r, "fuite_l"))
+    from fuel_tracking.services.stock_initial_sources import RAV_PERTES_CALCUL as PERTES
+
+    (vole, _), (fuite, _) = col(lambda r: rav(r, PERTES[0])), col(lambda r: rav(r, PERTES[1]))
     add = lambda *xs: None if all(x is None for x in xs) else round(sum(x or 0 for x in xs), 1)  # noqa: E731
     livree, perdue = add(eydon, carte), add(vole, fuite)
     autre = None if ajout is None and retrait is None else round((ajout or 0) - (retrait or 0), 1)
     conso, rates, n_neg = [], [], 0
     for r in rows:
         a, b, rv = ini(r), fin(r), r.get("ravitaillement") or {}
-        if a is None or b is None or rv.get("source") != "ENOC":
+        if a is None or b is None or rv.get("source") != "ENOC" or any(rv.get(k) is None for k in PERTES):
             continue
         c = a + sum(rav(r, k) or 0 for k in ("eydon_l", "carte_total_l", "ajout_l")) \
-            - sum(rav(r, k) or 0 for k in ("retrait_l", "vole_l", "fuite_l")) - b
+            - sum(rav(r, k) or 0 for k in ("retrait_l", *PERTES)) - b
         conso.append(c)
         n_neg += c < 0
         d0 = (r.get("stock_initial_sources") or {}).get("date")
@@ -436,10 +439,11 @@ def table_kpis(rows: list[dict], d_from: date, d_to: date) -> dict:
                      [("EYDON (L)", eydon), ("CARTE TOTAL (L)", carte), ("Total (L)", livree)]),
         "autre_l": (f"{tab} — colonnes « Total Ajout » et « Total Retrait » (ENOC).", "Σ Ajout − Σ Retrait.",
                     [("Ajout (L)", ajout), ("Retrait (L)", retrait), ("Total (L)", autre)]),
-        "perdue_l": (f"{tab} — colonnes « Total QTE volée déclarée » et « QTE vidangée / Fuite » (ENOC).", "Σ volé + Σ vidangé / fuite.",
+        "perdue_l": (f"{tab} — colonnes « Total QTE volée déclarée » et « QTE vidangée / Fuite » (fichier de closing).", "Σ volé + Σ vidangé / fuite.",
                      [("Volé (L)", vole), ("Vidangé / fuite (L)", fuite), ("Total (L)", perdue)]),
-        "conso_releves_l": (tab + ".", "Pour chaque site complet (stock initial et final retenus + mouvements ENOC lus) : stock initial + "
-                            "EYDON + CARTE TOTAL + Ajout − Retrait − volé − vidangé − stock final ; puis somme.",
+        "conso_releves_l": (tab + ".", "Pour chaque site complet (stock initial et final retenus + mouvements ENOC lus + volé / vidangé du fichier "
+                            "de closing renseignés) : stock initial + EYDON + CARTE TOTAL + Ajout − Retrait − volé − vidangé (fichier de "
+                            "closing) − stock final ; puis somme.",
                             [("Sites complets", n_c), ("Sites du tableau", len(rows)), ("dont consommation négative", n_neg), ("Total (L)", s_conso)]),
         "conso_moyenne_jour_l": (tab + ".", "Pour chaque site complet : consommation ÷ jours entre la date du stock initial et celle du stock "
                                  "final ; puis moyenne de ces L/jour.", [("Sites pris en compte", len(rates))]),

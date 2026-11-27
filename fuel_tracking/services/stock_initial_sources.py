@@ -35,6 +35,11 @@ après le jour du relevé initial à 00:00, jusqu'au jour du relevé final à 00
   Total Retrait                                 ponctions sortantes ENOC ;
   Total QTE volée déclarée                      vols déclarés dans ENOC ;
   Total QTE vidangée / Fuite / Écart de Stock   vidanges déclarées dans ENOC.
+Les colonnes affichées « Total QTE volée déclarée » et « Total QTE vidangée / Fuite / Écart de Stock » lisent la ligne du
+fichier de clôture de la période (« Qté volée » / « Qté vidangée ») : vole_closing_l / vidange_closing_l. Case vide du fichier
+ou aucune ligne de fichier : vide, jamais 0. Ce sont aussi ces valeurs du fichier qui entrent dans la variation de stock et la
+synthèse (RAV_PERTES_CALCUL). Les vols / vidanges ENOC (vole_l / fuite_l) restent calculés mais sont mis de côté (non affichés,
+non utilisés) : pour revenir à ENOC, remettre RAV_PERTES_CALCUL = RAV_PERTES_ENOC.
 Mouvement rejeté, non intégré, ponction déséquilibrée : non compté. Aucune ligne de fichier (pas de dates) : vide, jamais 0.
 """
 from __future__ import annotations
@@ -369,6 +374,23 @@ def ravitaillement(rows: list[dict]) -> None:
                                "debut": d0.isoformat() if d0 else None, "fin": d1.isoformat() if d1 else None,
                                # « Date de Relevé Finale » telle qu'écrite dans la ligne du fichier de clôture (contrôle) ; vide si absente
                                "date_finale_fichier": _file_final_date(r, details)}
+
+
+CLOSING_LOSS_KEYS = {"vole_closing_l": "vole_l", "vidange_closing_l": "vidange_l"}
+# Volé / vidangé utilisés dans les calculs (variation de stock, synthèse) : fichier de clôture pour le moment.
+RAV_PERTES_ENOC = ("vole_l", "fuite_l")                       # mis de côté (toujours calculé, plus utilisé)
+RAV_PERTES_CALCUL = ("vole_closing_l", "vidange_closing_l")
+RAV_PERTES_LIBELLE = {"vole_closing_l": "qté volée", "vidange_closing_l": "qté vidangée / fuite", "vole_l": "vols ENOC", "fuite_l": "vidanges ENOC"}
+
+
+def ravitaillement_closing(rows: list[dict], lines: dict) -> None:
+    """Ajoute au bloc « ravitaillement » la qté volée et la qté vidangée / fuite / écart de stock lues sur la ligne du fichier
+    de clôture de la période (mêmes dates que le tableau). Valeur du fichier telle quelle ; case vide ou pas de ligne : None."""
+    for r in rows:
+        line = (lines.get(r["site_id"]) or {}).get("fin") or {}
+        rv = r.setdefault("ravitaillement", {})
+        for out_key, file_key in CLOSING_LOSS_KEYS.items():
+            rv[out_key] = _f(line.get(file_key))
 
 
 def _file_line_values(rows) -> dict:
@@ -729,7 +751,8 @@ def stock_vs_theoretical(r: dict) -> dict:
     """Ligne enrichie → bloc « analyse_variation » :
       - conso_theorique_retenue_l : Estimation Conso Fuel Théorique retenue (bloc ESTIMATION) ;
       - variation_l : stock initial retenu + EYDON + CARTE TOTAL + Ajout − Retrait − Volé − Vidangé / Fuite − stock final retenu,
-        seulement si les deux stocks retenus existent et que les mouvements ENOC ont été lus (même règle que la synthèse) ;
+        seulement si les deux stocks retenus existent, que les mouvements ENOC ont été lus et que le volé / vidangé du fichier de
+        clôture est renseigné (même règle que la synthèse) ; volé / vidangé : RAV_PERTES_CALCUL (fichier de clôture) ;
         négative conservée ;
       - delta_l = conso théorique retenue − variation de stock ;
       - grande_difference : « Oui » si |DELTA| > 100 L, « Non » sinon ;
@@ -745,9 +768,12 @@ def stock_vs_theoretical(r: dict) -> dict:
         var, var_motif = None, " et ".join(m for m, v in (("stock initial retenu n.d.", ini), ("stock final retenu n.d.", fin)) if v is None)
     elif rv.get("source") != "ENOC":
         var, var_motif = None, "mouvements ENOC non lus (dates de relevé absentes du fichier)"
+    elif any(rv.get(k) is None for k in RAV_PERTES_CALCUL):
+        manque = " et ".join(RAV_PERTES_LIBELLE[k] for k in RAV_PERTES_CALCUL if rv.get(k) is None)
+        var, var_motif = None, f"{manque} non renseignée dans le fichier de clôture"
     else:
         var = ini + sum(f(rv.get(k)) or 0 for k in ("eydon_l", "carte_total_l", "ajout_l")) \
-            - sum(f(rv.get(k)) or 0 for k in ("retrait_l", "vole_l", "fuite_l")) - fin
+            - sum(f(rv.get(k)) or 0 for k in ("retrait_l", *RAV_PERTES_CALCUL)) - fin
         var, var_motif = round(var, 3), None
     tol = round(max(ALERTE_TOLERANCE_MIN_L, ALERTE_TOLERANCE_PCT * abs(theo)), 3) if theo is not None else None
     alerte = alerte_motif = alerte_detail = None
@@ -889,6 +915,7 @@ def enrich(rows: list[dict], fetch: bool = True) -> str | None:
     lines = _file_line_values(rows)
     pairs = row_pairs(rows, lines)
     ravitaillement(rows)
+    ravitaillement_closing(rows, lines)   # qtés volée / vidangée du fichier de clôture (affichage, hors calcul de variation)
     runtimes = _fms_runtimes(rows, lines)
     _closing_ge = closing_genset_types(lines)   # type de GE lu sur la ligne du fichier de clôture du mois (2ᵉ source)
     _ge_now = __import__("fuel_tracking.services.ge_info", fromlist=["x"]).sites_info((r["site_id"] for r in rows), _closing_ge)
@@ -1074,7 +1101,7 @@ def _first_of(*candidates):
 TOTAL_FIELDS = {
     "stock_initial_sources": ("terrain_l", "gardiennage_l", "fms_l", "retenue_l", "compteur_terrain_h", "compteur_gardiennage_h",
                               "compteur_fms_h", "compteur_retenu_h"),
-    "ravitaillement": ("eydon_l", "carte_total_l", "ajout_l", "retrait_l", "vole_l", "fuite_l"),
+    "ravitaillement": ("eydon_l", "carte_total_l", "ajout_l", "retrait_l", "vole_l", "fuite_l", "vole_closing_l", "vidange_closing_l"),
     "stock_final_sources": ("terrain_l", "gardiennage_l", "fms_l", "retenue_l", "compteur_terrain_h", "compteur_gardiennage_h",
                             "compteur_fms_h", "compteur_retenu_h"),
     "estimation_theorique": ("prp_kva", "prp_kw", "tm_dg_on_h", "tm_rectifier_h", "tm_terrain_h", "tm_index_fms_h", "tm_retenu_h",
