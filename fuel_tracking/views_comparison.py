@@ -71,6 +71,9 @@ class ConsommationsView(APIView):
         from fuel_tracking.services.stock_initial_sources import seuils_alerte_options
 
         data["seuil_alerte"] = seuils_alerte_options(p.get("seuil"))   # liste déroulante « Seuil de tolérance Alerte »
+        from fuel_tracking.services.stock_initial_sources import monthly_labels
+
+        data["analyse_mensuelle"] = monthly_labels(d_from, d_to)   # mois N / N-1 des en-têtes (jamais figés)
         data["periode"]["par_defaut"] = is_default
         return Response(data)
 
@@ -191,7 +194,7 @@ def _cached_totals(d_from, d_to, p, rows):
     params = {k: v for k, v in (p.dict() if hasattr(p, "dict") else dict(p)).items() if k not in ("page", "page_size")}
     base = FuelImportBatch.objects.filter(source_type="BASE_GE").order_by("-received_at").values_list("pk", flat=True).first()
     raw = json.dumps([str(d_from), str(d_to), sorted(params.items()), _data_version(), base, (G.cached() or {}).get("lu_le")], default=str)
-    key = "fuel-conso-totaux-v12:" + hashlib.sha1(raw.encode()).hexdigest()
+    key = "fuel-conso-totaux-v13:" + hashlib.sha1(raw.encode()).hexdigest()
     try:
         hit = cache.get(key)
     except Exception:  # noqa: BLE001
@@ -232,7 +235,7 @@ def _cached_index(d_from, d_to, p, rows):
     params = {k: v for k, v in (p.dict() if hasattr(p, "dict") else dict(p)).items() if k not in ("page", "page_size", CF.PARAM, "colonne")}
     base = FuelImportBatch.objects.filter(source_type="BASE_GE").order_by("-received_at").values_list("pk", flat=True).first()
     raw = json.dumps([str(d_from), str(d_to), sorted(params.items()), _data_version(), base, (G.cached() or {}).get("lu_le")], default=str)
-    key = "fuel-conso-colonnes-v12:" + hashlib.sha1(raw.encode()).hexdigest()
+    key = "fuel-conso-colonnes-v13:" + hashlib.sha1(raw.encode()).hexdigest()
     try:
         hit = cache.get(key)
     except Exception:  # noqa: BLE001

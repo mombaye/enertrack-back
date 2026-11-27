@@ -2714,6 +2714,65 @@ class AlerteAppFuelTests(MvpBase):
                                                             "autres": {"Variation négative": 1}})
 
 
+class MonthlyAnalysisTests(MvpBase):
+    """ANALYSE ESTIMATION CONSOMMATION FUEL MENSUELLE Vs MOIS PRÉCÉDENT (formules Output App Fuel d'Ops, colonnes BX → CB)."""
+
+    @staticmethod
+    def row(var=620.0, debut="2026-10-01", fin="2026-10-31"):
+        return {"site_id": "S_1", "stock": {}, "periode": {"debut": debut, "fin": fin},
+                "analyse_variation": {"variation_l": var, "variation_motif": None if var is not None else "stock final retenu n.d."}}
+
+    def test_formules_ops(self):
+        from fuel_tracking.services import stock_initial_sources as S
+
+        lines = {"S_1": {"fin": {"periode": ["2026-09-30", "2026-10-31"]},
+                         "n1": {"periode": ["2026-08-30", "2026-10-01"], "conso_closing_l": 640.0, "fichier": "Closing sept"}}}
+        a = S.monthly_analysis(self.row(), lines)
+        self.assertEqual(a["nb_jours"], 31)                         # 31/10 − 30/09
+        self.assertEqual(a["conso_moyenne_l_j"], 20.0)              # 620 ÷ 31
+        self.assertEqual((a["mois_n_libelle"], a["jours_mois_n"]), ("OCTOBRE 2026", 31))
+        self.assertEqual(a["estimation_mois_l"], 620.0)             # 20 × 31
+        self.assertEqual((a["mois_n1_libelle"], a["jours_n1"]), ("SEPTEMBRE 2026", 32))
+        self.assertEqual(a["equivalent_n1_l"], 620.0)               # 640 ÷ 32 × 31
+        self.assertEqual(a["delta_l"], 0.0)
+
+    def test_absent_jamais_zero(self):
+        from fuel_tracking.services import stock_initial_sources as S
+
+        lines = {"S_1": {"fin": {"periode": ["2026-09-30", "2026-10-31"]}, "n1": None}}
+        a = S.monthly_analysis(self.row(var=None), lines)
+        self.assertIsNone(a["conso_moyenne_l_j"])
+        self.assertIn("variation de stock n.d.", a["conso_moyenne_motif"])
+        self.assertIsNone(a["equivalent_n1_l"])
+        self.assertEqual(a["equivalent_n1_motif"], "aucune ligne de closing de septembre 2026 pour ce site")
+        self.assertIsNone(a["delta_l"])
+        self.assertIn("équivalent N-1 n.d.", a["delta_motif"])
+        lines["S_1"]["n1"] = {"periode": ["2026-08-30", "2026-10-01"], "conso_closing_l": None}
+        self.assertEqual(S.monthly_analysis(self.row(), lines)["equivalent_n1_motif"],
+                         "Qtité cons considérée vide dans le fichier de closing N-1")
+
+    def test_mois_dynamiques(self):
+        from datetime import date
+
+        from fuel_tracking.services import stock_initial_sources as S
+
+        lab = S.monthly_labels(date(2026, 9, 30), date(2026, 11, 1))
+        self.assertEqual((lab["mois_n_libelle"], lab["mois_n1_libelle"], lab["jours_mois_n"]), ("OCTOBRE 2026", "SEPTEMBRE 2026", 31))
+        lab = S.monthly_labels(date(2027, 1, 1), date(2027, 1, 31))
+        self.assertEqual((lab["mois_n_libelle"], lab["mois_n1_libelle"], lab["jours_mois_n1"]), ("JANVIER 2027", "DÉCEMBRE 2026", 31))
+        lab = S.monthly_labels(date(2028, 3, 1), date(2028, 3, 31))
+        self.assertEqual((lab["mois_n1_libelle"], lab["jours_mois_n1"]), ("FÉVRIER 2028", 29))
+
+    def test_ligne_n1_du_mois_precedent(self):
+        from fuel_tracking.services import stock_initial_sources as S
+
+        cand = {("2026-07-30", "2026-08-30"): {"conso_closing_l": 1.0}, ("2026-08-30", "2026-10-01"): {"conso_closing_l": 2.0},
+                ("2026-08-30", "2026-09-28"): {"conso_closing_l": 3.0}, ("2026-10-01", "2026-10-31"): {"conso_closing_l": 4.0}}
+        n1 = S._line_month_n1(cand, self.row(), "2026-10-01")
+        self.assertEqual((n1["conso_closing_l"], n1["periode"]), (2.0, ["2026-08-30", "2026-10-01"]))   # finit au relevé initial
+        self.assertIsNone(S._line_month_n1({("2026-10-01", "2026-10-31"): {}}, self.row(), "2026-10-01"))
+
+
 class RuntimeVisibilityTests(MvpBase):
     """Temps de marche GE : visibilité (%) de chaque source ; seules les sources vues sur plus de 50 % de la période sont retenues."""
 

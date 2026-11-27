@@ -452,6 +452,7 @@ def _file_line_values(rows) -> dict:
     for r in rows:
         d0, d1 = str(r["stock"].get("date_initial") or "")[:10], str(r["stock"].get("date_final") or "")[:10]
         cand = lines.get(r["site_id"], {})
+        n1 = _line_month_n1(cand, r, d0)
         if _custom(r):
             # période personnalisée : dates de la période seulement, aucune valeur de terrain ; type de GE repris de la ligne de
             # clôture qui couvre la date de fin (sinon la date de début)
@@ -461,15 +462,117 @@ def _file_line_values(rows) -> dict:
                    **{k: cov.get(k) for k in ("fabricant_ge", "type_ge", "fichier") if cov.get(k) is not None}}
             if cov.get("periode"):
                 syn["periode_ge"] = cov["periode"]
-            out[r["site_id"]] = {"ini": syn, "fin": syn}
+            out[r["site_id"]] = {"ini": syn, "fin": syn, "n1": n1}
             continue
         # ligne du fichier de la période : mêmes dates que le bilan, sinon même Date de Relevé Finale, sinon même Date de
         # Relevé Initiale. Ses DEUX dates font foi pour tout le tableau (stock initial, ravitaillement, temps de marche, final).
         line = (cand.get((d0, d1)) if d0 and d1 else None) \
             or next((c for (a, b), c in sorted(cand.items()) if d1 and b == d1), None) \
             or next((c for (a, b), c in sorted(cand.items()) if d0 and a == d0), None)
-        out[r["site_id"]] = {"ini": line or {}, "fin": line or {}}
+        out[r["site_id"]] = {"ini": line or {}, "fin": line or {}, "n1": n1}
     return out
+
+
+MOIS_FR = ("JANVIER", "FÉVRIER", "MARS", "AVRIL", "MAI", "JUIN", "JUILLET", "AOÛT", "SEPTEMBRE", "OCTOBRE", "NOVEMBRE", "DÉCEMBRE")
+
+
+def _month_of(d0: date | None, d1: date | None) -> date | None:
+    """Mois (1ᵉʳ jour) d'une période = mois de son milieu : une ligne de closing du 30/08 au 01/10 est celle de septembre,
+    une période du 01/10 au 31/10 (ou du 30/09 au 01/11) celle d'octobre."""
+    if not d0 or not d1 or d1 < d0:
+        return None
+    mid = d0 + (d1 - d0) / 2
+    return mid.replace(day=1)
+
+
+def _prev_month(m: date) -> date:
+    return (m - timedelta(days=1)).replace(day=1)
+
+
+def month_label(m: date | None) -> str | None:
+    return f"{MOIS_FR[m.month - 1]} {m.year}" if m else None
+
+
+def month_days(m: date) -> int:
+    import calendar
+
+    return calendar.monthrange(m.year, m.month)[1]
+
+
+def period_month(r: dict) -> date | None:
+    """Mois N d'une ligne du tableau = mois de la période affichée (sélecteur de période)."""
+    per = r.get("periode") or {}
+    return _month_of(_day(per.get("debut")), _day(per.get("fin")))
+
+
+def monthly_labels(d_from: date, d_to: date) -> dict:
+    """Mois N (période affichée) et N-1, pour les en-têtes du bloc « ANALYSE ESTIMATION CONSOMMATION FUEL MENSUELLE »."""
+    m = _month_of(d_from, d_to)
+    m1 = _prev_month(m) if m else None
+    return {"mois_n": m.strftime("%Y-%m") if m else None, "mois_n_libelle": month_label(m), "jours_mois_n": month_days(m) if m else None,
+            "mois_n1": m1.strftime("%Y-%m") if m1 else None, "mois_n1_libelle": month_label(m1), "jours_mois_n1": month_days(m1) if m1 else None}
+
+
+def _line_month_n1(cand: dict, r: dict, d0: str) -> dict | None:
+    """Ligne du fichier de closing du mois N-1 du site (mois de son milieu = mois précédant celui du tableau) ; plusieurs :
+    celle qui finit à la Date de Relevé Initiale de la période, sinon la plus récente. Aucune : None (jamais une autre période)."""
+    m = period_month(r)
+    if m is None:
+        return None
+    want = _prev_month(m)
+    found = [((a, b), c) for (a, b), c in cand.items() if _month_of(_day(a), _day(b)) == want]
+    if not found:
+        return None
+    found.sort(key=lambda x: (x[0][1] == d0, x[0][1]))
+    (a, b), c = found[-1]
+    return {**c, "periode": [a, b]}
+
+
+def monthly_analysis(r: dict, lines: dict) -> dict:
+    """Bloc « ANALYSE ESTIMATION CONSOMMATION FUEL MENSUELLE Vs CONSOMMATION FUEL MOIS PRÉCÉDENT » (formules du fichier Output
+    App Fuel d'Ops, colonnes BX → CB) :
+      - nb_jours = Date de Relevé Finale − Date de Relevé Initiale (mêmes dates que tout le tableau) ;
+      - conso_moyenne_l_j = variation de stock considérée ÷ nb_jours ;
+      - estimation_mois_l = conso_moyenne_l_j × jours du mois N (mois de la période affichée) ;
+      - equivalent_n1_l = Qtité cons considérée de la ligne de closing du mois N-1 ÷ ses jours × jours du mois N ;
+      - delta_l = estimation_mois_l − equivalent_n1_l.
+    Donnée absente : null avec sa raison (jamais 0, contrairement au fichier d'Ops)."""
+    m = period_month(r)
+    jm = month_days(m) if m else None
+    d0, d1 = file_dates(r, lines)
+    nb = (d1 - d0).days if d0 and d1 and d1 > d0 else None
+    var = (r.get("analyse_variation") or {}).get("variation_l")
+    if nb is None:
+        moy, moy_motif = None, "dates de relevé absentes"
+    elif var is None:
+        moy, moy_motif = None, "variation de stock n.d." + (f" ({(r.get('analyse_variation') or {}).get('variation_motif')})"
+                                                           if (r.get("analyse_variation") or {}).get("variation_motif") else "")
+    else:
+        moy, moy_motif = round(float(var) / nb, 3), None
+    est = round(moy * jm, 3) if moy is not None and jm else None
+    n1 = (lines.get(r["site_id"]) or {}).get("n1") or {}
+    per1 = (list(n1.get("periode") or []) + [None, None])[:2]
+    a1, b1 = _day(per1[0]), _day(per1[1])
+    j1 = (b1 - a1).days if a1 and b1 and b1 > a1 else None
+    c1 = _f(n1.get("conso_closing_l"))
+    m1 = _prev_month(m) if m else None
+    if not n1:
+        eq, eq_motif = None, f"aucune ligne de closing de {month_label(m1).lower()} pour ce site" if m1 else "mois de la période n.d."
+    elif c1 is None:
+        eq, eq_motif = None, "Qtité cons considérée vide dans le fichier de closing N-1"
+    elif not j1:
+        eq, eq_motif = None, "dates de relevé de la ligne de closing N-1 absentes"
+    else:
+        eq, eq_motif = round(c1 / j1 * jm, 3), None
+    delta = round(est - eq, 3) if est is not None and eq is not None else None
+    delta_motif = None if delta is not None else " ; ".join(x for x in (
+        est is None and f"estimation du mois n.d. ({moy_motif})", eq is None and f"équivalent N-1 n.d. ({eq_motif})") if x)
+    return {"nb_jours": nb, "conso_moyenne_l_j": moy, "conso_moyenne_motif": moy_motif,
+            "mois_n": m.strftime("%Y-%m") if m else None, "mois_n_libelle": month_label(m), "jours_mois_n": jm,
+            "estimation_mois_l": est, "mois_n1": m1.strftime("%Y-%m") if m1 else None, "mois_n1_libelle": month_label(m1),
+            "conso_n1_l": c1, "jours_n1": j1, "periode_n1": [x.isoformat() if x else None for x in (a1, b1)] if n1 else None,
+            "fichier_n1": n1.get("fichier"), "formule_n1_coherente": n1.get("formule_coherente"),
+            "equivalent_n1_l": eq, "equivalent_n1_motif": eq_motif, "delta_l": delta, "delta_motif": delta_motif}
 
 
 def closing_genset_types(lines: dict) -> dict:
@@ -1126,6 +1229,7 @@ def enrich(rows: list[dict], fetch: bool = True, seuil: str | None = None) -> st
         e.update(theoretical_conso(e))
         e.update(retained_estimation(e))
         r["analyse_variation"] = stock_vs_theoretical(r, seuil)
+        r["analyse_mensuelle"] = monthly_analysis(r, lines)
     return err
 
 
@@ -1187,6 +1291,7 @@ TOTAL_FIELDS = {
                              "p_rect_kw", "p_ge_kw", "p_grid_kw", "p_load_dc_kw", "p_batt_kw", "p_retenue_kw",
                              "conso_theorique_l", "conso_fuel_sensor_l", "conso_fuel_sensor_avant_l", "conso_retenue_l"),
     "analyse_variation": ("conso_theorique_retenue_l", "variation_l", "delta_l"),
+    "analyse_mensuelle": ("conso_moyenne_l_j", "estimation_mois_l", "equivalent_n1_l", "delta_l"),
 }
 # Colonnes texte : « total » = nombre de sites renseignés (case vide / « n.d. » non comptée)
 TOTAL_COUNTS = {"estimation_theorique": ("fabricant_ge", "type_ge", "source_ge", "tm_source", "p_retenue_source")}
