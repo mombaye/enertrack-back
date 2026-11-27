@@ -191,7 +191,7 @@ def _cached_totals(d_from, d_to, p, rows):
     params = {k: v for k, v in (p.dict() if hasattr(p, "dict") else dict(p)).items() if k not in ("page", "page_size")}
     base = FuelImportBatch.objects.filter(source_type="BASE_GE").order_by("-received_at").values_list("pk", flat=True).first()
     raw = json.dumps([str(d_from), str(d_to), sorted(params.items()), _data_version(), base, (G.cached() or {}).get("lu_le")], default=str)
-    key = "fuel-conso-totaux-v11:" + hashlib.sha1(raw.encode()).hexdigest()
+    key = "fuel-conso-totaux-v12:" + hashlib.sha1(raw.encode()).hexdigest()
     try:
         hit = cache.get(key)
     except Exception:  # noqa: BLE001
@@ -232,7 +232,7 @@ def _cached_index(d_from, d_to, p, rows):
     params = {k: v for k, v in (p.dict() if hasattr(p, "dict") else dict(p)).items() if k not in ("page", "page_size", CF.PARAM, "colonne")}
     base = FuelImportBatch.objects.filter(source_type="BASE_GE").order_by("-received_at").values_list("pk", flat=True).first()
     raw = json.dumps([str(d_from), str(d_to), sorted(params.items()), _data_version(), base, (G.cached() or {}).get("lu_le")], default=str)
-    key = "fuel-conso-colonnes-v11:" + hashlib.sha1(raw.encode()).hexdigest()
+    key = "fuel-conso-colonnes-v12:" + hashlib.sha1(raw.encode()).hexdigest()
     try:
         hit = cache.get(key)
     except Exception:  # noqa: BLE001
@@ -284,7 +284,16 @@ def _cached_build(d_from, d_to, p):
     if data is None:
         data = C.build(d_from, d_to, params)
         cache.set(key, data, BUILD_TTL)
-    return copy.deepcopy(data)
+    data = copy.deepcopy(data)
+    if not (data.get("periode") or {}).get("bilan_disponible", True):
+        # période personnalisée (aucun bilan) : relevés à la veille du début et à la date de fin (règles du 27/11/2026)
+        from datetime import timedelta
+
+        from fuel_tracking.services import stock_initial_sources as S
+
+        S.mark_custom_period(data.get("rows") or [], d_from, d_to)
+        data["periode"]["personnalisee"] = {"releve_initial": (d_from - timedelta(days=1)).isoformat(), "releve_final": d_to.isoformat()}
+    return data
 
 
 class ConsommationsSanteView(APIView):

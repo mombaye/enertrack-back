@@ -41,6 +41,13 @@ ou aucune ligne de fichier : vide, jamais 0. Ce sont aussi ces valeurs du fichie
 synthèse (RAV_PERTES_CALCUL). Les vols / vidanges ENOC (vole_l / fuite_l) restent calculés mais sont mis de côté (non affichés,
 non utilisés) : pour revenir à ENOC, remettre RAV_PERTES_CALCUL = RAV_PERTES_ENOC.
 Mouvement rejeté, non intégré, ponction déséquilibrée : non compté. Aucune ligne de fichier (pas de dates) : vide, jamais 0.
+
+Période personnalisée (période choisie sans aucun bilan enregistré, ex. 01/10 → 13/10 ; règles validées par le Fuel Manager le
+27/11/2026) : voir mark_custom_period. Relevé initial = veille de la date de début, relevé final = date de fin ; stock retenu =
+Fuel Sensor FMS, sinon relevé de gardien ENOC du jour, sinon n.d. (aucun relevé de terrain : le fichier de clôture n'en a qu'aux
+dates de clôture) ; mouvements ENOC entre ces dates (même règle que le mois) ; volé / vidangé = déclarations ENOC de la période
+(le fichier de clôture n'a que des totaux mensuels) ; temps de marche, puissances, CPH, conso théorique, alerte : mêmes règles.
+Une période qui a des bilans (mois de clôture) est calculée exactement comme avant.
 """
 from __future__ import annotations
 
@@ -311,6 +318,21 @@ def _file_line_context(ini: dict | None, fin: dict | None) -> dict | None:
     return None
 
 
+def mark_custom_period(rows: list[dict], d_from: date, d_to: date) -> None:
+    """Période sans aucun bilan : chaque ligne reçoit les dates de relevé de la période personnalisée (veille de la date de
+    début → date de fin), utilisées par tout le tableau à la place de la ligne du fichier de clôture."""
+    d0, d1 = d_from - timedelta(days=1), d_to
+    for r in rows:
+        if r["stock"].get("bilan_id"):
+            continue
+        r["periode_personnalisee"] = {"releve_initial": d0.isoformat(), "releve_final": d1.isoformat()}
+        r["stock"]["date_initial"], r["stock"]["date_final"] = d0.isoformat(), d1.isoformat()
+
+
+def _custom(r: dict) -> dict | None:
+    return r.get("periode_personnalisee") or None
+
+
 def _file_dates(r: dict, details: dict) -> tuple[date | None, date | None]:
     """Date de Relevé Initiale / Finale de la ligne du fichier du site (sinon dates des relevés retenus par le bilan)."""
     ctx = _file_line_context(*details.get(r["stock"].get("bilan_id"), (None, None)))
@@ -377,20 +399,26 @@ def ravitaillement(rows: list[dict]) -> None:
 
 
 CLOSING_LOSS_KEYS = {"vole_closing_l": "vole_l", "vidange_closing_l": "vidange_l"}
-# Volé / vidangé utilisés dans les calculs (variation de stock, synthèse) : fichier de clôture pour le moment.
-RAV_PERTES_ENOC = ("vole_l", "fuite_l")                       # mis de côté (toujours calculé, plus utilisé)
-RAV_PERTES_CALCUL = ("vole_closing_l", "vidange_closing_l")
-RAV_PERTES_LIBELLE = {"vole_closing_l": "qté volée", "vidange_closing_l": "qté vidangée / fuite", "vole_l": "vols ENOC", "fuite_l": "vidanges ENOC"}
+# Volé / vidangé utilisés dans les calculs (variation de stock, synthèse) et affichés : vole_retenu_l / vidange_retenu_l =
+# fichier de clôture sur une période de clôture ; déclarations ENOC (vole_l / fuite_l) sur une période personnalisée.
+RAV_PERTES_ENOC = ("vole_l", "fuite_l")
+RAV_PERTES_CALCUL = ("vole_retenu_l", "vidange_retenu_l")
+RAV_PERTES_LIBELLE = {"vole_retenu_l": "qté volée", "vidange_retenu_l": "qté vidangée / fuite"}
+PERTES_SRC_CLOSING, PERTES_SRC_ENOC = "Fichier de closing", "ENOC (période personnalisée)"
 
 
 def ravitaillement_closing(rows: list[dict], lines: dict) -> None:
     """Ajoute au bloc « ravitaillement » la qté volée et la qté vidangée / fuite / écart de stock lues sur la ligne du fichier
-    de clôture de la période (mêmes dates que le tableau). Valeur du fichier telle quelle ; case vide ou pas de ligne : None."""
+    de clôture de la période (mêmes dates que le tableau). Valeur du fichier telle quelle ; case vide ou pas de ligne : None.
+    Valeurs retenues (vole_retenu_l / vidange_retenu_l) : fichier de clôture ; période personnalisée : vols / vidanges ENOC."""
     for r in rows:
         line = (lines.get(r["site_id"]) or {}).get("fin") or {}
         rv = r.setdefault("ravitaillement", {})
         for out_key, file_key in CLOSING_LOSS_KEYS.items():
             rv[out_key] = _f(line.get(file_key))
+        src = (RAV_PERTES_ENOC, PERTES_SRC_ENOC) if _custom(r) else (tuple(CLOSING_LOSS_KEYS), PERTES_SRC_CLOSING)
+        rv["vole_retenu_l"], rv["vidange_retenu_l"] = rv.get(src[0][0]), rv.get(src[0][1])
+        rv["pertes_source"] = src[1]
 
 
 def _file_line_values(rows) -> dict:
@@ -424,6 +452,17 @@ def _file_line_values(rows) -> dict:
     for r in rows:
         d0, d1 = str(r["stock"].get("date_initial") or "")[:10], str(r["stock"].get("date_final") or "")[:10]
         cand = lines.get(r["site_id"], {})
+        if _custom(r):
+            # période personnalisée : dates de la période seulement, aucune valeur de terrain ; type de GE repris de la ligne de
+            # clôture qui couvre la date de fin (sinon la date de début)
+            cov = next((c for (a, b), c in sorted(cand.items()) if a < d1 <= b), None) \
+                or next((c for (a, b), c in sorted(cand.items()) if a <= d0 < b), None) or {}
+            syn = {"periode": [d0, d1], "personnalisee": True,
+                   **{k: cov.get(k) for k in ("fabricant_ge", "type_ge", "fichier") if cov.get(k) is not None}}
+            if cov.get("periode"):
+                syn["periode_ge"] = cov["periode"]
+            out[r["site_id"]] = {"ini": syn, "fin": syn}
+            continue
         # ligne du fichier de la période : mêmes dates que le bilan, sinon même Date de Relevé Finale, sinon même Date de
         # Relevé Initiale. Ses DEUX dates font foi pour tout le tableau (stock initial, ravitaillement, temps de marche, final).
         line = (cand.get((d0, d1)) if d0 and d1 else None) \
@@ -442,7 +481,7 @@ def closing_genset_types(lines: dict) -> dict:
     for sid, line in lines.items():
         c = line.get("fin") or {}
         if ge_label(c.get("type_ge")):
-            per = [str(x or "?")[:10] for x in (list(c.get("periode") or []) + [None, None])[:2]]
+            per = [str(x or "?")[:10] for x in (list(c.get("periode_ge") or c.get("periode") or []) + [None, None])[:2]]
             out[sid.upper()] = (c.get("fabricant_ge"), ge_label(c["type_ge"]),
                                 f"Fichier de clôture ({c.get('fichier') or 'Closing'}, {per[0]} → {per[1]})")
     return out
@@ -803,7 +842,7 @@ def stock_vs_theoretical(r: dict, seuil: str | None = None) -> dict:
         var, var_motif = None, "mouvements ENOC non lus (dates de relevé absentes du fichier)"
     elif any(rv.get(k) is None for k in RAV_PERTES_CALCUL):
         manque = " et ".join(RAV_PERTES_LIBELLE[k] for k in RAV_PERTES_CALCUL if rv.get(k) is None)
-        var, var_motif = None, f"{manque} non renseignée dans le fichier de clôture"
+        var, var_motif = None, f"{manque} non renseignée ({(rv.get('pertes_source') or PERTES_SRC_CLOSING).lower()})"
     else:
         var = ini + sum(f(rv.get(k)) or 0 for k in ("eydon_l", "carte_total_l", "ajout_l")) \
             - sum(f(rv.get(k)) or 0 for k in ("retrait_l", *RAV_PERTES_CALCUL)) - fin
@@ -987,10 +1026,14 @@ def enrich(rows: list[dict], fetch: bool = True, seuil: str | None = None) -> st
         terrain = (_f(li0.get("_niveau_initial_l")) if li0.get("_niveau_initial_l") is not None
                    else (r["stock"].get("initial_l") if (r["stock"].get("source_initial") or "").lower() == "closing"
                          and str(d or "") == str(_day(r["stock"].get("date_initial")) or "") else None))
+        if _custom(r):
+            terrain = None   # période personnalisée : aucun relevé de terrain (le fichier n'en a qu'aux dates de clôture)
         g = guards.get((r["site_id"], d), {}) if d else {}
         p = sf.get((r["site_id"], d), {}) if d else {}
         fms, idx = p.get("niveau_l"), p.get("index_h")
         retenue, src = (fms, SRC_FMS) if fms is not None else ((terrain, SRC_TERRAIN) if terrain is not None else (None, None))
+        if _custom(r):   # période personnalisée : FMS, sinon relevé de gardien ENOC du jour, sinon n.d.
+            retenue, src = _first_of((fms, SRC_FMS), (g.get("litres"), SRC_GUARD))
         line = (lines.get(r["site_id"]) or {}).get("ini") or {}
         cpt_terrain = _f(line.get("compteur_terrain_initial_h"))
         # ordre : Index Compteur FMS → Société de gardiennage → relevé de terrain du fichier de clôture
@@ -1137,7 +1180,7 @@ def _first_of(*candidates):
 TOTAL_FIELDS = {
     "stock_initial_sources": ("terrain_l", "gardiennage_l", "fms_l", "retenue_l", "compteur_terrain_h", "compteur_gardiennage_h",
                               "compteur_fms_h", "compteur_retenu_h"),
-    "ravitaillement": ("eydon_l", "carte_total_l", "ajout_l", "retrait_l", "vole_l", "fuite_l", "vole_closing_l", "vidange_closing_l"),
+    "ravitaillement": ("eydon_l", "carte_total_l", "ajout_l", "retrait_l", "vole_l", "fuite_l", "vole_retenu_l", "vidange_retenu_l"),
     "stock_final_sources": ("terrain_l", "gardiennage_l", "fms_l", "retenue_l", "compteur_terrain_h", "compteur_gardiennage_h",
                             "compteur_fms_h", "compteur_retenu_h"),
     "estimation_theorique": ("prp_kva", "prp_kw", "tm_dg_on_h", "tm_rectifier_h", "tm_terrain_h", "tm_index_fms_h", "tm_retenu_h",

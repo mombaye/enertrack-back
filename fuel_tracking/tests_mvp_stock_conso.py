@@ -929,6 +929,37 @@ class StockInitialSourcesTests(OutputAppFuelImportTests):
         x = rows[0]["stock_initial_sources"]
         self.assertEqual((x["gardiennage_l"], x["compteur_gardiennage_h"]), (None, None))
 
+    def test_custom_period_uses_fms_or_guard_at_eve_and_end_without_file_values(self):
+        from datetime import date
+
+        from fuel_tracking.services import stock_initial_sources as S
+
+        rows = self._rows()
+        rows[0]["stock"]["bilan_id"] = None                     # 01/10 → 13/10 : aucun bilan enregistré pour cette période
+        S.mark_custom_period(rows, date(2026, 10, 1), date(2026, 10, 13))
+        self.assertEqual((rows[0]["stock"]["date_initial"], rows[0]["stock"]["date_final"]), ("2026-09-30", "2026-10-13"))
+        docs = [{"site_id": "DKR_0001", "date_releve": "2026-09-30T17:00:00", "tanks": [{"level_liters": 950, "level_cm": 82}]},
+                {"site_id": "DKR_0001", "date_releve": "2026-10-13T09:00:00", "tanks": [{"level_liters": 610, "level_cm": 55}]}]
+        self._enrich(rows, docs)
+        i, f, rv = rows[0]["stock_initial_sources"], rows[0]["stock_final_sources"], rows[0]["ravitaillement"]
+        # veille du début et date de fin ; pas de FMS ici : relevé de gardien ENOC ; aucune valeur de terrain du fichier
+        self.assertEqual((i["date"], i["terrain_l"], i["retenue_l"], i["source"]), ("2026-09-30", None, 950.0, S.SRC_GUARD))
+        self.assertEqual((f["date"], f["terrain_l"], f["retenue_l"], f["source"]), ("2026-10-13", None, 610.0, S.SRC_GUARD))
+        self.assertEqual((rv["debut"], rv["fin"], rv["source"], rv["pertes_source"]), ("2026-09-30", "2026-10-13", "ENOC", S.PERTES_SRC_ENOC))
+        self.assertEqual((rv["vole_retenu_l"], rv["vidange_retenu_l"], rv["vole_closing_l"]), (rv["vole_l"], rv["fuite_l"], None))
+        self.assertIsNone(rows[0]["estimation_theorique"]["tm_terrain_h"])   # aucun compteur de terrain hors dates de clôture
+
+    def test_month_rows_with_bilan_are_not_marked(self):
+        from datetime import date
+
+        from fuel_tracking.services import stock_initial_sources as S
+
+        rows = self._rows()
+        before = (rows[0]["stock"]["date_initial"], rows[0]["stock"]["date_final"])
+        S.mark_custom_period(rows, date(2026, 10, 1), date(2026, 10, 13))
+        self.assertNotIn("periode_personnalisee", rows[0])
+        self.assertEqual((rows[0]["stock"]["date_initial"], rows[0]["stock"]["date_final"]), before)
+
     def test_enoc_down_leaves_guard_empty_with_message(self):
         rows = self._rows()
         msg = self._enrich(rows, down=True)
@@ -1000,6 +1031,12 @@ class StockInitialSourcesTests(OutputAppFuelImportTests):
         got = [(r["ravitaillement"]["vole_closing_l"], r["ravitaillement"]["vidange_closing_l"]) for r in rows]
         self.assertEqual(got, [(849.0, 0.0), (None, 1467.5), (None, None)])   # 0 du fichier = 0 ; case vide / pas de ligne = vide
         self.assertEqual((rows[0]["ravitaillement"]["vole_l"], rows[0]["ravitaillement"]["fuite_l"]), (40.0, 15.0))   # ENOC intact
+        self.assertEqual([(r["ravitaillement"]["vole_retenu_l"], r["ravitaillement"]["vidange_retenu_l"], r["ravitaillement"]["pertes_source"])
+                          for r in rows[:2]], [(849.0, 0.0, S.PERTES_SRC_CLOSING), (None, 1467.5, S.PERTES_SRC_CLOSING)])
+        perso = [{"site_id": "A_1", "periode_personnalisee": {"releve_initial": "2026-09-30"}, "ravitaillement": {"vole_l": 40.0, "fuite_l": 15.0}}]
+        S.ravitaillement_closing(perso, lines)   # période personnalisée : vols / vidanges ENOC, jamais les totaux mensuels du fichier
+        self.assertEqual((perso[0]["ravitaillement"]["vole_retenu_l"], perso[0]["ravitaillement"]["vidange_retenu_l"],
+                          perso[0]["ravitaillement"]["pertes_source"]), (40.0, 15.0, S.PERTES_SRC_ENOC))
 
     def test_variation_uses_closing_file_losses_not_enoc(self):
         from fuel_tracking.services import stock_initial_sources as S
@@ -1007,12 +1044,12 @@ class StockInitialSourcesTests(OutputAppFuelImportTests):
         rv = {"source": "ENOC", "eydon_l": 500, "carte_total_l": 0, "ajout_l": 0, "retrait_l": 0, "vole_l": 999, "fuite_l": 999}
         row = lambda **k: {"stock_initial_sources": {"retenue_l": 1000}, "stock_final_sources": {"retenue_l": 600},  # noqa: E731
                            "estimation_theorique": {"conso_retenue_l": 300}, "ravitaillement": {**rv, **k}}
-        a = S.stock_vs_theoretical(row(vole_closing_l=100.0, vidange_closing_l=50.0))
+        a = S.stock_vs_theoretical(row(vole_retenu_l=100.0, vidange_retenu_l=50.0))
         self.assertEqual(a["variation_l"], 1000 + 500 - 100 - 50 - 600)   # 750 : vols / vidanges ENOC (999) mis de côté
-        self.assertEqual(S.stock_vs_theoretical(row(vole_closing_l=0.0, vidange_closing_l=0.0))["variation_l"], 900.0)   # 0 du fichier = 0
-        b = S.stock_vs_theoretical(row(vole_closing_l=None, vidange_closing_l=0.0))   # case vide du fichier : pas de calcul, jamais 0
+        self.assertEqual(S.stock_vs_theoretical(row(vole_retenu_l=0.0, vidange_retenu_l=0.0))["variation_l"], 900.0)   # 0 du fichier = 0
+        b = S.stock_vs_theoretical(row(vole_retenu_l=None, vidange_retenu_l=0.0, pertes_source=S.PERTES_SRC_CLOSING))   # case vide du fichier : pas de calcul, jamais 0
         self.assertIsNone(b["variation_l"])
-        self.assertEqual(b["variation_motif"], "qté volée non renseignée dans le fichier de clôture")
+        self.assertEqual(b["variation_motif"], "qté volée non renseignée (fichier de closing)")
         self.assertIsNone(S.stock_vs_theoretical(row())["variation_l"])   # aucune ligne de fichier
 
     def _set_terrain_counter(self, rows, value, periode_start=None):
@@ -2445,10 +2482,10 @@ class TableKpisTests(SimpleTestCase):
     def test_synthese_depuis_le_tableau(self):
         from fuel_tracking.services.closing_kpis import table_kpis
 
-        rav = lambda **k: {"source": "ENOC", **dict.fromkeys(("eydon_l", "carte_total_l", "ajout_l", "retrait_l", "vole_l", "fuite_l", "vole_closing_l", "vidange_closing_l"), 0.0), **k}  # noqa: E731
+        rav = lambda **k: {"source": "ENOC", **dict.fromkeys(("eydon_l", "carte_total_l", "ajout_l", "retrait_l", "vole_l", "fuite_l", "vole_retenu_l", "vidange_retenu_l"), 0.0), **k}  # noqa: E731
         rows = [
             {"stock_initial_sources": {"retenue_l": 1000.0, "date": "2026-09-30"}, "stock_final_sources": {"retenue_l": 400.0, "date": "2026-10-30"},
-             "ravitaillement": rav(eydon_l=600.0, vole_closing_l=50.0), "estimation_theorique": {"type_ge": "K22"}},          # conso 1 150 L / 30 j
+             "ravitaillement": rav(eydon_l=600.0, vole_retenu_l=50.0), "estimation_theorique": {"type_ge": "K22"}},          # conso 1 150 L / 30 j
             {"stock_initial_sources": {"retenue_l": 500.0, "date": "2026-10-01"}, "stock_final_sources": {"retenue_l": None},
              "ravitaillement": rav(ajout_l=100.0), "estimation_theorique": {"type_ge": None}},                         # incomplet
             {"stock_initial_sources": {"retenue_l": 200.0, "date": "2026-10-01"}, "stock_final_sources": {"retenue_l": 150.0, "date": "2026-10-11"},
@@ -2524,14 +2561,14 @@ class StockVsTheoreticalTests(MvpBase):
 
     @staticmethod
     def row(theo=1848.47, ini=1000.0, fin=400.0, src="ENOC", **rav):
-        rv = {"source": src, **dict.fromkeys(("eydon_l", "carte_total_l", "ajout_l", "retrait_l", "vole_l", "fuite_l", "vole_closing_l", "vidange_closing_l"), 0.0), **rav}
+        rv = {"source": src, **dict.fromkeys(("eydon_l", "carte_total_l", "ajout_l", "retrait_l", "vole_l", "fuite_l", "vole_retenu_l", "vidange_retenu_l"), 0.0), **rav}
         return {"site_id": "S_1", "stock_initial_sources": {"retenue_l": ini}, "stock_final_sources": {"retenue_l": fin},
                 "ravitaillement": rv, "estimation_theorique": {"conso_retenue_l": theo, "conso_retenue_motif": None if theo is not None else "Puissance retenue n.d."}}
 
     def test_variation_delta_and_flag(self):
         from fuel_tracking.services.stock_initial_sources import stock_vs_theoretical as A
 
-        a = A(self.row(theo=1000.0, eydon_l=600.0, carte_total_l=100.0, ajout_l=50.0, retrait_l=20.0, vole_closing_l=10.0, vidange_closing_l=5.0))
+        a = A(self.row(theo=1000.0, eydon_l=600.0, carte_total_l=100.0, ajout_l=50.0, retrait_l=20.0, vole_retenu_l=10.0, vidange_retenu_l=5.0))
         self.assertEqual(a["variation_l"], 1000 + 600 + 100 + 50 - 20 - 10 - 5 - 400)   # 1 315 L
         self.assertEqual(a["delta_l"], 1000 - 1315)
         self.assertEqual(a["grande_difference"], "Oui")                                    # |−315| > 100

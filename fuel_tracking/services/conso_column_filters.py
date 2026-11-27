@@ -20,7 +20,7 @@ FILTER_KEYS = TOP + tuple(f"inventaire.{k}" for k in ("region", "indoor_outdoor"
         "date", "terrain_l", "gardiennage_l", "fms_l", "retenue_l", "source", "compteur_terrain_h", "compteur_gardiennage_h",
         "compteur_fms_h", "compteur_retenu_h", "source_compteur")) \
     + tuple(f"ravitaillement.{k}" for k in ("date_finale_fichier", "eydon_l", "carte_total_l", "ajout_l", "retrait_l", "vole_l", "fuite_l",
-                                                     "vole_closing_l", "vidange_closing_l")) \
+                                                     "vole_closing_l", "vidange_closing_l", "vole_retenu_l", "vidange_retenu_l")) \
     + tuple(f"estimation_theorique.{k}" for k in (
         "fabricant_ge", "type_ge", "source_ge", "prp_kva", "prp_kw", "tm_dg_on_h", "tm_rectifier_h", "tm_terrain_h", "tm_index_fms_h",
         "tm_dg_on_visibilite_pct", "tm_rectifier_visibilite_pct", "tm_terrain_visibilite_pct", "tm_index_fms_visibilite_pct",

@@ -439,11 +439,9 @@ def table_kpis(rows: list[dict], d_from: date, d_to: date) -> dict:
                      [("EYDON (L)", eydon), ("CARTE TOTAL (L)", carte), ("Total (L)", livree)]),
         "autre_l": (f"{tab} — colonnes « Total Ajout » et « Total Retrait » (ENOC).", "Σ Ajout − Σ Retrait.",
                     [("Ajout (L)", ajout), ("Retrait (L)", retrait), ("Total (L)", autre)]),
-        "perdue_l": (f"{tab} — colonnes « Total QTE volée déclarée » et « QTE vidangée / Fuite » (fichier de closing).", "Σ volé + Σ vidangé / fuite.",
+        "perdue_l": (f"{tab} — colonnes « Total QTE volée déclarée » et « QTE vidangée / Fuite » (fichier de closing ; ENOC sur une période personnalisée).", "Σ volé + Σ vidangé / fuite.",
                      [("Volé (L)", vole), ("Vidangé / fuite (L)", fuite), ("Total (L)", perdue)]),
-        "conso_releves_l": (tab + ".", "Pour chaque site complet (stock initial et final retenus + mouvements ENOC lus + volé / vidangé du fichier "
-                            "de closing renseignés) : stock initial + EYDON + CARTE TOTAL + Ajout − Retrait − volé − vidangé (fichier de "
-                            "closing) − stock final ; puis somme.",
+        "conso_releves_l": (tab + ".", "Pour chaque site complet (stock initial et final retenus + mouvements ENOC lus + volé / vidangé renseignés) : stock initial + EYDON + CARTE TOTAL + Ajout − Retrait − volé − vidangé − stock final ; puis somme.",
                             [("Sites complets", n_c), ("Sites du tableau", len(rows)), ("dont consommation négative", n_neg), ("Total (L)", s_conso)]),
         "conso_moyenne_jour_l": (tab + ".", "Pour chaque site complet : consommation ÷ jours entre la date du stock initial et celle du stock "
                                  "final ; puis moyenne de ces L/jour.", [("Sites pris en compte", len(rates))]),
